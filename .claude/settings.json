@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add *)",
+      "Bash(git commit *)"
+    ],
+    "deny": [
+      "Bash(git worktree remove *)",
+      "Bash(git worktree prune*)",
+      "Bash(*git worktree remove*)",
+      "Bash(*git worktree prune*)"
+    ]
+  },
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  }
+}

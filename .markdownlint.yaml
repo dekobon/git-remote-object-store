@@ -1,0 +1,50 @@
+# markdownlint configuration
+# https://github.com/DavidAnson/markdownlint/blob/main/schema/.markdownlint.yaml
+
+# MD001 - Heading levels should only increment by one level at a time.
+# Disabled: sub-documents (gap analyses, issues) intentionally start at h3
+# because they are sections of a larger logical document.
+MD001: false
+
+# MD013 - Line length.
+# Disabled: documentation files contain tables, URLs, and code references
+# that regularly exceed any reasonable line limit.
+MD013: false
+
+# MD024 - Multiple headings with the same content.
+# Disabled: CHANGELOG and divergences docs legitimately repeat headings
+# like "Problem", "Solution", "Verification" under different parent sections.
+MD024: false
+
+# MD029 - Ordered list item prefix.
+# Disabled: some documents use continuous numbering across subsections
+# (e.g., a prioritized list split into phases 1-3, 4-5, 6-7).
+MD029: false
+
+# MD033 - Inline HTML.
+# Disabled: false positives on angle-bracket syntax like <T> in prose.
+MD033: false
+
+# MD036 - Emphasis used instead of a heading.
+# Disabled: bold text is used intentionally for styled labels and steps
+# that are not meant to be headings (no TOC entry, no fragment link).
+MD036: false
+
+# MD040 - Fenced code blocks should have a language specified.
+# Disabled: many blocks contain mixed output, config snippets, or
+# pseudocode where no single language tag is appropriate.
+MD040: false
+
+# MD041 - First line in a file should be a top-level heading.
+# Disabled: issue files start at h3 by convention and some specs
+# open with prose context before the first heading.
+MD041: false
+
+# MD052 - Reference links and images should use a defined label.
+# Disabled: false positive on bracket notation like ['parsed'] in prose.
+MD052: false
+
+# MD060 - Table column style.
+# Disabled: enforcing consistent pipe spacing across all existing tables
+# is not worth the churn. Tables are readable as-is.
+MD060: false

@@ -1,0 +1,30 @@
+[package]
+name = "git-remote-object-store"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/dekobon/git-remote-object-store"
+authors = ["Elijah Zupancic <elijah@zupancic.name>"]
+description = "Git remote helper backed by cloud object stores (S3, Azure Blob Storage)"
+readme = "README.md"
+keywords = ["git", "remote-helper", "s3", "azure", "object-store"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+
+[dependencies]
+
+# Keep line tables in release builds so dsymutil/objcopy can produce
+# meaningful backtraces from a released binary. Release CI splits
+# these into separate debug-symbol artefacts and strips the primary
+# binary before shipping; local `cargo install` users get a slightly
+# larger binary with line-level panic backtraces.
+[profile.release]
+debug = "line-tables-only"
