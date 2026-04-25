@@ -88,7 +88,7 @@ impl RefName {
     /// for any string git itself would reject.
     pub fn new(name: impl Into<String>) -> Result<Self, RefNameError> {
         let name = name.into();
-        match gix_validate::reference::name(BStr::new(name.as_bytes())) {
+        match gix_validate::reference::name(BStr::new(&name)) {
             Ok(_) => Ok(RefName(name)),
             Err(source) => Err(RefNameError::Invalid { name, source }),
         }
@@ -141,7 +141,7 @@ pub enum RefNameError {
 /// form used when constructing a [`RefName`], use [`RefName::new`] instead.
 #[must_use]
 pub fn validate_ref_name(name: &str) -> bool {
-    gix_validate::reference::name_partial(BStr::new(name.as_bytes())).is_ok()
+    gix_validate::reference::name_partial(BStr::new(name)).is_ok()
 }
 
 /// Aggregate error for the helpers in this module.
@@ -297,14 +297,13 @@ pub async fn bundle(
         "bundle output folder must be absolute"
     );
     let bundle_path = folder.join(format!("{sha}.bundle"));
-    let bundle_arg = bundle_path.clone().into_os_string();
     let ref_arg = OsString::from(ref_name.as_str());
     let cwd = repo_cwd(repo).to_owned();
 
     let args: [&OsStr; 4] = [
         OsStr::new("bundle"),
         OsStr::new("create"),
-        bundle_arg.as_os_str(),
+        bundle_path.as_os_str(),
         ref_arg.as_os_str(),
     ];
     run_git("bundle create", &args, &cwd).await?;
@@ -347,7 +346,7 @@ pub fn rev_parse(repo: &Repository, spec: &str) -> Result<Sha, GitError> {
     if spec.is_empty() {
         return Err(GitError::EmptySpec);
     }
-    let id = repo.rev_parse_single(BStr::new(spec.as_bytes()))?;
+    let id = repo.rev_parse_single(BStr::new(spec))?;
     Ok(Sha::from_object_id(id.detach()))
 }
 
@@ -376,12 +375,11 @@ pub fn is_ancestor(repo: &Repository, ancestor: Sha, descendant: Sha) -> Result<
 /// Uses `gix-archive`'s native zip writer via
 /// [`Repository::worktree_archive`]; no subprocess.
 pub fn archive(repo: &Repository, folder: &Path, ref_name: &RefName) -> Result<PathBuf, GitError> {
-    let object = repo
-        .rev_parse_single(BStr::new(ref_name.as_str().as_bytes()))?
-        .object()?;
-    let tree = object.peel_to_kind(gix::object::Kind::Tree)?;
-    let tree_id = tree.id;
-    let (stream, _index) = repo.worktree_stream(tree_id)?;
+    let tree = repo
+        .rev_parse_single(BStr::new(ref_name.as_str()))?
+        .object()?
+        .peel_to_kind(gix::object::Kind::Tree)?;
+    let (stream, _index) = repo.worktree_stream(tree.id)?;
 
     let path = folder.join("repo.zip");
     let file = std::fs::File::create(&path)?;
@@ -412,8 +410,8 @@ pub fn last_commit_message(repo: &Repository) -> Result<String, GitError> {
         Err(e) => return Err(e.into()),
     };
     let short = commit.short_id()?;
-    let summary = commit.message()?.summary().into_owned();
-    Ok(format!("{} {}", short, summary.to_str_lossy()))
+    let message = commit.message()?;
+    Ok(format!("{} {}", short, message.summary().to_str_lossy()))
 }
 
 /// Read a remote's URL out of the repository's configuration.
@@ -422,7 +420,7 @@ pub fn last_commit_message(repo: &Repository) -> Result<String, GitError> {
 /// `git remote get-url` semantics.
 pub fn remote_url(repo: &Repository, name: &str) -> Result<String, GitError> {
     let remote = repo
-        .find_remote(BStr::new(name.as_bytes()))
+        .find_remote(BStr::new(name))
         .map_err(|e| match e {
             gix::remote::find::existing::Error::NotFound { .. } => {
                 GitError::RemoteNotFound(name.to_owned())
