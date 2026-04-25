@@ -18,7 +18,7 @@
 //! similar error-path tests deterministically.
 
 use std::collections::BTreeMap;
-use std::collections::Bound;
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -361,6 +361,39 @@ mod tests {
         let all = store.list("").await.unwrap();
         let keys: Vec<&str> = all.iter().map(|m| m.key.as_str()).collect();
         assert_eq!(keys, vec!["a", "z"]);
+    }
+
+    #[tokio::test]
+    async fn put_bytes_overwrites_existing_key() {
+        let store = MockStore::new();
+        store
+            .put_bytes("k", body(b"first"), PutOpts::default())
+            .await
+            .unwrap();
+        store
+            .put_bytes("k", body(b"second-longer"), PutOpts::default())
+            .await
+            .unwrap();
+        assert_eq!(&store.get_bytes("k").await.unwrap()[..], b"second-longer");
+        let meta = store.head("k").await.unwrap();
+        assert_eq!(meta.size, b"second-longer".len() as u64);
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_fault_fires_before_existing_key_check() {
+        // Both a fault is armed AND the key is already present. The
+        // implementation must consult the fault queue before the
+        // contains_key short-circuit, so callers see Err(PreconditionFailed)
+        // rather than Ok(false). Locks in the ordering at mock.rs:248-270.
+        let store = MockStore::new();
+        store.insert("k", body(b"existing"));
+        store.arm(Fault::PreconditionFailedOnPutIfAbsent { key: "k".into() });
+
+        let err = store.put_if_absent("k", body(b"x")).await.unwrap_err();
+        assert!(matches!(err, Error::PreconditionFailed(ref k) if k == "k"));
+        // Body unchanged.
+        assert_eq!(&store.get_bytes("k").await.unwrap()[..], b"existing");
+        assert_eq!(store.pending_faults(), 0);
     }
 
     #[tokio::test]
