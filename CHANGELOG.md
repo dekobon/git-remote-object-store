@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Phase 4 object-store seam (`src/object_store/`): backend-neutral
+  `ObjectStore` async trait (eight methods covering list / head / get /
+  put / put-if-absent / copy / delete), shared `Error` enum mapping S3
+  and Azure failure codes onto `NotFound` / `AccessDenied` /
+  `PreconditionFailed` / `Conflict` / `Network` / `Other`, and the
+  `ObjectMeta` / `PutOpts` value types. The trait is dispatched via
+  `Arc<dyn ObjectStore>` (`async_trait` macro keeps `dyn + Send + Sync`
+  ergonomic). An in-memory `MockStore` lives behind a new `test-util`
+  Cargo feature (also active under `cfg(test)`) so unit tests in this
+  crate AND integration tests for phases 5–9 can drive push, fetch,
+  locking, and doctor logic without MinIO/Azurite. The mock supports
+  FIFO fault injection (`PreconditionFailed` on `put_if_absent`,
+  `NotFound` on `head`, `Network` on `get_bytes`, `AccessDenied` on
+  `list`) so Phase 8's stale-lock retry path is deterministic, and
+  `insert_with` back-dates `last_modified` for the staleness check.
 - Phase 3 git wrapper (`src/git.rs`): the eight helpers from upstream
   `git_remote_s3/git.py` ported onto `gix` (gitoxide) with two newtypes
   (`Sha`, `RefName`), a `GitError` aggregate, and a single private
