@@ -112,15 +112,23 @@ percent-encoding = "2"
 # Property-based testing for URL round-trip parse/format.
 proptest = "1"
 
-# MinIO testcontainer used by `tests/s3_store_integration.rs` (gated on the
+# RustFS testcontainer used by `tests/s3_store_integration.rs` (gated on the
 # `integration-s3` Cargo feature). Cargo does not allow `optional = true` on
-# dev-dependencies, so these compile for every `cargo test` invocation but
-# only link into the integration test file when the feature is enabled.
-# `blocking` enables `SyncRunner`, which starts the container outside of any
-# tokio runtime so it can be shared across multiple `#[tokio::test]`-spawned
-# runtimes without their dispatch tasks tearing each other down.
-testcontainers = { version = "0.27", features = ["blocking"] }
-testcontainers-modules = { version = "0.15", features = ["minio"] }
+# dev-dependencies, so this compiles for every `cargo test` invocation but
+# only links into the integration test file when the feature is enabled.
+# Features:
+#   - `blocking` enables `SyncRunner`, which starts the container outside of
+#     any tokio runtime so it can be shared across multiple `#[tokio::test]`
+#     -spawned runtimes without their dispatch tasks tearing each other down.
+#   - `http_wait_plain` enables `WaitFor::http(...)`, required because RustFS
+#     writes its startup logs to a log file inside the container rather than
+#     to stdout, so a log-message wait would never fire. We poll the S3
+#     endpoint instead.
+#
+# The fixture uses `testcontainers::GenericImage` directly with a pinned
+# RustFS tag rather than `testcontainers-modules`, which hardcodes `:latest`
+# and would silently drift across alpha releases.
+testcontainers = { version = "0.27", features = ["blocking", "http_wait_plain"] }
 
 # SHA-256 for byte-equality assertions on the multipart-download integration test
 # (avoids holding the 50 MiB body twice in memory).
