@@ -20,6 +20,90 @@ module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 
 [dependencies]
+# Async runtime
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "fs",
+    "io-util",
+    "process",
+    "signal",
+    "time",
+] }
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time
+time = { version = "0.3", features = ["parsing", "formatting"] }
+
+# JSON (LFS)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# URL parsing
+url = "2"
+
+# Git operations (gitoxide). Sub-crates are kept on the same versions
+# `gix` 0.82 itself selects to avoid duplicate copies in the dep graph.
+#
+# `gix` is pulled in with default features on purpose: `gix-hash` 0.24's
+# `Kind` enum has its `Sha1` / `Sha256` variants gated behind the matching
+# crate features, and its own default feature set is empty. The explicit
+# `features = ["sha1"]` below ensures `Kind` is inhabited; disabling
+# `gix`'s defaults causes the rest of the gix tree to be compiled without
+# `sha1` and reintroduces the non-exhaustive-match build error in
+# gix-hash. Keep the defaults until we have a reason to slim the tree
+# (Phase 14 packaging is the right place to revisit).
+gix = "0.82"
+gix-hash = { version = "0.24", features = ["sha1"] }
+gix-validate = "0.11"
+gix-archive = "0.31"
+
+# Bytes / IO
+bytes = "1"
+tempfile = "3"
+
+# Remote-helper shims. Git invokes them by scheme as `git-remote-<scheme>`,
+# so the installed binary names must be `git-remote-s3+https` etc.
+#
+# Phase-1 spike result (execution-plan.md §5.6 / §6): cargo rejects `+` in
+# `[[bin]] name` ("invalid character '+' in crate name"). Falling back to
+# hyphenated cargo bin names; an `xtask` step will rename / hardlink them
+# to the `+` form at install time. Tracked separately for Phase 14
+# (packaging).
+
+[[bin]]
+name = "git-remote-s3-https"
+path = "src/bin/git-remote-s3-https.rs"
+
+[[bin]]
+name = "git-remote-s3-http"
+path = "src/bin/git-remote-s3-http.rs"
+
+[[bin]]
+name = "git-remote-az-https"
+path = "src/bin/git-remote-az-https.rs"
+
+[[bin]]
+name = "git-remote-az-http"
+path = "src/bin/git-remote-az-http.rs"
+
+[[bin]]
+name = "git-remote-object-store"
+path = "src/bin/git-remote-object-store.rs"
+
+[[bin]]
+name = "git-lfs-object-store"
+path = "src/bin/git-lfs-object-store.rs"
 
 # Keep line tables in release builds so dsymutil/objcopy can produce
 # meaningful backtraces from a released binary. Release CI splits
