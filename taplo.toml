@@ -1,0 +1,5 @@
+# Discover *.toml (default) plus non-standard TOML extensions
+include = ["**/*.toml", "**/*.toml.example"]
+
+# Global exclusions -- directories not managed by this project
+exclude = ["target/**", ".claude/**"]

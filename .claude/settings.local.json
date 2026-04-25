@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/elijah/Development/Open_Source/host-identity/**)",
+      "Bash(cargo init *)",
+      "Bash(cargo build *)",
+      "Read(//home/elijah/Development/Open_Source/f5-agent/**)"
+    ]
+  }
+}
