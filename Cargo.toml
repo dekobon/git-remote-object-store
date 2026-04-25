@@ -19,7 +19,19 @@ pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 
+[features]
+# Expose test-only helpers (notably `object_store::mock::MockStore`) to
+# integration tests in `tests/` and to higher-phase test code that lives
+# outside the lib crate. Production builds leave the feature off; in-crate
+# unit tests pick up the helpers via `cfg(test)` regardless of the feature.
+test-util = []
+
 [dependencies]
+# Async traits via Boxed futures. `async_trait` keeps `dyn ObjectStore +
+# Send + Sync` ergonomic; native AFIT (stable since 1.75) is awkward
+# through `dyn` because each method's future must be `Send`-bounded.
+async-trait = "0.1"
+
 # Async runtime
 tokio = { version = "1", features = [
     "rt-multi-thread",

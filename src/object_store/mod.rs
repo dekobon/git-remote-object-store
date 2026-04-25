@@ -1,9 +1,109 @@
 //! Backend-neutral object-store trait shared by the S3 and Azure Blob
 //! implementations.
 //!
-//! See §2.1 of `execution-plan.md` for the trait sketch. Implementation
-//! lands in Phase 4 (trait + mock) and Phases 5 / 11 (S3 / Azure backends).
+//! See `execution-plan.md` §2.1 for the trait sketch and §2.3 / §5.1 for
+//! the error mapping rationale. Phase 4 lands the trait, value types, and
+//! an in-memory mock; Phase 5 fills in `s3.rs` and Phase 11 fills in
+//! `azure.rs`.
+//!
+//! Trait dispatch is intended for `Arc<dyn ObjectStore>` so the protocol
+//! REPL (Phase 6) can drive either backend without monomorphisation. Async
+//! methods are routed through [`async_trait`] so `dyn ObjectStore + Send +
+//! Sync` composes cleanly — native `async fn`-in-trait would require
+//! per-method `Send` bounds that don't survive `dyn`.
 
 pub mod azure;
 pub mod error;
 pub mod s3;
+
+#[cfg(any(test, feature = "test-util"))]
+pub mod mock;
+
+use std::path::Path;
+
+use bytes::Bytes;
+use time::OffsetDateTime;
+
+pub use self::error::{BoxError, Error};
+
+/// Metadata returned by `list` and `head`.
+///
+/// `key` is the full backend key (the prefix passed to `list` is included);
+/// `last_modified` is the server-side wall clock, used by Phase 8's
+/// stale-lock recovery (`execution-plan.md` §1.1 / §5.2).
+#[derive(Debug, Clone)]
+pub struct ObjectMeta {
+    /// Full key of the stored object.
+    pub key: String,
+    /// Body length in bytes.
+    pub size: u64,
+    /// Server-side last-modified timestamp.
+    pub last_modified: OffsetDateTime,
+}
+
+/// Optional `put_bytes` knobs.
+///
+/// Both fields are populated only by the zip-archive push path
+/// (`../git-remote-s3/git_remote_s3/remote.py:275-281`), where upstream
+/// supplies `Content-Disposition` and the
+/// `codepipeline-artifact-revision-summary` user metadata. Defaults to
+/// "no extras", which covers every other write.
+#[derive(Debug, Clone, Default)]
+pub struct PutOpts {
+    /// HTTP `Content-Disposition` header to associate with the object.
+    pub content_disposition: Option<String>,
+    /// Backend user-defined metadata (key/value pairs). Backends should
+    /// preserve insertion order; key case-folding is backend-defined.
+    pub user_metadata: Vec<(String, String)>,
+}
+
+/// Backend-neutral cloud object-store surface.
+///
+/// Method semantics — every implementation must satisfy these contracts so
+/// higher layers can target the trait without backend-specific branching.
+///
+/// - **`list(prefix)`** — byte-prefix match (matches S3 `Prefix=`
+///   semantics; `list("a")` returns `a`, `a/1`, and `aaa`). Returns full
+///   keys; ordering is backend-defined.
+/// - **`get_to_file(key, dest)`** — caller must ensure `dest`'s parent
+///   directory exists.
+/// - **`put_bytes`** — overwrites if the key already exists.
+/// - **`put_if_absent`** — returns `Ok(true)` on creation, `Ok(false)` if
+///   the key already existed. Backends collapse both 412
+///   (`PreconditionFailed`) and 409 (`Conflict`) into `Ok(false)` per
+///   `execution-plan.md` §5.1; transport-level failures still surface as
+///   `Err`.
+/// - **`copy(src, dst)`** — overwrites `dst`; returns `Err(NotFound)` when
+///   `src` is absent.
+/// - **`delete`** — returns `Err(NotFound)` on missing key. Callers that
+///   want best-effort delete (e.g., `release_lock`) swallow it.
+#[async_trait::async_trait]
+pub trait ObjectStore: Send + Sync {
+    /// Enumerate every object whose key has `prefix` as a byte prefix.
+    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, Error>;
+
+    /// Stream the object body to `dest`. The destination's parent
+    /// directory must already exist.
+    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<(), Error>;
+
+    /// Read the entire object body into memory.
+    async fn get_bytes(&self, key: &str) -> Result<Bytes, Error>;
+
+    /// Write `body` to `key`, overwriting any existing object.
+    async fn put_bytes(&self, key: &str, body: Bytes, opts: PutOpts) -> Result<(), Error>;
+
+    /// Create `key` if and only if it does not exist. Returns `Ok(true)`
+    /// when the object was created, `Ok(false)` when the key was already
+    /// present.
+    async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, Error>;
+
+    /// Fetch metadata for an exact key.
+    async fn head(&self, key: &str) -> Result<ObjectMeta, Error>;
+
+    /// Copy `src` to `dst` server-side, including body and user metadata.
+    async fn copy(&self, src: &str, dst: &str) -> Result<(), Error>;
+
+    /// Delete `key`. Returns `Err(Error::NotFound)` if the key was not
+    /// present.
+    async fn delete(&self, key: &str) -> Result<(), Error>;
+}
