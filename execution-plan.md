@@ -247,10 +247,10 @@ s3+https://<account-id>.r2.cloudflarestorage.com/my-bucket/my-repo
 s3+https://s3.us-west-002.backblazeb2.com/my-bucket/my-repo
 
 # Azure public cloud
-az+https://my-account.blob.core.windows.net/my-container/my-repo
+az+https://myaccount.blob.core.windows.net/my-container/my-repo
 
 # Azure US Government
-az+https://my-account.blob.core.usgovcloudapi.net/my-container/my-repo
+az+https://myaccount.blob.core.usgovcloudapi.net/my-container/my-repo
 
 # Azurite emulator (account is path-style)
 az+http://127.0.0.1:10000/devstoreaccount1/my-container/my-repo

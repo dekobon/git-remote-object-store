@@ -72,6 +72,10 @@ gix-archive = "0.31"
 bytes = "1"
 tempfile = "3"
 
+[dev-dependencies]
+# Property-based testing for URL round-trip parse/format.
+proptest = "1"
+
 # Remote-helper shims. Git invokes them by scheme as `git-remote-<scheme>`,
 # so the installed binary names must be `git-remote-s3+https` etc.
 #

@@ -18,6 +18,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the management and LFS binaries.
 - GitHub Actions CI workflow running `cargo fmt --check`,
   `cargo clippy --all-targets -- -D warnings`, and `cargo test`.
+- Phase 2 URL parser (`src/url.rs`): `parse(&str) -> Result<RemoteUrl, ParseError>`
+  for the `s3+https`, `s3+http`, `az+https`, `az+http` grammar in
+  `execution-plan.md` §3.1. Includes addressing-style auto-detection
+  (§3.4) with `?addressing=path|virtual` override, query-flag extraction
+  (`zip`, `profile`, `credential`, `region`), and cleartext-HTTP gating
+  (§3.5) — non-loopback `*+http://` is rejected unless
+  `GIT_REMOTE_OBJECT_STORE_ALLOW_HTTP=1` is set.
+- Integration tests in `tests/url_parsing.rs` covering every concrete
+  example in §3.1 plus negative cases for invalid bucket / account /
+  container charsets, missing segments, unknown flags, illegal flag
+  values, and cleartext-HTTP rejection. `proptest` round-trip
+  (parse → display → parse) for the legal grammar.
+
+### Changed
+
+- Fixed §3.1 Azure example to use `myaccount` rather than `my-account`;
+  the previous form contradicted the §3.5 account charset rule
+  `[a-z0-9]{3,24}` (no hyphens).
 
 ### Changed
 
