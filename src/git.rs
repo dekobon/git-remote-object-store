@@ -14,11 +14,12 @@
 //!
 //! [gix]: https://docs.rs/gix
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::string::FromUtf8Error;
 use std::sync::atomic::AtomicBool;
 
 use gix::Repository;
@@ -159,6 +160,15 @@ pub enum GitError {
     /// Remote exists but has neither a fetch nor a push URL.
     #[error("remote has no fetch or push URL: {0}")]
     RemoteHasNoUrl(String),
+    /// Remote URL is not valid UTF-8.
+    #[error("remote {remote} URL is not valid UTF-8")]
+    NonUtf8RemoteUrl {
+        /// The remote whose URL could not be decoded.
+        remote: String,
+        /// The underlying decode error.
+        #[source]
+        source: FromUtf8Error,
+    },
     /// `git` binary is not on `PATH`.
     #[error("git binary not found on PATH")]
     GitBinaryMissing,
@@ -250,7 +260,11 @@ async fn run_git(
         .output()
         .await
         .map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => GitError::GitBinaryMissing,
+            // `cwd` not existing also surfaces as `NotFound`; only treat
+            // a missing-binary kind as such if the cwd is sane. The
+            // probe is best-effort — a TOCTOU window is harmless here
+            // since both branches still fail the call.
+            io::ErrorKind::NotFound if cwd.is_dir() => GitError::GitBinaryMissing,
             _ => GitError::Io(e),
         })?;
 
@@ -284,27 +298,32 @@ fn repo_cwd(repo: &Repository) -> &Path {
 ///
 /// Falls back to `git bundle create` because `gix` 0.82 has no public
 /// bundle writer (see `docs/development/spike-gix-bundle-parity.md`).
-/// `folder` must be an absolute path; `cwd` for the spawned `git` is
-/// the repository's work tree (or git directory for bare repos).
+/// `folder` is canonicalized so the returned bundle path resolves
+/// identically regardless of the caller's cwd at observation time.
+///
+/// The returned future is **not** `Send`: `gix::Repository` is `!Sync`,
+/// so the captured `&Repository` parameter cannot cross thread
+/// boundaries. Callers must `.await` it directly rather than passing
+/// it to `tokio::spawn`. This is fine for the protocol REPL, which
+/// drives bundle/unbundle serially.
 pub async fn bundle(
     repo: &Repository,
     folder: &Path,
     sha: Sha,
     ref_name: &RefName,
 ) -> Result<PathBuf, GitError> {
-    debug_assert!(
-        folder.is_absolute(),
-        "bundle output folder must be absolute"
-    );
+    let folder = folder.canonicalize()?;
     let bundle_path = folder.join(format!("{sha}.bundle"));
-    let ref_arg = OsString::from(ref_name.as_str());
+    let ref_arg = OsStr::new(ref_name.as_str());
+    // `&Repository` is !Send (Repository is Send but !Sync), so we must
+    // not hold a `&Path` borrowed from `repo` across the .await. Detach
+    // to an owned PathBuf before suspension.
     let cwd = repo_cwd(repo).to_owned();
-
     let args: [&OsStr; 4] = [
         OsStr::new("bundle"),
         OsStr::new("create"),
         bundle_path.as_os_str(),
-        ref_arg.as_os_str(),
+        ref_arg,
     ];
     run_git("bundle create", &args, &cwd).await?;
     Ok(bundle_path)
@@ -315,26 +334,24 @@ pub async fn bundle(
 /// Falls back to `git bundle unbundle` for the same reason as
 /// [`bundle`]. The trailing `ref_name` argument to `git bundle unbundle`
 /// is what causes the ref to be created in the local repo — it is not
-/// optional.
+/// optional. `folder` is canonicalized so resolution is independent of
+/// the caller's cwd.
 pub async fn unbundle(
     repo: &Repository,
     folder: &Path,
     sha: Sha,
     ref_name: &RefName,
 ) -> Result<(), GitError> {
-    debug_assert!(
-        folder.is_absolute(),
-        "unbundle input folder must be absolute"
-    );
-    let bundle_path = folder.join(format!("{sha}.bundle")).into_os_string();
-    let ref_arg = OsString::from(ref_name.as_str());
+    let folder = folder.canonicalize()?;
+    let bundle_path = folder.join(format!("{sha}.bundle"));
+    let ref_arg = OsStr::new(ref_name.as_str());
+    // See `bundle()` for why `cwd` is owned, not borrowed.
     let cwd = repo_cwd(repo).to_owned();
-
     let args: [&OsStr; 4] = [
         OsStr::new("bundle"),
         OsStr::new("unbundle"),
         bundle_path.as_os_str(),
-        ref_arg.as_os_str(),
+        ref_arg,
     ];
     run_git("bundle unbundle", &args, &cwd).await?;
     Ok(())
@@ -419,19 +436,21 @@ pub fn last_commit_message(repo: &Repository) -> Result<String, GitError> {
 /// Tries the fetch URL first and falls back to the push URL, matching
 /// `git remote get-url` semantics.
 pub fn remote_url(repo: &Repository, name: &str) -> Result<String, GitError> {
-    let remote = repo
-        .find_remote(BStr::new(name))
-        .map_err(|e| match e {
-            gix::remote::find::existing::Error::NotFound { .. } => {
-                GitError::RemoteNotFound(name.to_owned())
-            }
-            other => GitError::FindRemote(Box::new(other)),
-        })?;
+    let owned_name = || name.to_owned();
+    let remote = repo.find_remote(BStr::new(name)).map_err(|e| match e {
+        gix::remote::find::existing::Error::NotFound { .. } => {
+            GitError::RemoteNotFound(owned_name())
+        }
+        other => GitError::FindRemote(Box::new(other)),
+    })?;
     let url = remote
         .url(Direction::Fetch)
         .or_else(|| remote.url(Direction::Push))
-        .ok_or_else(|| GitError::RemoteHasNoUrl(name.to_owned()))?;
-    Ok(url.to_bstring().to_string())
+        .ok_or_else(|| GitError::RemoteHasNoUrl(owned_name()))?;
+    String::from_utf8(url.to_bstring().into()).map_err(|source| GitError::NonUtf8RemoteUrl {
+        remote: owned_name(),
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -679,6 +698,36 @@ mod tests {
     }
 
     #[test]
+    fn archive_resolves_tag_through_peel() {
+        // Annotated tag → commit → tree peel chain. This exercises the
+        // tag-handling branch in `peel_to_kind` that the branch test
+        // skips.
+        let (repo, _dir) = empty_repo();
+        let commit_oid = add_commit(&repo, "refs/heads/main", &[], "first");
+        let tag = gix::objs::Tag {
+            target: commit_oid,
+            target_kind: gix::object::Kind::Commit,
+            name: "v1".into(),
+            tagger: Some(signature().to_owned().expect("static signature is valid")),
+            message: "release".into(),
+            pgp_signature: None,
+        };
+        let tag_id = repo.write_object(&tag).expect("write tag").detach();
+        repo.reference(
+            "refs/tags/v1",
+            tag_id,
+            gix::refs::transaction::PreviousValue::MustNotExist,
+            "create tag",
+        )
+        .expect("create tag ref");
+        let ref_name = RefName::new("refs/tags/v1").expect("RefName");
+        let out_dir = TempDir::new().expect("tempdir");
+        let zip_path = archive(&repo, out_dir.path(), &ref_name).expect("archive tag");
+        let bytes = std::fs::read(&zip_path).expect("read zip");
+        assert_eq!(&bytes[..4], b"PK\x03\x04");
+    }
+
+    #[test]
     fn last_commit_message_format_short_sha_then_subject() {
         let (repo, _dir) = empty_repo();
         add_commit(&repo, "refs/heads/main", &[], "Initial commit");
@@ -724,6 +773,23 @@ mod tests {
             remote_url(&repo, "missing"),
             Err(GitError::RemoteNotFound(_))
         ));
+    }
+
+    #[test]
+    fn remote_url_falls_back_to_push_url_when_fetch_url_absent() {
+        // A remote with only `pushurl` and no `url` should still resolve.
+        // gix's `find_remote` parses the section name from any of url
+        // or pushurl, so we set pushurl alone.
+        let (repo, dir) = empty_repo();
+        let push_url = "https://example.com/push.git";
+        let config_path = repo.git_dir().join("config");
+        let existing = std::fs::read_to_string(&config_path).expect("read config");
+        let amended = format!("{existing}\n[remote \"only-push\"]\n\tpushurl = {push_url}\n");
+        std::fs::write(&config_path, amended).expect("write config");
+        let repo = gix::open(repo.git_dir()).expect("re-open");
+        let got = remote_url(&repo, "only-push").expect("remote_url");
+        assert_eq!(got, push_url);
+        drop(dir);
     }
 
     // --- bundle / unbundle (subprocess) -------------------------------
