@@ -4,7 +4,10 @@
       "Read(//home/elijah/Development/Open_Source/host-identity/**)",
       "Bash(cargo init *)",
       "Bash(cargo build *)",
-      "Read(//home/elijah/Development/Open_Source/f5-agent/**)"
+      "Read(//home/elijah/Development/Open_Source/f5-agent/**)",
+      "Bash(gh repo *)",
+      "Bash(gh label *)",
+      "Bash(gh issue *)"
     ]
   }
 }
