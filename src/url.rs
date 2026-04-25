@@ -161,21 +161,20 @@ pub fn parse(input: &str) -> Result<RemoteUrl, ParseError> {
     let body = trimmed
         .strip_prefix(backend.scheme_prefix())
         .ok_or_else(|| ParseError::UnsupportedScheme(scheme_of(trimmed)))?;
-    let mut endpoint = Url::parse(body)?;
+    let endpoint = Url::parse(body)?;
 
-    let host = endpoint
-        .host_str()
-        .ok_or(ParseError::MissingHost)?
-        .to_owned();
+    let host = endpoint.host_str().ok_or(ParseError::MissingHost)?;
     if endpoint.scheme() == "http" && !is_loopback(&endpoint) && !http_allowed_by_env() {
-        return Err(ParseError::CleartextHttpForbidden { host });
+        return Err(ParseError::CleartextHttpForbidden {
+            host: host.to_owned(),
+        });
     }
 
     let (flags, addressing_override) = extract_flags(&endpoint)?;
 
     match backend {
-        Backend::S3 => finish_s3(&mut endpoint, flags, addressing_override),
-        Backend::Azure => finish_azure(&mut endpoint, flags, addressing_override),
+        Backend::S3 => finish_s3(endpoint, flags, addressing_override),
+        Backend::Azure => finish_azure(endpoint, flags, addressing_override),
     }
 }
 
@@ -331,14 +330,7 @@ fn join_prefix(segments: &[String]) -> Option<String> {
 /// Set the URL's path so that [`fmt::Display`] reproduces the canonical
 /// form (with trailing `/` stripped).
 fn set_canonical_path(u: &mut Url, segments: &[&str]) {
-    let mut path = String::from("/");
-    for (i, seg) in segments.iter().enumerate() {
-        if i > 0 {
-            path.push('/');
-        }
-        path.push_str(seg);
-    }
-    u.set_path(&path);
+    u.set_path(&format!("/{}", segments.join("/")));
 }
 
 // ---------------------------------------------------------------------------
@@ -346,11 +338,11 @@ fn set_canonical_path(u: &mut Url, segments: &[&str]) {
 // ---------------------------------------------------------------------------
 
 fn finish_s3(
-    endpoint: &mut Url,
+    mut endpoint: Url,
     flags: RemoteFlags,
     addressing_override: Option<AddressingOverride>,
 ) -> Result<RemoteUrl, ParseError> {
-    let segments = path_segments(endpoint);
+    let segments = path_segments(&endpoint);
     let host = endpoint
         .host_str()
         .ok_or(ParseError::MissingHost)?
@@ -384,10 +376,10 @@ fn finish_s3(
             .chain(prefix_segments.iter().map(String::as_str))
             .collect(),
     };
-    set_canonical_path(endpoint, &canonical);
+    set_canonical_path(&mut endpoint, &canonical);
 
     Ok(RemoteUrl::S3 {
-        endpoint: endpoint.clone(),
+        endpoint,
         bucket,
         prefix,
         addressing,
@@ -399,10 +391,9 @@ fn detect_s3_addressing(host: &str) -> S3Addressing {
     // §3.4: virtual-hosted iff the second hostname label is `s3`.
     // Otherwise default to path-style; the `?addressing=` override is
     // available for S3-compatible endpoints that follow a different
-    // virtual-hosted convention.
-    let mut labels = host.split('.');
-    let _ = labels.next();
-    if labels.next().map(str::to_ascii_lowercase).as_deref() == Some("s3") {
+    // virtual-hosted convention. Hosts are already lowercased by the
+    // `url` crate (RFC 3986), so direct comparison is sufficient.
+    if host.split('.').nth(1) == Some("s3") {
         S3Addressing::VirtualHosted
     } else {
         S3Addressing::PathStyle
@@ -410,12 +401,10 @@ fn detect_s3_addressing(host: &str) -> S3Addressing {
 }
 
 fn leftmost_label(host: &str) -> Option<String> {
-    let label = host.split('.').next()?;
-    if label.is_empty() {
-        None
-    } else {
-        Some(label.to_owned())
-    }
+    host.split('.')
+        .next()
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
 }
 
 // ---------------------------------------------------------------------------
@@ -423,11 +412,11 @@ fn leftmost_label(host: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 fn finish_azure(
-    endpoint: &mut Url,
+    mut endpoint: Url,
     flags: RemoteFlags,
     addressing_override: Option<AddressingOverride>,
 ) -> Result<RemoteUrl, ParseError> {
-    let segments = path_segments(endpoint);
+    let segments = path_segments(&endpoint);
     let host = endpoint
         .host_str()
         .ok_or(ParseError::MissingHost)?
@@ -441,16 +430,16 @@ fn finish_azure(
     let (account, container, prefix_segments) = match addressing {
         AzureAddressing::Subdomain => {
             let account = leftmost_label(&host).ok_or(ParseError::MissingAccount)?;
-            let (container, tail) = segments.split_first().ok_or(ParseError::MissingContainer)?;
-            (account, container.clone(), tail)
+            match segments.as_slice() {
+                [] => return Err(ParseError::MissingContainer),
+                [container, rest @ ..] => (account, container.clone(), rest),
+            }
         }
-        AzureAddressing::PathStyle => {
-            let mut iter = segments.iter();
-            let account = iter.next().ok_or(ParseError::MissingAccount)?.clone();
-            let container = iter.next().ok_or(ParseError::MissingContainer)?.clone();
-            let tail = &segments[2..];
-            (account, container, tail)
-        }
+        AzureAddressing::PathStyle => match segments.as_slice() {
+            [] => return Err(ParseError::MissingAccount),
+            [_] => return Err(ParseError::MissingContainer),
+            [account, container, rest @ ..] => (account.clone(), container.clone(), rest),
+        },
     };
 
     if !is_valid_account(&account) {
@@ -470,10 +459,10 @@ fn finish_azure(
             .chain(prefix_segments.iter().map(String::as_str))
             .collect(),
     };
-    set_canonical_path(endpoint, &canonical);
+    set_canonical_path(&mut endpoint, &canonical);
 
     Ok(RemoteUrl::Azure {
-        endpoint: endpoint.clone(),
+        endpoint,
         account,
         container,
         prefix,
@@ -483,10 +472,9 @@ fn finish_azure(
 }
 
 fn detect_azure_addressing(host: &str) -> AzureAddressing {
-    // §3.4: subdomain iff the second hostname label is `blob`.
-    let mut labels = host.split('.');
-    let _ = labels.next();
-    if labels.next().map(str::to_ascii_lowercase).as_deref() == Some("blob") {
+    // §3.4: subdomain iff the second hostname label is `blob`. Hosts
+    // are already lowercased by the `url` crate (RFC 3986).
+    if host.split('.').nth(1) == Some("blob") {
         AzureAddressing::Subdomain
     } else {
         AzureAddressing::PathStyle
