@@ -32,6 +32,7 @@ Coding conventions for the project live in `.claude/rules/`:
 | `.claude/rules/changelog.md` | CHANGELOG format |
 | `.claude/rules/documentation.md` | No stale counts in docs |
 | `.claude/rules/lessons-learned.md` | Where hard-won lessons live and the quality bar |
+| `.claude/rules/protocol-stdout.md` | stdout/stderr discipline for the helper-protocol binaries |
 
 ## Git & Workflow
 
