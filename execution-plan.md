@@ -90,6 +90,80 @@ Protocol-level invariants:
 - `git ls-remote` output: order by `LastModified` desc, filter to
   `<prefix>/refs/.../<sha>.bundle`.
 
+### 1.1 Wire-format invariants (cross-implementation contract)
+
+The on-bucket layout is the only piece of upstream's surface this rewrite
+*must* preserve byte-for-byte. Existing buckets created by
+`git-remote-s3` must remain readable by this implementation, and buckets
+created by this implementation must remain readable by upstream. Every
+detail below is grounded in `../git-remote-s3/git_remote_s3/remote.py` —
+treat that file as the spec, and re-read it before implementing the
+relevant phase. AGENTS.md "Upstream is the source of truth" applies.
+
+**Key paths.** All keys are constructed under `<prefix>/`, where
+`<prefix>` is the second path segment of the parsed URL (or empty for
+single-bucket repos at the root). The grammar:
+
+| Key | Created by | Body | Notes |
+|-----|-----------|------|-------|
+| `<prefix>/HEAD` | first push to any ref | the bare ref string (e.g., `refs/heads/main`), no `ref:` prefix, no trailing newline | written via `put_object`; preserved verbatim |
+| `<prefix>/<ref>/<sha>.bundle` | push | git bundle bytes (output of `git bundle create`) | `<ref>` is the full ref name including `refs/heads/...`; `<sha>` is the lowercase hex commit OID (40 chars for SHA-1, 64 for SHA-256 if/when gix gains parity) |
+| `<prefix>/<ref>/repo.zip` | push when `?zip=1` | output of `git archive --format=zip` | optional; `?zip=1` query flag must be set on the URL |
+| `<prefix>/<ref>/PROTECTED#` | doctor / management CLI | zero bytes | sentinel marker; presence is matched by **prefix** (`startswith("PROTECTED#")`), not by exact key, so any key under `<ref>/` starting with `PROTECTED#` is interpreted as the marker |
+| `<prefix>/<ref>/LOCK#.lock` | acquire-lock | zero bytes | created via S3 `If-None-Match: *` (conditional write); presence == lock held |
+| `<prefix>/lfs/<oid>` | LFS upload | LFS object payload | `<oid>` is the lowercase hex Git LFS OID (full 64-char SHA-256) |
+
+**Listing semantics.** `get_bundles_for_ref(<ref>)` lists keys under
+`<prefix>/<ref>/` and filters out:
+
+- any key containing `PROTECTED#` (substring match)
+- any key containing `.zip` (substring match — note this is permissive and
+  excludes anything zip-related, not just the canonical `repo.zip`)
+- any key containing `/LOCKS/` (legacy — kept for back-compat with older
+  upstream layouts)
+- any key ending with `.lock`
+
+The remaining keys are the bundle objects, sorted by `LastModified`
+descending — the most recent bundle is the active tip. Multiple bundles
+under one ref is an error state (concurrent-write race) and is reported
+as `error <ref> "multiple bundles exists on server"`.
+
+**Locking.** Per-ref lock under `<prefix>/<ref>/LOCK#.lock`:
+
+- Acquire: `put_object` with `IfNoneMatch: "*"`. A `412 PreconditionFailed`
+  means the lock is already held.
+- Stale-lock handling: on `412`, `head_object` the lock and compare
+  `LastModified` against `now()`. If the difference exceeds the configured
+  TTL, delete the lock and retry the conditional `put_object`.
+- TTL default: **60 seconds**. Override via env
+  `GIT_REMOTE_S3_LOCK_TTL_SECONDS` (upstream name preserved for parity).
+  This is the only env var in the wire-format-invariant set; do NOT add
+  parallel `..._OBJECT_STORE_...` aliases — match upstream exactly.
+- Release: `delete_object` on the lock key.
+
+**HEAD bootstrapping.** On push, if `head_object` on `<prefix>/HEAD`
+returns 404, write `HEAD` with body = the ref being pushed. Subsequent
+pushes do not update `HEAD` (it is the *initial* default ref, not the
+*current* tip).
+
+**ls-remote output.** The git remote helper writes one line per ref to
+stdout in the format `<sha> <ref>\n`, plus a `@<head_ref> HEAD\n` line
+indicating the symbolic-ref target. Output ends with an empty line.
+This is the standard `list` capability of the git remote-helper protocol.
+
+**Encoding.** All keys, ref names, and HEAD bodies are UTF-8 byte
+strings. No BOM, no normalization. Git itself constrains ref names to a
+known charset (`gix-validate::reference::name`), so non-ASCII in keys
+arises only from the user-supplied `<prefix>`, which is preserved
+verbatim.
+
+**Byte-for-byte parity is enforced by integration tests** (Phase 8 / 13)
+that round-trip a real repository through both implementations against
+the same MinIO bucket. Adding a new key path, changing `HEAD` body
+encoding, or changing the lock-key suffix would break that test — and
+existing user buckets — so any such change requires an explicit
+divergence note in §6 and the same enforcement logic on the read side.
+
 ## 2. High-level Rust architecture
 
 Single Cargo crate (binary + library), with the binary entry points
