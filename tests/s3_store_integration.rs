@@ -38,7 +38,7 @@ use sha2::{Digest, Sha256};
 use testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::SyncRunner;
-use testcontainers::{Container, GenericImage};
+use testcontainers::{Container, ContainerRequest, GenericImage, ImageExt};
 
 /// `RustFS` Docker image. Pinned by [`RUSTFS_TAG`].
 const RUSTFS_IMAGE: &str = "rustfs/rustfs";
@@ -52,17 +52,28 @@ const RUSTFS_API_PORT: u16 = 9000;
 const TEST_USER: &str = "rustfsadmin";
 const TEST_PASSWORD: &str = "rustfsadmin";
 
-fn rustfs_image() -> GenericImage {
-    // RustFS writes startup logs to a file inside the container
-    // (`/logs/rustfs.log`), not to stdout, so a `message_on_stdout`
-    // wait never fires. Poll the S3 endpoint instead — an
-    // unauthenticated `GET /` returns 403 once the server is serving.
+fn rustfs_image() -> ContainerRequest<GenericImage> {
+    // Wait condition: RustFS 1.0.0-alpha.73+ defaults to logging to
+    // stdout, but the official Docker image sets
+    // `RUSTFS_OBS_LOG_DIRECTORY=/logs` at build time, redirecting logs
+    // back to a file inside the container (see rustfs#1075). Even with
+    // the env-var override below restoring stdout logging, polling the
+    // S3 endpoint is a more reliable readiness signal than parsing a
+    // specific startup line — an unauthenticated `GET /` returns 403
+    // once the server is serving.
     let http_wait = HttpWaitStrategy::new("/")
         .with_port(RUSTFS_API_PORT.tcp())
         .with_expected_status_code(403_u16);
     GenericImage::new(RUSTFS_IMAGE, RUSTFS_TAG)
         .with_wait_for(WaitFor::http(http_wait))
         .with_exposed_port(RUSTFS_API_PORT.tcp())
+        // Override the image's baked-in `RUSTFS_OBS_LOG_DIRECTORY=/logs`
+        // so logs flow to stdout (per rustfs#1075). testcontainers
+        // captures container stdout/stderr; if a future debug session
+        // needs RustFS's startup logs, they'll be available via
+        // `docker logs <container>` rather than buried inside a
+        // container-internal file.
+        .with_env_var("RUSTFS_OBS_LOG_DIRECTORY", "")
 }
 
 /// Shared `RustFS` container — started synchronously on first access
