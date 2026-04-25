@@ -1,5 +1,12 @@
 //! Integration tests for [`object_store::s3::S3Store`][s3] against a
-//! real S3-compatible server (`MinIO` via `testcontainers`).
+//! real S3-compatible server (`RustFS` via `testcontainers`).
+//!
+//! `RustFS` (`https://github.com/rustfs/rustfs`) is an Apache-2.0 S3
+//! implementation. The Docker image tag is **pinned**: the upstream
+//! `testcontainers-modules` `RustFS` module hardcodes `:latest`, but
+//! `RustFS` is alpha-stage and the floating tag would let alpha-version
+//! drift break CI silently. Bump [`RUSTFS_TAG`] deliberately when a
+//! new alpha lands.
 //!
 //! Gated on the `integration-s3` Cargo feature so that contributors
 //! without Docker are not blocked. CI runs this on Linux:
@@ -8,7 +15,7 @@
 //! cargo test --features integration-s3
 //! ```
 //!
-//! The whole test binary shares one `MinIO` container (started lazily
+//! The whole test binary shares one `RustFS` container (started lazily
 //! via [`OnceLock`]); each test creates its own bucket with a random
 //! suffix so they parallel-test cleanly.
 //!
@@ -28,29 +35,52 @@ use git_remote_object_store::object_store::s3::S3Store;
 use git_remote_object_store::object_store::{Error, ObjectStore, PutOpts};
 use git_remote_object_store::url::{ENV_ALLOW_HTTP, RemoteUrl, parse};
 use sha2::{Digest, Sha256};
-use testcontainers::Container;
+use testcontainers::core::wait::HttpWaitStrategy;
+use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::SyncRunner;
-use testcontainers_modules::minio::MinIO;
+use testcontainers::{Container, GenericImage};
 
-const TEST_USER: &str = "minioadmin";
-const TEST_PASSWORD: &str = "minioadmin";
+/// `RustFS` Docker image. Pinned by [`RUSTFS_TAG`].
+const RUSTFS_IMAGE: &str = "rustfs/rustfs";
+/// `RustFS` image tag. Pinned to avoid alpha-version drift; bump
+/// deliberately and re-run the suite to verify S3 parity is preserved.
+const RUSTFS_TAG: &str = "1.0.0-alpha.99";
+/// `RustFS` container API port (exposed via the SDK).
+const RUSTFS_API_PORT: u16 = 9000;
+/// `RustFS` default root credentials (per the upstream docs and
+/// `crates/e2e_test/src/reliant/conditional_writes.rs`).
+const TEST_USER: &str = "rustfsadmin";
+const TEST_PASSWORD: &str = "rustfsadmin";
 
-/// Shared `MinIO` container — started synchronously on first access via
-/// [`SyncRunner`] so its lifetime is independent of any single
+fn rustfs_image() -> GenericImage {
+    // RustFS writes startup logs to a file inside the container
+    // (`/logs/rustfs.log`), not to stdout, so a `message_on_stdout`
+    // wait never fires. Poll the S3 endpoint instead — an
+    // unauthenticated `GET /` returns 403 once the server is serving.
+    let http_wait = HttpWaitStrategy::new("/")
+        .with_port(RUSTFS_API_PORT.tcp())
+        .with_expected_status_code(403_u16);
+    GenericImage::new(RUSTFS_IMAGE, RUSTFS_TAG)
+        .with_wait_for(WaitFor::http(http_wait))
+        .with_exposed_port(RUSTFS_API_PORT.tcp())
+}
+
+/// Shared `RustFS` container — started synchronously on first access
+/// via [`SyncRunner`] so its lifetime is independent of any single
 /// `#[tokio::test]`'s tokio runtime. Multiple tokio runtimes (one per
 /// test) reuse the same container and port without their dispatch
 /// tasks tearing each other down.
-static MINIO: OnceLock<MinioFixture> = OnceLock::new();
+static RUSTFS: OnceLock<RustFsFixture> = OnceLock::new();
 static BUCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-struct MinioFixture {
+struct RustFsFixture {
     /// Owned container handle — keeping it alive keeps the container alive.
-    _container: Container<MinIO>,
+    _container: Container<GenericImage>,
     port: u16,
 }
 
-fn fixture() -> &'static MinioFixture {
-    MINIO.get_or_init(|| {
+fn fixture() -> &'static RustFsFixture {
+    RUSTFS.get_or_init(|| {
         // The S3 SDK consults env vars at config-load time. Set them
         // once for the whole test binary before any S3Store
         // instantiates its credential provider chain.
@@ -69,11 +99,13 @@ fn fixture() -> &'static MinioFixture {
         // is one). Run the start on a dedicated `std::thread` that has
         // no ambient runtime, then ferry the result back.
         let handle = std::thread::Builder::new()
-            .name("minio-fixture-start".to_owned())
+            .name("rustfs-fixture-start".to_owned())
             .spawn(|| {
-                let container = MinIO::default().start().expect("MinIO container starts");
-                let port = container.get_host_port_ipv4(9000).expect("MinIO host port");
-                MinioFixture {
+                let container = rustfs_image().start().expect("RustFS container starts");
+                let port = container
+                    .get_host_port_ipv4(RUSTFS_API_PORT)
+                    .expect("RustFS host port");
+                RustFsFixture {
                     _container: container,
                     port,
                 }
@@ -410,7 +442,7 @@ async fn access_denied_via_wrong_creds() {
     // We can't easily reconfigure the trait's credential provider per-
     // store (the SDK reads env vars at load time), so instantiate the
     // SDK client directly with deliberately-wrong creds and call its
-    // get_object — this verifies that MinIO rejects bad signatures
+    // get_object — this verifies that the server rejects bad signatures
     // with 403 (the path our classifier maps to AccessDenied).
     let fixture = fixture();
     let endpoint = format!("http://127.0.0.1:{}", fixture.port);
@@ -449,6 +481,6 @@ async fn access_denied_via_wrong_creds() {
     assert_eq!(
         raw_status,
         Some(403),
-        "expected 403 from MinIO for bad creds, got {err:?}"
+        "expected 403 from RustFS for bad creds, got {err:?}"
     );
 }

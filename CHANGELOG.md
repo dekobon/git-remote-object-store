@@ -30,12 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the trait's `Err(NotFound)` contract on missing keys (S3 DELETE is
   idempotent). Copy keys with reserved characters (`#` from
   `LOCK#.lock`) are percent-encoded before being placed in the
-  `x-amz-copy-source` header. Integration tests run against MinIO via
-  `testcontainers` behind the new `integration-s3` Cargo feature
-  (Docker required); these cover round-trip put/get, pagination beyond
-  one page, concurrent `put_if_absent` contention, the 50 MiB+
-  multipart download path, percent-encoded copy, atomic-fail behaviour
-  of `get_to_file`, and `AccessDenied` mapping.
+  `x-amz-copy-source` header. Integration tests run against RustFS
+  (Apache-2.0) via `testcontainers` behind the new `integration-s3`
+  Cargo feature (Docker required). The fixture pins the RustFS image
+  tag explicitly so alpha-version drift cannot break CI silently.
+  Tests cover round-trip put/get, pagination beyond one page,
+  concurrent `put_if_absent` contention, the 50 MiB+ multipart
+  download path, percent-encoded copy, atomic-fail behaviour of
+  `get_to_file`, and `AccessDenied` mapping.
 - Phase 4 object-store seam (`src/object_store/`): backend-neutral
   `ObjectStore` async trait (eight methods covering list / head / get /
   put / put-if-absent / copy / delete), shared `Error` enum mapping S3

@@ -208,7 +208,7 @@ src/
 tests/
   url_parsing.rs
   protocol_smoke.rs
-  s3_integration.rs              — backed by MinIO docker
+  s3_integration.rs              — backed by RustFS docker (Apache-2.0, pinned tag)
   azure_integration.rs           — backed by Azurite docker
 ```
 
@@ -311,7 +311,7 @@ s3+https://my-bucket.s3.us-west-2.amazonaws.com/my-repo
 # AWS S3, path-style addressing
 s3+https://s3.us-west-2.amazonaws.com/my-bucket/my-repo
 
-# Local MinIO (CI / dev)
+# Local RustFS / MinIO (CI / dev)
 s3+http://localhost:9000/my-bucket/my-repo
 
 # Cloudflare R2
@@ -535,8 +535,8 @@ and document the constraint.
   output `tokio::fs::File` at positioned offsets. The SDK still
   handles SigV4, retries, and connection pooling — we only own
   the orchestration (~100 LOC).
-- Integration tests with MinIO via `testcontainers` (Docker required
-  for `cargo test --features integration-s3`).
+- Integration tests with RustFS (Apache-2.0) via `testcontainers`,
+  pinned image tag (Docker required for `cargo test --features integration-s3`).
 
 ### Phase 6 — Remote helper protocol skeleton
 
