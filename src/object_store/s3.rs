@@ -42,8 +42,6 @@ use std::sync::Arc;
 
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
-use aws_sdk_s3::operation::get_object::GetObjectError;
-use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_smithy_types_convert::date_time::DateTimeExt;
 use bytes::Bytes;
@@ -99,6 +97,15 @@ const COPY_SOURCE_ENCODE: &AsciiSet = &CONTROLS
     .add(b'{')
     .add(b'|')
     .add(b'}');
+
+/// Wrap any concrete `std::error::Error` into [`Error::Other`].
+///
+/// Replaces the open-coded `|e| Error::Other(Box::new(e))` closure
+/// that otherwise repeats at every I/O / time-conversion / persist
+/// call site.
+fn other_boxed<E: std::error::Error + Send + Sync + 'static>(e: E) -> Error {
+    Error::Other(Box::new(e))
+}
 
 /// Production [`ObjectStore`] backed by `aws-sdk-s3`.
 #[derive(Debug)]
@@ -225,7 +232,7 @@ pub(crate) fn normalize_endpoint(endpoint: &Url, addressing: S3Addressing) -> Re
             .to_owned();
         rewritten
             .set_host(Some(&regional_host))
-            .map_err(|e| Error::Other(Box::new(e)))?;
+            .map_err(other_boxed)?;
     }
 
     Ok(rewritten)
@@ -299,30 +306,54 @@ pub(crate) fn encode_copy_source(bucket: &str, key: &str) -> String {
 /// `key` is the operation's key/prefix context — it appears in the
 /// resulting [`Error::NotFound`] / [`Error::AccessDenied`] /
 /// [`Error::PreconditionFailed`] / [`Error::Conflict`] payload.
+///
+/// Note that this also covers typed `NotFound` / `NoSuchKey` variants
+/// the SDK constructs from 404 responses: those carry HTTP 404 on
+/// `svc.raw().status()` and so route through the status-based branch
+/// of [`classify_status_and_code`].
 fn classify<E>(err: SdkError<E>, key: &str) -> Error
 where
     E: std::error::Error + Send + Sync + 'static + ProvideErrorMetadata,
 {
-    match &err {
-        SdkError::DispatchFailure(_) | SdkError::TimeoutError(_) => {
-            return Error::Network(Box::new(err));
+    if let SdkError::ServiceError(svc) = &err {
+        let status = svc.raw().status().as_u16();
+        let code = svc.err().code();
+        if let Some(mapped) = classify_status_and_code(status, code, key) {
+            return mapped;
         }
-        SdkError::ConstructionFailure(_) | SdkError::ResponseError(_) => {
-            return Error::Other(Box::new(err));
-        }
-        SdkError::ServiceError(svc) => {
-            let status = svc.raw().status().as_u16();
-            let inner = svc.err();
-            let code = inner.code();
-            if let Some(mapped) = classify_status_and_code(status, code, key) {
-                // Drop `err` after we've extracted what we need.
-                drop(err);
-                return mapped;
-            }
-        }
-        _ => {}
     }
-    Error::Other(Box::new(err))
+    match &err {
+        SdkError::DispatchFailure(_) | SdkError::TimeoutError(_) => Error::Network(Box::new(err)),
+        _ => Error::Other(Box::new(err)),
+    }
+}
+
+/// Convert a single [`aws_sdk_s3::types::Object`] from a
+/// `ListObjectsV2` page into the trait's [`ObjectMeta`].
+///
+/// Extracted so unit tests can drive the missing-key and
+/// missing-last-modified guard branches via `Object`'s builder
+/// without synthesising a full `ListObjectsV2Output`.
+pub(crate) fn object_to_meta(obj: &aws_sdk_s3::types::Object) -> Result<ObjectMeta, Error> {
+    let key = obj
+        .key()
+        .ok_or_else(|| Error::Other("list_objects_v2 returned an object without a key".into()))?
+        .to_owned();
+    let size = u64::try_from(obj.size().unwrap_or(0)).unwrap_or(0);
+    let last_modified = obj
+        .last_modified()
+        .ok_or_else(|| {
+            Error::Other(
+                format!("list_objects_v2 returned object `{key}` without last_modified").into(),
+            )
+        })?
+        .to_time()
+        .map_err(other_boxed)?;
+    Ok(ObjectMeta {
+        key,
+        size,
+        last_modified,
+    })
 }
 
 /// Pure classifier core (no `SdkError` involvement) so unit tests can
@@ -360,27 +391,9 @@ impl ObjectStore for S3Store {
                 .await
                 .map_err(|e| classify(e, prefix))?;
 
+            out.reserve(resp.contents().len());
             for obj in resp.contents() {
-                let key = obj.key().unwrap_or_default().to_owned();
-                let size = u64::try_from(obj.size().unwrap_or(0)).unwrap_or(0);
-                let last_modified = obj
-                    .last_modified()
-                    .ok_or_else(|| {
-                        Error::Other(
-                            format!(
-                                "list_objects_v2 returned object `{}` without last_modified",
-                                obj.key().unwrap_or("?")
-                            )
-                            .into(),
-                        )
-                    })?
-                    .to_time()
-                    .map_err(|e| Error::Other(Box::new(e)))?;
-                out.push(ObjectMeta {
-                    key,
-                    size,
-                    last_modified,
-                });
+                out.push(object_to_meta(obj)?);
             }
 
             if !resp.is_truncated().unwrap_or(false) {
@@ -400,7 +413,7 @@ impl ObjectStore for S3Store {
         let parent = dest.parent().ok_or_else(|| {
             Error::Other(format!("destination `{}` has no parent directory", dest.display()).into())
         })?;
-        let temp = NamedTempFile::new_in(parent).map_err(|e| Error::Other(Box::new(e)))?;
+        let temp = NamedTempFile::new_in(parent).map_err(other_boxed)?;
 
         let size = self.head(key).await?.size;
         if size == 0 {
@@ -430,14 +443,7 @@ impl ObjectStore for S3Store {
             .key(key)
             .send()
             .await
-            .map_err(|e| match &e {
-                SdkError::ServiceError(svc)
-                    if matches!(svc.err(), GetObjectError::NoSuchKey(_)) =>
-                {
-                    Error::NotFound(key.to_owned())
-                }
-                _ => classify(e, key),
-            })?;
+            .map_err(|e| classify(e, key))?;
         let aggregated = resp
             .body
             .collect()
@@ -497,14 +503,7 @@ impl ObjectStore for S3Store {
             .key(key)
             .send()
             .await
-            .map_err(|e| match &e {
-                SdkError::ServiceError(svc)
-                    if matches!(svc.err(), HeadObjectError::NotFound(_)) =>
-                {
-                    Error::NotFound(key.to_owned())
-                }
-                _ => classify(e, key),
-            })?;
+            .map_err(|e| classify(e, key))?;
         let size = u64::try_from(resp.content_length().unwrap_or(0)).unwrap_or(0);
         let last_modified = resp
             .last_modified()
@@ -512,7 +511,7 @@ impl ObjectStore for S3Store {
                 Error::Other(format!("head_object on `{key}` returned no last_modified").into())
             })?
             .to_time()
-            .map_err(|e| Error::Other(Box::new(e)))?;
+            .map_err(other_boxed)?;
         Ok(ObjectMeta {
             key: key.to_owned(),
             size,
@@ -572,15 +571,13 @@ impl S3Store {
             .truncate(true)
             .open(temp_path)
             .await
-            .map_err(|e| Error::Other(Box::new(e)))?;
+            .map_err(other_boxed)?;
 
         while let Some(chunk) = resp.body.next().await {
             let bytes = chunk.map_err(|e| Error::Network(Box::new(e)))?;
-            file.write_all(&bytes)
-                .await
-                .map_err(|e| Error::Other(Box::new(e)))?;
+            file.write_all(&bytes).await.map_err(other_boxed)?;
         }
-        file.flush().await.map_err(|e| Error::Other(Box::new(e)))?;
+        file.flush().await.map_err(other_boxed)?;
         Ok(())
     }
 
@@ -597,11 +594,8 @@ impl S3Store {
             .truncate(false)
             .open(temp_path)
             .await
-            .map_err(|e| Error::Other(Box::new(e)))?;
-        async_file
-            .set_len(size)
-            .await
-            .map_err(|e| Error::Other(Box::new(e)))?;
+            .map_err(other_boxed)?;
+        async_file.set_len(size).await.map_err(other_boxed)?;
 
         let file = Arc::new(Mutex::new(async_file));
         let semaphore = Arc::new(Semaphore::new(MULTIPART_MAX_CONCURRENCY));
@@ -614,10 +608,7 @@ impl S3Store {
             let file = Arc::clone(&file);
             let semaphore = Arc::clone(&semaphore);
             tasks.spawn(async move {
-                let _permit = semaphore
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| Error::Other(Box::new(e)))?;
+                let _permit = semaphore.acquire_owned().await.map_err(other_boxed)?;
                 let resp = client
                     .get_object()
                     .bucket(&bucket)
@@ -643,24 +634,23 @@ impl S3Store {
                     ));
                 }
                 let mut f = file.lock().await;
-                f.seek(SeekFrom::Start(start))
-                    .await
-                    .map_err(|e| Error::Other(Box::new(e)))?;
-                f.write_all(&bytes)
-                    .await
-                    .map_err(|e| Error::Other(Box::new(e)))?;
+                f.seek(SeekFrom::Start(start)).await.map_err(other_boxed)?;
+                f.write_all(&bytes).await.map_err(other_boxed)?;
                 Ok(())
             });
         }
 
         while let Some(joined) = tasks.join_next().await {
-            joined.map_err(|e| Error::Other(Box::new(e)))??;
+            joined.map_err(other_boxed)??;
         }
 
+        // All spawned tasks have been joined above — each task's
+        // captured `Arc` clone was dropped when its closure
+        // completed, so this is the only outstanding reference.
         let mut file = Arc::try_unwrap(file)
-            .map_err(|_| Error::Other("multipart download leaked a file handle".into()))?
+            .expect("file Arc is unique after the JoinSet::join_next loop drains")
             .into_inner();
-        file.flush().await.map_err(|e| Error::Other(Box::new(e)))?;
+        file.flush().await.map_err(other_boxed)?;
         Ok(())
     }
 }
@@ -669,9 +659,75 @@ impl S3Store {
 mod tests {
     use super::*;
     use crate::url::{AzureAddressing, RemoteFlags};
+    use aws_sdk_s3::primitives::DateTime;
+    use aws_sdk_s3::types::Object;
 
     fn parse_endpoint(s: &str) -> Url {
         Url::parse(s).expect("test endpoint URL parses")
+    }
+
+    // --- object_to_meta -----------------------------------------------
+
+    #[test]
+    fn object_to_meta_round_trips_well_formed_object() {
+        let modified = DateTime::from_secs(1_700_000_000);
+        let obj = Object::builder()
+            .key("refs/heads/main/abc.bundle")
+            .size(42)
+            .last_modified(modified)
+            .build();
+        let meta = object_to_meta(&obj).expect("conversion succeeds");
+        assert_eq!(meta.key, "refs/heads/main/abc.bundle");
+        assert_eq!(meta.size, 42);
+        assert_eq!(meta.last_modified.unix_timestamp(), 1_700_000_000);
+    }
+
+    #[test]
+    fn object_to_meta_rejects_missing_key() {
+        let obj = Object::builder()
+            .last_modified(DateTime::from_secs(1_700_000_000))
+            .build();
+        let err = object_to_meta(&obj).expect_err("missing key must error");
+        match err {
+            Error::Other(inner) => {
+                assert!(
+                    inner.to_string().contains("without a key"),
+                    "error message names the failure: {inner}"
+                );
+            }
+            other => panic!("expected Error::Other for missing key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_to_meta_rejects_missing_last_modified() {
+        let obj = Object::builder().key("k").size(0).build();
+        let err = object_to_meta(&obj).expect_err("missing last_modified must error");
+        match err {
+            Error::Other(inner) => {
+                let msg = inner.to_string();
+                assert!(
+                    msg.contains("without last_modified"),
+                    "names failure: {msg}"
+                );
+                assert!(msg.contains("`k`"), "includes the key for context: {msg}");
+            }
+            other => panic!("expected Error::Other for missing last_modified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_to_meta_clamps_negative_size_to_zero() {
+        // S3 cannot legally return a negative size, but the SDK types
+        // it as `i64`. Defensive default: clamp to 0 rather than
+        // sign-extend to a huge u64.
+        let obj = Object::builder()
+            .key("k")
+            .size(-1)
+            .last_modified(DateTime::from_secs(1_700_000_000))
+            .build();
+        let meta = object_to_meta(&obj).expect("conversion succeeds");
+        assert_eq!(meta.size, 0);
     }
 
     // --- plan_ranges --------------------------------------------------
