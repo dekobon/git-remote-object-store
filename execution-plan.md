@@ -812,11 +812,13 @@ silently breaks `git fetch`. Add a lint pass (clippy
 **Resolved (additional):**
 
 - **Git operations backend**: gitoxide (`gix`) for native Rust
-  bundle/unbundle/rev-parse/is-ancestor/archive. No subprocess to
-  `git`. Phase 3 ports the upstream `git.py` surface onto `gix`
-  APIs; if any operation isn't yet stable in `gix` (e.g., bundle
-  creation parity), that specific call falls back to subprocess
-  with a tracking issue.
+  rev-parse/is-ancestor/archive/last-commit-message/remote-url/
+  ref-name validation. Phase 3 ports the upstream `git.py` surface
+  onto `gix` APIs; the spike result (see
+  `docs/development/spike-gix-bundle-parity.md`) is that `gix` 0.82
+  has no public bundle API, so `bundle`/`unbundle` retain a
+  subprocess fallback funnelled through a single `run_git` helper
+  that enforces the helper-protocol stdout discipline.
 - **S3 multipart download**: hand-rolled ranged GETs through the
   `aws-sdk-s3` client (SigV4 still handled by the SDK). See §5.3.
 - **Azure multipart download**: use `BlobClient::download()` —
