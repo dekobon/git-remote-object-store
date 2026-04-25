@@ -403,12 +403,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copy_replicates_body_and_metadata() {
+    async fn copy_replicates_body_and_metadata_with_fresh_timestamp() {
         let store = MockStore::new();
+        let src_time = OffsetDateTime::now_utc() - Duration::from_secs(60);
         store.insert_with(
             "src",
             body(b"payload"),
-            OffsetDateTime::now_utc() - Duration::from_secs(60),
+            src_time,
             PutOpts {
                 content_disposition: Some("attachment; filename=foo".into()),
                 user_metadata: vec![("k".into(), "v".into())],
@@ -425,6 +426,14 @@ mod tests {
             Some("attachment; filename=foo")
         );
         assert_eq!(opts.user_metadata, vec![("k".to_string(), "v".to_string())]);
+        // S3's copy_object semantics: dst gets a fresh server-side
+        // timestamp, not the back-dated source's.
+        let dst_meta = store.head("dst").await.unwrap();
+        assert!(
+            dst_meta.last_modified > src_time,
+            "expected fresh timestamp on dst, got {} ≤ src {src_time}",
+            dst_meta.last_modified,
+        );
     }
 
     #[tokio::test]
@@ -458,12 +467,13 @@ mod tests {
 
     #[tokio::test]
     async fn get_to_file_missing_parent_dir_yields_other() {
+        let dir = tempfile::tempdir().unwrap();
+        // Path under a subdir we deliberately do not create — guarantees
+        // ENOENT from the host without coupling to any absolute path.
+        let path = dir.path().join("missing-subdir").join("out.bin");
         let store = MockStore::new();
         store.insert("k", body(b"x"));
-        let err = store
-            .get_to_file("k", Path::new("/nonexistent-parent/out.bin"))
-            .await
-            .unwrap_err();
+        let err = store.get_to_file("k", &path).await.unwrap_err();
         assert!(matches!(err, Error::Other(_)));
     }
 
@@ -516,12 +526,16 @@ mod tests {
     #[tokio::test]
     async fn head_not_found_fault_fires_once() {
         let store = MockStore::new();
-        store.insert("k", body(b""));
+        store.insert("k", body(b"abc"));
         store.arm(Fault::NotFoundOnHead { key: "k".into() });
         let err = store.head("k").await.unwrap_err();
         assert!(matches!(err, Error::NotFound(ref k) if k == "k"));
-        // Without a queued fault, head succeeds.
-        assert!(store.head("k").await.is_ok());
+        // Without a queued fault, head returns the inserted object's
+        // metadata (key + size). Inspecting the payload guards against
+        // regressions that swap the returned key or size.
+        let meta = store.head("k").await.unwrap();
+        assert_eq!(meta.key, "k");
+        assert_eq!(meta.size, 3);
     }
 
     #[tokio::test]
@@ -535,13 +549,20 @@ mod tests {
     }
 
     #[test]
-    fn next_lex_handles_empty_and_max() {
+    fn next_lex_covers_empty_short_and_invalid_utf8_fallback() {
+        // Empty input: rposition finds no non-0xFF byte, so the function
+        // returns Unbounded.
         assert!(matches!(next_lex(""), Bound::Unbounded));
-        // All-0xFF inputs (cannot occur in valid UTF-8 strings, but guard
-        // anyway): use `\u{10FFFF}` which encodes as four bytes ending
-        // 0xBF — the increment fires normally.
+        // Short ASCII inputs increment the last byte cleanly.
         assert!(matches!(next_lex("a"), Bound::Excluded(s) if s == "b"));
         assert!(matches!(next_lex("ab"), Bound::Excluded(s) if s == "ac"));
+        // Unicode max code point U+10FFFF encodes as F4 8F BF BF.
+        // Incrementing the trailing 0xBF yields F4 8F BF C0, which is
+        // invalid UTF-8 (lone 0xC0 continuation), so the
+        // String::from_utf8 fallback path returns Unbounded. This is the
+        // only realistic way to exercise that branch through the &str
+        // surface.
+        assert!(matches!(next_lex("\u{10FFFF}"), Bound::Unbounded));
     }
 
     #[test]
