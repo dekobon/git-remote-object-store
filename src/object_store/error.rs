@@ -36,19 +36,19 @@ pub enum Error {
     /// Authentication succeeded but the principal is not allowed to perform
     /// the operation. Maps from S3 `AccessDenied` (HTTP 403) and Azure
     /// `AuthorizationFailure`.
-    #[error("access denied for {0}")]
+    #[error("access denied: {0}")]
     AccessDenied(String),
 
     /// Conditional request returned 412 — the precondition (typically
     /// `If-None-Match: "*"`) was not satisfied. See `execution-plan.md`
     /// §5.1; backends `put_if_absent` collapses this into `Ok(false)`, so
     /// callers should rarely observe it directly.
-    #[error("precondition failed for {0}")]
+    #[error("precondition failed: {0}")]
     PreconditionFailed(String),
 
     /// Conditional request returned 409. Treated by `put_if_absent` callers
     /// the same as `PreconditionFailed`, but kept distinct for diagnostics.
-    #[error("conflict on {0}")]
+    #[error("conflict: {0}")]
     Conflict(String),
 
     /// Transport-level failure (DNS, TLS, timeout, connection reset).
@@ -78,13 +78,13 @@ mod tests {
         );
         assert_eq!(
             Error::AccessDenied("a/b".into()).to_string(),
-            "access denied for a/b"
+            "access denied: a/b"
         );
         assert_eq!(
             Error::PreconditionFailed("a/b".into()).to_string(),
-            "precondition failed for a/b"
+            "precondition failed: a/b"
         );
-        assert_eq!(Error::Conflict("a/b".into()).to_string(), "conflict on a/b");
+        assert_eq!(Error::Conflict("a/b".into()).to_string(), "conflict: a/b");
     }
 
     #[test]

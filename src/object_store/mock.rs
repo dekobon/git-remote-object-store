@@ -158,9 +158,19 @@ impl MockStore {
         f(&mut guard)
     }
 
-    fn take_fault(state: &mut MockState, matches: impl Fn(&Fault) -> bool) -> Option<Fault> {
-        let position = state.faults.iter().position(matches)?;
-        Some(state.faults.remove(position))
+    /// Pop the first fault for which `map` returns `Some(err)` and bubble
+    /// that error out. The closure runs twice on the matching fault — once
+    /// to locate it, once to extract the error — but the queue is tiny in
+    /// tests, so the duplicated match is cheaper than threading the
+    /// destructured payload through the callsite.
+    fn check_fault(
+        state: &mut MockState,
+        map: impl Fn(&Fault) -> Option<Error>,
+    ) -> Result<(), Error> {
+        let Some(position) = state.faults.iter().position(|f| map(f).is_some()) else {
+            return Ok(());
+        };
+        Err(map(&state.faults.remove(position)).expect("position guarantees match"))
     }
 }
 
@@ -173,45 +183,32 @@ impl MockStore {
 /// `succ` is `prefix` with the last non-`0xFF` byte incremented and any
 /// trailing `0xFF` bytes truncated.
 fn next_lex(prefix: &str) -> Bound<String> {
-    if prefix.is_empty() {
+    let bytes = prefix.as_bytes();
+    let Some(pivot) = bytes.iter().rposition(|&b| b != 0xFF) else {
         return Bound::Unbounded;
-    }
-    let mut bytes = prefix.as_bytes().to_vec();
-    while let Some(last) = bytes.last_mut() {
-        if *last == 0xFF {
-            bytes.pop();
-        } else {
-            *last += 1;
-            // The increment may produce an invalid UTF-8 byte; fall back to
-            // an unbounded upper if so. In the wire-format-invariant key
-            // space (`<prefix>/<ref>/...`) this never fires because every
-            // legal prefix ends with a printable ASCII byte.
-            return match String::from_utf8(bytes) {
-                Ok(s) => Bound::Excluded(s),
-                Err(_) => Bound::Unbounded,
-            };
-        }
-    }
-    Bound::Unbounded
+    };
+    let mut next = bytes[..=pivot].to_vec();
+    next[pivot] += 1;
+    // The increment may produce an invalid UTF-8 byte; fall back to an
+    // unbounded upper if so. In the wire-format-invariant key space
+    // (`<prefix>/<ref>/...`) this never fires because every legal prefix
+    // ends with a printable ASCII byte.
+    String::from_utf8(next).map_or(Bound::Unbounded, Bound::Excluded)
 }
 
 #[async_trait]
 impl ObjectStore for MockStore {
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, Error> {
         self.with_state(|s| {
-            if let Some(fault) = Self::take_fault(
-                s,
-                |f| matches!(f, Fault::AccessDeniedOnList { prefix: p } if p == prefix),
-            ) {
-                return match fault {
-                    Fault::AccessDeniedOnList { prefix } => Err(Error::AccessDenied(prefix)),
-                    _ => unreachable!("matcher guarantees AccessDeniedOnList"),
-                };
-            }
-            let lower = Bound::Included(prefix.to_string());
-            let upper = next_lex(prefix);
+            Self::check_fault(s, |f| match f {
+                Fault::AccessDeniedOnList { prefix: p } if p == prefix => {
+                    Some(Error::AccessDenied(p.clone()))
+                }
+                _ => None,
+            })?;
+            let bounds = (Bound::Included(prefix.to_string()), next_lex(prefix));
             Ok(s.objects
-                .range::<String, _>((lower, upper))
+                .range(bounds)
                 .map(|(key, object)| ObjectMeta {
                     key: key.clone(),
                     size: object.body.len() as u64,
@@ -230,17 +227,12 @@ impl ObjectStore for MockStore {
 
     async fn get_bytes(&self, key: &str) -> Result<Bytes, Error> {
         self.with_state(|s| {
-            if let Some(fault) = Self::take_fault(
-                s,
-                |f| matches!(f, Fault::NetworkOnGetBytes { key: k } if k == key),
-            ) {
-                return match fault {
-                    Fault::NetworkOnGetBytes { key } => Err(Error::Network(Box::new(
-                        std::io::Error::other(format!("mock network: {key}")),
-                    ))),
-                    _ => unreachable!(),
-                };
-            }
+            Self::check_fault(s, |f| match f {
+                Fault::NetworkOnGetBytes { key: k } if k == key => Some(Error::Network(Box::new(
+                    std::io::Error::other(format!("mock network: {k}")),
+                ))),
+                _ => None,
+            })?;
             s.objects
                 .get(key)
                 .map(|o| o.body.clone())
@@ -255,19 +247,12 @@ impl ObjectStore for MockStore {
 
     async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, Error> {
         self.with_state(|s| {
-            if let Some(fault) = Self::take_fault(s, |f| {
-                matches!(
-                    f,
-                    Fault::PreconditionFailedOnPutIfAbsent { key: k } if k == key
-                )
-            }) {
-                return match fault {
-                    Fault::PreconditionFailedOnPutIfAbsent { key } => {
-                        Err(Error::PreconditionFailed(key))
-                    }
-                    _ => unreachable!(),
-                };
-            }
+            Self::check_fault(s, |f| match f {
+                Fault::PreconditionFailedOnPutIfAbsent { key: k } if k == key => {
+                    Some(Error::PreconditionFailed(k.clone()))
+                }
+                _ => None,
+            })?;
             if s.objects.contains_key(key) {
                 return Ok(false);
             }
@@ -286,15 +271,10 @@ impl ObjectStore for MockStore {
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, Error> {
         self.with_state(|s| {
-            if let Some(fault) = Self::take_fault(
-                s,
-                |f| matches!(f, Fault::NotFoundOnHead { key: k } if k == key),
-            ) {
-                return match fault {
-                    Fault::NotFoundOnHead { key } => Err(Error::NotFound(key)),
-                    _ => unreachable!(),
-                };
-            }
+            Self::check_fault(s, |f| match f {
+                Fault::NotFoundOnHead { key: k } if k == key => Some(Error::NotFound(k.clone())),
+                _ => None,
+            })?;
             s.objects
                 .get(key)
                 .map(|o| ObjectMeta {
