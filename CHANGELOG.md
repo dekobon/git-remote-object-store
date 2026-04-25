@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Phase 3 git wrapper (`src/git.rs`): the eight helpers from upstream
+  `git_remote_s3/git.py` ported onto `gix` (gitoxide) with two newtypes
+  (`Sha`, `RefName`), a `GitError` aggregate, and a single private
+  `run_git` helper that funnels every `git` subprocess through one
+  stdio-disciplined entry point. `archive` uses `gix-archive`'s native
+  zip writer; `bundle`/`unbundle` retain a subprocess fallback because
+  `gix` 0.82 has no public bundle API. Spike result captured in
+  `docs/development/spike-gix-bundle-parity.md`.
 - Phase 1 scaffolding: Cargo manifest with the dependency set called out in
   `execution-plan.md` (tokio, thiserror/anyhow, tracing, time, serde,
   clap v4, url, gix and selected sub-crates, bytes, tempfile).
