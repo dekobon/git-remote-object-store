@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Phase 5 S3 backend (`src/object_store/s3.rs`): full `ObjectStore`
+  implementation against `aws-sdk-s3` 1.x. The SDK owns SigV4, retries,
+  and connection pooling; this module owns URL → SDK config translation
+  (endpoint normalisation that strips both the bucket label and any
+  query string before handing the URL to the SDK; region resolution
+  that honours `?region=`, parses AWS hostnames, and falls back to
+  `us-east-1` for non-AWS endpoints so SigV4 has a region to sign
+  with), error classification (404→`NotFound`, 403→`AccessDenied`,
+  412→`PreconditionFailed`, 409→`Conflict`, network/timeout→`Network`),
+  and a hand-rolled multipart download orchestrator (HEAD for size,
+  then concurrent ranged GETs through a Tokio semaphore, max 8 in
+  flight, 16 MiB chunks, 25 MiB threshold) matching the upstream
+  `boto3.s3.transfer.TransferConfig` defaults. `put_if_absent` calls
+  `put_object().if_none_match("*")` and collapses both 412 and 409 to
+  `Ok(false)` so racing `If-None-Match: "*"` PUTs surface as "lock not
+  acquired" rather than as hard errors. `get_to_file` writes to a
+  sibling `NamedTempFile` and persists on success so a partial failure
+  cannot leave a corrupt destination. `delete` HEADs first to honour
+  the trait's `Err(NotFound)` contract on missing keys (S3 DELETE is
+  idempotent). Copy keys with reserved characters (`#` from
+  `LOCK#.lock`) are percent-encoded before being placed in the
+  `x-amz-copy-source` header. Integration tests run against MinIO via
+  `testcontainers` behind the new `integration-s3` Cargo feature
+  (Docker required); these cover round-trip put/get, pagination beyond
+  one page, concurrent `put_if_absent` contention, the 50 MiB+
+  multipart download path, percent-encoded copy, atomic-fail behaviour
+  of `get_to_file`, and `AccessDenied` mapping.
 - Phase 4 object-store seam (`src/object_store/`): backend-neutral
   `ObjectStore` async trait (eight methods covering list / head / get /
   put / put-if-absent / copy / delete), shared `Error` enum mapping S3
