@@ -26,6 +26,10 @@ missing_errors_doc = "allow"
 # unit tests pick up the helpers via `cfg(test)` regardless of the feature.
 test-util = []
 
+# Enables the MinIO-backed integration tests in `tests/s3_store_integration.rs`.
+# Requires Docker on the host running `cargo test --features integration-s3`.
+integration-s3 = []
+
 [dependencies]
 # Async traits via Boxed futures. `async_trait` keeps `dyn ObjectStore +
 # Send + Sync` ergonomic; native AFIT (stable since 1.75) is awkward
@@ -84,9 +88,43 @@ gix-archive = "0.31"
 bytes = "1"
 tempfile = "3"
 
+# AWS SDK for the S3 backend (Phase 5). `aws-config` carries the
+# `behavior-version-latest` feature so the SDK picks up its own latest
+# defaults automatically; revisit pinning at Phase 14 if reproducibility
+# becomes a concern.
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+
+# Bridges `aws_smithy_types::DateTime` → `time::OffsetDateTime` for the
+# `ObjectMeta::last_modified` conversion.
+aws-smithy-types-convert = { version = "0.60", features = ["convert-time"] }
+
+# Required for `StreamExt::next` on `aws_smithy_types::byte_stream::ByteStream`
+# in the small-object GET path and the multipart download orchestrator.
+futures = "0.3"
+
+# `x-amz-copy-source` is forwarded verbatim by aws-sdk-s3 — keys with
+# reserved characters (notably `#` in `LOCK#.lock`) must be percent-encoded
+# before being passed in.
+percent-encoding = "2"
+
 [dev-dependencies]
 # Property-based testing for URL round-trip parse/format.
 proptest = "1"
+
+# MinIO testcontainer used by `tests/s3_store_integration.rs` (gated on the
+# `integration-s3` Cargo feature). Cargo does not allow `optional = true` on
+# dev-dependencies, so these compile for every `cargo test` invocation but
+# only link into the integration test file when the feature is enabled.
+# `blocking` enables `SyncRunner`, which starts the container outside of any
+# tokio runtime so it can be shared across multiple `#[tokio::test]`-spawned
+# runtimes without their dispatch tasks tearing each other down.
+testcontainers = { version = "0.27", features = ["blocking"] }
+testcontainers-modules = { version = "0.15", features = ["minio"] }
+
+# SHA-256 for byte-equality assertions on the multipart-download integration test
+# (avoids holding the 50 MiB body twice in memory).
+sha2 = "0.10"
 
 # Remote-helper shims. Git invokes them by scheme as `git-remote-<scheme>`,
 # so the installed binary names must be `git-remote-s3+https` etc.
