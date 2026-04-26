@@ -212,6 +212,7 @@ async fn head_returns_size_and_recent_last_modified() {
         age.whole_seconds() < 60 && age.whole_seconds() > -60,
         "last_modified out of range: {age}"
     );
+    assert!(meta.etag.is_some(), "S3 head_object must return an ETag");
 }
 
 #[tokio::test]
