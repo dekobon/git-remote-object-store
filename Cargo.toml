@@ -41,6 +41,7 @@ tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
     "fs",
+    "io-std",
     "io-util",
     "process",
     "signal",
@@ -53,6 +54,8 @@ anyhow = "1"
 
 # Logging
 tracing = "0.1"
+# `reload` is required for runtime verbosity flips driven by the helper
+# protocol's `option verbosity <n>` line (Phase 6 / execution-plan.md §2.4).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Time
