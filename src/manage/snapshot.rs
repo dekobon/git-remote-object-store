@@ -106,45 +106,42 @@ async fn classify_into(
         );
         return Ok(());
     };
-    let segments: Vec<&str> = relative.split('/').collect();
 
-    match segments.as_slice() {
-        ["HEAD"] => {
-            let body = store.get_bytes(&object.key).await?;
-            snapshot.head = std::str::from_utf8(&body)
-                .ok()
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty());
-        }
-        // Lock files (`<ref>/LOCK#.lock` and any future `*.lock` keys)
-        // are scanned separately by `list_and_handle_stale_locks`.
-        // The lock suffix is a wire-format token on a case-sensitive
-        // S3/Azure key, not a filesystem extension — clippy's
-        // case-insensitive-extension hint does not apply.
-        #[allow(clippy::case_sensitive_file_extension_comparisons)]
-        [.., last] if last.ends_with(".lock") => {}
-        // The optional `<ref>/repo.zip` artefact (`?zip=1` push variant)
-        // is not a bundle and not a protection marker. Skip silently.
-        [.., "repo.zip"] => {}
-        [_ref_root, _rest @ ..] if segments.len() >= 2 => {
-            let last = segments[segments.len() - 1];
-            let ref_path = segments[..segments.len() - 1].join("/");
-            let entry = snapshot.refs.entry(ref_path).or_default();
+    if relative == "HEAD" {
+        let body = store.get_bytes(&object.key).await?;
+        snapshot.head = std::str::from_utf8(&body)
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        return Ok(());
+    }
 
-            if last.starts_with("PROTECTED#") {
-                entry.is_protected = true;
-            } else if let Some(sha) = last.strip_suffix(".bundle") {
-                entry.bundles.push(BundleEntry {
-                    sha: sha.to_owned(),
-                    key: object.key.clone(),
-                    last_modified: object.last_modified,
-                });
-            }
-            // Anything else under `<ref>/` is an unknown sidecar; leave
-            // it alone so the doctor doesn't accidentally rewrite a key
-            // it doesn't recognise.
-        }
-        _ => {}
+    // Every other key is `<ref-path>/<last>`. Anything without a slash
+    // (e.g. a sidecar dropped at the prefix root) is unknown and
+    // skipped — the doctor never rewrites keys it does not recognise.
+    let Some((ref_path, last)) = relative.rsplit_once('/') else {
+        return Ok(());
+    };
+
+    // `LOCK#.lock` and any future `*.lock` keys are scanned separately
+    // by `list_and_handle_stale_locks`; `repo.zip` is the optional
+    // `?zip=1` push artefact and is neither a bundle nor a marker.
+    // Both are case-sensitive wire-format tokens, not filesystem
+    // extensions — clippy's case-insensitive hint does not apply.
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    if last.ends_with(".lock") || last == "repo.zip" {
+        return Ok(());
+    }
+
+    let entry = snapshot.refs.entry(ref_path.to_owned()).or_default();
+    if last.starts_with("PROTECTED#") {
+        entry.is_protected = true;
+    } else if let Some(sha) = last.strip_suffix(".bundle") {
+        entry.bundles.push(BundleEntry {
+            sha: sha.to_owned(),
+            key: object.key.clone(),
+            last_modified: object.last_modified,
+        });
     }
     Ok(())
 }

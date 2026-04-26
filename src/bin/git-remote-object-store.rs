@@ -23,7 +23,7 @@ use tracing_subscriber::EnvFilter;
 
 use git_remote_object_store::git as git_helpers;
 use git_remote_object_store::manage::{
-    DEFAULT_LOCK_TTL_SECONDS, DialoguerPrompter, ManageError,
+    DEFAULT_LOCK_TTL_SECONDS, DialoguerPrompter,
     branch::ManageBranch,
     doctor::{Doctor, DoctorOpts},
 };
@@ -147,8 +147,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             };
             let prompter = DialoguerPrompter;
             let doctor = Doctor::new(store, prefix, opts, &prompter);
-            doctor.run().await.map_err(into_anyhow)?;
-            Ok(())
+            Ok(doctor.run().await?)
         }
         Command::DeleteBranch { target, branch } => {
             run_branch(&target, &branch, BranchAction::Delete).await
@@ -172,15 +171,13 @@ enum BranchAction {
 async fn run_branch(target: &Target, branch: &str, action: BranchAction) -> Result<()> {
     let (store, prefix) = open_target(target).await?;
     let prompter = DialoguerPrompter;
-    let mb = ManageBranch::open(store, prefix, branch.to_owned(), &prompter)
-        .await
-        .map_err(into_anyhow)?;
-    match action {
+    let mb = ManageBranch::open(store, prefix, branch.to_owned(), &prompter).await?;
+    let outcome = match action {
         BranchAction::Delete => mb.delete_branch().await,
         BranchAction::Protect => mb.protect_branch().await,
         BranchAction::Unprotect => mb.unprotect_branch().await,
-    }
-    .map_err(into_anyhow)
+    };
+    Ok(outcome?)
 }
 
 /// Resolve `target.remote` to an `(ObjectStore, prefix)` pair.
@@ -218,16 +215,4 @@ fn remote_url_from_named_remote(cwd: &Path, name: &str) -> Result<String> {
     git_helpers::remote_url(&repo, name)
         .map_err(|err| anyhow!(err))
         .with_context(|| format!("failed to read remote `{name}` URL"))
-}
-
-fn into_anyhow(err: ManageError) -> anyhow::Error {
-    match err {
-        ManageError::Cancelled => anyhow!("operation cancelled"),
-        ManageError::BranchNotFound(name) => {
-            anyhow!("branch not found: {name}")
-        }
-        ManageError::MissingPrefix => anyhow!("remote URL is missing the repository prefix"),
-        ManageError::Store(e) => anyhow!(e).context("object-store call failed"),
-        ManageError::Io(e) => anyhow!(e),
-    }
 }
