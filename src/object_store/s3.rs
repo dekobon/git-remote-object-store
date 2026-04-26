@@ -484,23 +484,17 @@ impl ObjectStore for S3Store {
         // payloads need multipart upload. Bundle objects in our schema
         // do not approach that limit; LFS-driven needs may extend the
         // trait in a later phase.
-        let mut req = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from(body));
-        if let Some(cd) = &opts.content_disposition {
-            req = req.content_disposition(cd);
-        }
-        for (k, v) in &opts.user_metadata {
-            // S3 lowercases user-metadata keys on storage and limits the
-            // combined header set to ~2 KB; ASCII only (RFC 2047 encode
-            // non-ASCII upstream).
-            req = req.metadata(k, v);
-        }
-        req.send().await.map_err(|e| classify(e, key))?;
-        Ok(())
+        self.put_body(key, ByteStream::from(body), opts).await
+    }
+
+    async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), Error> {
+        // `ByteStream::from_path` streams from disk via tokio's async
+        // file I/O, avoiding a full in-memory copy. For files above the
+        // SDK's internal multipart threshold (~8 MiB) the SDK's transfer
+        // manager will switch to multipart upload automatically,
+        // removing the single-PUT 5 GiB ceiling.
+        let stream = ByteStream::from_path(src).await.map_err(other_boxed)?;
+        self.put_body(key, stream, opts).await
     }
 
     async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, Error> {
@@ -583,6 +577,30 @@ impl ObjectStore for S3Store {
 }
 
 impl S3Store {
+    /// Common upload helper: sends the given [`ByteStream`] to S3 with
+    /// optional `Content-Disposition` and user metadata from [`PutOpts`].
+    /// Shared by `put_bytes` (in-memory) and `put_path` (streamed from
+    /// disk).
+    async fn put_body(&self, key: &str, body: ByteStream, opts: PutOpts) -> Result<(), Error> {
+        let mut req = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(body);
+        if let Some(cd) = &opts.content_disposition {
+            req = req.content_disposition(cd);
+        }
+        for (k, v) in &opts.user_metadata {
+            // S3 lowercases user-metadata keys on storage and limits the
+            // combined header set to ~2 KB; ASCII only (RFC 2047 encode
+            // non-ASCII upstream).
+            req = req.metadata(k, v);
+        }
+        req.send().await.map_err(|e| classify(e, key))?;
+        Ok(())
+    }
+
     /// Stream a small (<= [`MULTIPART_THRESHOLD`]) object directly to the
     /// temp-file path. Caller is responsible for `persist`-ing the file.
     ///

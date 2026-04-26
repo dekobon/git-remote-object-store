@@ -23,6 +23,7 @@ use std::path::Path;
 
 use bytes::Bytes;
 use time::OffsetDateTime;
+use tracing::debug;
 
 pub use self::error::{BoxError, Error};
 
@@ -73,6 +74,9 @@ pub struct PutOpts {
 /// - **`get_to_file(key, dest)`** — caller must ensure `dest`'s parent
 ///   directory exists.
 /// - **`put_bytes`** — overwrites if the key already exists.
+/// - **`put_path`** — streams a local file to the key, overwriting if
+///   present. Default reads the file into memory; backends should
+///   override for large-file streaming.
 /// - **`put_if_absent`** — returns `Ok(true)` on creation, `Ok(false)` if
 ///   the key already existed. Backends collapse both 412
 ///   (`PreconditionFailed`) and 409 (`Conflict`) into `Ok(false)` per
@@ -96,6 +100,20 @@ pub trait ObjectStore: Send + Sync {
 
     /// Write `body` to `key`, overwriting any existing object.
     async fn put_bytes(&self, key: &str, body: Bytes, opts: PutOpts) -> Result<(), Error>;
+
+    /// Stream a local file to `key`, overwriting any existing object.
+    ///
+    /// Backends should override this to stream from disk without buffering
+    /// the entire file in process memory. The default implementation reads
+    /// the file into memory and delegates to [`put_bytes`](Self::put_bytes);
+    /// this is correct but defeats the streaming intent for large files.
+    async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), Error> {
+        debug!(key, path = %src.display(), "put_path: default read-then-put_bytes fallback");
+        let body = tokio::fs::read(src)
+            .await
+            .map_err(|e| Error::Other(Box::new(e)))?;
+        self.put_bytes(key, Bytes::from(body), opts).await
+    }
 
     /// Create `key` if and only if it does not exist. Returns `Ok(true)`
     /// when the object was created, `Ok(false)` when the key was already
