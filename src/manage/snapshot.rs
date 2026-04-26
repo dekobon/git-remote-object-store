@@ -126,10 +126,7 @@ async fn classify_into(
     // `LOCK#.lock` and any future `*.lock` keys are scanned separately
     // by `list_and_handle_stale_locks`; `repo.zip` is the optional
     // `?zip=1` push artefact and is neither a bundle nor a marker.
-    // Both are case-sensitive wire-format tokens, not filesystem
-    // extensions — clippy's case-insensitive hint does not apply.
-    #[allow(clippy::case_sensitive_file_extension_comparisons)]
-    if last.ends_with(".lock") || last == "repo.zip" {
+    if super::is_lock_key(last) || last == "repo.zip" {
         return Ok(());
     }
 

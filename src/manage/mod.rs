@@ -27,6 +27,15 @@ use crate::object_store::Error as ObjectStoreError;
 /// `../git-remote-s3/git_remote_s3/remote.py`.
 pub const DEFAULT_LOCK_TTL_SECONDS: u64 = 60;
 
+/// `true` iff `key` is a lock-file key. The `.lock` suffix is a
+/// wire-format token on a case-sensitive S3/Azure key, not a filesystem
+/// extension — clippy's case-insensitive-extension hint is silenced
+/// once here so callers don't need to repeat the rationale.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+pub(super) fn is_lock_key(key: &str) -> bool {
+    key.ends_with(".lock")
+}
+
 /// Errors surfaced by the management surface.
 #[derive(Debug, Error)]
 pub enum ManageError {

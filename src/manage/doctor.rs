@@ -198,8 +198,10 @@ impl<'a> Doctor<'a> {
             println!("Removing {}", losing.sha);
             self.store.delete(&losing.key).await?;
         } else {
-            let suffix: String = Uuid::new_v4().simple().to_string()[..8].to_owned();
-            let new_ref = format!("{ref_path}_{suffix}");
+            // `{:.8}` truncates the 32-char simple UUID to its first 8
+            // hex digits — a single allocation, mirroring upstream's
+            // `str(uuid.uuid4())[:8]`.
+            let new_ref = format!("{ref_path}_{:.8}", Uuid::new_v4().simple());
             let dst_key = format!("{}/{new_ref}/{}.bundle", self.prefix, losing.sha);
             println!("Moving {} to new branch {new_ref}", losing.sha);
             self.store.copy(&losing.key, &dst_key).await?;
@@ -232,10 +234,11 @@ impl<'a> Doctor<'a> {
         // `dialoguer::Select` cannot return an out-of-range index; an
         // out-of-range answer here is a test-script bug (see
         // `fix_multiple_bundles`).
-        let new_head = (*candidates
+        let new_head = candidates
             .get(chosen)
-            .expect("Prompter::select returned out-of-range index"))
-        .to_owned();
+            .copied()
+            .expect("Prompter::select returned out-of-range index")
+            .to_owned();
 
         let head_key = format!("{}/HEAD", self.prefix);
         println!("Setting {new_head} as HEAD");
@@ -255,17 +258,9 @@ impl<'a> Doctor<'a> {
 
         let stale: Vec<(String, Duration)> = objects
             .into_iter()
-            // `.lock` is a wire-format key suffix, not a filesystem
-            // extension — see the matching note in `snapshot.rs`.
-            .filter(|o| {
-                #[allow(clippy::case_sensitive_file_extension_comparisons)]
-                {
-                    o.key.ends_with(".lock")
-                }
-            })
+            .filter(|o| super::is_lock_key(&o.key))
             .filter_map(|o| {
-                let elapsed = now - o.last_modified;
-                let elapsed = Duration::try_from(elapsed).ok()?;
+                let elapsed = Duration::try_from(now - o.last_modified).ok()?;
                 (elapsed > ttl).then_some((o.key, elapsed))
             })
             .collect();
