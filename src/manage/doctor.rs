@@ -198,10 +198,14 @@ impl<'a> Doctor<'a> {
             println!("Removing {}", losing.sha);
             self.store.delete(&losing.key).await?;
         } else {
-            // `{:.8}` truncates the 32-char simple UUID to its first 8
-            // hex digits — a single allocation, mirroring upstream's
-            // `str(uuid.uuid4())[:8]`.
-            let new_ref = format!("{ref_path}_{:.8}", Uuid::new_v4().simple());
+            // `Uuid::Simple`'s `Display` impl does NOT honor the
+            // precision specifier (`{:.8}`), so encode into a stack
+            // buffer and slice to 8 chars — mirroring upstream's
+            // `str(uuid.uuid4())[:8]` (`<ref>_<uuid8>` per
+            // `execution-plan.md` §1.1 / Phase 9).
+            let mut buf = [0u8; uuid::fmt::Simple::LENGTH];
+            let suffix = &Uuid::new_v4().simple().encode_lower(&mut buf)[..8];
+            let new_ref = format!("{ref_path}_{suffix}");
             let dst_key = format!("{}/{new_ref}/{}.bundle", self.prefix, losing.sha);
             println!("Moving {} to new branch {new_ref}", losing.sha);
             self.store.copy(&losing.key, &dst_key).await?;
@@ -320,9 +324,14 @@ mod tests {
         let mock = MockStore::new();
         mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
         mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        let initial_keys = mock.keys();
         let prompter = ScriptedPrompter::new([]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
         doctor.run().await.expect("doctor.run");
+        // A clean run must not mutate the bucket — no objects added,
+        // moved, or removed. This catches a `Doctor::run` regressed to
+        // a no-op as well as one that over-eagerly fixes a non-issue.
+        assert_eq!(mock.keys(), initial_keys);
         assert_eq!(prompter.remaining(), 0);
     }
 
@@ -346,13 +355,25 @@ mod tests {
         assert!(mock.contains("myrepo/refs/heads/main/aaaaaaaa.bundle"));
         // Loser was moved off the main ref.
         assert!(!mock.contains("myrepo/refs/heads/main/bbbbbbbb.bundle"));
-        // The new quarantine ref has a key with the moved bundle.
+        // The new quarantine ref has a key with the moved bundle, and
+        // the suffix is exactly 8 lowercase hex characters as documented
+        // in `execution-plan.md` §1.1 / Phase 9 (`<ref>_<uuid8>`).
         let moved = mock
             .keys()
             .into_iter()
             .find(|k| k.starts_with("myrepo/refs/heads/main_") && k.ends_with("/bbbbbbbb.bundle"))
             .expect("quarantine key created");
-        assert!(moved.len() > "myrepo/refs/heads/main_/bbbbbbbb.bundle".len());
+        let suffix = moved
+            .strip_prefix("myrepo/refs/heads/main_")
+            .and_then(|rest| rest.strip_suffix("/bbbbbbbb.bundle"))
+            .expect("quarantine key matches `<ref>_<suffix>/<sha>.bundle`");
+        assert_eq!(suffix.len(), 8, "expected 8-char suffix, got {suffix:?}");
+        assert!(
+            suffix
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "expected lowercase hex suffix, got {suffix:?}"
+        );
     }
 
     #[tokio::test]
