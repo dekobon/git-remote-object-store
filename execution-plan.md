@@ -636,29 +636,58 @@ and document the constraint.
 ### Phase 11 — Azure Blob backend
 
 - Implement `object_store::azure::AzureBlobStore` against
-  `azure_storage_blob` (the actively maintained official crate).
-- Map the trait verbatim:
+  `azure_storage_blob` 0.12 (the actively maintained official
+  crate; still in beta as of 2026-04).
+- Map the trait verbatim where the SDK supports it:
   - `list` → `BlobContainerClient::list_blobs` with a prefix and
-    page iteration.
+    `into_pages()` pagination. Empty prefix is sent as `None`
+    (Azurite signs `prefix=` differently than an absent param).
   - `get_to_file` → `BlobClient::download()` directly. The SDK
     performs internal parallel range downloads, so no
     hand-rolled chunking is needed (asymmetric with S3 by design
     — see §5.3).
   - `put_bytes` / `put_if_absent` → `BlobClient::upload` with
-    optional `If-None-Match: *` access condition.
+    `BlockBlobClientUploadOptions::with_if_not_exists()` (sets
+    `If-None-Match: "*"`).
   - `head` → `BlobClient::get_properties`.
-  - `copy` → `BlobClient::copy_from_url`.
   - `delete` → `BlobClient::delete`.
+- **SDK divergences from the original plan** (the SDK is still in
+  beta; these decisions are kept narrow to preserve the trait
+  contract while staying compatible with the SDK as it stabilises):
+  - `copy` → download-then-upload round trip. The 0.12 crate does
+    not expose `BlobClient::copy_from_url`; the only available
+    server-side copy is `BlockBlobClient::upload_blob_from_url`,
+    which requires a SAS-tokened source URL or
+    `x-ms-copy-source-authorization` header — neither integrates
+    cleanly with our credential model. Lock files (the only
+    `copy` consumer in the trait) are zero bytes, so a
+    download-then-upload is one extra round trip on a tiny payload.
+  - **Custom shared-key signing policy.** The 0.12 crate accepts
+    only `Arc<dyn TokenCredential>` (Entra ID) on its
+    constructors. Azurite needs shared-key auth (no Entra ID
+    server without an HTTPS+OAuth setup), and many production
+    accounts still use account keys. We register an
+    `azure_core::http::policies::Policy` that signs each request
+    with the Azure Storage shared-key v2 scheme. Tracking
+    upstream: `Azure/azure-sdk-for-rust#2975`.
 - Note: a `Range` request against a zero-byte blob returns HTTP
-  416. Bundles are never zero bytes, but document this in a
-  comment near `head` / range-handling helpers.
+  416. Bundles are never zero bytes, and the
+  `meta.size == 0 → persist empty tempfile` short-circuit in
+  `get_to_file` avoids any download SDK call against an empty
+  blob, so the 416 path is unreachable from the trait surface.
 - Credential resolution:
-  1. If URL has `<credential>@`, look up env vars
+  1. If URL has `?credential=<NAME>`, look up env vars
      `AZSTORE_<NAME>_KEY`, `AZSTORE_<NAME>_CONNECTION_STRING`,
-     or `AZSTORE_<NAME>_SAS`.
-  2. Else use `DefaultAzureCredential` (env, workload identity,
-     managed identity, Azure CLI, etc.).
-- Integration tests against Azurite via `testcontainers`.
+     or `AZSTORE_<NAME>_SAS` (in priority order).
+  2. Else use `DeveloperToolsCredential` (env, workload identity,
+     managed identity, Azure CLI, etc.). The 0.35 `azure_identity`
+     crate renamed `DefaultAzureCredential` to
+     `DeveloperToolsCredential`; behaviour is the same.
+- Integration tests against Azurite via `testcontainers`. The
+  Azurite container is started with `--skipApiVersionCheck`
+  because the SDK ships a newer `x-ms-version` than the pinned
+  Azurite image accepts (semantically a no-op for our request
+  shapes).
 
 ### Phase 12 — Azure binaries and surface
 

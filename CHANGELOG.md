@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Azure Blob Storage backend (`AzureBlobStore`, Phase 11): full
+  `ObjectStore` trait implementation against the official
+  `azure_storage_blob` 0.12 crate. `list` paginates through
+  `BlobContainerClient::list_blobs`; `get_to_file` streams via the
+  SDK's parallelised `BlobClient::download` (no hand-rolled multipart
+  on Azure, asymmetric with S3 by design); `put_bytes` /
+  `put_if_absent` use `BlockBlobClientUploadOptions::with_if_not_exists`
+  to surface 409/412 contention as `Ok(false)`. Wired into
+  `protocol::backend::build`, so existing `git-remote-az+https` /
+  `git-remote-az+http` shims now drive a real backend. (#11)
+- Custom shared-key signing policy (`auth::SharedKeySigningPolicy`):
+  the SDK does not yet support shared-key authentication
+  (`Azure/azure-sdk-for-rust#2975`), so we install our own per-try
+  `azure_core::http::policies::Policy` that signs each outgoing
+  request with the Azure Storage shared-key v2 scheme. This is the
+  only way to authenticate against Azurite without an HTTPS+OAuth
+  setup, and unblocks production accounts that still use account
+  keys. SAS-token signing (`SasSigningPolicy`) and
+  `?credential=<NAME>` env-var resolution
+  (`AZSTORE_<NAME>_KEY` / `_CONNECTION_STRING` / `_SAS`) ship in the
+  same patch. (#11)
+- Azurite-backed integration suite
+  (`tests/azure_store_integration.rs`, gated on
+  `--features integration-azure`): mirrors the RustFS S3 fixture
+  (one shared container, fresh-per-test container allocation, the
+  16-racer `put_if_absent` contention canary, and round-trips for
+  `head` / `list` / `copy` / `delete` / `get_to_file` zero-byte and
+  multi-megabyte). (#11)
 - LFS custom-transfer agent (`git-lfs-object-store`, Phase 10): a single
   binary that serves both backends. Subcommands `install`,
   `enable-debug`, and `disable-debug` mutate the local repo's
