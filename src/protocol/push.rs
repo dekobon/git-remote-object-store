@@ -285,10 +285,7 @@ pub(crate) async fn release_lock(
     store: &dyn ObjectStore,
     lock_key: &str,
 ) -> Result<(), ObjectStoreError> {
-    match store.delete(lock_key).await {
-        Ok(()) | Err(ObjectStoreError::NotFound(_)) => Ok(()),
-        Err(e) => Err(e),
-    }
+    delete_idempotent(store, lock_key).await
 }
 
 /// Idempotent delete: treats `NotFound` as success (another client may
