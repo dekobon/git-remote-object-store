@@ -7,7 +7,10 @@
       "Read(//home/elijah/Development/Open_Source/f5-agent/**)",
       "Bash(gh repo *)",
       "Bash(gh label *)",
-      "Bash(gh issue *)"
+      "Bash(gh issue *)",
+      "Bash(gh api *)",
+      "Bash(git log *)",
+      "WebFetch(domain:hub.docker.com)"
     ]
   }
 }
