@@ -137,17 +137,15 @@ where
 
 /// Shared `main` for every `git-remote-{s3,az}-{http,https}` binary.
 ///
-/// Reads `argv[2]` (the URL — git always passes remote-name as argv[1]
-/// and URL as argv[2]), parses it, builds the backend, installs the
-/// tracing subscriber, masks SIGPIPE on Unix, and drives [`run`].
+/// Git always invokes a remote helper as `git-remote-<scheme> <remote-name>
+/// <url>` — see `git help gitremote-helpers`. We read the URL from
+/// `argv[2]`, matching the upstream Python helper exactly.
 pub async fn run_main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let remote_arg = args
-        .get(2)
-        .or_else(|| args.get(1))
-        .ok_or_else(|| anyhow!("missing remote URL on command line"))?;
+    let remote_arg = std::env::args()
+        .nth(2)
+        .ok_or_else(|| anyhow!("missing remote URL: expected `<remote-name> <url>` on argv"))?;
 
-    let remote = url::parse(remote_arg).context("failed to parse remote URL")?;
+    let remote = url::parse(&remote_arg).context("failed to parse remote URL")?;
     let reload = tracing_init::init().ok();
 
     #[cfg(unix)]

@@ -16,7 +16,7 @@
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::warn;
 
-use crate::object_store::{Error as ObjectStoreError, ObjectMeta, ObjectStore};
+use crate::object_store::{Error as ObjectStoreError, ObjectStore};
 
 /// Errors specific to the list path that the dispatcher converts into
 /// fatal exits.
@@ -83,27 +83,29 @@ async fn collect_bundles(
     // Match upstream: `list_objects_v2(Prefix=prefix)` with no trailing
     // slash. The strip step below disambiguates sibling-prefix collisions.
     let listed = store.list(prefix.unwrap_or("")).await?;
-    let mut metas: Vec<ObjectMeta> = listed
+
+    // Parse every match exactly once, carrying the timestamp alongside
+    // the parsed entry so the sort below doesn't force a re-parse.
+    let mut parsed: Vec<(time::OffsetDateTime, BundleEntry)> = listed
         .into_iter()
-        .filter(|m| relative_key(prefix, &m.key).is_some_and(|rel| parse_bundle_key(rel).is_some()))
+        .filter_map(|m| {
+            let rel = relative_key(prefix, &m.key)?;
+            let (ref_path, sha) = parse_bundle_key(rel)?;
+            Some((
+                m.last_modified,
+                BundleEntry {
+                    sha: sha.to_owned(),
+                    ref_path: ref_path.to_owned(),
+                },
+            ))
+        })
         .collect();
 
     // LastModified desc, stable: callers care about freshness ordering
     // when a ref has multiple bundles mid-rotation.
-    metas.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+    parsed.sort_by(|(a, _), (b, _)| b.cmp(a));
 
-    let entries = metas
-        .into_iter()
-        .filter_map(|m| {
-            let rel = relative_key(prefix, &m.key)?.to_owned();
-            let (ref_path, sha) = parse_bundle_key(&rel)?;
-            Some(BundleEntry {
-                sha: sha.to_owned(),
-                ref_path: ref_path.to_owned(),
-            })
-        })
-        .collect();
-    Ok(entries)
+    Ok(parsed.into_iter().map(|(_, entry)| entry).collect())
 }
 
 async fn read_remote_head(
@@ -176,6 +178,7 @@ fn parse_bundle_key(rel_key: &str) -> Option<(&str, &str)> {
         return None;
     }
     // ref_path is everything before the trailing "/<sha>.bundle".
+    // The `-1` drops the `/` separator between ref_path and last segment.
     let split_at = rel_key.len() - last.len() - 1;
     Some((&rel_key[..split_at], sha))
 }

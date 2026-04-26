@@ -101,9 +101,9 @@ async fn list_for_push_skips_head_lookup() {
     let (out, result) = drive(s3_url(Some("repo")), Arc::new(store), "list for-push\n").await;
     result.expect("list for-push should succeed");
     let text = std::str::from_utf8(&out).unwrap();
-    assert!(text.contains(&format!("{SHA_A} refs/heads/main\n")));
-    assert!(!text.contains("HEAD"), "for-push must not emit @ref HEAD");
-    assert!(text.ends_with("\n\n") || text.ends_with('\n'));
+    // Exact-eq subsumes presence of the bundle line, absence of `@<ref> HEAD`,
+    // and the trailing-blank-line terminator in a single assertion.
+    assert_eq!(text, format!("{SHA_A} refs/heads/main\n\n"));
 }
 
 #[tokio::test]
@@ -136,8 +136,9 @@ async fn list_omits_head_when_pointed_ref_has_no_bundle() {
     let (out, result) = drive(s3_url(Some("repo")), Arc::new(store), "list\n").await;
     result.expect("list should succeed");
     let text = std::str::from_utf8(&out).unwrap();
-    assert!(!text.contains("HEAD\n"), "no listed ref matches HEAD body");
-    assert!(text.contains(&format!("{SHA_A} refs/heads/feature\n")));
+    // Exact-eq: no `@refs/heads/main HEAD` line (the listed ref does not
+    // match the head body) and the bundle line is the only output.
+    assert_eq!(text, format!("{SHA_A} refs/heads/feature\n\n"));
 }
 
 #[tokio::test]
@@ -308,7 +309,7 @@ async fn invalid_command_returns_error() {
 
 #[tokio::test]
 async fn fetch_command_returns_not_implemented() {
-    let (_out, result) = drive(
+    let (out, result) = drive(
         s3_url(Some("repo")),
         Arc::new(MockStore::new()),
         &format!("fetch {SHA_A} refs/heads/main\n"),
@@ -318,11 +319,14 @@ async fn fetch_command_returns_not_implemented() {
         Err(ProtocolError::Fetch(_)) => {}
         other => panic!("expected Fetch error, got {other:?}"),
     }
+    // The stub bails before writing anything; a regression that emitted
+    // partial protocol output before erroring would corrupt git's parser.
+    assert!(out.is_empty(), "stub must not write to stdout: {out:?}");
 }
 
 #[tokio::test]
 async fn push_command_returns_not_implemented() {
-    let (_out, result) = drive(
+    let (out, result) = drive(
         s3_url(Some("repo")),
         Arc::new(MockStore::new()),
         "push refs/heads/main:refs/heads/main\n",
@@ -332,6 +336,9 @@ async fn push_command_returns_not_implemented() {
         Err(ProtocolError::Push(_)) => {}
         other => panic!("expected Push error, got {other:?}"),
     }
+    // The stub bails before writing anything; a regression that emitted
+    // partial protocol output before erroring would corrupt git's parser.
+    assert!(out.is_empty(), "stub must not write to stdout: {out:?}");
 }
 
 #[tokio::test]
@@ -367,7 +374,13 @@ async fn head_with_trailing_whitespace_is_trimmed() {
     let (out, result) = drive(s3_url(Some("repo")), Arc::new(store), "list\n").await;
     result.expect("list should succeed");
     let text = std::str::from_utf8(&out).unwrap();
-    assert!(text.contains("@refs/heads/main HEAD\n"));
+    // Exact-eq: confirms the leading whitespace was stripped (otherwise the
+    // ref-match would fail and `@<ref> HEAD` would be omitted) AND that no
+    // extra padding leaked through to the protocol output.
+    assert_eq!(
+        text,
+        format!("@refs/heads/main HEAD\n{SHA_A} refs/heads/main\n\n")
+    );
 }
 
 #[tokio::test]
