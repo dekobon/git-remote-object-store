@@ -1,5 +1,10 @@
 //! `git-remote-az+https` helper shim.
 //!
-//! Phase 1 placeholder; the protocol REPL is wired up in Phase 6 / 12.
+//! Thin wrapper around [`git_remote_object_store::protocol::run_main`].
+//! The Azure backend itself is wired in Phase 11 — until then the REPL
+//! exits early with a "not yet implemented" error.
 
-fn main() {}
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    git_remote_object_store::protocol::run_main().await
+}

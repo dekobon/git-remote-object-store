@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Phase 6 remote-helper protocol skeleton (`src/protocol/`): asynchronous
+  REPL (`protocol::run`) generic over its reader/writer so tests can drive
+  it via `tokio::io::duplex`, plus a shared `protocol::run_main` entry that
+  every `git-remote-{s3,az}-{http,https}` binary now invokes. Implements
+  the four Phase-6 commands: `capabilities` (announces `*push`, `*fetch`,
+  `option`), `list` and `list for-push` (lists `<sha> <ref>` lines, sorted
+  by `LastModified` descending, filtered to
+  `^refs/.+/.+/[a-f0-9]{40}\.bundle$`, with `@<ref> HEAD` emitted only when
+  not for-push and the head ref appears in the listing), and `option
+  verbosity <n>` (responds `ok` and reloads the `tracing` filter to `info`
+  for `n >= 2`, `unsupported` otherwise). Stripping happens against
+  `<prefix>/` so a sibling-prefix repo cannot match. HEAD body is trimmed
+  per upstream `.strip()` semantics; `Error::NotFound` on HEAD is
+  swallowed silently. `fetch`/`push` lines are recognised but return a
+  structured "not yet implemented" error pending Phases 7/8 — fail-fast
+  rather than the upstream silent-queue-then-flush so `git fetch`/`git push`
+  surfaces a clear reason. Stdin EOF is a clean exit; stdout `BrokenPipe`
+  is caught at the top level and the process exits 0 (mirroring
+  upstream's `os.dup2(devnull, stdout)` trick). On Unix, SIGPIPE is masked
+  via `tokio::signal::unix::signal(SignalKind::pipe())` so writes return
+  EPIPE rather than killing the process.
+- Phase 6 backend factory (`protocol::backend::build`) dispatches a parsed
+  `RemoteUrl` to `S3Store` (Phase 5) or returns
+  `BackendError::AzureNotImplemented` for `RemoteUrl::Azure` until
+  Phase 11 lands the Azure backend.
+- Phase 6 stderr-only tracing initialiser (`protocol::tracing_init`)
+  honours `GIT_REMOTE_OBJECT_STORE_VERBOSE` and the upstream-compat alias
+  `GIT_REMOTE_S3_VERBOSE`; a numeric `>= 2` bumps the start level to
+  `info`. The filter sits behind `reload::Layer` so the protocol can flip
+  verbosity at runtime.
+- `clippy.toml` now bans `println!`/`print!`/`dbg!` via `disallowed-macros`
+  per execution-plan.md §5.8 / `.claude/rules/protocol-stdout.md`. The
+  management CLI and LFS agent will opt out at the file level when they
+  start writing to stdout in Phases 9/10.
+- Tokio's `io-std` feature is now enabled so the helper binaries can read
+  stdin and write stdout asynchronously.
+- Smoke test `tests/protocol_smoke.rs` (gated on `feature = "test-util"`)
+  drives `protocol::run` end-to-end against `MockStore` via
+  `tokio::io::duplex`, asserting exact stdout bytes for capabilities,
+  list / list for-push, option verbosity, the `fetch`/`push` stub error
+  paths, EOF, blank lines, HEAD trimming, sibling-prefix collisions, and
+  bundle-key filter rejections.
 - Phase 5 S3 backend (`src/object_store/s3.rs`): full `ObjectStore`
   implementation against `aws-sdk-s3` 1.x. The SDK owns SigV4, retries,
   and connection pooling; this module owns URL → SDK config translation
