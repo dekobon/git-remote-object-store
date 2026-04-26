@@ -22,6 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prompts go through a `Prompter` trait so unit tests drive the same
   code path with a scripted prompter against `MockStore`. (#9)
 
+### Security
+
+- Disable `aws-sdk-s3`'s default `rustls` feature to drop the legacy
+  `rustls 0.21` / `rustls-webpki 0.101.x` dependency chain pulled in by
+  `aws-smithy-runtime/tls-rustls`. The crate now uses the modern
+  `default-https-client` path (`rustls 0.23` / `rustls-webpki 0.103.x`),
+  resolving GHSA-4p46-pwfr-66x6 (high — DoS via panic on malformed CRL
+  BIT STRING) and the two webpki name-constraint advisories
+  (GHSA-fjxv-7rqg-78g4, GHSA-fhc7-32rr-h57g).
+
 ### Fixed
 
 - `release_lock` now propagates non-`NotFound` delete failures instead of
