@@ -60,6 +60,7 @@ use url::Url;
 
 use crate::url::{RemoteUrl, S3Addressing};
 
+use super::error::other_boxed;
 use super::{Error, ObjectMeta, ObjectStore, PutOpts};
 
 /// Object-size cutoff above which `get_to_file` switches from a single
@@ -103,15 +104,6 @@ const COPY_SOURCE_ENCODE: &AsciiSet = &CONTROLS
     .add(b'{')
     .add(b'|')
     .add(b'}');
-
-/// Wrap any concrete `std::error::Error` into [`Error::Other`].
-///
-/// Replaces the open-coded `|e| Error::Other(Box::new(e))` closure
-/// that otherwise repeats at every I/O / time-conversion / persist
-/// call site.
-fn other_boxed<E: std::error::Error + Send + Sync + 'static>(e: E) -> Error {
-    Error::Other(Box::new(e))
-}
 
 /// Production [`ObjectStore`] backed by `aws-sdk-s3`.
 #[derive(Debug)]
@@ -426,14 +418,14 @@ impl ObjectStore for S3Store {
 
         // Attempt the head→download cycle up to twice: if the object is
         // mutated between `head` and the body GET, the `If-Match` guard
-        // returns 412 and we retry with the new ETag/size.
-        let mut last_err: Option<Error> = None;
-        for _attempt in 0..2 {
+        // returns 412 and we retry with the new ETag/size. On the second
+        // iteration the `attempt == 0` guard is false, so a repeated 412
+        // falls through to `Err(e) => return Err(e)` — every path returns.
+        for attempt in 0..2 {
             let meta = self.head(key).await?;
             if meta.size == 0 {
                 let temp = NamedTempFile::new_in(parent).map_err(other_boxed)?;
-                temp.persist(dest)
-                    .map_err(|e| Error::Other(Box::new(e.error)))?;
+                persist_temp(temp, dest)?;
                 return Ok(());
             }
 
@@ -448,18 +440,16 @@ impl ObjectStore for S3Store {
 
             match result {
                 Ok(()) => {
-                    temp.persist(dest)
-                        .map_err(|e| Error::Other(Box::new(e.error)))?;
+                    persist_temp(temp, dest)?;
                     return Ok(());
                 }
-                Err(e @ Error::PreconditionFailed(_)) => {
+                Err(Error::PreconditionFailed(_)) if attempt == 0 => {
                     tracing::warn!(key, "object changed between head and GET; retrying");
-                    last_err = Some(e);
                 }
                 Err(e) => return Err(e),
             }
         }
-        Err(last_err.expect("loop ran at least once"))
+        unreachable!("both loop iterations return from within the match")
     }
 
     async fn get_bytes(&self, key: &str) -> Result<Bytes, Error> {
@@ -489,10 +479,11 @@ impl ObjectStore for S3Store {
 
     async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), Error> {
         // `ByteStream::from_path` streams from disk via tokio's async
-        // file I/O, avoiding a full in-memory copy. For files above the
-        // SDK's internal multipart threshold (~8 MiB) the SDK's transfer
-        // manager will switch to multipart upload automatically,
-        // removing the single-PUT 5 GiB ceiling.
+        // file I/O, avoiding a full in-memory copy. Note: the 5 GiB
+        // single-PUT ceiling still applies — `aws-sdk-s3` PutObject
+        // does not auto-switch to multipart (that requires the separate
+        // `aws-s3-transfer-manager` crate). Bundles well below 5 GiB;
+        // LFS phase may need a multipart wrapper.
         let stream = ByteStream::from_path(src).await.map_err(other_boxed)?;
         self.put_body(key, stream, opts).await
     }
@@ -574,6 +565,14 @@ impl ObjectStore for S3Store {
             .map_err(|e| classify(e, key))?;
         Ok(())
     }
+}
+
+/// Atomically rename a [`NamedTempFile`] to `dest`, mapping the
+/// [`tempfile::PersistError`] into [`Error::Other`].
+fn persist_temp(temp: NamedTempFile, dest: &Path) -> Result<(), Error> {
+    temp.persist(dest)
+        .map_err(|e| Error::Other(Box::new(e.error)))?;
+    Ok(())
 }
 
 impl S3Store {

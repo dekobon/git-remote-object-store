@@ -62,6 +62,15 @@ pub enum Error {
     Other(BoxError),
 }
 
+/// Wrap any concrete `std::error::Error` into [`Error::Other`].
+///
+/// Replaces the open-coded `|e| Error::Other(Box::new(e))` closure
+/// that otherwise repeats at every I/O / time-conversion / persist
+/// call site.
+pub(crate) fn other_boxed<E: StdError + Send + Sync + 'static>(e: E) -> Error {
+    Error::Other(Box::new(e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

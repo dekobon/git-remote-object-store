@@ -25,6 +25,7 @@ use bytes::Bytes;
 use time::OffsetDateTime;
 use tracing::debug;
 
+use self::error::other_boxed;
 pub use self::error::{BoxError, Error};
 
 /// Metadata returned by `list` and `head`.
@@ -109,9 +110,7 @@ pub trait ObjectStore: Send + Sync {
     /// this is correct but defeats the streaming intent for large files.
     async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), Error> {
         debug!(key, path = %src.display(), "put_path: default read-then-put_bytes fallback");
-        let body = tokio::fs::read(src)
-            .await
-            .map_err(|e| Error::Other(Box::new(e)))?;
+        let body = tokio::fs::read(src).await.map_err(other_boxed)?;
         self.put_bytes(key, Bytes::from(body), opts).await
     }
 

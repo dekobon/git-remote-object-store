@@ -570,6 +570,15 @@ async fn push_one(
                 ),
             })
         }
+        // Every other combination: the push's own outcome (whether
+        // Ok(Error{..}) or Err(..)) takes priority over the release
+        // result — including when both fail. Log the release failure
+        // so operators can spot dangling locks that coincide with push
+        // errors; the lock TTL will eventually clean up.
+        (_, Err(e)) => {
+            warn!(key = %lock, "lock release failed (push already errored): {e}");
+            result
+        }
         _ => result,
     }
 }

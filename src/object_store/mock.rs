@@ -26,6 +26,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use time::OffsetDateTime;
 
+use super::error::other_boxed;
 use super::{Error, ObjectMeta, ObjectStore, PutOpts};
 
 /// Produce a deterministic, content-derived `ETag` string that mimics the
@@ -33,11 +34,9 @@ use super::{Error, ObjectMeta, ObjectStore, PutOpts};
 /// hash — sufficient for test-time identity checks without pulling in a
 /// crypto dependency.
 fn mock_etag(body: &[u8]) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in body {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
+    let h = body.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
     format!("\"{h:016x}\"")
 }
 
@@ -240,7 +239,10 @@ impl ObjectStore for MockStore {
                     key: key.clone(),
                     size: object.body.len() as u64,
                     last_modified: object.last_modified,
-                    etag: Some(mock_etag(&object.body)),
+                    // S3 ListObjectsV2 returns ETags, but S3Store sets
+                    // `etag: None` (not consumed by any caller). Match
+                    // that to avoid mock/prod fidelity drift.
+                    etag: None,
                 })
                 .collect())
         })
@@ -256,9 +258,7 @@ impl ObjectStore for MockStore {
             })
         })?;
         let bytes = self.get_bytes(key).await?;
-        tokio::fs::write(dest, &bytes)
-            .await
-            .map_err(|e| Error::Other(Box::new(e)))
+        tokio::fs::write(dest, &bytes).await.map_err(other_boxed)
     }
 
     async fn get_bytes(&self, key: &str) -> Result<Bytes, Error> {
@@ -279,13 +279,6 @@ impl ObjectStore for MockStore {
     async fn put_bytes(&self, key: &str, body: Bytes, opts: PutOpts) -> Result<(), Error> {
         self.insert_with(key, body, OffsetDateTime::now_utc(), opts);
         Ok(())
-    }
-
-    async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), Error> {
-        let body = tokio::fs::read(src)
-            .await
-            .map_err(|e| Error::Other(Box::new(e)))?;
-        self.put_bytes(key, Bytes::from(body), opts).await
     }
 
     async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, Error> {

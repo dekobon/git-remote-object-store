@@ -55,7 +55,7 @@ pub async fn drive_in(
 ) -> (Vec<u8>, Result<(), ProtocolError>) {
     let (client_side, helper_side) = tokio::io::duplex(64 * 1024);
     let (helper_in, helper_out) = tokio::io::split(helper_side);
-    let (client_reader, mut client_writer) = tokio::io::split(client_side);
+    let (mut client_reader, mut client_writer) = tokio::io::split(client_side);
 
     let script_bytes = script.as_bytes().to_owned();
     let writer_task = tokio::spawn(async move {
@@ -66,11 +66,7 @@ pub async fn drive_in(
     let reader_task = tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
         let mut buf = Vec::new();
-        client_reader
-            .take(u64::MAX)
-            .read_to_end(&mut buf)
-            .await
-            .unwrap();
+        client_reader.read_to_end(&mut buf).await.unwrap();
         buf
     });
 
