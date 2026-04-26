@@ -17,11 +17,11 @@
 //! Diagnostics use `tracing` configured to write to stderr (or to a
 //! debug log file when invoked with the `debug` argv slot).
 
-pub mod agent;
-pub mod install;
-pub mod oid;
-pub mod protocol;
-pub mod run;
+pub(crate) mod agent;
+pub(crate) mod install;
+pub(crate) mod oid;
+pub(crate) mod protocol;
+pub(crate) mod run;
 
 pub use install::{AGENT_NAME, InstallError, disable_debug, enable_debug, install};
 pub use run::{GitRemoteResolver, RemoteResolver, RunError, run};

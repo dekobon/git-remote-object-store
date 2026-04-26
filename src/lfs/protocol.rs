@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// internally-tagged enum representation handles the dispatch.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "event", rename_all = "lowercase")]
-pub enum Event {
+pub(crate) enum Event {
     /// First event. Carries the operation (`upload` or `download`),
     /// the local remote name (e.g. `origin`), and a few hints we don't
     /// currently consume.
@@ -26,68 +26,62 @@ pub enum Event {
     Terminate,
 }
 
-/// Fields of the `init` event. Only `remote` is consumed today; the
-/// other fields are accepted so the deserializer does not reject
-/// well-formed events.
+/// Fields of the `init` event.
+///
+/// Only `remote` is captured. Upstream's `operation` /
+/// `concurrent` / `concurrenttransfers` fields are accepted on the
+/// wire but unused — serde silently drops unknown fields, so they
+/// don't need to appear in this struct to keep deserialization
+/// happy.
 #[derive(Debug, Deserialize)]
-pub struct InitEvent {
-    /// Direction the LFS client is about to drive. Captured for logs
-    /// only; both directions are handled the same way at init time.
-    #[serde(default)]
-    pub operation: Option<String>,
+pub(crate) struct InitEvent {
     /// Local git remote name (e.g. `origin`). Resolved to a URL via
     /// `git remote get-url`.
-    pub remote: String,
-    /// Concurrent transfers hint from the LFS client. Ignored.
-    #[serde(default)]
-    pub concurrent: Option<bool>,
-    /// Concurrency hint. Ignored.
-    #[serde(default, rename = "concurrenttransfers")]
-    pub concurrent_transfers: Option<u32>,
+    pub(crate) remote: String,
 }
 
 /// Fields of an `upload` event.
 #[derive(Debug, Deserialize)]
-pub struct UploadEvent {
+pub(crate) struct UploadEvent {
     /// LFS object id (lowercase SHA-256 hex).
-    pub oid: String,
+    pub(crate) oid: String,
     /// Body length in bytes (used for the final progress event).
-    pub size: u64,
+    pub(crate) size: u64,
     /// Local file containing the body to upload.
-    pub path: String,
+    pub(crate) path: String,
 }
 
 /// Fields of a `download` event.
 #[derive(Debug, Deserialize)]
-pub struct DownloadEvent {
+pub(crate) struct DownloadEvent {
     /// LFS object id (lowercase SHA-256 hex).
-    pub oid: String,
+    pub(crate) oid: String,
     /// Body length in bytes.
-    pub size: u64,
+    pub(crate) size: u64,
 }
 
 /// Outgoing acknowledgement of `init`. The protocol expects either an
 /// empty JSON object (`{}`) on success or `{"error":{...}}` on failure.
 #[derive(Debug, Serialize)]
-pub struct InitResponse<'a> {
+pub(crate) struct InitResponse<'a> {
     /// Populated on failure; absent on success (the empty-object form).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<EventError<'a>>,
+    pub(crate) error: Option<EventError<'a>>,
 }
 
 /// Progress event emitted while an upload/download is running.
 #[derive(Debug, Serialize)]
-pub struct ProgressEvent<'a> {
+pub(crate) struct ProgressEvent<'a> {
     /// Always the literal `"progress"`.
-    pub event: &'static str,
+    pub(crate) event: &'static str,
     /// LFS oid this progress refers to.
-    pub oid: &'a str,
+    pub(crate) oid: &'a str,
     /// Cumulative bytes transferred so far.
     #[serde(rename = "bytesSoFar")]
-    pub bytes_so_far: u64,
+    pub(crate) bytes_so_far: u64,
     /// Bytes transferred since the previous progress event.
     #[serde(rename = "bytesSinceLast")]
-    pub bytes_since_last: u64,
+    pub(crate) bytes_since_last: u64,
 }
 
 /// Terminal event for an upload or download.
@@ -95,27 +89,27 @@ pub struct ProgressEvent<'a> {
 /// On success: `event=complete, oid` (and `path` for downloads). On
 /// failure: `event=complete, oid, error={code, message}`.
 #[derive(Debug, Serialize)]
-pub struct CompleteEvent<'a> {
+pub(crate) struct CompleteEvent<'a> {
     /// Always the literal `"complete"`.
-    pub event: &'static str,
+    pub(crate) event: &'static str,
     /// LFS oid this event refers to.
-    pub oid: &'a str,
+    pub(crate) oid: &'a str,
     /// Path the body was downloaded to. Only present for `download`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<&'a str>,
+    pub(crate) path: Option<&'a str>,
     /// Error payload. Only present on failure.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<EventError<'a>>,
+    pub(crate) error: Option<EventError<'a>>,
 }
 
 /// `{code, message}` error object embedded in init / complete events.
 #[derive(Debug, Serialize)]
-pub struct EventError<'a> {
+pub(crate) struct EventError<'a> {
     /// Numeric error code. Mirrors upstream's choice of `2` for
     /// generic agent errors and `32` for malformed init.
-    pub code: u32,
+    pub(crate) code: u32,
     /// Human-readable description.
-    pub message: &'a str,
+    pub(crate) message: &'a str,
 }
 
 #[cfg(test)]
@@ -123,16 +117,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_init_event() {
+    fn parses_init_event_and_ignores_unused_fields() {
+        // Upstream emits `operation` / `concurrent` /
+        // `concurrenttransfers` — serde must silently drop them.
         let json = r#"{"event":"init","operation":"upload","remote":"origin","concurrent":true,"concurrenttransfers":3}"#;
         let evt: Event = serde_json::from_str(json).expect("parse init");
         match evt {
-            Event::Init(init) => {
-                assert_eq!(init.remote, "origin");
-                assert_eq!(init.operation.as_deref(), Some("upload"));
-                assert_eq!(init.concurrent, Some(true));
-                assert_eq!(init.concurrent_transfers, Some(3));
-            }
+            Event::Init(init) => assert_eq!(init.remote, "origin"),
             other => panic!("expected init, got {other:?}"),
         }
     }

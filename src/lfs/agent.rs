@@ -7,6 +7,7 @@
 //! into a `complete` event with an `error` payload (recoverable —
 //! the LFS client moves on to the next event).
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -24,7 +25,7 @@ use crate::object_store::{Error as ObjectStoreError, ObjectStore};
 const ERR_CODE_GENERIC: u32 = 2;
 
 /// Driver for a single LFS session against one remote.
-pub struct Agent {
+pub(crate) struct Agent {
     store: Arc<dyn ObjectStore>,
     /// Bucket / container prefix derived from the remote URL. Empty
     /// string when the URL had no `<prefix>` segment.
@@ -36,6 +37,9 @@ pub struct Agent {
 /// Fatal errors during agent dispatch. Object-store failures are *not*
 /// in this enum: those become `complete` events instead of process
 /// exits, which is the protocol contract.
+///
+/// Surfaces through the public [`RunError::Agent`][crate::lfs::RunError]
+/// variant, so this type is part of the crate's public API.
 #[derive(Debug, Error)]
 pub enum AgentError {
     /// stdin/stdout transport failure — fatal.
@@ -51,7 +55,11 @@ pub enum AgentError {
 impl Agent {
     /// Build an agent. `prefix` is the path-prefix from the parsed
     /// remote URL (no trailing `/`); `tmp_dir` is `<git-dir>/lfs/tmp`.
-    pub fn new(store: Arc<dyn ObjectStore>, prefix: Option<String>, tmp_dir: PathBuf) -> Self {
+    pub(crate) fn new(
+        store: Arc<dyn ObjectStore>,
+        prefix: Option<String>,
+        tmp_dir: PathBuf,
+    ) -> Self {
         Self {
             store,
             prefix: prefix.unwrap_or_default(),
@@ -71,95 +79,141 @@ impl Agent {
 
     /// Handle an `upload` event: skip when the key already exists,
     /// otherwise stream the file body and emit progress + complete.
-    pub async fn upload<W: AsyncWrite + Unpin>(
+    pub(crate) async fn upload<W: AsyncWrite + Unpin>(
         &self,
         oid_raw: &str,
         size: u64,
         path: &Path,
         writer: &mut W,
     ) -> Result<(), AgentError> {
-        let oid = match LfsOid::from_str(oid_raw) {
-            Ok(o) => o,
-            Err(e) => {
-                return write_complete_error(writer, oid_raw, &format!("invalid oid: {e}")).await;
+        match self.try_upload(oid_raw, path).await {
+            Ok(UploadOutcome::AlreadyPresent) => write_complete(writer, oid_raw, None, None).await,
+            Ok(UploadOutcome::Uploaded { oid }) => {
+                write_progress(writer, oid.as_str(), size, size).await?;
+                write_complete(writer, oid.as_str(), None, None).await
             }
-        };
+            Err(OpError { oid, message }) => {
+                write_complete(writer, &oid, None, Some(&message)).await
+            }
+        }
+    }
+
+    /// Handle a `download` event: stream the body to
+    /// `<tmp_dir>/<oid>` and emit progress + complete-with-path.
+    pub(crate) async fn download<W: AsyncWrite + Unpin>(
+        &self,
+        oid_raw: &str,
+        size: u64,
+        writer: &mut W,
+    ) -> Result<(), AgentError> {
+        match self.try_download(oid_raw).await {
+            Ok(DownloadOutcome { oid, dest_str }) => {
+                write_progress(writer, oid.as_str(), size, size).await?;
+                write_complete(writer, oid.as_str(), Some(&dest_str), None).await
+            }
+            Err(OpError { oid, message }) => {
+                write_complete(writer, &oid, None, Some(&message)).await
+            }
+        }
+    }
+
+    async fn try_upload(&self, oid_raw: &str, path: &Path) -> Result<UploadOutcome, OpError> {
+        let oid = parse_oid(oid_raw)?;
         let key = self.key(&oid);
         debug!(oid = %oid, key = %key, "lfs upload");
 
         match self.store.head(&key).await {
             Ok(_) => {
                 debug!(oid = %oid, "object already present; skipping upload");
-                return write_complete_success(writer, oid.as_str(), None).await;
+                return Ok(UploadOutcome::AlreadyPresent);
             }
             Err(ObjectStoreError::NotFound(_)) => {}
             Err(e) => {
                 warn!(oid = %oid, error = %e, "head failed during upload");
-                return write_complete_error(writer, oid.as_str(), &e.to_string()).await;
+                return Err(OpError::with_cause(oid.as_str(), &e));
             }
         }
 
-        if let Err(e) = self
-            .store
+        self.store
             .put_path(&key, path, crate::object_store::PutOpts::default())
             .await
-        {
-            warn!(oid = %oid, error = %e, "upload failed");
-            return write_complete_error(writer, oid.as_str(), &e.to_string()).await;
-        }
+            .map_err(|e| {
+                warn!(oid = %oid, error = %e, "upload failed");
+                OpError::with_cause(oid.as_str(), &e)
+            })?;
 
-        write_progress(writer, oid.as_str(), size, size).await?;
-        write_complete_success(writer, oid.as_str(), None).await
+        Ok(UploadOutcome::Uploaded { oid })
     }
 
-    /// Handle a `download` event: stream the body to
-    /// `<tmp_dir>/<oid>` and emit progress + complete-with-path.
-    pub async fn download<W: AsyncWrite + Unpin>(
-        &self,
-        oid_raw: &str,
-        size: u64,
-        writer: &mut W,
-    ) -> Result<(), AgentError> {
-        let oid = match LfsOid::from_str(oid_raw) {
-            Ok(o) => o,
-            Err(e) => {
-                return write_complete_error(writer, oid_raw, &format!("invalid oid: {e}")).await;
-            }
-        };
+    async fn try_download(&self, oid_raw: &str) -> Result<DownloadOutcome, OpError> {
+        let oid = parse_oid(oid_raw)?;
         let key = self.key(&oid);
         let dest = self.tmp_dir.join(oid.as_str());
         debug!(oid = %oid, key = %key, dest = %dest.display(), "lfs download");
 
-        if let Some(parent) = dest.parent()
-            && let Err(e) = tokio::fs::create_dir_all(parent).await
-        {
-            warn!(oid = %oid, error = %e, "create_dir_all failed");
-            return write_complete_error(writer, oid.as_str(), &e.to_string()).await;
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                warn!(oid = %oid, error = %e, "create_dir_all failed");
+                OpError::with_cause(oid.as_str(), &e)
+            })?;
         }
 
-        if let Err(e) = self.store.get_to_file(&key, &dest).await {
+        self.store.get_to_file(&key, &dest).await.map_err(|e| {
             warn!(oid = %oid, error = %e, "download failed");
-            return write_complete_error(writer, oid.as_str(), &e.to_string()).await;
-        }
+            OpError::with_cause(oid.as_str(), &e)
+        })?;
 
-        let dest_str = match dest.to_str() {
-            Some(s) => s.to_owned(),
-            None => {
-                return write_complete_error(
-                    writer,
-                    oid.as_str(),
-                    "download destination is not valid UTF-8",
-                )
-                .await;
-            }
-        };
+        let dest_str = dest.to_str().map(str::to_owned).ok_or_else(|| {
+            OpError::with_cause(oid.as_str(), &"download destination is not valid UTF-8")
+        })?;
 
-        write_progress(writer, oid.as_str(), size, size).await?;
-        write_complete_success(writer, oid.as_str(), Some(&dest_str)).await
+        Ok(DownloadOutcome { oid, dest_str })
     }
 }
 
-async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, line: &str) -> Result<(), AgentError> {
+enum UploadOutcome {
+    AlreadyPresent,
+    Uploaded { oid: LfsOid },
+}
+
+struct DownloadOutcome {
+    oid: LfsOid,
+    dest_str: String,
+}
+
+/// Recoverable per-event error. `oid` is owned because we may have
+/// failed before parsing succeeded (in which case the wire-side oid
+/// string from the event is the only handle we have).
+struct OpError {
+    oid: String,
+    message: String,
+}
+
+impl OpError {
+    /// Build from any `Display`-able cause. Used uniformly for
+    /// object-store errors, `std::io::Error`s, and string literals.
+    fn with_cause(oid: &str, cause: &dyn fmt::Display) -> Self {
+        Self {
+            oid: oid.to_owned(),
+            message: cause.to_string(),
+        }
+    }
+}
+
+fn parse_oid(oid_raw: &str) -> Result<LfsOid, OpError> {
+    LfsOid::from_str(oid_raw)
+        .map_err(|e| OpError::with_cause(oid_raw, &format_args!("invalid oid: {e}")))
+}
+
+/// Serialize `evt` and write it as one newline-terminated line.
+/// Shared with [`crate::lfs::run`] so init-ack and per-event writes
+/// go through the same flush discipline.
+pub(crate) async fn write_event<W, E>(writer: &mut W, evt: &E) -> Result<(), AgentError>
+where
+    W: AsyncWrite + Unpin,
+    E: serde::Serialize,
+{
+    let line = serde_json::to_string(evt)?;
     writer.write_all(line.as_bytes()).await?;
     writer.write_all(b"\n").await?;
     writer.flush().await?;
@@ -172,47 +226,40 @@ async fn write_progress<W: AsyncWrite + Unpin>(
     bytes_so_far: u64,
     bytes_since_last: u64,
 ) -> Result<(), AgentError> {
-    let evt = ProgressEvent {
-        event: "progress",
-        oid,
-        bytes_so_far,
-        bytes_since_last,
-    };
-    let line = serde_json::to_string(&evt)?;
-    write_line(writer, &line).await
+    write_event(
+        writer,
+        &ProgressEvent {
+            event: "progress",
+            oid,
+            bytes_so_far,
+            bytes_since_last,
+        },
+    )
+    .await
 }
 
-async fn write_complete_success<W: AsyncWrite + Unpin>(
+/// Emit a terminal `complete` event. `path` carries the local
+/// destination on download success; `error_message` carries the
+/// failure message on either-direction error.
+async fn write_complete<W: AsyncWrite + Unpin>(
     writer: &mut W,
     oid: &str,
     path: Option<&str>,
+    error_message: Option<&str>,
 ) -> Result<(), AgentError> {
-    let evt = CompleteEvent {
-        event: "complete",
-        oid,
-        path,
-        error: None,
-    };
-    let line = serde_json::to_string(&evt)?;
-    write_line(writer, &line).await
-}
-
-async fn write_complete_error<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    oid: &str,
-    message: &str,
-) -> Result<(), AgentError> {
-    let evt = CompleteEvent {
-        event: "complete",
-        oid,
-        path: None,
-        error: Some(EventError {
-            code: ERR_CODE_GENERIC,
-            message,
-        }),
-    };
-    let line = serde_json::to_string(&evt)?;
-    write_line(writer, &line).await
+    write_event(
+        writer,
+        &CompleteEvent {
+            event: "complete",
+            oid,
+            path,
+            error: error_message.map(|message| EventError {
+                code: ERR_CODE_GENERIC,
+                message,
+            }),
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
