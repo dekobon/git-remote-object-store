@@ -11,10 +11,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use thiserror::Error;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite};
 use tracing::{debug, error, warn};
 
-use crate::lfs::agent::{Agent, AgentError};
+use crate::lfs::agent::{self, Agent, AgentError};
 use crate::lfs::protocol::{Event, EventError, InitEvent, InitResponse};
 use crate::object_store::ObjectStore;
 use crate::protocol::backend;
@@ -33,12 +33,62 @@ pub enum RunError {
     /// Agent dispatch error (transport or serialization).
     #[error(transparent)]
     Agent(#[from] AgentError),
-    /// First event was not `init`. The LFS spec requires it.
-    #[error("expected init as the first event, got {0:?}")]
+    /// An incoming line was not valid LFS JSON, or an outgoing event
+    /// could not be serialized. Either is fatal — the protocol cannot
+    /// continue past a parse mismatch.
+    #[error("malformed LFS event: {0}")]
+    MalformedEvent(#[from] serde_json::Error),
+    /// First event was not `init`. The LFS spec requires it. The
+    /// payload is the `Debug` rendering of the offending event,
+    /// captured at construction time.
+    #[error("expected init as the first event, got {0}")]
     InitNotFirst(String),
     /// Stdin closed before any event was read.
     #[error("stdin closed before init")]
     StdinClosed,
+}
+
+impl RunError {
+    /// `true` if this error is a `BrokenPipe` / `WriteZero` from
+    /// stdout closing — the bin-side REPL turns those into a clean
+    /// exit. Walks both the direct `Io` variant and the nested
+    /// `Agent(AgentError::Io)` variant produced by writes that flow
+    /// through the agent's [`write_event`][crate::lfs::agent::write_event].
+    #[must_use]
+    pub fn is_broken_pipe(&self) -> bool {
+        let io_err = match self {
+            Self::Io(e) | Self::Agent(AgentError::Io(e)) => Some(e),
+            _ => None,
+        };
+        io_err.is_some_and(|e| {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::WriteZero,
+            )
+        })
+    }
+}
+
+/// Init-time failures that the bin-side REPL converts into an LFS
+/// `init` error response and a clean exit. Distinct from [`RunError`]
+/// because none of these are fatal to the agent — they're reported on
+/// the wire as `{"error":{...}}`, then the loop returns `Ok(())`.
+#[derive(Debug, Error)]
+enum InitError {
+    /// `init.remote` was the empty string. Upstream's helper accepts
+    /// it and then explodes later; we reject up front.
+    #[error("init.remote is empty")]
+    EmptyRemote,
+    /// `git remote get-url` / URL parsing / backend construction
+    /// failed for the named remote.
+    #[error("cannot resolve remote \"{remote}\": {source}")]
+    Resolve {
+        /// Remote name from the init event.
+        remote: String,
+        /// Underlying resolver failure.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 /// How to resolve a remote name to an [`ObjectStore`]. Production
@@ -69,14 +119,14 @@ impl RemoteResolver for GitRemoteResolver {
         remote_name: &str,
     ) -> Result<(Arc<dyn ObjectStore>, Option<String>), Box<dyn std::error::Error + Send + Sync>>
     {
-        type BoxErr = Box<dyn std::error::Error + Send + Sync>;
-        let repo = gix::discover(&self.repo_dir).map_err(|e| Box::new(e) as BoxErr)?;
-        let raw = crate::git::remote_url(&repo, remote_name).map_err(|e| Box::new(e) as BoxErr)?;
-        let parsed = url::parse(&raw).map_err(|e| Box::new(e) as BoxErr)?;
+        // `?` against `Box<dyn Error + Send + Sync>` uses the blanket
+        // `From<E: Error + Send + Sync + 'static> for Box<...>`, so no
+        // explicit cast is needed at each call site.
+        let repo = gix::discover(&self.repo_dir)?;
+        let raw = crate::git::remote_url(&repo, remote_name)?;
+        let parsed = url::parse(&raw)?;
         let prefix = parsed.prefix().map(str::to_owned);
-        let store = backend::build(&parsed)
-            .await
-            .map_err(|e| Box::new(e) as BoxErr)?;
+        let store = backend::build(&parsed).await?;
         Ok((store, prefix))
     }
 }
@@ -120,20 +170,16 @@ where
             write_init_ack(&mut writer, None).await?;
             a
         }
-        Err(msg) => {
-            error!(error = %msg, "init failed");
-            write_init_ack(&mut writer, Some(&msg)).await?;
+        Err(err) => {
+            error!(error = %err, "init failed");
+            write_init_ack(&mut writer, Some(&err.to_string())).await?;
             return Ok(());
         }
     };
 
     while let Some(line) = lines.next_line().await? {
         debug!(line = %line, "lfs event");
-        let event = match parse_event(&line) {
-            Ok(e) => e,
-            Err(RunError::InitNotFirst(_)) => unreachable!("only set on the init dispatch"),
-            Err(other) => return Err(other),
-        };
+        let event = parse_event(&line)?;
         match event {
             Event::Init(_) => {
                 warn!("received second init; ignoring");
@@ -156,31 +202,31 @@ where
 }
 
 fn parse_event(line: &str) -> Result<Event, RunError> {
-    serde_json::from_str(line).map_err(|e| {
-        // Treat malformed JSON as a fatal protocol error — git-lfs
-        // never sends garbage on the wire.
-        RunError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("malformed LFS event: {e}"),
-        ))
-    })
+    // Malformed JSON is fatal — git-lfs never sends garbage on the
+    // wire. The `?` operator at call sites turns this into
+    // `RunError::MalformedEvent` via the `#[from]` impl.
+    Ok(serde_json::from_str(line)?)
 }
 
 async fn init_agent<Res>(
     init: &InitEvent,
     resolver: &Res,
     tmp_dir: PathBuf,
-) -> Result<Agent, String>
+) -> Result<Agent, InitError>
 where
     Res: RemoteResolver + ?Sized,
 {
     if init.remote.is_empty() {
-        return Err("init.remote is empty".to_owned());
+        return Err(InitError::EmptyRemote);
     }
-    let (store, prefix) = resolver
-        .resolve(&init.remote)
-        .await
-        .map_err(|e| format!("cannot resolve remote \"{}\": {e}", init.remote))?;
+    let (store, prefix) =
+        resolver
+            .resolve(&init.remote)
+            .await
+            .map_err(|source| InitError::Resolve {
+                remote: init.remote.clone(),
+                source,
+            })?;
     Ok(Agent::new(store, prefix, tmp_dir))
 }
 
@@ -194,12 +240,7 @@ async fn write_init_ack<W: AsyncWrite + Unpin>(
             message: m,
         }),
     };
-    let line = serde_json::to_string(&resp)
-        .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?;
-    writer.write_all(line.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-    Ok(())
+    Ok(agent::write_event(writer, &resp).await?)
 }
 
 #[cfg(test)]
@@ -332,6 +373,90 @@ mod tests {
         assert!(matches!(err, RunError::InitNotFirst(_)));
     }
 
+    #[test]
+    fn init_not_first_display_does_not_double_quote_payload() {
+        // Regression guard: the variant carries a payload that has
+        // already been `Debug`-rendered by the caller, so the error
+        // message must use `{0}` (Display) over the wrapped String,
+        // not `{0:?}` which would double-quote the Debug form.
+        let err = RunError::InitNotFirst("Upload(UploadEvent { oid: \"abc\" })".to_owned());
+        let rendered = err.to_string();
+        assert!(
+            rendered.starts_with("expected init as the first event, got Upload(UploadEvent {"),
+            "InitNotFirst should not wrap the payload in extra quotes: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_remote_in_init_emits_error_object_and_exits_cleanly() {
+        // Regression guard for InitError::EmptyRemote — upstream's
+        // helper accepts the empty string and explodes later; we
+        // reject up front and emit the structured error response.
+        struct UnreachableResolver;
+        #[async_trait::async_trait]
+        impl RemoteResolver for UnreachableResolver {
+            async fn resolve(
+                &self,
+                _remote_name: &str,
+            ) -> Result<
+                (Arc<dyn ObjectStore>, Option<String>),
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                panic!("resolver should not be called when init.remote is empty");
+            }
+        }
+        let tmp = TempDir::new().unwrap();
+        let events = vec![r#"{"event":"init","remote":""}"#.to_owned()];
+        let (lines, res) = drive(&events, &UnreachableResolver, tmp.path()).await;
+        res.expect("empty-remote init failure is non-fatal");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("\"error\""));
+        assert!(lines[0].contains("\"code\":32"));
+        assert!(
+            lines[0].contains("init.remote is empty"),
+            "ack should include the InitError::EmptyRemote message: {}",
+            lines[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn broken_pipe_during_init_ack_is_clean_exit() {
+        // Regression guard: if stdout closes mid-init-ack, the bin
+        // turns the resulting error into a clean exit. RunError
+        // must classify it as `is_broken_pipe()` so the bin's
+        // `Err(other) if other.is_broken_pipe()` arm fires.
+        use tokio::io::{AsyncWrite, ErrorKind, duplex};
+
+        // A writer that returns BrokenPipe immediately. A `duplex`
+        // pair where the read half is dropped achieves this.
+        let (writer, reader) = duplex(64);
+        drop(reader); // force BrokenPipe on the next write
+
+        let store = MockStore::new();
+        let resolver = StubResolver {
+            store,
+            prefix: None,
+        };
+        let tmp = TempDir::new().unwrap();
+        let input = r#"{"event":"init","remote":"origin"}"#;
+        let buffered = tokio::io::BufReader::new(std::io::Cursor::new(input.as_bytes().to_vec()));
+
+        let res = run(buffered, writer, &resolver, tmp.path()).await;
+        let err = res.expect_err("write to closed duplex must surface as Err");
+        assert!(
+            err.is_broken_pipe(),
+            "init-ack BrokenPipe must be classified as broken-pipe, got: {err:?}"
+        );
+
+        // Suppress the unused-import warning for AsyncWrite/ErrorKind
+        // when the expectations above already pass — the imports
+        // document the writer kind we're using.
+        let _ = (
+            std::marker::PhantomData::<dyn AsyncWrite>,
+            ErrorKind::BrokenPipe,
+        );
+    }
+
     #[tokio::test]
     async fn malformed_json_is_fatal() {
         let store = MockStore::new();
@@ -343,7 +468,7 @@ mod tests {
         let events = vec!["not json".to_owned()];
         let (_, res) = drive(&events, &resolver, tmp.path()).await;
         let err = res.expect_err("garbage line must error");
-        assert!(matches!(err, RunError::Io(_)));
+        assert!(matches!(err, RunError::MalformedEvent(_)));
     }
 
     #[tokio::test]

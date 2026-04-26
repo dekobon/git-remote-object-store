@@ -17,14 +17,8 @@ use crate::git::{self, GitError};
 /// the binary name (`git-lfs-object-store`).
 pub const AGENT_NAME: &str = "git-lfs-object-store";
 
-fn key_path() -> String {
-    format!("lfs.customtransfer.{AGENT_NAME}.path")
-}
-
-fn key_args() -> String {
-    format!("lfs.customtransfer.{AGENT_NAME}.args")
-}
-
+const KEY_PATH: &str = "lfs.customtransfer.git-lfs-object-store.path";
+const KEY_ARGS: &str = "lfs.customtransfer.git-lfs-object-store.args";
 const KEY_STANDALONE: &str = "lfs.standalonetransferagent";
 
 /// Errors surfaced by the install / debug-toggle subcommands.
@@ -44,7 +38,7 @@ pub enum InstallError {
 ///
 /// Mirrors `../git-remote-s3/git_remote_s3/lfs.py:install`.
 pub async fn install(cwd: &Path) -> Result<(), InstallError> {
-    git::config_add(cwd, &key_path(), AGENT_NAME).await?;
+    git::config_add(cwd, KEY_PATH, AGENT_NAME).await?;
     git::config_add(cwd, KEY_STANDALONE, AGENT_NAME).await?;
     Ok(())
 }
@@ -53,12 +47,12 @@ pub async fn install(cwd: &Path) -> Result<(), InstallError> {
 /// invokes the agent it forwards the `debug` argv slot, switching the
 /// agent's logging from stderr to a file in `<git-dir>/lfs/tmp/`.
 pub async fn enable_debug(cwd: &Path) -> Result<(), InstallError> {
-    git::config_add(cwd, &key_args(), "debug").await?;
+    git::config_add(cwd, KEY_ARGS, "debug").await?;
     Ok(())
 }
 
 /// Inverse of [`enable_debug`]: clear `lfs.customtransfer.<agent>.args`.
 pub async fn disable_debug(cwd: &Path) -> Result<(), InstallError> {
-    git::config_unset(cwd, &key_args()).await?;
+    git::config_unset(cwd, KEY_ARGS).await?;
     Ok(())
 }

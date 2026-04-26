@@ -18,12 +18,12 @@ const SHA256_HEX_LEN: usize = 64;
 
 /// Validated lowercase SHA-256 hex string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct LfsOid(String);
+pub(crate) struct LfsOid(String);
 
 impl LfsOid {
     /// Borrow as a plain `&str`. Always 64 lowercase hex chars.
     #[must_use]
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -50,7 +50,7 @@ impl FromStr for LfsOid {
 
 /// Errors returned by [`LfsOid::from_str`].
 #[derive(Debug, Error, PartialEq, Eq)]
-pub enum LfsOidError {
+pub(crate) enum LfsOidError {
     /// Input length differed from the SHA-256 hex length (64).
     #[error("LFS oid must be {SHA256_HEX_LEN} chars, got {actual}")]
     WrongLength {
