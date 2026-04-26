@@ -493,6 +493,34 @@ pub fn remote_url(repo: &Repository, name: &str) -> Result<String, GitError> {
     })
 }
 
+/// `git config --add <key> <value>` in `cwd`.
+///
+/// Used by the LFS agent's `install` / `enable-debug` subcommands
+/// (Phase 10). `--add` rather than plain `set` so that re-running
+/// `install` does not silently clobber an existing entry the user
+/// added by hand.
+pub async fn config_add(cwd: &Path, key: &str, value: &str) -> Result<(), GitError> {
+    let args: [&OsStr; 4] = [
+        OsStr::new("config"),
+        OsStr::new("--add"),
+        OsStr::new(key),
+        OsStr::new(value),
+    ];
+    run_git("config --add", &args, cwd).await?;
+    Ok(())
+}
+
+/// `git config --unset <key>` in `cwd`.
+///
+/// Used by the LFS agent's `disable-debug` subcommand (Phase 10).
+/// Returns [`GitError::Subprocess`] if the key was not set; callers
+/// that want idempotent behaviour should match on that.
+pub async fn config_unset(cwd: &Path, key: &str) -> Result<(), GitError> {
+    let args: [&OsStr; 3] = [OsStr::new("config"), OsStr::new("--unset"), OsStr::new(key)];
+    run_git("config --unset", &args, cwd).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

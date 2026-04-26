@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- LFS custom-transfer agent (`git-lfs-object-store`, Phase 10): a single
+  binary that serves both backends. Subcommands `install`,
+  `enable-debug`, and `disable-debug` mutate the local repo's
+  `git config`; passing no argument (or `debug`, set automatically by
+  `enable-debug`) starts the LFS REPL. The REPL handles the `init`,
+  `upload`, `download`, and `terminate` events of the line-oriented
+  JSON protocol: uploads HEAD `<prefix>/lfs/<oid>` and skip on hit,
+  otherwise stream the body and emit a final `progress` plus
+  `complete`; downloads stream to `<git-dir>/lfs/tmp/<oid>` and emit
+  `complete` with the path. Debug logs go to
+  `<git-dir>/lfs/tmp/git-lfs-object-store.log` when enabled, never to
+  stdout. (#10)
 - Management CLI (`git-remote-object-store`) with `doctor`,
   `delete-branch`, `protect`, and `unprotect` subcommands. Each accepts a
   remote URL (`s3+https://…`, `az+https://…`) or the name of a git remote
