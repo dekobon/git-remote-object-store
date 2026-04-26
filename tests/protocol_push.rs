@@ -320,14 +320,10 @@ async fn multi_bundle_pre_lock_rejects_push() {
     drop(other_seed);
 
     let store = Arc::new(MockStore::new());
-    store.insert(
-        format!("repo/refs/heads/main/{}.bundle", &shas[0]),
-        Bytes::from_static(b"a"),
-    );
-    store.insert(
-        format!("repo/refs/heads/main/{extra_sha}.bundle"),
-        Bytes::from_static(b"b"),
-    );
+    let primary_key = format!("repo/refs/heads/main/{}.bundle", &shas[0]);
+    let extra_key = format!("repo/refs/heads/main/{extra_sha}.bundle");
+    store.insert(&primary_key, Bytes::from_static(b"a"));
+    store.insert(&extra_key, Bytes::from_static(b"b"));
 
     let (out, result) = drive_in(
         s3_url(Some("repo"), false),
@@ -339,6 +335,10 @@ async fn multi_bundle_pre_lock_rejects_push() {
     result.expect("push should produce a refusal");
     let text = std::str::from_utf8(&out).unwrap();
     assert!(text.contains("multiple bundles"), "got {text:?}");
+    // Pre-existing bundles must remain — a regression that stealth-deleted
+    // before the early return would still satisfy the message check.
+    assert!(store.contains(&primary_key));
+    assert!(store.contains(&extra_key));
 }
 
 #[tokio::test]
@@ -495,8 +495,9 @@ async fn batched_pushes_emit_outcome_per_command() {
         eprintln!("skipping: git not on PATH");
         return;
     }
-    // Build a seed repo with two refs.
-    let (seed, _shas) = make_seed_repo(1, "primary");
+    // Build a seed repo with two refs pointing at the same commit.
+    let (seed, shas) = make_seed_repo(1, "primary");
+    let sha = &shas[0];
     git(
         &["update-ref", "refs/heads/feature", "refs/heads/main"],
         seed.path(),
@@ -518,6 +519,11 @@ async fn batched_pushes_emit_outcome_per_command() {
         text, "ok refs/heads/main\nok refs/heads/feature\n\n",
         "two ok lines + single trailing terminator",
     );
+    // Both bundles must be uploaded — a regression that emitted `ok` for
+    // the second push without invoking the upload would satisfy the wire
+    // assertion alone.
+    assert!(store.contains(&format!("repo/refs/heads/main/{sha}.bundle")));
+    assert!(store.contains(&format!("repo/refs/heads/feature/{sha}.bundle")));
 }
 
 #[tokio::test]

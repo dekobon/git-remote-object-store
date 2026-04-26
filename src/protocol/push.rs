@@ -882,6 +882,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!acquired);
+        // Confirm head() was actually called — a regression that skipped
+        // the staleness branch and returned Ok(false) directly would also
+        // satisfy `!acquired`. The fault firing proves head ran.
+        assert_eq!(store.pending_faults(), 0);
     }
 
     #[tokio::test]
@@ -941,11 +945,10 @@ mod tests {
         // via `git push :ref` because the marker inflates the count.
         let store = MockStore::new();
         let r = rn("refs/heads/main");
-        store.insert(
-            format!("repo/refs/heads/main/{SHA}.bundle"),
-            Bytes::from_static(b"b"),
-        );
-        store.insert("repo/refs/heads/main/PROTECTED#", Bytes::from_static(b""));
+        let bundle = format!("repo/refs/heads/main/{SHA}.bundle");
+        let protected = "repo/refs/heads/main/PROTECTED#";
+        store.insert(&bundle, Bytes::from_static(b"b"));
+        store.insert(protected, Bytes::from_static(b""));
         let outcome = delete_remote_ref(&store, Some("repo"), &r, false)
             .await
             .unwrap();
@@ -953,17 +956,20 @@ mod tests {
             PushOutcome::Error { message, .. } => assert!(message.contains("multiple bundles")),
             PushOutcome::Ok { .. } => panic!("expected Error outcome"),
         }
+        // Both keys must remain — a regression that deleted on the way
+        // to the error branch would still satisfy the message check.
+        assert!(store.contains(&bundle));
+        assert!(store.contains(protected));
     }
 
     #[tokio::test]
     async fn delete_remote_ref_zip_mode_expects_two_keys() {
         let store = MockStore::new();
         let r = rn("refs/heads/main");
-        store.insert(
-            format!("repo/refs/heads/main/{SHA}.bundle"),
-            Bytes::from_static(b"b"),
-        );
-        store.insert("repo/refs/heads/main/repo.zip", Bytes::from_static(b""));
+        let bundle = format!("repo/refs/heads/main/{SHA}.bundle");
+        let zip = "repo/refs/heads/main/repo.zip";
+        store.insert(&bundle, Bytes::from_static(b"b"));
+        store.insert(zip, Bytes::from_static(b""));
         let outcome = delete_remote_ref(&store, Some("repo"), &r, true)
             .await
             .unwrap();
@@ -973,6 +979,11 @@ mod tests {
                 remote_ref: "refs/heads/main".into()
             }
         );
+        // Verify both keys were actually deleted — without these, a
+        // regression that returned Ok without invoking the delete loop
+        // would still pass.
+        assert!(!store.contains(&bundle));
+        assert!(!store.contains(zip));
     }
 
     // --- PushOutcome rendering ----------------------------------------
