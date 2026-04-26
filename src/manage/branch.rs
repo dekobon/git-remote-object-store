@@ -64,12 +64,11 @@ impl<'a> ManageBranch<'a> {
             println!("Aborted");
             return Ok(());
         }
-        let count = objects.len();
         for object in &objects {
             self.store.delete(&object.key).await?;
         }
         println!("Branch {} has been deleted", self.branch);
-        info!(branch = %self.branch, count, "branch deleted");
+        info!(branch = %self.branch, count = objects.len(), "branch deleted");
         Ok(())
     }
 
