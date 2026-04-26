@@ -342,18 +342,29 @@ pub async fn unbundle(
     sha: Sha,
     ref_name: &RefName,
 ) -> Result<(), GitError> {
+    unbundle_at(repo_cwd(repo), folder, sha, ref_name).await
+}
+
+/// Path-only variant of [`unbundle`] for callers that cannot hold a
+/// `&Repository` across `.await` (notably the parallel fetch handler:
+/// `gix::Repository` is `!Sync`, so it cannot be shared across
+/// concurrent tasks).
+pub async fn unbundle_at(
+    cwd: &Path,
+    folder: &Path,
+    sha: Sha,
+    ref_name: &RefName,
+) -> Result<(), GitError> {
     let folder = folder.canonicalize()?;
     let bundle_path = folder.join(format!("{sha}.bundle"));
     let ref_arg = OsStr::new(ref_name.as_str());
-    // See `bundle()` for why `cwd` is owned, not borrowed.
-    let cwd = repo_cwd(repo).to_owned();
     let args: [&OsStr; 4] = [
         OsStr::new("bundle"),
         OsStr::new("unbundle"),
         bundle_path.as_os_str(),
         ref_arg,
     ];
-    run_git("bundle unbundle", &args, &cwd).await?;
+    run_git("bundle unbundle", &args, cwd).await?;
     Ok(())
 }
 

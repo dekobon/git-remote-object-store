@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Phase 7 parallel `fetch` handler (`src/protocol/fetch.rs`): the REPL now
+  collects `fetch <sha> <ref>` lines until a blank line and dispatches them
+  through a `tokio::task::JoinSet` bounded by a `tokio::sync::Semaphore`
+  with `MAX_FETCH_CONCURRENCY = 8` permits (parity with upstream's
+  `boto3.s3.transfer.TransferConfig(max_concurrency=8)`). Each task
+  downloads `<prefix>/<ref>/<sha>.bundle` to a private tempdir, runs
+  `git bundle unbundle` against the local repository's working directory,
+  and records the SHA in a session-wide `Arc<Mutex<HashSet<Sha>>>` so a
+  later batch in the same REPL session skips already-fetched refs. The
+  batch driver drains every task before returning so a single failure
+  cannot leave zombies running into a closing helper. `protocol::run` now
+  takes a `repo_dir: PathBuf` parameter; `run_main` derives it from the
+  process cwd (set by git when it invokes the helper).
+
+### Changed
+
+- `protocol::ProtocolError::Fetch` now wraps a structured `fetch::FetchError`
+  enum (`Parse` / `Sha` / `Ref` / `Store` / `Io` / `Git` / `Join`) instead
+  of the Phase 6 `FetchNotImplemented` placeholder.
+- `git::unbundle` is now a thin wrapper over a new
+  `git::unbundle_at(cwd, …)` path-only variant. The parallel fetch path
+  uses the path variant because `gix::Repository` is `!Sync` and cannot be
+  shared across spawned tasks.
+
 - Phase 6 remote-helper protocol skeleton (`src/protocol/`): asynchronous
   REPL (`protocol::run`) generic over its reader/writer so tests can drive
   it via `tokio::io::duplex`, plus a shared `protocol::run_main` entry that
