@@ -235,7 +235,12 @@ mod tests {
         mock.insert("myrepo/refs/heads/main/bbb.bundle", Bytes::from("b"));
         let s: Arc<dyn ObjectStore> = Arc::new(mock);
         let snap = analyze(&s, "myrepo").await.expect("analyze");
-        assert_eq!(snap.refs["refs/heads/main"].bundles.len(), 2);
+        let shas: std::collections::BTreeSet<&str> = snap.refs["refs/heads/main"]
+            .bundles
+            .iter()
+            .map(|b| b.sha.as_str())
+            .collect();
+        assert_eq!(shas, ["aaa", "bbb"].into_iter().collect());
     }
 
     #[tokio::test]
@@ -265,7 +270,16 @@ mod tests {
         mock.insert("myrepo/refs/heads/feature/x/aaa.bundle", Bytes::from("a"));
         let s: Arc<dyn ObjectStore> = Arc::new(mock);
         let snap = analyze(&s, "myrepo").await.expect("analyze");
-        assert!(snap.refs.contains_key("refs/heads/feature/x"));
+        let entry = snap
+            .refs
+            .get("refs/heads/feature/x")
+            .expect("nested ref recorded");
+        assert_eq!(entry.bundles.len(), 1);
+        assert_eq!(entry.bundles[0].sha, "aaa");
+        assert_eq!(
+            entry.bundles[0].key,
+            "myrepo/refs/heads/feature/x/aaa.bundle"
+        );
     }
 
     #[tokio::test]
