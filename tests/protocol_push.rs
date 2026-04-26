@@ -4,108 +4,18 @@
 
 #![cfg(feature = "test-util")]
 
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+mod common;
+
+use std::sync::Arc;
 
 use bytes::Bytes;
 use git_remote_object_store::object_store::mock::MockStore;
 use git_remote_object_store::object_store::{ObjectStore, PutOpts};
-use git_remote_object_store::protocol::{ProtocolError, run};
-use git_remote_object_store::url::{self, RemoteUrl};
 use tempfile::TempDir;
 use time::Duration;
 use time::OffsetDateTime;
-use tokio::io::AsyncWriteExt;
 
-fn git_available() -> bool {
-    static AVAIL: OnceLock<bool> = OnceLock::new();
-    *AVAIL.get_or_init(|| {
-        std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .is_ok()
-    })
-}
-
-fn s3_url(prefix: Option<&str>, zip: bool) -> RemoteUrl {
-    let mut raw = match prefix {
-        Some(p) => format!("s3+https://my-bucket.s3.us-west-2.amazonaws.com/{p}"),
-        None => "s3+https://my-bucket.s3.us-west-2.amazonaws.com/".to_string(),
-    };
-    if zip {
-        raw.push_str("?zip=1");
-    }
-    url::parse(&raw).expect("test URL must parse")
-}
-
-async fn drive_in(
-    remote: RemoteUrl,
-    store: Arc<dyn ObjectStore>,
-    script: &str,
-    repo_dir: PathBuf,
-) -> (Vec<u8>, Result<(), ProtocolError>) {
-    let (client_side, helper_side) = tokio::io::duplex(64 * 1024);
-    let (helper_in, helper_out) = tokio::io::split(helper_side);
-    let (client_reader, mut client_writer) = tokio::io::split(client_side);
-
-    let script_bytes = script.as_bytes().to_owned();
-    let writer_task = tokio::spawn(async move {
-        client_writer.write_all(&script_bytes).await.unwrap();
-        client_writer.shutdown().await.unwrap();
-    });
-
-    let reader_task = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut buf = Vec::new();
-        client_reader
-            .take(u64::MAX)
-            .read_to_end(&mut buf)
-            .await
-            .unwrap();
-        buf
-    });
-
-    let result = run(
-        remote,
-        store,
-        tokio::io::BufReader::new(helper_in),
-        helper_out,
-        None,
-        repo_dir,
-    )
-    .await;
-
-    writer_task.await.unwrap();
-    let output = reader_task.await.unwrap();
-    (output, result)
-}
-
-fn git(args: &[&str], cwd: &Path) {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("spawn git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
-
-fn git_capture(args: &[&str], cwd: &Path) -> String {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("spawn git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr),
-    );
-    String::from_utf8(output.stdout).expect("git stdout utf-8")
-}
+use common::{drive_in, git, git_available, git_capture, s3_url_with_zip};
 
 /// Initialise a fresh repo with `n` linear commits on `refs/heads/main`
 /// and return the dir + Vec<sha> in commit order (oldest first).
@@ -148,7 +58,7 @@ async fn push_to_empty_remote_uploads_bundle_and_seeds_head() {
     let store = Arc::new(MockStore::new());
     let script = "push refs/heads/main:refs/heads/main\n\n";
     let (out, result) = drive_in(
-        s3_url(Some("repo"), false),
+        s3_url_with_zip(Some("repo"), false),
         Arc::clone(&store) as Arc<dyn ObjectStore>,
         script,
         seed.path().to_path_buf(),
@@ -190,7 +100,7 @@ async fn push_fast_forward_replaces_old_bundle() {
     );
 
     let (out, result) = drive_in(
-        s3_url(Some("repo"), false),
+        s3_url_with_zip(Some("repo"), false),
         Arc::clone(&store) as Arc<dyn ObjectStore>,
         "push refs/heads/main:refs/heads/main\n\n",
         seed.path().to_path_buf(),
@@ -225,7 +135,7 @@ async fn push_non_fast_forward_is_rejected_without_force() {
     );
 
     let (out, result) = drive_in(
-        s3_url(Some("repo"), false),
+        s3_url_with_zip(Some("repo"), false),
         Arc::clone(&store) as Arc<dyn ObjectStore>,
         "push refs/heads/main:refs/heads/main\n\n",
         seed.path().to_path_buf(),
@@ -261,7 +171,7 @@ async fn force_push_overwrites_unrelated_remote() {
     );
 
     let (out, result) = drive_in(
-        s3_url(Some("repo"), false),
+        s3_url_with_zip(Some("repo"), false),
         Arc::clone(&store) as Arc<dyn ObjectStore>,
         "push +refs/heads/main:refs/heads/main\n\n",
         seed.path().to_path_buf(),
@@ -294,7 +204,7 @@ async fn force_push_protected_falls_back_to_ancestor_check() {
     store.insert("repo/refs/heads/main/PROTECTED#", Bytes::from_static(b""));
 
     let (out, result) = drive_in(
-        s3_url(Some("repo"), false),
+        s3_url_with_zip(Some("repo"), false),
         Arc::clone(&store) as Arc<dyn ObjectStore>,
         "push +refs/heads/main:refs/heads/main\n\n",
         seed.path().to_path_buf(),
@@ -326,7 +236,7 @@ async fn multi_bundle_pre_lock_rejects_push() {
     store.insert(&extra_key, Bytes::from_static(b"b"));
 
     let (out, result) = drive_in(
-        s3_url(Some("repo"), false),
+        s3_url_with_zip(Some("repo"), false),
         Arc::clone(&store) as Arc<dyn ObjectStore>,
         "push refs/heads/main:refs/heads/main\n\n",
         seed.path().to_path_buf(),
@@ -358,7 +268,7 @@ async fn push_with_held_lock_returns_contention_error() {
     );
 
     let (out, result) = drive_in(
-        s3_url(Some("repo"), false),
+        s3_url_with_zip(Some("repo"), false),
         Arc::clone(&store) as Arc<dyn ObjectStore>,
         "push refs/heads/main:refs/heads/main\n\n",
         seed.path().to_path_buf(),
@@ -388,7 +298,7 @@ async fn push_recovers_stale_lock() {
     );
 
     let (out, result) = drive_in(
-        s3_url(Some("repo"), false),
+        s3_url_with_zip(Some("repo"), false),
         Arc::clone(&store) as Arc<dyn ObjectStore>,
         "push refs/heads/main:refs/heads/main\n\n",
         seed.path().to_path_buf(),
@@ -412,7 +322,7 @@ async fn zip_variant_uploads_repo_zip_with_metadata() {
     let store = Arc::new(MockStore::new());
 
     let (out, result) = drive_in(
-        s3_url(Some("repo"), true),
+        s3_url_with_zip(Some("repo"), true),
         Arc::clone(&store) as Arc<dyn ObjectStore>,
         "push refs/heads/main:refs/heads/main\n\n",
         seed.path().to_path_buf(),
@@ -457,7 +367,7 @@ async fn delete_remote_ref_removes_single_bundle() {
     );
 
     let (out, result) = drive_in(
-        s3_url(Some("repo"), false),
+        s3_url_with_zip(Some("repo"), false),
         Arc::clone(&store) as Arc<dyn ObjectStore>,
         "push :refs/heads/main\n\n",
         seed.path().to_path_buf(),
@@ -478,7 +388,7 @@ async fn delete_missing_remote_ref_emits_not_found() {
     let store = Arc::new(MockStore::new());
 
     let (out, result) = drive_in(
-        s3_url(Some("repo"), false),
+        s3_url_with_zip(Some("repo"), false),
         Arc::clone(&store) as Arc<dyn ObjectStore>,
         "push :refs/heads/main\n\n",
         seed.path().to_path_buf(),
@@ -507,7 +417,7 @@ async fn batched_pushes_emit_outcome_per_command() {
     let script = "push refs/heads/main:refs/heads/main\n\
                   push refs/heads/feature:refs/heads/feature\n\n";
     let (out, result) = drive_in(
-        s3_url(Some("repo"), false),
+        s3_url_with_zip(Some("repo"), false),
         Arc::clone(&store) as Arc<dyn ObjectStore>,
         script,
         seed.path().to_path_buf(),
@@ -536,7 +446,7 @@ async fn nonexistent_local_ref_emits_error() {
     let store = Arc::new(MockStore::new());
 
     let (out, result) = drive_in(
-        s3_url(Some("repo"), false),
+        s3_url_with_zip(Some("repo"), false),
         Arc::clone(&store) as Arc<dyn ObjectStore>,
         "push refs/heads/does-not-exist:refs/heads/main\n\n",
         seed.path().to_path_buf(),
@@ -574,7 +484,7 @@ async fn force_push_protected_with_ancestor_remote_proceeds() {
     store.insert("repo/refs/heads/main/PROTECTED#", Bytes::from_static(b""));
 
     let (out, result) = drive_in(
-        s3_url(Some("repo"), false),
+        s3_url_with_zip(Some("repo"), false),
         Arc::clone(&store) as Arc<dyn ObjectStore>,
         "push +refs/heads/main:refs/heads/main\n\n",
         seed.path().to_path_buf(),
@@ -617,7 +527,7 @@ async fn batched_push_continues_after_per_push_transport_failure() {
     let script = "push refs/heads/main:refs/heads/main\n\
                   push refs/heads/feature:refs/heads/feature\n\n";
     let (out, result) = drive_in(
-        s3_url(Some("repo"), false),
+        s3_url_with_zip(Some("repo"), false),
         Arc::clone(&store) as Arc<dyn ObjectStore>,
         script,
         seed.path().to_path_buf(),
@@ -671,7 +581,7 @@ async fn lock_release_failure_overrides_successful_push() {
     });
 
     let (out, result) = drive_in(
-        s3_url(Some("repo"), false),
+        s3_url_with_zip(Some("repo"), false),
         Arc::clone(&store) as Arc<dyn ObjectStore>,
         "push refs/heads/main:refs/heads/main\n\n",
         seed.path().to_path_buf(),
@@ -737,7 +647,7 @@ async fn lock_release_failure_does_not_mask_push_error() {
     });
 
     let (out, result) = drive_in(
-        s3_url(Some("repo"), false),
+        s3_url_with_zip(Some("repo"), false),
         Arc::clone(&store) as Arc<dyn ObjectStore>,
         "push refs/heads/main:refs/heads/main\n\n",
         seed.path().to_path_buf(),
