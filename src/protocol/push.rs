@@ -276,13 +276,18 @@ pub(crate) async fn acquire_lock(
     store.put_if_absent(lock_key, Bytes::new()).await
 }
 
-/// Best-effort lock release. Swallows `NotFound` (TTL-driven cleanup
-/// elsewhere may have already deleted it); other errors are logged at
-/// `warn` and discarded so the success outcome of the push is not lost.
-pub(crate) async fn release_lock(store: &dyn ObjectStore, lock_key: &str) {
+/// Release a previously acquired per-ref lock. `NotFound` is mapped to
+/// `Ok(())` (another client or the TTL may have already cleaned it up);
+/// every other delete failure is propagated so the caller can surface
+/// it. Mirrors upstream `release_lock`
+/// (`../git-remote-s3/git_remote_s3/remote.py:408-416`).
+pub(crate) async fn release_lock(
+    store: &dyn ObjectStore,
+    lock_key: &str,
+) -> Result<(), ObjectStoreError> {
     match store.delete(lock_key).await {
-        Ok(()) | Err(ObjectStoreError::NotFound(_)) => {}
-        Err(e) => warn!(key = %lock_key, "failed to release lock: {e}"),
+        Ok(()) | Err(ObjectStoreError::NotFound(_)) => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -551,8 +556,25 @@ async fn push_one(
         local.zip_artifacts,
     )
     .await;
-    release_lock(store, &lock).await;
-    result
+    let release_result = release_lock(store, &lock).await;
+
+    // Upstream `cmd_push` (`../git-remote-s3/git_remote_s3/remote.py:297-303`)
+    // overrides a successful push with an error when the lock release
+    // fails, so the operator is alerted and concurrent pushers are not
+    // left hitting a dangling lock for the full TTL. A genuine push
+    // error takes priority — do not mask it with the release failure.
+    match (&result, release_result) {
+        (Ok(PushOutcome::Ok { .. }), Err(e)) => {
+            warn!(key = %lock, "failed to release lock: {e}");
+            Ok(PushOutcome::Error {
+                remote_ref: remote_ref_str,
+                message: format!(
+                    r#""failed to release lock. You may need to manually remove the lock {lock} from the server or use git-remote-object-store doctor to fix."?"#,
+                ),
+            })
+        }
+        _ => result,
+    }
 }
 
 /// Re-list under the lock, upload the bundle, init HEAD, delete the
@@ -928,16 +950,33 @@ mod tests {
     #[tokio::test]
     async fn release_lock_swallows_not_found() {
         let store = MockStore::new();
-        // Releasing an absent lock must not panic or error.
-        release_lock(&store, "missing").await;
+        // Releasing an absent lock must map NotFound to Ok(()).
+        release_lock(&store, "missing").await.unwrap();
     }
 
     #[tokio::test]
     async fn release_lock_deletes_existing_key() {
         let store = MockStore::new();
         store.insert("k", Bytes::new());
-        release_lock(&store, "k").await;
+        release_lock(&store, "k").await.unwrap();
         assert!(!store.contains("k"));
+    }
+
+    #[tokio::test]
+    async fn release_lock_propagates_non_not_found_errors() {
+        use crate::object_store::mock::Fault;
+        let store = MockStore::new();
+        store.insert("k", Bytes::new());
+        store.arm(Fault::NetworkOnDelete { key: "k".into() });
+        let err = release_lock(&store, "k").await.unwrap_err();
+        assert!(
+            matches!(err, ObjectStoreError::Network(_)),
+            "expected Network error, got {err:?}",
+        );
+        // The fault fired exactly once.
+        assert_eq!(store.pending_faults(), 0);
+        // Key remains because the delete was faulted, not executed.
+        assert!(store.contains("k"));
     }
 
     // --- delete_remote_ref --------------------------------------------

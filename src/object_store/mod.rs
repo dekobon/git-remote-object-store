@@ -75,8 +75,8 @@ pub struct PutOpts {
 ///   `Err`.
 /// - **`copy(src, dst)`** — overwrites `dst`; returns `Err(NotFound)` when
 ///   `src` is absent.
-/// - **`delete`** — returns `Err(NotFound)` on missing key. Callers that
-///   want best-effort delete (e.g., `release_lock`) swallow it.
+/// - **`delete`** — returns `Err(NotFound)` on missing key. `release_lock`
+///   maps `NotFound` to `Ok(())` and propagates other errors.
 #[async_trait::async_trait]
 pub trait ObjectStore: Send + Sync {
     /// Enumerate every object whose key has `prefix` as a byte prefix.

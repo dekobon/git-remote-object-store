@@ -56,6 +56,11 @@ pub enum Fault {
         /// Prefix being listed.
         prefix: String,
     },
+    /// Force `delete(key)` to return [`Error::Network`].
+    NetworkOnDelete {
+        /// Key being deleted.
+        key: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +308,12 @@ impl ObjectStore for MockStore {
 
     async fn delete(&self, key: &str) -> Result<(), Error> {
         self.with_state(|s| {
+            Self::check_fault(s, |f| match f {
+                Fault::NetworkOnDelete { key: k } if k == key => Some(Error::Network(Box::new(
+                    std::io::Error::other(format!("mock network on delete: {k}")),
+                ))),
+                _ => None,
+            })?;
             s.objects
                 .remove(key)
                 .map(|_| ())
@@ -596,6 +607,20 @@ mod tests {
         // only realistic way to exercise that branch through the &str
         // surface.
         assert!(matches!(next_lex("\u{10FFFF}"), Bound::Unbounded));
+    }
+
+    #[tokio::test]
+    async fn delete_network_fault_fires_once() {
+        let store = MockStore::new();
+        store.insert("k", body(b"x"));
+        store.arm(Fault::NetworkOnDelete { key: "k".into() });
+        let err = store.delete("k").await.unwrap_err();
+        assert!(matches!(err, Error::Network(_)));
+        // Object was not removed because the fault fired first.
+        assert!(store.contains("k"));
+        // Second call without a fault succeeds.
+        store.delete("k").await.unwrap();
+        assert!(!store.contains("k"));
     }
 
     #[test]
