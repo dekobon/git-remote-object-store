@@ -14,6 +14,7 @@ use bytes::Bytes;
 use tracing::info;
 
 use super::{ManageError, Prompter};
+use crate::git::RefName;
 use crate::object_store::{Error as ObjectStoreError, ObjectStore, PutOpts};
 
 /// Operations on a single branch within a repository.
@@ -34,10 +35,21 @@ impl<'a> ManageBranch<'a> {
         branch: impl Into<String>,
         prompter: &'a dyn Prompter,
     ) -> Result<Self, ManageError> {
+        let branch = branch.into();
+        // Reject branch names that git itself would reject. S3 / Azure
+        // are case-sensitive byte stores with no path semantics, so a
+        // value like `foo/../bar` would be stored verbatim and produce
+        // unrecoverable junk under `<prefix>/refs/heads/`. The strict
+        // `RefName::new` (delegating to `gix_validate::reference::name`)
+        // rejects empties, `..`, control characters, and the rest of
+        // git's invalid-ref alphabet.
+        if RefName::new(format!("refs/heads/{branch}")).is_err() {
+            return Err(ManageError::InvalidBranch(branch));
+        }
         let mb = Self {
             store,
             prefix: prefix.into(),
-            branch: branch.into(),
+            branch,
             prompter,
         };
         if mb.store.list(&mb.branch_prefix()).await?.is_empty() {
@@ -198,5 +210,64 @@ mod tests {
         mb.unprotect_branch()
             .await
             .expect("unprotect should be idempotent");
+    }
+
+    #[tokio::test]
+    async fn open_rejects_invalid_branch_name() {
+        // Attempting `delete-branch foo/../bar` would otherwise build
+        // literal `<prefix>/refs/heads/foo/../bar/...` keys on S3.
+        let mock = MockStore::new();
+        let store: Arc<dyn ObjectStore> = Arc::new(mock);
+        let prompter = ScriptedPrompter::new([]);
+        match ManageBranch::open(store, "myrepo", "foo/../bar", &prompter).await {
+            Err(ManageError::InvalidBranch(name)) => assert_eq!(name, "foo/../bar"),
+            Err(other) => panic!("expected InvalidBranch, got {other:?}"),
+            Ok(_) => panic!("expected open to reject `foo/../bar`"),
+        }
+    }
+
+    #[tokio::test]
+    async fn open_rejects_branch_with_control_char() {
+        let mock = MockStore::new();
+        let store: Arc<dyn ObjectStore> = Arc::new(mock);
+        let prompter = ScriptedPrompter::new([]);
+        match ManageBranch::open(store, "myrepo", "main\nrefs/heads/other", &prompter).await {
+            Err(ManageError::InvalidBranch(_)) => {}
+            Err(other) => panic!("expected InvalidBranch, got {other:?}"),
+            Ok(_) => panic!("expected open to reject control-char branch"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_branch_partial_failure_propagates_error() {
+        // `MockStore::list` returns keys in lexicographic (BTreeMap)
+        // order, so the loop deletes aaa, then attempts bbb (armed to
+        // fail), then ccc. `delete_branch` returns the error
+        // immediately on the failed delete; aaa is gone, bbb and ccc
+        // remain.
+        let mock = MockStore::new();
+        mock.insert("myrepo/refs/heads/main/aaa.bundle", Bytes::from("a"));
+        mock.insert("myrepo/refs/heads/main/bbb.bundle", Bytes::from("b"));
+        mock.insert("myrepo/refs/heads/main/ccc.bundle", Bytes::from("c"));
+        mock.arm(crate::object_store::mock::Fault::NetworkOnDelete {
+            key: "myrepo/refs/heads/main/bbb.bundle".to_owned(),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        let err = mb
+            .delete_branch()
+            .await
+            .expect_err("partial delete must propagate");
+        assert!(
+            matches!(err, ManageError::Store(_)),
+            "expected Store error, got {err:?}"
+        );
+        assert!(!mock.contains("myrepo/refs/heads/main/aaa.bundle"));
+        assert!(mock.contains("myrepo/refs/heads/main/bbb.bundle"));
+        assert!(mock.contains("myrepo/refs/heads/main/ccc.bundle"));
     }
 }
