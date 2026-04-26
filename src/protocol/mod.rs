@@ -11,6 +11,7 @@
 //! per-command handlers below.
 
 use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
@@ -28,6 +29,7 @@ pub mod option;
 pub mod push;
 pub mod tracing_init;
 
+use self::fetch::{FetchedRefs, fetch_batch};
 use self::option::handle_option;
 use self::tracing_init::ReloadHandle;
 
@@ -42,9 +44,9 @@ pub enum ProtocolError {
     #[error("list failed: {0}")]
     List(#[from] list::ListError),
 
-    /// `fetch` is a Phase 7 deliverable.
-    #[error(transparent)]
-    Fetch(#[from] fetch::FetchNotImplemented),
+    /// `fetch` batch failed.
+    #[error("fetch failed: {0}")]
+    Fetch(#[from] fetch::FetchError),
 
     /// `push` is a Phase 8 deliverable.
     #[error(transparent)]
@@ -64,6 +66,15 @@ enum Command {
     Fetch(String),
     Push(String),
     Empty,
+}
+
+/// Which batched command stream is currently being collected.
+///
+/// Phase 7 only accumulates `fetch` lines into a batch. Phase 8 will
+/// add a `Push` variant alongside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Fetch,
 }
 
 fn parse_command(line: &str) -> Option<Command> {
@@ -96,18 +107,27 @@ fn parse_command(line: &str) -> Option<Command> {
 /// Run the helper REPL until stdin closes (clean exit) or the writer
 /// breaks (`BrokenPipe` — also a clean exit, mirroring upstream's
 /// `os.dup2(devnull, stdout)` trick).
+///
+/// `repo_dir` is the local repository the helper is operating against;
+/// the parallel fetch path uses it as the cwd for `git bundle unbundle`.
 pub async fn run<R, W>(
     remote: RemoteUrl,
     store: Arc<dyn ObjectStore>,
     reader: R,
     mut writer: W,
     reload: Option<ReloadHandle>,
+    repo_dir: PathBuf,
 ) -> Result<(), ProtocolError>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut lines = reader.lines();
+    let repo_dir = Arc::new(repo_dir);
+    let fetched_refs = FetchedRefs::new();
+    let mut mode: Option<Mode> = None;
+    let mut fetch_cmds: Vec<String> = Vec::new();
+
     while let Some(line) = lines.next_line().await? {
         debug!(cmd = %line, "received protocol command");
         let Some(cmd) = parse_command(&line) else {
@@ -124,9 +144,27 @@ where
             Command::Option(args) => {
                 handle_option(&args, reload.as_ref(), &mut writer).await?;
             }
-            Command::Fetch(_) => return Err(fetch::FetchNotImplemented.into()),
+            Command::Fetch(args) => {
+                if mode != Some(Mode::Fetch) {
+                    fetch_cmds.clear();
+                    mode = Some(Mode::Fetch);
+                }
+                fetch_cmds.push(args);
+            }
             Command::Push(_) => return Err(push::PushNotImplemented.into()),
             Command::Empty => {
+                if mode == Some(Mode::Fetch) && !fetch_cmds.is_empty() {
+                    let drained = std::mem::take(&mut fetch_cmds);
+                    fetch_batch(
+                        Arc::clone(&store),
+                        remote.prefix().map(str::to_owned),
+                        Arc::clone(&repo_dir),
+                        drained,
+                        fetched_refs.clone(),
+                    )
+                    .await?;
+                    mode = None;
+                }
                 writer.write_all(b"\n").await?;
                 writer.flush().await?;
             }
@@ -161,10 +199,16 @@ pub async fn run_main() -> anyhow::Result<()> {
         .await
         .context("failed to build object-store backend")?;
 
+    // Git invokes remote helpers from inside the local repository (cwd
+    // is the worktree, with `GIT_DIR` set when relevant). `git bundle
+    // unbundle` auto-discovers the git directory from cwd, so the
+    // process cwd is the right thing to hand the parallel fetch path.
+    let repo_dir = std::env::current_dir().context("failed to read current working directory")?;
+
     let stdin = BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();
 
-    match run(remote, store, stdin, stdout, reload).await {
+    match run(remote, store, stdin, stdout, reload, repo_dir).await {
         Ok(()) => Ok(()),
         Err(ProtocolError::Io(e)) if is_broken_pipe(&e) => {
             debug!("stdout closed (BrokenPipe); exiting cleanly");

@@ -38,6 +38,15 @@ async fn drive(
     store: Arc<dyn ObjectStore>,
     script: &str,
 ) -> (Vec<u8>, Result<(), ProtocolError>) {
+    drive_in(remote, store, script, std::env::temp_dir()).await
+}
+
+async fn drive_in(
+    remote: RemoteUrl,
+    store: Arc<dyn ObjectStore>,
+    script: &str,
+    repo_dir: std::path::PathBuf,
+) -> (Vec<u8>, Result<(), ProtocolError>) {
     let (client_side, helper_side) = tokio::io::duplex(64 * 1024);
     let (helper_in, helper_out) = tokio::io::split(helper_side);
     let (client_reader, mut client_writer) = tokio::io::split(client_side);
@@ -62,6 +71,7 @@ async fn drive(
         tokio::io::BufReader::new(helper_in),
         helper_out,
         None,
+        repo_dir,
     )
     .await;
 
@@ -319,23 +329,6 @@ async fn invalid_command_returns_error() {
         Err(ProtocolError::InvalidCommand(line)) => assert_eq!(line, "nonsense"),
         other => panic!("expected InvalidCommand error, got {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn fetch_command_returns_not_implemented() {
-    let (out, result) = drive(
-        s3_url(Some("repo")),
-        Arc::new(MockStore::new()),
-        &format!("fetch {SHA_A} refs/heads/main\n"),
-    )
-    .await;
-    match result {
-        Err(ProtocolError::Fetch(_)) => {}
-        other => panic!("expected Fetch error, got {other:?}"),
-    }
-    // The stub bails before writing anything; a regression that emitted
-    // partial protocol output before erroring would corrupt git's parser.
-    assert!(out.is_empty(), "stub must not write to stdout: {out:?}");
 }
 
 #[tokio::test]
