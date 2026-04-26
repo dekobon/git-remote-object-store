@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `release_lock` now propagates non-`NotFound` delete failures instead of
+  silently swallowing them. When the push itself succeeds but the lock
+  cannot be released, the outcome is replaced with
+  `error <ref> "failed to release lock. ..."` matching upstream
+  `cmd_push`'s `finally` block. A genuine push error is never masked by
+  a release failure. (#18)
+
+- `S3Store::get_to_file` now guards against concurrent object mutation:
+  every GET carries `If-Match: <etag>` from the preceding `HeadObject`.
+  If the object is overwritten mid-download, S3 returns 412 and the
+  operation retries once before propagating `Error::PreconditionFailed`.
+  (#20)
+
 - Push batches no longer abort on the first per-push transport, git, or
   local-I/O failure. `push_batch` now catches `PushError::Store`, `Git`,
   `Io`, and `Sha` per-push and converts them to `error <ref> "..."` outcome
@@ -29,6 +42,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consecutive hyphens. Closes #17.
 
 ### Added
+
+- `ObjectStore::put_path` streams local files to the backend without
+  buffering in process memory. The push handler now uses it for bundle
+  and zip artifact uploads, removing OOM risk for large repos and the
+  5 GiB single-PUT ceiling. (#21)
+
+- Shared protocol-test helpers extracted into `tests/common/mod.rs`,
+  eliminating ~100 lines of duplicated `git()`, `git_capture()`,
+  `s3_url()`, `drive_in()`, and `git_available()` across
+  `protocol_smoke.rs`, `protocol_fetch.rs`, and `protocol_push.rs`.
+  (#19)
 
 - Phase 8 `push` handler with per-ref locking (`src/protocol/push.rs`): the
   REPL now batches `push <refspec>` lines until a blank line and processes

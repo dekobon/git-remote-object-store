@@ -859,3 +859,23 @@ so reviewers can diff against the source of truth.
 - aws-sdk-s3 client docs: <https://docs.rs/aws-sdk-s3>
 - Azure SDK for Rust: <https://github.com/Azure/azure-sdk-for-rust>
 - `azure_storage_blob` crate: <https://crates.io/crates/azure_storage_blob>
+
+## Resolved Divergences (post-plan)
+
+### #20 — s3: get_to_file If-Match guard (2026-04-26)
+
+- **Upstream behavior**: `boto3.download_file` does not use `If-Match`
+  headers; concurrent mutation between `HeadObject` and the body GET
+  may produce a silently truncated or corrupted file.
+- **New behavior**: Every GET in `get_to_file` carries
+  `If-Match: <etag>` from the preceding `HeadObject`. If S3 returns
+  412 the operation retries once, then propagates
+  `Error::PreconditionFailed`.
+- **Rationale**: Silent data corruption is a worse failure mode than
+  a structured error. The guard adds one ETag string per request
+  (negligible overhead) and catches a real race that can corrupt
+  bundle files. This is a strictly defensive improvement — no
+  behavioral change to the on-the-wire object layout, locking
+  semantics, or LFS transfer protocol.
+- **Affected sections**: Relates to §5 (S3 object-store
+  implementation); the canonical record lives in this section.
