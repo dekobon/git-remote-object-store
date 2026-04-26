@@ -68,6 +68,16 @@ serde_json = "1"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# Interactive prompts for the management CLI (`git-remote-object-store`).
+# Default features pull in fuzzy-select / completion / history machinery
+# that the `Select` + `Confirm` flows here do not exercise; disabling them
+# keeps the dependency footprint tight.
+dialoguer = { version = "0.11", default-features = false }
+
+# UUID v4 for the doctor's quarantine ref suffix
+# (`<ref>_<uuid8>` per execution-plan.md §1.1 / Phase 9).
+uuid = { version = "1", features = ["v4"] }
+
 # URL parsing
 url = "2"
 

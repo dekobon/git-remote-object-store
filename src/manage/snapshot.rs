@@ -1,0 +1,285 @@
+//! Read-only view of a repository's on-bucket layout, built by listing
+//! `<prefix>/` and grouping the results into refs, bundles, protection
+//! markers, and HEAD. Mirrors the `analyze_repo` step in upstream
+//! `../git-remote-s3/git_remote_s3/manage.py`, but flattened to the
+//! single-repo case (one CLI invocation == one prefix).
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use time::OffsetDateTime;
+use tracing::warn;
+
+use super::ManageError;
+use crate::object_store::{ObjectMeta, ObjectStore};
+
+/// One bundle object listed under a ref.
+#[derive(Debug, Clone)]
+pub struct BundleEntry {
+    /// Hex-encoded commit OID extracted from the bundle filename.
+    /// Stored as `String` (not `Sha`) because the doctor must report
+    /// even malformed entries — `<sha>.bundle` keys with non-hex names
+    /// still need to be displayed and offered for deletion.
+    pub sha: String,
+    /// Full object key, used directly for `delete` / `copy` calls so the
+    /// caller never has to reconstruct it.
+    pub key: String,
+    /// Server-side last-modified timestamp.
+    pub last_modified: OffsetDateTime,
+}
+
+/// Per-ref snapshot — protection state plus every bundle object.
+#[derive(Debug, Clone, Default)]
+pub struct RefSnapshot {
+    /// `true` iff at least one `<ref>/PROTECTED#…` marker is present.
+    /// Per `execution-plan.md` §1.1 the marker is matched by **prefix**,
+    /// so any key under `<ref>/` whose final segment starts with
+    /// `PROTECTED#` counts.
+    pub is_protected: bool,
+    /// Bundle objects under this ref, in listing order. The doctor's
+    /// "multiple bundles" check fires when this is longer than one.
+    pub bundles: Vec<BundleEntry>,
+}
+
+/// Whole-repository snapshot.
+#[derive(Debug, Clone, Default)]
+pub struct RepoSnapshot {
+    /// Body of `<prefix>/HEAD`, decoded as UTF-8 and trimmed of
+    /// surrounding whitespace. `None` when the object is absent or its
+    /// body is not valid UTF-8.
+    pub head: Option<String>,
+    /// Refs keyed by their full ref-path (e.g. `refs/heads/main`).
+    pub refs: BTreeMap<String, RefSnapshot>,
+}
+
+impl RepoSnapshot {
+    /// `true` iff [`head`](Self::head) names a ref that exists in
+    /// [`refs`](Self::refs). A `None` HEAD or a HEAD pointing at a ref
+    /// with no listed keys is "invalid" and triggers `fix_head`.
+    #[must_use]
+    pub fn is_head_valid(&self) -> bool {
+        self.head
+            .as_ref()
+            .is_some_and(|h| self.refs.contains_key(h))
+    }
+}
+
+/// Walk every object under `<prefix>/` and group it into a
+/// [`RepoSnapshot`].
+///
+/// `prefix` must be the full repository prefix from the parsed remote
+/// URL (e.g. `acme/myrepo`), without a trailing `/` — this function
+/// appends one to match the upstream listing semantics.
+pub async fn analyze(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+) -> Result<RepoSnapshot, ManageError> {
+    let list_prefix = format!("{prefix}/");
+    let objects = store.list(&list_prefix).await?;
+
+    let mut snapshot = RepoSnapshot::default();
+    for object in objects {
+        classify_into(&list_prefix, &object, &mut snapshot, store).await?;
+    }
+    Ok(snapshot)
+}
+
+/// Slot one listed object into the snapshot. `list_prefix` is the
+/// `<prefix>/` form used to strip the leading namespace; everything
+/// else is matched against the **relative** path so adding new
+/// non-bundle keys (e.g. metadata sidecars) only requires an extra
+/// match arm here.
+async fn classify_into(
+    list_prefix: &str,
+    object: &ObjectMeta,
+    snapshot: &mut RepoSnapshot,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<(), ManageError> {
+    let Some(relative) = object.key.strip_prefix(list_prefix) else {
+        // Defensive: `list` should only return keys that share the
+        // requested prefix. If a backend ever returns a sibling key,
+        // skip it rather than misattribute.
+        warn!(
+            key = %object.key,
+            list_prefix = %list_prefix,
+            "list returned key outside requested prefix; skipping"
+        );
+        return Ok(());
+    };
+    let segments: Vec<&str> = relative.split('/').collect();
+
+    match segments.as_slice() {
+        ["HEAD"] => {
+            let body = store.get_bytes(&object.key).await?;
+            snapshot.head = std::str::from_utf8(&body)
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty());
+        }
+        // Lock files (`<ref>/LOCK#.lock` and any future `*.lock` keys)
+        // are scanned separately by `list_and_handle_stale_locks`.
+        // The lock suffix is a wire-format token on a case-sensitive
+        // S3/Azure key, not a filesystem extension — clippy's
+        // case-insensitive-extension hint does not apply.
+        #[allow(clippy::case_sensitive_file_extension_comparisons)]
+        [.., last] if last.ends_with(".lock") => {}
+        // The optional `<ref>/repo.zip` artefact (`?zip=1` push variant)
+        // is not a bundle and not a protection marker. Skip silently.
+        [.., "repo.zip"] => {}
+        [_ref_root, _rest @ ..] if segments.len() >= 2 => {
+            let last = segments[segments.len() - 1];
+            let ref_path = segments[..segments.len() - 1].join("/");
+            let entry = snapshot.refs.entry(ref_path).or_default();
+
+            if last.starts_with("PROTECTED#") {
+                entry.is_protected = true;
+            } else if let Some(sha) = last.strip_suffix(".bundle") {
+                entry.bundles.push(BundleEntry {
+                    sha: sha.to_owned(),
+                    key: object.key.clone(),
+                    last_modified: object.last_modified,
+                });
+            }
+            // Anything else under `<ref>/` is an unknown sidecar; leave
+            // it alone so the doctor doesn't accidentally rewrite a key
+            // it doesn't recognise.
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object_store::ObjectStore;
+    use crate::object_store::mock::MockStore;
+    use bytes::Bytes;
+
+    fn store() -> Arc<dyn ObjectStore> {
+        Arc::new(MockStore::new())
+    }
+
+    #[tokio::test]
+    async fn empty_listing_yields_empty_snapshot() {
+        let s = store();
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+        assert!(snap.head.is_none());
+        assert!(snap.refs.is_empty());
+        assert!(!snap.is_head_valid());
+    }
+
+    #[tokio::test]
+    async fn single_ref_one_bundle() {
+        let mock = MockStore::new();
+        mock.insert("myrepo/refs/heads/main/abc123.bundle", Bytes::from("body"));
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+        let main = snap.refs.get("refs/heads/main").expect("main present");
+        assert_eq!(main.bundles.len(), 1);
+        assert_eq!(main.bundles[0].sha, "abc123");
+        assert_eq!(main.bundles[0].key, "myrepo/refs/heads/main/abc123.bundle");
+        assert!(!main.is_protected);
+    }
+
+    #[tokio::test]
+    async fn protected_marker_exact_match() {
+        let mock = MockStore::new();
+        mock.insert("myrepo/refs/heads/main/PROTECTED#", Bytes::new());
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+        assert!(snap.refs["refs/heads/main"].is_protected);
+        assert!(snap.refs["refs/heads/main"].bundles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn protected_marker_prefix_match() {
+        // §1.1: PROTECTED# is matched by prefix, not exact equality.
+        let mock = MockStore::new();
+        mock.insert("myrepo/refs/heads/main/PROTECTED#tag", Bytes::new());
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+        assert!(snap.refs["refs/heads/main"].is_protected);
+    }
+
+    #[tokio::test]
+    async fn head_object_is_decoded_and_trimmed() {
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main\n"));
+        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("body"));
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+        assert_eq!(snap.head.as_deref(), Some("refs/heads/main"));
+        assert!(snap.is_head_valid());
+    }
+
+    #[tokio::test]
+    async fn head_object_invalid_utf8_yields_none() {
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from(vec![0xff, 0xfe]));
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+        assert!(snap.head.is_none());
+        assert!(!snap.is_head_valid());
+    }
+
+    #[tokio::test]
+    async fn head_pointing_at_unknown_ref_is_invalid() {
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/missing"));
+        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("body"));
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+        assert_eq!(snap.head.as_deref(), Some("refs/heads/missing"));
+        assert!(!snap.is_head_valid());
+    }
+
+    #[tokio::test]
+    async fn multiple_bundles_under_one_ref() {
+        let mock = MockStore::new();
+        mock.insert("myrepo/refs/heads/main/aaa.bundle", Bytes::from("a"));
+        mock.insert("myrepo/refs/heads/main/bbb.bundle", Bytes::from("b"));
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+        assert_eq!(snap.refs["refs/heads/main"].bundles.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn lock_files_are_skipped_in_ref_grouping() {
+        let mock = MockStore::new();
+        mock.insert("myrepo/refs/heads/main/LOCK#.lock", Bytes::new());
+        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+        assert_eq!(snap.refs["refs/heads/main"].bundles.len(), 1);
+        assert!(!snap.refs["refs/heads/main"].is_protected);
+    }
+
+    #[tokio::test]
+    async fn repo_zip_is_skipped_in_ref_grouping() {
+        let mock = MockStore::new();
+        mock.insert("myrepo/refs/heads/main/repo.zip", Bytes::from("zip"));
+        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+        assert_eq!(snap.refs["refs/heads/main"].bundles.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn nested_ref_path_is_preserved() {
+        let mock = MockStore::new();
+        mock.insert("myrepo/refs/heads/feature/x/aaa.bundle", Bytes::from("a"));
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+        assert!(snap.refs.contains_key("refs/heads/feature/x"));
+    }
+
+    #[tokio::test]
+    async fn empty_head_body_treated_as_missing() {
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from(""));
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+        assert!(snap.head.is_none());
+    }
+}
