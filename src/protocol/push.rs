@@ -95,7 +95,7 @@ impl PushOutcome {
     /// Format `self` as the single line emitted on stdout (terminator
     /// included).
     #[must_use]
-    pub fn as_protocol_line(&self) -> String {
+    pub(crate) fn as_protocol_line(&self) -> String {
         match self {
             PushOutcome::Ok { remote_ref } => format!("ok {remote_ref}\n"),
             PushOutcome::Error {
@@ -272,10 +272,7 @@ pub(crate) async fn acquire_lock(
         return Ok(false);
     }
     debug!(key = %lock_key, age_secs = age.whole_seconds(), "deleting stale lock");
-    match store.delete(lock_key).await {
-        Ok(()) | Err(ObjectStoreError::NotFound(_)) => {}
-        Err(e) => return Err(e),
-    }
+    delete_idempotent(store, lock_key).await?;
     store.put_if_absent(lock_key, Bytes::new()).await
 }
 
@@ -286,6 +283,15 @@ pub(crate) async fn release_lock(store: &dyn ObjectStore, lock_key: &str) {
     match store.delete(lock_key).await {
         Ok(()) | Err(ObjectStoreError::NotFound(_)) => {}
         Err(e) => warn!(key = %lock_key, "failed to release lock: {e}"),
+    }
+}
+
+/// Idempotent delete: treats `NotFound` as success (another client may
+/// have raced ahead) but propagates every other error.
+async fn delete_idempotent(store: &dyn ObjectStore, key: &str) -> Result<(), ObjectStoreError> {
+    match store.delete(key).await {
+        Ok(()) | Err(ObjectStoreError::NotFound(_)) => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -328,6 +334,15 @@ pub(crate) async fn push_batch(
     Ok(outcomes)
 }
 
+/// Recoverable per-push errors discovered while talking to the local
+/// repo. Mapped by the caller into [`PushOutcome::Error`] strings.
+enum GitProbeError {
+    /// `local_spec` did not resolve in the local repo.
+    LocalRefNotFound,
+    /// Pre-existing remote bundle is not an ancestor of `local_sha`.
+    NotAncestor,
+}
+
 /// Local git work that must run synchronously because `gix::Repository`
 /// is `!Sync` and cannot cross `.await` points without making the
 /// surrounding future `!Send`.
@@ -336,21 +351,26 @@ struct LocalGit {
     local_sha: Sha,
     /// Working directory for `git bundle create` subprocess calls.
     cwd: PathBuf,
-    /// On the zip path: pre-resolved archive bytes and metadata.
-    /// `None` on the regular push path.
+    /// On the zip path: archive on disk + metadata for the upload.
+    /// `None` on the regular push path. The `TempDir` keeps the file
+    /// alive until the async caller reads its bytes.
     zip_artifacts: Option<ZipArtifacts>,
 }
 
 struct ZipArtifacts {
-    archive_bytes: Bytes,
+    archive_path: PathBuf,
     short_sha: String,
     commit_msg: String,
+    /// Owned tempdir that backs `archive_path`; dropped after upload.
+    _tempdir: tempfile::TempDir,
 }
 
 /// Open the repo, resolve `local_sha`, optionally check ancestry, and
 /// (for the zip variant) build the archive synchronously. The
 /// `Repository` handle is dropped before this returns so the caller's
-/// `Future` can stay `Send`.
+/// `Future` can stay `Send`. Archive bytes are NOT read here — the
+/// async caller does that with `tokio::fs::read` to avoid blocking the
+/// runtime on file I/O.
 fn local_git_work(
     repo_dir: &Path,
     local_spec: &str,
@@ -372,17 +392,18 @@ fn local_git_work(
     }
 
     let zip_artifacts = if zip {
-        let temp = tempfile::Builder::new()
+        let tempdir = tempfile::Builder::new()
             .prefix("git_remote_object_store_archive_")
             .tempdir()?;
-        let archive_path = git::archive(&repo, temp.path(), local_spec)?;
-        let archive_bytes = Bytes::from(std::fs::read(&archive_path)?);
+        let archive_path = git::archive(&repo, tempdir.path(), local_spec)?;
         let commit_msg = git::last_commit_message(&repo).unwrap_or_default();
-        let short_sha: String = local_sha.to_string().chars().take(8).collect();
+        let sha_hex = local_sha.to_string();
+        let short_sha = sha_hex[..8].to_owned();
         Some(ZipArtifacts {
-            archive_bytes,
+            archive_path,
             short_sha,
             commit_msg,
+            _tempdir: tempdir,
         })
     } else {
         None
@@ -394,15 +415,6 @@ fn local_git_work(
         cwd,
         zip_artifacts,
     }))
-}
-
-/// Recoverable per-push errors discovered while talking to the local
-/// repo. Mapped by the caller into [`PushOutcome::Error`] strings.
-enum GitProbeError {
-    /// `local_spec` did not resolve in the local repo.
-    LocalRefNotFound,
-    /// Pre-existing remote bundle is not an ancestor of `local_sha`.
-    NotAncestor,
 }
 
 /// Execute one push: lock, validate, upload, release. Mirrors the
@@ -567,13 +579,11 @@ async fn perform_push_under_lock(
     if let Some(prev) = current_key
         && prev != bundle_dest
     {
-        match store.delete(&prev).await {
-            Ok(()) | Err(ObjectStoreError::NotFound(_)) => {}
-            Err(e) => return Err(PushError::Store(e)),
-        }
+        delete_idempotent(store, &prev).await?;
     }
 
     if let Some(artifacts) = zip_artifacts {
+        let archive_bytes = Bytes::from(tokio::fs::read(&artifacts.archive_path).await?);
         let opts = PutOpts {
             content_disposition: Some(format!(
                 "attachment; filename=repo-{}.zip",
@@ -585,9 +595,7 @@ async fn perform_push_under_lock(
             )],
         };
         let zip_dest = archive_key(prefix, remote_ref);
-        store
-            .put_bytes(&zip_dest, artifacts.archive_bytes, opts)
-            .await?;
+        store.put_bytes(&zip_dest, archive_bytes, opts).await?;
     }
 
     Ok(PushOutcome::Ok {
@@ -610,10 +618,7 @@ async fn delete_remote_ref(
     let remote_ref_str = remote_ref.as_str().to_owned();
     if entries.len() == expected {
         for entry in &entries {
-            match store.delete(&entry.key).await {
-                Ok(()) | Err(ObjectStoreError::NotFound(_)) => {}
-                Err(e) => return Err(PushError::Store(e)),
-            }
+            delete_idempotent(store, &entry.key).await?;
         }
         Ok(PushOutcome::Ok {
             remote_ref: remote_ref_str,
