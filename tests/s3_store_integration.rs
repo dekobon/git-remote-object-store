@@ -416,6 +416,84 @@ async fn large_object_multipart_download() {
 }
 
 #[tokio::test]
+async fn put_path_streams_file_and_round_trips() {
+    let (store, _bucket) = fresh_bucket().await;
+
+    // Create a 32 MiB temp file with deterministic content — large enough
+    // to exercise the streaming path without approaching the 5 GiB single-PUT
+    // ceiling that `put_path` is designed to remove.
+    let size: usize = 32 * 1024 * 1024;
+    let mut payload = vec![0u8; size];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = u8::try_from(i.wrapping_mul(2_654_435_761) & 0xff).unwrap_or(0);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(&payload);
+    let expected_hash = hasher.finalize();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("big-upload.bin");
+    tokio::fs::write(&src, &payload).await.expect("write src");
+
+    // Upload via put_path (streaming from disk).
+    store
+        .put_path("streamed", &src, PutOpts::default())
+        .await
+        .expect("put_path");
+
+    // Download via get_to_file and hash-compare.
+    let dest = tmp.path().join("downloaded.bin");
+    store
+        .get_to_file("streamed", &dest)
+        .await
+        .expect("get_to_file");
+
+    let actual_hash = {
+        use std::io::Read;
+        let mut file = std::fs::File::open(&dest).expect("open downloaded");
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = file.read(&mut buf).expect("read");
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        hasher.finalize()
+    };
+    assert_eq!(
+        actual_hash, expected_hash,
+        "put_path → get_to_file round-trip corrupted body"
+    );
+    let metadata = std::fs::metadata(&dest).expect("metadata");
+    assert_eq!(metadata.len(), size as u64);
+}
+
+#[tokio::test]
+async fn put_path_with_opts_preserves_metadata() {
+    let (store, _bucket) = fresh_bucket().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("small.txt");
+    tokio::fs::write(&src, b"hello via path")
+        .await
+        .expect("write src");
+
+    let opts = PutOpts {
+        content_disposition: Some("attachment; filename=test.txt".into()),
+        user_metadata: vec![("x-custom".into(), "value".into())],
+    };
+    store
+        .put_path("meta-test", &src, opts)
+        .await
+        .expect("put_path");
+
+    // Verify the body round-trips.
+    let body = store.get_bytes("meta-test").await.expect("get_bytes");
+    assert_eq!(&body[..], b"hello via path");
+}
+
+#[tokio::test]
 async fn get_missing_key_is_not_found() {
     let (store, _bucket) = fresh_bucket().await;
     let err = store.get_bytes("absent").await.expect_err("get missing");

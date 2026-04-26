@@ -281,6 +281,13 @@ impl ObjectStore for MockStore {
         Ok(())
     }
 
+    async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), Error> {
+        let body = tokio::fs::read(src)
+            .await
+            .map_err(|e| Error::Other(Box::new(e)))?;
+        self.put_bytes(key, Bytes::from(body), opts).await
+    }
+
     async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, Error> {
         self.with_state(|s| {
             Self::check_fault(s, |f| match f {
@@ -695,6 +702,63 @@ mod tests {
         assert!(a.starts_with('"') && a.ends_with('"'));
         // Different input ⇒ different output.
         assert_ne!(mock_etag(b"abc"), mock_etag(b"xyz"));
+    }
+
+    #[tokio::test]
+    async fn put_path_round_trips_same_as_put_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("payload.bin");
+        let content = b"put_path round-trip content";
+        tokio::fs::write(&file_path, content).await.unwrap();
+
+        let store = MockStore::new();
+        let opts = PutOpts {
+            content_disposition: Some("attachment".into()),
+            user_metadata: vec![("key".into(), "val".into())],
+        };
+        store
+            .put_path("via-path", &file_path, opts.clone())
+            .await
+            .unwrap();
+        store
+            .put_bytes("via-bytes", body(content), opts)
+            .await
+            .unwrap();
+
+        let path_body = store.get_bytes("via-path").await.unwrap();
+        let bytes_body = store.get_bytes("via-bytes").await.unwrap();
+        assert_eq!(
+            path_body, bytes_body,
+            "put_path and put_bytes must produce identical bodies"
+        );
+
+        let path_meta = store.metadata("via-path").expect("via-path exists");
+        let bytes_meta = store.metadata("via-bytes").expect("via-bytes exists");
+        assert_eq!(
+            path_meta.content_disposition, bytes_meta.content_disposition,
+            "metadata must match"
+        );
+        assert_eq!(
+            path_meta.user_metadata, bytes_meta.user_metadata,
+            "user_metadata must match"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_path_missing_file_returns_error() {
+        let store = MockStore::new();
+        let err = store
+            .put_path(
+                "k",
+                Path::new("/tmp/nonexistent-abc123xyz"),
+                PutOpts::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Other(_)),
+            "expected Error::Other, got {err:?}"
+        );
     }
 
     #[test]

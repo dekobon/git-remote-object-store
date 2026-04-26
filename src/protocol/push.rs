@@ -603,10 +603,9 @@ async fn perform_push_under_lock(
         });
     }
 
-    let body = Bytes::from(tokio::fs::read(bundle_path).await?);
     let bundle_dest = bundle_key(prefix, remote_ref, local_sha);
     store
-        .put_bytes(&bundle_dest, body, PutOpts::default())
+        .put_path(&bundle_dest, bundle_path, PutOpts::default())
         .await?;
 
     // HEAD bootstrap: write only if absent. Single round-trip via
@@ -627,7 +626,6 @@ async fn perform_push_under_lock(
     }
 
     if let Some(artifacts) = zip_artifacts {
-        let archive_bytes = Bytes::from(tokio::fs::read(&artifacts.archive_path).await?);
         let opts = PutOpts {
             content_disposition: Some(format!(
                 "attachment; filename=repo-{}.zip",
@@ -639,7 +637,9 @@ async fn perform_push_under_lock(
             )],
         };
         let zip_dest = archive_key(prefix, remote_ref);
-        store.put_bytes(&zip_dest, archive_bytes, opts).await?;
+        store
+            .put_path(&zip_dest, &artifacts.archive_path, opts)
+            .await?;
     }
 
     Ok(PushOutcome::Ok {
