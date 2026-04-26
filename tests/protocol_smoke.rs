@@ -263,6 +263,20 @@ async fn option_verbosity_two_responds_ok() {
 }
 
 #[tokio::test]
+async fn option_verbosity_zero_responds_unsupported() {
+    // Explicit "off" — git probes with `option verbosity 0` to silence
+    // helpers; we have nothing to say so we must respond `unsupported`.
+    let (out, result) = drive(
+        s3_url(Some("repo")),
+        Arc::new(MockStore::new()),
+        "option verbosity 0\n",
+    )
+    .await;
+    result.expect("option should succeed");
+    assert_eq!(&out, b"unsupported\n");
+}
+
+#[tokio::test]
 async fn option_verbosity_one_responds_unsupported() {
     let (out, result) = drive(
         s3_url(Some("repo")),

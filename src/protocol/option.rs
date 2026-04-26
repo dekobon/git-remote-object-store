@@ -24,9 +24,11 @@ where
 {
     let response: &[u8] = match parse_option(args) {
         Some(OptionRequest::Verbosity(n)) if n >= 2 => {
-            // Best-effort flip: a reload failure (or an absent handle in
-            // tests) should not break the protocol — log and respond ok.
             if let Some(handle) = reload {
+                // Reload error is best-effort: if the subscriber's filter
+                // can't be flipped (e.g. it was poisoned), we still respond
+                // `ok` so git's protocol stream stays well-formed. Losing a
+                // verbosity bump is preferable to aborting the session.
                 let _ = tracing_init::raise_to_info(handle);
             }
             b"ok\n"

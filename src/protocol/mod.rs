@@ -141,12 +141,18 @@ where
 /// <url>` — see `git help gitremote-helpers`. We read the URL from
 /// `argv[2]`, matching the upstream Python helper exactly.
 pub async fn run_main() -> anyhow::Result<()> {
-    let remote_arg = std::env::args()
-        .nth(2)
-        .ok_or_else(|| anyhow!("missing remote URL: expected `<remote-name> <url>` on argv"))?;
-
-    let remote = url::parse(&remote_arg).context("failed to parse remote URL")?;
-    let reload = tracing_init::init().ok();
+    let remote = parse_remote_arg(std::env::args())?;
+    let reload = match tracing_init::init() {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            // Tracing failed to install (typically: another global subscriber
+            // already exists, e.g. in some test harnesses). The protocol can
+            // still run — we just lose runtime verbosity flips. Surface the
+            // diagnostic on stderr since `tracing` itself is not available.
+            eprintln!("warning: tracing subscriber install failed: {e}");
+            None
+        }
+    };
 
     #[cfg(unix)]
     install_sigpipe_mask();
@@ -166,6 +172,22 @@ pub async fn run_main() -> anyhow::Result<()> {
         }
         Err(other) => Err(other.into()),
     }
+}
+
+/// Extract and parse the remote URL from a process-argv-style iterator.
+///
+/// Split out from [`run_main`] so the argv contract (slot, error message)
+/// is testable without spawning a process or installing a global tracing
+/// subscriber.
+fn parse_remote_arg<I>(args: I) -> anyhow::Result<RemoteUrl>
+where
+    I: IntoIterator<Item = String>,
+{
+    let raw = args
+        .into_iter()
+        .nth(2)
+        .ok_or_else(|| anyhow!("missing remote URL: expected `<remote-name> <url>` on argv"))?;
+    url::parse(&raw).context("failed to parse remote URL")
 }
 
 fn is_broken_pipe(err: &std::io::Error) -> bool {
@@ -239,5 +261,40 @@ mod tests {
         assert!(is_broken_pipe(&write_zero));
         let other = std::io::Error::from(ErrorKind::Other);
         assert!(!is_broken_pipe(&other));
+    }
+
+    /// Build the argv that git actually passes: `argv[0]` is the binary
+    /// path, `argv[1]` is the remote name, `argv[2]` is the URL.
+    fn argv(extras: &[&str]) -> Vec<String> {
+        let mut v = vec!["git-remote-s3-https".to_owned(), "origin".to_owned()];
+        v.extend(extras.iter().map(|s| (*s).to_owned()));
+        v
+    }
+
+    #[test]
+    fn parse_remote_arg_reads_argv_slot_two() {
+        let url = "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo";
+        let remote = parse_remote_arg(argv(&[url])).expect("parse should succeed");
+        assert_eq!(remote.prefix(), Some("repo"));
+    }
+
+    #[test]
+    fn parse_remote_arg_errors_when_url_missing() {
+        let err = parse_remote_arg(argv(&[])).expect_err("argv[2] missing should error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("missing remote URL"),
+            "error should name the missing slot: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_remote_arg_errors_on_bad_url() {
+        let err = parse_remote_arg(argv(&["not a url"])).expect_err("invalid URL should error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to parse remote URL"),
+            "error should preserve context: {msg}"
+        );
     }
 }
