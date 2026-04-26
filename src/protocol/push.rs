@@ -318,8 +318,13 @@ pub(crate) async fn push_batch(
     let mut outcomes = Vec::with_capacity(cmds.len());
 
     for cmd in cmds {
+        // `parse_push_args` failures are catastrophic: a malformed `push`
+        // line means we cannot trust subsequent commands. Abort the batch.
         let spec = parse_push_args(&cmd)?;
-        let outcome = push_one(
+        // Capture the ref name before `push_one` consumes the spec so we
+        // can still render an `error <ref> ...` line if the call fails.
+        let remote_ref_str = spec.remote_ref.as_str().to_owned();
+        let outcome = match push_one(
             store.as_ref(),
             prefix.as_deref(),
             repo_dir.as_path(),
@@ -328,7 +333,30 @@ pub(crate) async fn push_batch(
             OffsetDateTime::now_utc(),
             spec,
         )
-        .await?;
+        .await
+        {
+            Ok(o) => o,
+            // Per-push operational failures (transport, local git, local I/O,
+            // malformed remote bundle SHA) become `error <ref>` lines so the
+            // batch can continue, mirroring upstream `cmd_push`'s try/except
+            // shape (`../git-remote-s3/git_remote_s3/remote.py:286-296`).
+            // Without this, a single 5xx blip in the middle of a multi-ref
+            // push would silently drop the outcome lines for already-completed
+            // pushes and leave git's local ref-tracking inconsistent with the
+            // remote.
+            Err(e)
+                if matches!(
+                    e,
+                    PushError::Store(_) | PushError::Git(_) | PushError::Io(_) | PushError::Sha(_)
+                ) =>
+            {
+                PushOutcome::Error {
+                    remote_ref: remote_ref_str,
+                    message: format!(r#""{e}"?"#),
+                }
+            }
+            Err(e) => return Err(e),
+        };
         outcomes.push(outcome);
     }
     Ok(outcomes)
@@ -517,7 +545,6 @@ async fn push_one(
         store,
         prefix,
         &remote_ref,
-        &remote_ref_str,
         local.local_sha,
         pre_existing,
         &bundle_path,
@@ -531,12 +558,10 @@ async fn push_one(
 /// Re-list under the lock, upload the bundle, init HEAD, delete the
 /// previous bundle, optionally upload `repo.zip`. Split out so the lock
 /// release in the caller is unconditional.
-#[allow(clippy::too_many_arguments)]
 async fn perform_push_under_lock(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
     remote_ref: &RefName,
-    remote_ref_str: &str,
     local_sha: Sha,
     pre_existing: Option<String>,
     bundle_path: &std::path::Path,
@@ -545,7 +570,7 @@ async fn perform_push_under_lock(
     let current = bundles_for_ref(store, prefix, remote_ref).await?;
     if current.len() > 1 {
         return Ok(PushOutcome::Error {
-            remote_ref: remote_ref_str.to_owned(),
+            remote_ref: remote_ref.as_str().to_owned(),
             message: r#""multiple bundles exists for the same ref on server. Run git-remote-object-store doctor to fix.""#.to_owned(),
         });
     }
@@ -554,7 +579,7 @@ async fn perform_push_under_lock(
         && prev != now_key
     {
         return Ok(PushOutcome::Error {
-            remote_ref: remote_ref_str.to_owned(),
+            remote_ref: remote_ref.as_str().to_owned(),
             message: r#""stale remote. Please fetch and retry."?"#.to_owned(),
         });
     }
@@ -599,13 +624,25 @@ async fn perform_push_under_lock(
     }
 
     Ok(PushOutcome::Ok {
-        remote_ref: remote_ref_str.to_owned(),
+        remote_ref: remote_ref.as_str().to_owned(),
     })
 }
 
 /// Handle a delete refspec (`:<remote_ref>`). Mirrors upstream
 /// `remove_remote_ref`: list `<prefix>/<ref>/`, expect 1 (or 2 with zip)
 /// keys, delete them all, emit `ok` or the appropriate error.
+///
+/// The listing is **unfiltered** on purpose — it counts `LOCK#.lock`,
+/// `PROTECTED#`, and `repo.zip` against the expected total. Two
+/// upstream behaviours fall out:
+///
+/// 1. A protected ref (`PROTECTED#` marker) cannot be deleted via
+///    `git push :ref`: the marker inflates the count past `expected`,
+///    triggering the multi-bundle error. Removing the marker first
+///    (via the management CLI's `unprotect`) is required.
+/// 2. A ref whose only object is a stale `LOCK#.lock` deletes that
+///    lock as if it were the bundle and returns `ok`. This matches
+///    upstream `remove_remote_ref` (`../git-remote-s3/git_remote_s3/remote.py:172-196`).
 async fn delete_remote_ref(
     store: &dyn ObjectStore,
     prefix: Option<&str>,

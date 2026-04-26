@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Push batches no longer abort on the first per-push transport, git, or
+  local-I/O failure. `push_batch` now catches `PushError::Store`, `Git`,
+  `Io`, and `Sha` per-push and converts them to `error <ref> "..."` outcome
+  lines so the batch continues, mirroring upstream `cmd_push`'s
+  try/except shape (`../git-remote-s3/git_remote_s3/remote.py:286-296`).
+  Without this, a single 5xx blip mid-batch would silently drop the
+  outcome lines for already-completed pushes and leave git's local
+  ref-tracking inconsistent with the remote. `PushError::Parse`,
+  `InvalidLocalSpec`, and `RemoteRef` still abort the batch — those mean
+  subsequent commands cannot be trusted.
+
 - `url::is_valid_bucket` now rejects the AWS-reserved bucket prefixes
   (`xn--`, `sthree-`, `amzn-s3-demo-`) and suffixes (`-s3alias`,
   `--ol-s3`, `.mrap`, `--x-s3`, `--table-s3`), enforces the
