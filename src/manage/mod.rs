@@ -48,8 +48,17 @@ pub enum ManageError {
     #[error("branch not found: {0}")]
     BranchNotFound(String),
 
-    /// User cancelled an interactive prompt (Ctrl+C / EOF / explicit
-    /// "no" on a destructive confirmation).
+    /// Branch name failed `gix-validate`'s strict ref-name check; we
+    /// reject these at the management boundary so a value like
+    /// `foo/../bar` cannot land as a literal substring of a stored
+    /// object key.
+    #[error("invalid branch name: {0}")]
+    InvalidBranch(String),
+
+    /// User cancelled an interactive prompt via Ctrl+C or EOF. A
+    /// deliberate "no" on a confirmation prompt is not an error —
+    /// callers (`delete_branch`, `fix_multiple_bundles`) print
+    /// "Aborted" and return `Ok(())`.
     #[error("operation cancelled")]
     Cancelled,
 

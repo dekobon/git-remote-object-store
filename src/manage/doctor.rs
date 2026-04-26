@@ -29,9 +29,9 @@ use time::OffsetDateTime;
 use tracing::info;
 use uuid::Uuid;
 
-use super::snapshot::{BundleEntry, RepoSnapshot, analyze};
+use super::snapshot::{BundleEntry, RepoSnapshot, analyze_objects};
 use super::{DEFAULT_LOCK_TTL_SECONDS, ManageError, Prompter};
-use crate::object_store::{ObjectStore, PutOpts};
+use crate::object_store::{ObjectMeta, ObjectStore, PutOpts};
 
 /// Tunables for [`Doctor::run`]. Field names match the equivalent
 /// upstream Python `argparse` flags.
@@ -91,8 +91,13 @@ impl<'a> Doctor<'a> {
     /// immediately (each `delete` / `copy` / `put` is its own request),
     /// matching upstream's "best-effort" stance.
     pub async fn run(&self) -> Result<(), ManageError> {
-        let mut snapshot = analyze(&self.store, &self.prefix).await?;
-        self.report(&snapshot);
+        // Share one LIST between snapshot analysis and stale-lock
+        // scanning so a doctor run is a single bucket walk regardless
+        // of repo size.
+        let list_prefix = format!("{}/", self.prefix);
+        let objects = self.store.list(&list_prefix).await?;
+        let mut snapshot = analyze_objects(&objects, &list_prefix, &self.store).await?;
+        print!("{}", self.report(&snapshot));
 
         // Fix duplicates ref-by-ref. We need owned ref-names because
         // `fix_multiple_bundles` mutates the snapshot under `&mut`.
@@ -110,12 +115,17 @@ impl<'a> Doctor<'a> {
             self.fix_head(&mut snapshot).await?;
         }
 
-        self.list_and_handle_stale_locks().await?;
+        self.list_and_handle_stale_locks(&objects).await?;
         Ok(())
     }
 
-    fn report(&self, snapshot: &RepoSnapshot) {
-        println!("{}:", self.prefix);
+    /// Render the snapshot to a human-readable report. Returns the
+    /// finished string (with trailing newline) so callers can route
+    /// it to stdout, a logger, or a test buffer.
+    fn report(&self, snapshot: &RepoSnapshot) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let _ = writeln!(out, "{}:", self.prefix);
         for (ref_path, r) in &snapshot.refs {
             let star = if r.is_protected { "*" } else { "" };
             let status = match r.bundles.len() {
@@ -123,14 +133,15 @@ impl<'a> Doctor<'a> {
                 1 => "Ok",
                 _ => "Multiple bundles",
             };
-            println!(" {star} {ref_path}: {status}");
+            let _ = writeln!(out, " {star} {ref_path}: {status}");
         }
         let head_label = snapshot
             .head
             .as_deref()
             .filter(|h| snapshot.refs.contains_key(*h))
             .unwrap_or("Invalid");
-        println!("  HEAD: {head_label}");
+        let _ = writeln!(out, "  HEAD: {head_label}");
+        out
     }
 
     async fn fix_multiple_bundles(
@@ -170,8 +181,11 @@ impl<'a> Doctor<'a> {
             .clone();
 
         if !self.prompter.confirm("Confirm and apply changes")? {
+            // Match `delete_branch`: an interactive "no" is the user
+            // declining this fix, not an abort of the whole run. Doctor
+            // continues to the next ref / stale-lock scan with exit 0.
             println!("Aborted");
-            return Err(ManageError::Cancelled);
+            return Ok(());
         }
 
         println!("Keeping {keeper_sha}");
@@ -253,19 +267,17 @@ impl<'a> Doctor<'a> {
         Ok(())
     }
 
-    async fn list_and_handle_stale_locks(&self) -> Result<(), ManageError> {
+    async fn list_and_handle_stale_locks(&self, objects: &[ObjectMeta]) -> Result<(), ManageError> {
         println!("\nScanning for stale locks...");
-        let prefix = format!("{}/", self.prefix);
-        let objects = self.store.list(&prefix).await?;
         let now = OffsetDateTime::now_utc();
         let ttl = Duration::from_secs(self.opts.lock_ttl_seconds);
 
-        let stale: Vec<(String, Duration)> = objects
-            .into_iter()
+        let stale: Vec<(&str, Duration)> = objects
+            .iter()
             .filter(|o| super::is_lock_key(&o.key))
             .filter_map(|o| {
                 let elapsed = Duration::try_from(now - o.last_modified).ok()?;
-                (elapsed > ttl).then_some((o.key, elapsed))
+                (elapsed > ttl).then_some((o.key.as_str(), elapsed))
             })
             .collect();
 
@@ -401,8 +413,10 @@ mod tests {
         mock.insert("myrepo/refs/heads/main/bbb.bundle", Bytes::from("b"));
         let prompter = ScriptedPrompter::new([Answer::Select(0), Answer::Confirm(false)]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
-        let err = doctor.run().await.expect_err("aborted should propagate");
-        assert!(matches!(err, ManageError::Cancelled));
+        // User-no on the confirmation declines this fix but is not an
+        // abort of the whole run — the doctor continues to scan stale
+        // locks and exits 0. Both bundles must remain untouched.
+        doctor.run().await.expect("user-no should not error");
         assert!(mock.contains("myrepo/refs/heads/main/aaa.bundle"));
         assert!(mock.contains("myrepo/refs/heads/main/bbb.bundle"));
     }
@@ -481,5 +495,62 @@ mod tests {
         let doctor = Doctor::new(store_arc(&mock), "myrepo", opts, &prompter);
         doctor.run().await.expect("doctor.run");
         assert!(mock.contains("myrepo/refs/heads/main/LOCK#.lock"));
+    }
+
+    #[tokio::test]
+    async fn report_renders_protected_multi_bundle_and_invalid_head() {
+        // Build a snapshot covering every report-line shape: a
+        // protected ref with one bundle, a duplicate-bundle ref, an
+        // empty ref, plus a HEAD body that does not match any ref so
+        // the trailing label reads `Invalid`.
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/missing"));
+        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert("myrepo/refs/heads/main/PROTECTED#", Bytes::new());
+        mock.insert("myrepo/refs/heads/dev/aaa.bundle", Bytes::from("a"));
+        mock.insert("myrepo/refs/heads/dev/bbb.bundle", Bytes::from("a"));
+        mock.insert("myrepo/refs/heads/empty/PROTECTED#", Bytes::new());
+
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let snapshot = super::analyze_objects(
+            &mock.list("myrepo/").await.expect("list"),
+            "myrepo/",
+            &store_arc(&mock),
+        )
+        .await
+        .expect("analyze");
+
+        let report = doctor.report(&snapshot);
+        assert_eq!(
+            report,
+            "myrepo:\n  \
+             refs/heads/dev: Multiple bundles\n \
+             * refs/heads/empty: No bundles\n \
+             * refs/heads/main: Ok\n  \
+             HEAD: Invalid\n",
+        );
+    }
+
+    #[tokio::test]
+    async fn report_renders_valid_head_as_ref_label() {
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let snapshot = super::analyze_objects(
+            &mock.list("myrepo/").await.expect("list"),
+            "myrepo/",
+            &store_arc(&mock),
+        )
+        .await
+        .expect("analyze");
+
+        let report = doctor.report(&snapshot);
+        assert_eq!(
+            report,
+            "myrepo:\n  refs/heads/main: Ok\n  HEAD: refs/heads/main\n",
+        );
     }
 }

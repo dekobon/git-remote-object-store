@@ -70,16 +70,30 @@ impl RepoSnapshot {
 /// `prefix` must be the full repository prefix from the parsed remote
 /// URL (e.g. `acme/myrepo`), without a trailing `/` — this function
 /// appends one to match the upstream listing semantics.
+///
+/// Performs one `list` call. Callers that already have a listing of
+/// `<prefix>/` should call [`analyze_objects`] instead to avoid a
+/// second LIST round-trip.
 pub async fn analyze(
     store: &Arc<dyn ObjectStore>,
     prefix: &str,
 ) -> Result<RepoSnapshot, ManageError> {
     let list_prefix = format!("{prefix}/");
     let objects = store.list(&list_prefix).await?;
+    analyze_objects(&objects, &list_prefix, store).await
+}
 
+/// Group an already-fetched `<list_prefix>` listing into a
+/// [`RepoSnapshot`]. Used by [`analyze`] and by `Doctor::run` to share
+/// a single LIST across analysis and stale-lock scanning.
+pub async fn analyze_objects(
+    objects: &[ObjectMeta],
+    list_prefix: &str,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<RepoSnapshot, ManageError> {
     let mut snapshot = RepoSnapshot::default();
     for object in objects {
-        classify_into(&list_prefix, &object, &mut snapshot, store).await?;
+        classify_into(list_prefix, object, &mut snapshot, store).await?;
     }
     Ok(snapshot)
 }
