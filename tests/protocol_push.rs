@@ -705,79 +705,59 @@ async fn lock_release_failure_overrides_successful_push() {
 
 #[tokio::test]
 async fn lock_release_failure_does_not_mask_push_error() {
-    // When the push itself returns a PushOutcome::Error (not Ok) AND
-    // the lock release also fails, the push error must be surfaced —
+    // When perform_push_under_lock returns PushOutcome::Error (not Ok)
+    // AND the lock release also fails, the push error must be surfaced —
     // the release failure must not override it.
     //
-    // The "not ancestor" rejection fires from local_git_work, which
-    // runs before lock acquisition. Since release_lock is never
-    // called, we verify the important contract: the push's own error
-    // message reaches the wire unchanged when the push is rejected
-    // before locking.
+    // Trigger the "multiple bundles" error inside perform_push_under_lock
+    // by seeding two bundles for the same ref, then arm a NetworkOnDelete
+    // fault for the lock key. This exercises the `_ => result` match arm
+    // in push_one that preserves the original push error.
     use git_remote_object_store::object_store::mock::Fault;
     if !git_available() {
         eprintln!("skipping: git not on PATH");
         return;
     }
-    let (seed, shas) = make_seed_repo(2, "primary");
-    let ancestor_sha = &shas[0];
-
+    let (seed, _shas) = make_seed_repo(1, "primary");
     let store = Arc::new(MockStore::new());
-    // Pre-existing remote bundle for the ancestor commit.
-    store.insert(
-        format!("repo/refs/heads/main/{ancestor_sha}.bundle"),
-        Bytes::from_static(b"old"),
-    );
 
-    // Arm a lock-release fault. The "stale remote" check inside
-    // perform_push_under_lock fires because we mutate the
-    // pre-existing key between the pre-lock listing and the
-    // under-lock re-listing. The trick: replace the bundle with a
-    // different SHA between the two list calls. We cannot do that
-    // with the mock, so instead we set up a scenario where the
-    // push succeeds inside the lock but then release fails. However,
-    // the match arm only overrides Ok(PushOutcome::Ok). If the push
-    // outcome is Error, the release failure is irrelevant.
-    //
-    // To exercise the post-lock path: push the SECOND commit (which
-    // is a descendant of the first), so the push succeeds normally.
-    // Then arm a delete fault so release fails. The push outcome
-    // should be overridden to Error. This is already tested by
-    // lock_release_failure_overrides_successful_push above.
-    //
-    // For THIS test: verify that a pre-lock PushOutcome::Error
-    // (non-ancestor rejection) surfaces to the wire even when a
-    // delete fault is armed (the fault never fires because the
-    // lock is never acquired).
-    let (other_seed, other_shas) = make_seed_repo(1, "alt");
-    let unrelated_sha = &other_shas[0];
-    drop(other_seed);
+    // Seed two bundles for the same ref — perform_push_under_lock's
+    // re-listing will find >1 bundle and return PushOutcome::Error
+    // ("multiple bundles exists for the same ref on server").
+    store.insert("repo/refs/heads/main/aaaa.bundle", Bytes::from_static(b"a"));
+    store.insert("repo/refs/heads/main/bbbb.bundle", Bytes::from_static(b"b"));
 
-    let store2 = Arc::new(MockStore::new());
-    store2.insert(
-        format!("repo/refs/heads/main/{unrelated_sha}.bundle"),
-        Bytes::from_static(b"x"),
-    );
+    // Also arm a delete fault on the lock key. After
+    // perform_push_under_lock returns the multi-bundle error,
+    // release_lock will fire this fault and also fail. The match in
+    // push_one must preserve the push error, not replace it.
     let lock_key = "repo/refs/heads/main/LOCK#.lock";
-    store2.arm(Fault::NetworkOnDelete {
+    store.arm(Fault::NetworkOnDelete {
         key: lock_key.into(),
     });
 
     let (out, result) = drive_in(
         s3_url(Some("repo"), false),
-        Arc::clone(&store2) as Arc<dyn ObjectStore>,
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
         "push refs/heads/main:refs/heads/main\n\n",
         seed.path().to_path_buf(),
     )
     .await;
-    result.expect("push should produce a refusal, not abort");
+    result.expect("push should produce an error outcome, not abort");
 
     let text = std::str::from_utf8(&out).unwrap();
+    // The multi-bundle error from perform_push_under_lock must surface,
+    // NOT the release_lock failure.
     assert!(
-        text.contains("not ancestor"),
-        "push error must surface unchanged: {text:?}",
+        text.contains("multiple bundles"),
+        "push error must surface the multi-bundle message, not the lock release failure: {text:?}",
     );
-    // Fault was never consumed — the push returned before lock
-    // acquisition, so release_lock was never called.
-    assert_eq!(store2.pending_faults(), 1);
+    assert!(
+        !text.contains("failed to release lock"),
+        "release_lock failure must not override the push error: {text:?}",
+    );
+    // The delete fault was consumed — release_lock was actually called.
+    assert_eq!(store.pending_faults(), 0);
+    // The lock remains because the delete was faulted.
+    assert!(store.contains(lock_key));
 }
