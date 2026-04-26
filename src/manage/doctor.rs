@@ -116,22 +116,20 @@ impl<'a> Doctor<'a> {
 
     fn report(&self, snapshot: &RepoSnapshot) {
         println!("{}:", self.prefix);
-        let head = snapshot.head.as_deref();
-        let mut head_label = "Invalid";
         for (ref_path, r) in &snapshot.refs {
-            if head == Some(ref_path.as_str()) {
-                head_label = ref_path.as_str();
-            }
             let star = if r.is_protected { "*" } else { "" };
-            let status = if r.bundles.len() == 1 {
-                "Ok"
-            } else if r.bundles.is_empty() {
-                "No bundles"
-            } else {
-                "Multiple bundles"
+            let status = match r.bundles.len() {
+                0 => "No bundles",
+                1 => "Ok",
+                _ => "Multiple bundles",
             };
             println!(" {star} {ref_path}: {status}");
         }
+        let head_label = snapshot
+            .head
+            .as_deref()
+            .filter(|h| snapshot.refs.contains_key(*h))
+            .unwrap_or("Invalid");
         println!("  HEAD: {head_label}");
     }
 
@@ -145,51 +143,49 @@ impl<'a> Doctor<'a> {
             self.prefix
         );
 
-        // Take ownership of the bundles vec so we can mutate the
-        // snapshot for the rest of the run after deciding the keeper.
-        let bundles = std::mem::take(
-            &mut snapshot
-                .refs
-                .get_mut(ref_path)
-                .expect("ref present per caller's filter")
-                .bundles,
-        );
-        let labels: Vec<String> = bundles
+        // The caller filtered for refs with `bundles.len() > 1`; if the
+        // map shape changed in between, that's a programming error worth
+        // surfacing rather than papering over.
+        let ref_entry = snapshot
+            .refs
+            .get_mut(ref_path)
+            .expect("fix_multiple_bundles called with ref absent from snapshot");
+
+        let labels: Vec<String> = ref_entry
+            .bundles
             .iter()
             .map(|b| format!("{} {}", b.sha, b.last_modified))
             .collect();
 
         let keep_idx = self.prompter.select("Choose the bundle to keep", &labels)?;
-        if keep_idx >= bundles.len() {
-            return Err(ManageError::Cancelled);
-        }
+        // `dialoguer::Select` validates the index against the option count
+        // before returning, so out-of-range here means a test prompter
+        // queued an invalid script — surface loudly instead of silently
+        // mapping to `Cancelled`.
+        let keeper_sha = ref_entry
+            .bundles
+            .get(keep_idx)
+            .expect("Prompter::select returned out-of-range index")
+            .sha
+            .clone();
+
         if !self.prompter.confirm("Confirm and apply changes")? {
-            // Restore so a follow-up `doctor` run still sees the duplicates.
-            snapshot
-                .refs
-                .get_mut(ref_path)
-                .expect("ref present")
-                .bundles = bundles;
             println!("Aborted");
             return Err(ManageError::Cancelled);
         }
 
-        let keeper = &bundles[keep_idx];
-        println!("Keeping {}", keeper.sha);
-        for (idx, losing) in bundles.iter().enumerate() {
-            if idx == keep_idx {
-                continue;
-            }
+        println!("Keeping {keeper_sha}");
+        // Partition into (keep, evict). The snapshot is updated in place
+        // so subsequent steps (HEAD validation in particular) see the
+        // resolved layout.
+        let bundles = std::mem::take(&mut ref_entry.bundles);
+        let (keepers, losers): (Vec<_>, Vec<_>) =
+            bundles.into_iter().partition(|b| b.sha == keeper_sha);
+        ref_entry.bundles = keepers;
+
+        for losing in &losers {
             self.evict_losing_bundle(ref_path, losing).await?;
         }
-
-        // Reflect the resolved state in the snapshot so subsequent
-        // steps (HEAD validation in particular) see the new layout.
-        snapshot
-            .refs
-            .get_mut(ref_path)
-            .expect("ref present")
-            .bundles = vec![keeper.clone()];
         Ok(())
     }
 
@@ -215,11 +211,11 @@ impl<'a> Doctor<'a> {
     async fn fix_head(&self, snapshot: &mut RepoSnapshot) -> Result<(), ManageError> {
         println!("\nFix invalid HEAD for repo {}", self.prefix);
 
-        let candidates: Vec<String> = snapshot
+        let candidates: Vec<&str> = snapshot
             .refs
             .keys()
             .filter(|k| k.starts_with("refs/heads/"))
-            .cloned()
+            .map(String::as_str)
             .collect();
         if candidates.is_empty() {
             println!("No `refs/heads/*` available to assign as HEAD; skipping.");
@@ -233,10 +229,13 @@ impl<'a> Doctor<'a> {
         let chosen = self
             .prompter
             .select("Choose the new HEAD branch", &labels)?;
-        let new_head = candidates
+        // `dialoguer::Select` cannot return an out-of-range index; an
+        // out-of-range answer here is a test-script bug (see
+        // `fix_multiple_bundles`).
+        let new_head = (*candidates
             .get(chosen)
-            .ok_or(ManageError::Cancelled)?
-            .clone();
+            .expect("Prompter::select returned out-of-range index"))
+        .to_owned();
 
         let head_key = format!("{}/HEAD", self.prefix);
         println!("Setting {new_head} as HEAD");
@@ -302,8 +301,9 @@ impl<'a> Doctor<'a> {
     }
 }
 
-/// Drop the `refs/heads/` prefix when rendering a branch name to the
-/// user. Falls back to the full ref path if the prefix is absent.
+/// Last `/`-separated segment of a ref path, used as the human label in
+/// `fix_head`'s branch picker. Returns the full path if it has no
+/// slashes (e.g. a single-component ref).
 fn short_branch_name(full: &str) -> &str {
     full.rsplit('/').next().unwrap_or(full)
 }

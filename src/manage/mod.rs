@@ -34,12 +34,6 @@ pub enum ManageError {
     #[error(transparent)]
     Store(#[from] ObjectStoreError),
 
-    /// The remote URL did not include a repository prefix; every key
-    /// constructed by the management CLI is anchored under `<prefix>/`,
-    /// so the prefix is mandatory.
-    #[error("remote URL is missing the repository prefix")]
-    MissingPrefix,
-
     /// `delete-branch` / `protect` / `unprotect` was invoked against a
     /// branch that has no objects under `<prefix>/refs/heads/<branch>/`.
     #[error("branch not found: {0}")]

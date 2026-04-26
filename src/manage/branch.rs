@@ -40,7 +40,7 @@ impl<'a> ManageBranch<'a> {
             branch: branch.into(),
             prompter,
         };
-        if mb.list_branch().await?.is_empty() {
+        if mb.store.list(&mb.branch_prefix()).await?.is_empty() {
             return Err(ManageError::BranchNotFound(mb.branch));
         }
         Ok(mb)
@@ -54,26 +54,22 @@ impl<'a> ManageBranch<'a> {
         format!("{}/refs/heads/{}/PROTECTED#", self.prefix, self.branch)
     }
 
-    async fn list_branch(&self) -> Result<Vec<String>, ManageError> {
-        let objs = self.store.list(&self.branch_prefix()).await?;
-        Ok(objs.into_iter().map(|o| o.key).collect())
-    }
-
     /// Delete every object under the branch's prefix after a `yes/no`
     /// confirmation. Aborts (returns `Ok(())`) if the user answers no;
     /// the `Cancelled` variant is reserved for prompt I/O failures.
     pub async fn delete_branch(&self) -> Result<(), ManageError> {
-        let keys = self.list_branch().await?;
-        let prompt = format!("Delete branch {} ({} objects)?", self.branch, keys.len());
+        let objects = self.store.list(&self.branch_prefix()).await?;
+        let prompt = format!("Delete branch {} ({} objects)?", self.branch, objects.len());
         if !self.prompter.confirm(&prompt)? {
             println!("Aborted");
             return Ok(());
         }
-        for key in &keys {
-            self.store.delete(key).await?;
+        let count = objects.len();
+        for object in &objects {
+            self.store.delete(&object.key).await?;
         }
         println!("Branch {} has been deleted", self.branch);
-        info!(branch = %self.branch, count = keys.len(), "branch deleted");
+        info!(branch = %self.branch, count, "branch deleted");
         Ok(())
     }
 
