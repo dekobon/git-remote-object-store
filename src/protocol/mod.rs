@@ -31,6 +31,7 @@ pub mod tracing_init;
 
 use self::fetch::{FetchedRefs, fetch_batch};
 use self::option::handle_option;
+use self::push::push_batch;
 use self::tracing_init::ReloadHandle;
 
 /// Errors surfaced by the REPL loop.
@@ -48,9 +49,9 @@ pub enum ProtocolError {
     #[error("fetch failed: {0}")]
     Fetch(#[from] fetch::FetchError),
 
-    /// `push` is a Phase 8 deliverable.
-    #[error(transparent)]
-    Push(#[from] push::PushNotImplemented),
+    /// `push` batch failed.
+    #[error("push failed: {0}")]
+    Push(#[from] push::PushError),
 
     /// An input line did not match any recognised command.
     #[error("invalid command: {0:?}")]
@@ -70,11 +71,14 @@ enum Command {
 
 /// Which batched command stream is currently being collected.
 ///
-/// Phase 7 only accumulates `fetch` lines into a batch. Phase 8 will
-/// add a `Push` variant alongside.
+/// Push and fetch are mutually exclusive within a batch — switching
+/// between them resets the accumulator (matches upstream's
+/// `process_cmd` mode flip in
+/// `../git-remote-s3/git_remote_s3/remote.py:498-536`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Fetch,
+    Push,
 }
 
 fn parse_command(line: &str) -> Option<Command> {
@@ -127,6 +131,8 @@ where
     let fetched_refs = FetchedRefs::new();
     let mut mode: Option<Mode> = None;
     let mut fetch_cmds: Vec<String> = Vec::new();
+    let mut push_cmds: Vec<String> = Vec::new();
+    let zip = remote.flags().zip;
 
     while let Some(line) = lines.next_line().await? {
         debug!(cmd = %line, "received protocol command");
@@ -147,11 +153,19 @@ where
             Command::Fetch(args) => {
                 if mode != Some(Mode::Fetch) {
                     fetch_cmds.clear();
+                    push_cmds.clear();
                     mode = Some(Mode::Fetch);
                 }
                 fetch_cmds.push(args);
             }
-            Command::Push(_) => return Err(push::PushNotImplemented.into()),
+            Command::Push(args) => {
+                if mode != Some(Mode::Push) {
+                    push_cmds.clear();
+                    fetch_cmds.clear();
+                    mode = Some(Mode::Push);
+                }
+                push_cmds.push(args);
+            }
             Command::Empty => {
                 if mode == Some(Mode::Fetch) && !fetch_cmds.is_empty() {
                     let drained = std::mem::take(&mut fetch_cmds);
@@ -163,6 +177,22 @@ where
                         fetched_refs.clone(),
                     )
                     .await?;
+                    mode = None;
+                } else if mode == Some(Mode::Push) && !push_cmds.is_empty() {
+                    let drained = std::mem::take(&mut push_cmds);
+                    let outcomes = push_batch(
+                        Arc::clone(&store),
+                        remote.prefix().map(str::to_owned),
+                        Arc::clone(&repo_dir),
+                        zip,
+                        drained,
+                    )
+                    .await?;
+                    for outcome in &outcomes {
+                        writer
+                            .write_all(outcome.as_protocol_line().as_bytes())
+                            .await?;
+                    }
                     mode = None;
                 }
                 writer.write_all(b"\n").await?;

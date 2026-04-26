@@ -213,6 +213,15 @@ pub enum GitError {
     /// `find_remote()` failed.
     #[error(transparent)]
     FindRemote(Box<gix::remote::find::existing::Error>),
+    /// `gix::open()` failed.
+    #[error(transparent)]
+    Open(Box<gix::open::Error>),
+}
+
+impl From<gix::open::Error> for GitError {
+    fn from(e: gix::open::Error) -> Self {
+        GitError::Open(Box::new(e))
+    }
 }
 
 impl From<gix::repository::merge_base::Error> for GitError {
@@ -293,8 +302,14 @@ fn repo_cwd(repo: &Repository) -> &Path {
     repo.workdir().unwrap_or_else(|| repo.git_dir())
 }
 
-/// Write a git bundle for `ref_name` to `<folder>/<sha>.bundle` and
-/// return the absolute path.
+/// Write a git bundle for `spec` to `<folder>/<sha>.bundle` and return
+/// the absolute path.
+///
+/// `spec` is a rev-spec passed verbatim to `git bundle create` — a
+/// fully-qualified ref (`refs/heads/main`), a short branch (`main`),
+/// `HEAD`, or even a SHA. Callers should run [`validate_ref_name`] on
+/// untrusted input first; git itself enforces the same invariants and
+/// will fail the subprocess otherwise.
 ///
 /// Falls back to `git bundle create` because `gix` 0.82 has no public
 /// bundle writer (see `docs/development/spike-gix-bundle-parity.md`).
@@ -310,22 +325,35 @@ pub async fn bundle(
     repo: &Repository,
     folder: &Path,
     sha: Sha,
-    ref_name: &RefName,
+    spec: &str,
 ) -> Result<PathBuf, GitError> {
-    let folder = folder.canonicalize()?;
-    let bundle_path = folder.join(format!("{sha}.bundle"));
-    let ref_arg = OsStr::new(ref_name.as_str());
     // `&Repository` is !Send (Repository is Send but !Sync), so we must
     // not hold a `&Path` borrowed from `repo` across the .await. Detach
     // to an owned PathBuf before suspension.
     let cwd = repo_cwd(repo).to_owned();
+    bundle_at(&cwd, folder, sha, spec).await
+}
+
+/// Path-only variant of [`bundle`] for callers that cannot hold a
+/// `&Repository` across `.await` (the protocol push handler shares
+/// state across tokio tasks; `gix::Repository` is `!Sync`, so its
+/// future would not be `Send`).
+pub async fn bundle_at(
+    cwd: &Path,
+    folder: &Path,
+    sha: Sha,
+    spec: &str,
+) -> Result<PathBuf, GitError> {
+    let folder = folder.canonicalize()?;
+    let bundle_path = folder.join(format!("{sha}.bundle"));
+    let ref_arg = OsStr::new(spec);
     let args: [&OsStr; 4] = [
         OsStr::new("bundle"),
         OsStr::new("create"),
         bundle_path.as_os_str(),
         ref_arg,
     ];
-    run_git("bundle create", &args, &cwd).await?;
+    run_git("bundle create", &args, cwd).await?;
     Ok(bundle_path)
 }
 
@@ -397,14 +425,15 @@ pub fn is_ancestor(repo: &Repository, ancestor: Sha, descendant: Sha) -> Result<
     }
 }
 
-/// Write a zip archive of the tree at `ref_name` to `<folder>/repo.zip`
-/// and return the path.
+/// Write a zip archive of the tree at `spec` to `<folder>/repo.zip` and
+/// return the path.
 ///
-/// Uses `gix-archive`'s native zip writer via
+/// `spec` is any rev-spec gix can resolve — fully-qualified ref, short
+/// branch, tag, or SHA. Uses `gix-archive`'s native zip writer via
 /// [`Repository::worktree_archive`]; no subprocess.
-pub fn archive(repo: &Repository, folder: &Path, ref_name: &RefName) -> Result<PathBuf, GitError> {
+pub fn archive(repo: &Repository, folder: &Path, spec: &str) -> Result<PathBuf, GitError> {
     let tree = repo
-        .rev_parse_single(BStr::new(ref_name.as_str()))?
+        .rev_parse_single(BStr::new(spec))?
         .object()?
         .peel_to_kind(gix::object::Kind::Tree)?;
     let (stream, _index) = repo.worktree_stream(tree.id)?;
@@ -699,9 +728,8 @@ mod tests {
     fn archive_writes_repo_zip_with_pk_header() {
         let (repo, dir) = empty_repo();
         add_commit(&repo, "refs/heads/main", &[], "first");
-        let ref_name = RefName::new("refs/heads/main").expect("RefName");
         let out_dir = TempDir::new().expect("tempdir");
-        let zip_path = archive(&repo, out_dir.path(), &ref_name).expect("archive");
+        let zip_path = archive(&repo, out_dir.path(), "refs/heads/main").expect("archive");
         assert_eq!(zip_path, out_dir.path().join("repo.zip"));
         let bytes = std::fs::read(&zip_path).expect("read zip");
         assert_eq!(&bytes[..4], b"PK\x03\x04", "zip local-file-header missing");
@@ -731,9 +759,8 @@ mod tests {
             "create tag",
         )
         .expect("create tag ref");
-        let ref_name = RefName::new("refs/tags/v1").expect("RefName");
         let out_dir = TempDir::new().expect("tempdir");
-        let zip_path = archive(&repo, out_dir.path(), &ref_name).expect("archive tag");
+        let zip_path = archive(&repo, out_dir.path(), "refs/tags/v1").expect("archive tag");
         let bytes = std::fs::read(&zip_path).expect("read zip");
         assert_eq!(&bytes[..4], b"PK\x03\x04");
     }
@@ -818,7 +845,7 @@ mod tests {
         let ref_name = RefName::new("refs/heads/main").expect("RefName");
 
         let bundles = TempDir::new().expect("tempdir");
-        let bundle_path = bundle(&src_repo, bundles.path(), sha, &ref_name)
+        let bundle_path = bundle(&src_repo, bundles.path(), sha, ref_name.as_str())
             .await
             .expect("bundle");
         assert!(bundle_path.exists(), "bundle not written");
