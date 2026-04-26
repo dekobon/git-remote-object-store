@@ -146,8 +146,13 @@ fn make_dst_repo() -> TempDir {
 }
 
 #[tokio::test]
-async fn empty_fetch_batch_then_blank_line_emits_terminator() {
-    // No fetch commands ever sent — bare blank line, in idle mode.
+async fn idle_blank_line_with_fetch_wiring_emits_terminator() {
+    // Smoke coverage: confirm the new `repo_dir` parameter and FetchedRefs
+    // session state added in Phase 7 do not perturb the idle blank-line
+    // path. No fetch commands are sent — `mode` stays `None`, so the
+    // fetch batch flush in mod.rs is bypassed entirely. The internal
+    // empty-cmds short-circuit in `fetch_batch` is covered separately by
+    // the unit test in `src/protocol/fetch.rs`.
     let dst = make_dst_repo();
     let (out, result) = drive_in(
         s3_url(Some("repo")),
@@ -329,6 +334,8 @@ async fn fetch_missing_bundle_propagates_error() {
 
 #[tokio::test]
 async fn fetch_invalid_sha_returns_error() {
+    use git_remote_object_store::protocol::fetch::FetchError;
+
     let dst = make_dst_repo();
     let script = "fetch notahex refs/heads/main\n\n";
     let (_out, result) = drive_in(
@@ -338,14 +345,19 @@ async fn fetch_invalid_sha_returns_error() {
         dst.path().to_path_buf(),
     )
     .await;
+    // Pin the specific inner variant — a regression that misroutes a
+    // parse failure into Store / Parse / Ref must fail this assertion.
     match result {
-        Err(ProtocolError::Fetch(_)) => {}
-        other => panic!("expected Fetch error, got {other:?}"),
+        Err(ProtocolError::Fetch(FetchError::Sha(_))) => {}
+        other => panic!("expected Fetch(Sha) error, got {other:?}"),
     }
 }
 
 #[tokio::test]
 async fn fetched_refs_dedupes_across_batches() {
+    use git_remote_object_store::protocol::run;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+
     if !git_available() {
         eprintln!("skipping: git not on PATH");
         return;
@@ -353,24 +365,91 @@ async fn fetched_refs_dedupes_across_batches() {
     let (seed, sha) = make_seed_repo();
     let bundle = bundle_ref(seed.path(), &sha, "refs/heads/main");
 
-    let store = MockStore::new();
-    store.insert(format!("repo/refs/heads/main/{sha}.bundle"), bundle);
-    let store: Arc<dyn ObjectStore> = Arc::new(store);
+    let store = Arc::new(MockStore::new());
+    let key = format!("repo/refs/heads/main/{sha}.bundle");
+    store.insert(&key, bundle);
 
     let dst = make_dst_repo();
+    let remote = s3_url(Some("repo"));
+    let dst_path = dst.path().to_path_buf();
 
-    // Two consecutive fetch batches for the same SHA. After the first
-    // batch's unbundle the SHA is in fetched_refs; the second batch's
-    // task must short-circuit before download — even if the bundle were
-    // gone from the store, the second batch should still succeed.
-    let script = format!("fetch {sha} refs/heads/main\n\nfetch {sha} refs/heads/main\n\n",);
-    let (out, result) = drive_in(
-        s3_url(Some("repo")),
-        Arc::clone(&store),
-        &script,
-        dst.path().to_path_buf(),
+    // Drive the helper in stages within ONE `run()` call so both batches
+    // share the same session-wide `FetchedRefs`. After batch 1 succeeds,
+    // delete the bundle from the store. If dedup were broken, batch 2
+    // would re-download the missing key and surface NotFound; the test
+    // would then fail. Passing therefore proves the SHA was served from
+    // `FetchedRefs`, not from a duplicate store call.
+    let (client_side, helper_side) = tokio::io::duplex(64 * 1024);
+    let (helper_in, helper_out) = tokio::io::split(helper_side);
+    let (mut client_reader, mut client_writer) = tokio::io::split(client_side);
+
+    let store_for_run: Arc<dyn ObjectStore> = Arc::clone(&store) as _;
+    let run_task = tokio::spawn(async move {
+        run(
+            remote,
+            store_for_run,
+            BufReader::new(helper_in),
+            helper_out,
+            None,
+            dst_path,
+        )
+        .await
+    });
+
+    // Batch 1.
+    client_writer
+        .write_all(format!("fetch {sha} refs/heads/main\n\n").as_bytes())
+        .await
+        .unwrap();
+    let mut buf = [0u8; 1];
+    client_reader.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"\n", "batch 1 should emit the terminator");
+
+    // Drop the bundle so any re-fetch will fail.
+    store
+        .delete(&key)
+        .await
+        .expect("bundle must be present from setup");
+
+    // Batch 2 — must short-circuit via `FetchedRefs`. If dedup is
+    // broken the helper hits the (now-deleted) bundle key, returns
+    // `FetchError::Store(NotFound)`, drops `helper_out`, and the
+    // `read_exact` below sees EOF before any byte arrives. We wrap the
+    // read in a short timeout so the failure mode is explicit (named
+    // dedup regression, with the helper's actual error variant) rather
+    // than a generic EOF panic that hides which invariant broke.
+    client_writer
+        .write_all(format!("fetch {sha} refs/heads/main\n\n").as_bytes())
+        .await
+        .unwrap();
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client_reader.read_exact(&mut buf),
     )
-    .await;
-    result.expect("repeated batches should succeed");
-    assert_eq!(&out, b"\n\n", "two fetch batches → two terminators");
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(read_err)) => {
+            // Helper aborted before writing batch 2's terminator. Drain
+            // `run_task` so the panic message names the underlying
+            // FetchError variant (typically `Store(NotFound)`).
+            client_writer.shutdown().await.ok();
+            let run_outcome = run_task.await;
+            panic!(
+                "batch 2 emitted no terminator (read error: {read_err}); run() outcome: \
+                 {run_outcome:?} — dedup likely broken: helper attempted a forbidden re-fetch \
+                 of the deleted bundle"
+            );
+        }
+        Err(elapsed) => {
+            panic!("batch 2 read timed out after {elapsed} — helper appears stuck")
+        }
+    }
+    assert_eq!(&buf, b"\n", "batch 2 should emit the terminator");
+
+    // Close stdin so `run()` returns.
+    client_writer.shutdown().await.unwrap();
+    let result = run_task.await.unwrap();
+    result
+        .expect("second batch must short-circuit via fetched_refs even though the bundle is gone");
 }

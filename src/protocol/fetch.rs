@@ -159,17 +159,17 @@ pub(crate) async fn fetch_batch(
     // leave the rest running into a closing helper. First error wins.
     let mut first_err: Option<FetchError> = None;
     while let Some(joined) = tasks.join_next().await {
-        let res = joined.map_err(FetchError::from).and_then(|inner| inner);
+        // `joined` is `Result<Result<(), FetchError>, JoinError>` — flatten
+        // by promoting a join error (panic / cancellation) into a
+        // `FetchError::Join` and keeping the inner result otherwise.
+        let res: Result<(), FetchError> = joined.unwrap_or_else(|je| Err(je.into()));
         if let Err(err) = res
             && first_err.is_none()
         {
             first_err = Some(err);
         }
     }
-    match first_err {
-        Some(err) => Err(err),
-        None => Ok(()),
-    }
+    first_err.map_or(Ok(()), Err)
 }
 
 async fn fetch_one(
@@ -210,23 +210,12 @@ fn bundle_key(prefix: Option<&str>, ref_name: &RefName, sha: Sha) -> String {
 /// Parse the payload of a `fetch <sha> <ref>` line (the bytes after the
 /// `fetch ` prefix have already been stripped by the REPL).
 fn parse_fetch_args(args: &str) -> Result<(Sha, RefName), FetchError> {
-    let mut parts = args.splitn(2, ' ');
-    let sha = parts
-        .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| FetchError::Parse {
-            line: args.to_owned(),
-        })?;
-    let ref_name = parts
-        .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| FetchError::Parse {
-            line: args.to_owned(),
-        })?;
-    if ref_name.contains(' ') {
-        return Err(FetchError::Parse {
-            line: args.to_owned(),
-        });
+    let parse_err = || FetchError::Parse {
+        line: args.to_owned(),
+    };
+    let (sha, ref_name) = args.split_once(' ').ok_or_else(parse_err)?;
+    if sha.is_empty() || ref_name.is_empty() || ref_name.contains(' ') {
+        return Err(parse_err());
     }
     Ok((Sha::from_hex(sha)?, RefName::new(ref_name)?))
 }
@@ -313,7 +302,11 @@ mod tests {
     }
 
     #[test]
-    fn fetched_refs_dedupes_and_is_thread_safe() {
+    fn fetched_refs_dedupes_repeated_inserts() {
+        // The Mutex<HashSet> is structurally Send + Sync; the dedup
+        // semantics we actually rely on are HashSet's. Verify the
+        // observable contract: a second insert of the same Sha leaves
+        // the set at size 1 and `contains` flips on the first insert.
         let refs = FetchedRefs::new();
         let sha = Sha::from_hex(SHA).unwrap();
         assert!(!refs.contains(&sha));
@@ -321,5 +314,26 @@ mod tests {
         refs.insert(sha);
         assert!(refs.contains(&sha));
         assert_eq!(refs.snapshot().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_batch_empty_cmds_short_circuits() {
+        use crate::object_store::mock::MockStore;
+        // Empty-cmds early return at `fetch_batch:125` — no store call,
+        // no spawn. Covers the internal short-circuit that the
+        // integration test cannot reach (the REPL never calls
+        // `fetch_batch` with an empty Vec because the Empty arm guards
+        // on `!fetch_cmds.is_empty()`).
+        let store: Arc<dyn ObjectStore> = Arc::new(MockStore::new());
+        let repo_dir = tempfile::tempdir().expect("tempdir");
+        let result = fetch_batch(
+            store,
+            Some("repo".into()),
+            Arc::new(repo_dir.path().to_path_buf()),
+            Vec::new(),
+            FetchedRefs::new(),
+        )
+        .await;
+        assert!(matches!(result, Ok(())));
     }
 }
