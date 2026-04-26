@@ -499,34 +499,19 @@ const FORBIDDEN_BUCKET_SUFFIXES: &[&str] =
 /// none of the AWS reserved prefixes or suffixes.
 fn is_valid_bucket(s: &str) -> bool {
     let bytes = s.as_bytes();
-    if !(3..=63).contains(&bytes.len()) {
-        return false;
-    }
     let (Some(&first), Some(&last)) = (bytes.first(), bytes.last()) else {
         return false;
     };
-    if !is_ascii_alphanum_lower(first) || !is_ascii_alphanum_lower(last) {
-        return false;
-    }
-    let charset_ok = bytes
-        .iter()
-        .all(|b| is_ascii_alphanum_lower(*b) || *b == b'.' || *b == b'-');
-    if !charset_ok {
-        return false;
-    }
-    if s.contains("..") {
-        return false;
-    }
-    if is_ipv4_formatted(s) {
-        return false;
-    }
-    if FORBIDDEN_BUCKET_PREFIXES.iter().any(|p| s.starts_with(p)) {
-        return false;
-    }
-    if FORBIDDEN_BUCKET_SUFFIXES.iter().any(|p| s.ends_with(p)) {
-        return false;
-    }
-    true
+    (3..=63).contains(&bytes.len())
+        && is_ascii_alphanum_lower(first)
+        && is_ascii_alphanum_lower(last)
+        && bytes
+            .iter()
+            .all(|b| is_ascii_alphanum_lower(*b) || matches!(*b, b'.' | b'-'))
+        && !s.contains("..")
+        && !is_ipv4_formatted(s)
+        && !FORBIDDEN_BUCKET_PREFIXES.iter().any(|p| s.starts_with(p))
+        && !FORBIDDEN_BUCKET_SUFFIXES.iter().any(|p| s.ends_with(p))
 }
 
 /// `[a-z0-9]{3,24}` — Azure storage-account naming rule.
@@ -544,25 +529,16 @@ fn is_valid_account(s: &str) -> bool {
 /// <https://learn.microsoft.com/en-us/rest/api/storageservices/naming-and-referencing-containers--blobs--and-metadata>.
 fn is_valid_container(s: &str) -> bool {
     let bytes = s.as_bytes();
-    if !(3..=63).contains(&bytes.len()) {
-        return false;
-    }
     let (Some(&first), Some(&last)) = (bytes.first(), bytes.last()) else {
         return false;
     };
-    if !is_ascii_alphanum_lower(first) || !is_ascii_alphanum_lower(last) {
-        return false;
-    }
-    let charset_ok = bytes
-        .iter()
-        .all(|b| is_ascii_alphanum_lower(*b) || *b == b'-');
-    if !charset_ok {
-        return false;
-    }
-    if s.contains("--") {
-        return false;
-    }
-    true
+    (3..=63).contains(&bytes.len())
+        && is_ascii_alphanum_lower(first)
+        && is_ascii_alphanum_lower(last)
+        && bytes
+            .iter()
+            .all(|b| is_ascii_alphanum_lower(*b) || *b == b'-')
+        && !s.contains("--")
 }
 
 fn is_ascii_alphanum_lower(b: u8) -> bool {
