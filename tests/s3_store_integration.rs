@@ -471,8 +471,8 @@ async fn put_path_streams_file_and_round_trips() {
 }
 
 #[tokio::test]
-async fn put_path_with_opts_preserves_metadata() {
-    let (store, _bucket) = fresh_bucket().await;
+async fn put_path_with_opts_uploads_body() {
+    let (store, bucket) = fresh_bucket().await;
     let tmp = tempfile::tempdir().expect("tempdir");
     let src = tmp.path().join("small.txt");
     tokio::fs::write(&src, b"hello via path")
@@ -491,6 +491,29 @@ async fn put_path_with_opts_preserves_metadata() {
     // Verify the body round-trips.
     let body = store.get_bytes("meta-test").await.expect("get_bytes");
     assert_eq!(&body[..], b"hello via path");
+
+    // Verify metadata via a direct SDK head_object call — the trait's
+    // `head()` doesn't expose content_disposition or user metadata.
+    let fixture = fixture();
+    let client = setup_client(fixture.port).await;
+    let head = client
+        .head_object()
+        .bucket(&bucket)
+        .key("meta-test")
+        .send()
+        .await
+        .expect("head_object");
+    assert_eq!(
+        head.content_disposition().unwrap_or(""),
+        "attachment; filename=test.txt",
+        "content_disposition must survive put_path",
+    );
+    let user_meta = head.metadata().expect("user metadata present");
+    assert_eq!(
+        user_meta.get("x-custom").map(String::as_str),
+        Some("value"),
+        "user metadata must survive put_path",
+    );
 }
 
 #[tokio::test]

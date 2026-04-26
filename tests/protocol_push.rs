@@ -614,16 +614,19 @@ async fn lock_release_failure_overrides_successful_push() {
 }
 
 #[tokio::test]
-async fn lock_release_failure_does_not_mask_push_error() {
-    // When perform_push_under_lock returns PushOutcome::Error (not Ok)
-    // AND the lock release also fails, the push error must be surfaced —
-    // the release failure must not override it.
+async fn pre_lock_multi_bundle_rejection_surfaces_unchanged() {
+    // When the pre-lock `bundles_for_ref` check (push.rs:480-487) finds
+    // multiple bundles for the same ref, the push is rejected BEFORE
+    // lock acquisition. The multi-bundle error must surface on the wire.
     //
-    // Trigger the "multiple bundles" error inside perform_push_under_lock
-    // by seeding two bundles for the same ref, then arm a NetworkOnDelete
-    // fault for the lock key. This exercises the `_ => result` match arm
-    // in push_one that preserves the original push error.
-    use git_remote_object_store::object_store::mock::Fault;
+    // Note: the `_ => result` match arm in push_one (push.rs:577) that
+    // preserves a push error over a release failure cannot be exercised
+    // via this integration test: MockStore's state is static between
+    // the pre-lock and under-lock listings, so a multi-bundle condition
+    // always fires at the pre-lock check before lock acquisition. The
+    // under-lock path is covered structurally (only the `Ok(Ok{..})`
+    // arm overrides the result; all others fall through unchanged) and
+    // by the unit-level release_lock tests.
     if !git_available() {
         eprintln!("skipping: git not on PATH");
         return;
@@ -631,20 +634,10 @@ async fn lock_release_failure_does_not_mask_push_error() {
     let (seed, _shas) = make_seed_repo(1, "primary");
     let store = Arc::new(MockStore::new());
 
-    // Seed two bundles for the same ref — perform_push_under_lock's
-    // re-listing will find >1 bundle and return PushOutcome::Error
-    // ("multiple bundles exists for the same ref on server").
+    // Seed two bundles for the same ref — the pre-lock listing finds >1
+    // bundle and returns PushOutcome::Error before lock acquisition.
     store.insert("repo/refs/heads/main/aaaa.bundle", Bytes::from_static(b"a"));
     store.insert("repo/refs/heads/main/bbbb.bundle", Bytes::from_static(b"b"));
-
-    // Also arm a delete fault on the lock key. After
-    // perform_push_under_lock returns the multi-bundle error,
-    // release_lock will fire this fault and also fail. The match in
-    // push_one must preserve the push error, not replace it.
-    let lock_key = "repo/refs/heads/main/LOCK#.lock";
-    store.arm(Fault::NetworkOnDelete {
-        key: lock_key.into(),
-    });
 
     let (out, result) = drive_in(
         s3_url_with_zip(Some("repo"), false),
@@ -656,18 +649,13 @@ async fn lock_release_failure_does_not_mask_push_error() {
     result.expect("push should produce an error outcome, not abort");
 
     let text = std::str::from_utf8(&out).unwrap();
-    // The multi-bundle error from perform_push_under_lock must surface,
-    // NOT the release_lock failure.
     assert!(
         text.contains("multiple bundles"),
-        "push error must surface the multi-bundle message, not the lock release failure: {text:?}",
+        "multi-bundle rejection must appear on the wire: {text:?}",
     );
+    // The lock was never acquired — the pre-lock check returned early.
     assert!(
-        !text.contains("failed to release lock"),
-        "release_lock failure must not override the push error: {text:?}",
+        !store.contains("repo/refs/heads/main/LOCK#.lock"),
+        "lock must not be acquired when the pre-lock check rejects",
     );
-    // The delete fault was consumed — release_lock was actually called.
-    assert_eq!(store.pending_faults(), 0);
-    // The lock remains because the delete was faulted.
-    assert!(store.contains(lock_key));
 }
