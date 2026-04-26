@@ -234,7 +234,7 @@ fn parse_remote_sha_from_key(key: &str) -> Option<Sha> {
 pub(crate) fn lock_ttl_from_env() -> Duration {
     let secs = env::var(ENV_LOCK_TTL_SECONDS)
         .ok()
-        .and_then(|s| s.parse::<u64>().ok())
+        .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_LOCK_TTL_SECONDS);
     // i64 cast: 60-ish seconds will never overflow; even MAX would just
     // saturate to ~292 billion years which is fine for a TTL ceiling.
@@ -455,7 +455,7 @@ async fn push_one(
                 .to_owned(),
         });
     }
-    let pre_existing = pre_bundles.first().map(|m| m.key.clone());
+    let pre_existing = pre_bundles.into_iter().next().map(|m| m.key);
 
     let pre_existing_sha = match pre_existing.as_deref() {
         Some(key) => match parse_remote_sha_from_key(key) {
@@ -549,7 +549,7 @@ async fn perform_push_under_lock(
             message: r#""multiple bundles exists for the same ref on server. Run git-remote-object-store doctor to fix.""#.to_owned(),
         });
     }
-    let current_key = current.first().map(|m| m.key.clone());
+    let current_key = current.into_iter().next().map(|m| m.key);
     if let (Some(prev), Some(now_key)) = (pre_existing.as_deref(), current_key.as_deref())
         && prev != now_key
     {
@@ -569,7 +569,7 @@ async fn perform_push_under_lock(
     // put_if_absent — we don't care about the boolean (existing HEAD is
     // intentionally preserved).
     let head = head_key(prefix);
-    let _ = store
+    store
         .put_if_absent(
             &head,
             Bytes::copy_from_slice(remote_ref.as_str().as_bytes()),
