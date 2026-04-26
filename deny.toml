@@ -1,0 +1,48 @@
+# cargo-deny configuration. See https://embarkstudios.github.io/cargo-deny/.
+#
+# Run locally with `cargo deny check`. CI runs the same command via
+# `.github/workflows/ci.yml`.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[advisories]
+version = 2
+yanked = "warn"
+
+[bans]
+# Default to warning so a duplicate dep does not break CI overnight; the
+# `deny` list below upgrades specific crates to hard errors.
+multiple-versions = "warn"
+wildcards = "deny"
+
+# Hard ban on the legacy rustls / rustls-webpki versions that the
+# `aws-sdk-s3` legacy `rustls` feature pulled in (see Cargo.toml). Both
+# carry open RUSTSEC advisories; if a future dependency bump
+# reintroduces them, CI must fail loudly.
+deny = [
+    { name = "rustls", version = "<0.23" },
+    { name = "rustls-webpki", version = "<0.103" },
+]
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -106,14 +106,14 @@ tempfile = "3"
 # defaults automatically; revisit pinning at Phase 14 if reproducibility
 # becomes a concern.
 #
-# `aws-sdk-s3` defaults include the legacy `rustls` feature, which routes
-# through `aws-smithy-runtime/tls-rustls` → `aws-smithy-http-client/legacy-
-# rustls-ring` and pins `rustls 0.21` + `rustls-webpki 0.101.x` — both of
-# which carry open RUSTSEC advisories (GHSA-4p46-pwfr-66x6 high-severity
-# panic on malformed CRL, plus two name-constraint advisories). The modern
-# `default-https-client` feature uses `rustls 0.23` / `rustls-webpki
-# 0.103.x` instead. Disable defaults and re-enable everything except the
-# legacy `rustls` feature.
+# `aws-sdk-s3` defaults include the legacy `rustls` feature, which
+# routes through `aws-smithy-runtime/tls-rustls` and
+# `aws-smithy-http-client/legacy-rustls-ring`, pinning `rustls 0.21` +
+# `rustls-webpki 0.101.x` — both of which carry open RUSTSEC advisories
+# (GHSA-4p46-pwfr-66x6 high-severity panic on malformed CRL, plus two
+# name-constraint advisories). The modern `default-https-client` feature
+# uses `rustls 0.23` / `rustls-webpki 0.103.x` instead. Disable defaults
+# and re-enable everything except the legacy `rustls` feature.
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = { version = "1", default-features = false, features = [
     "sigv4a",
