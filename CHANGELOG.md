@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `release_lock` now propagates non-`NotFound` delete failures instead of
+  silently swallowing them. When the push itself succeeds but the lock
+  cannot be released, the outcome is replaced with
+  `error <ref> "failed to release lock. ..."` matching upstream
+  `cmd_push`'s `finally` block. A genuine push error is never masked by
+  a release failure.
+
 - Push batches no longer abort on the first per-push transport, git, or
   local-I/O failure. `push_batch` now catches `PushError::Store`, `Git`,
   `Io`, and `Sha` per-push and converts them to `error <ref> "..."` outcome
