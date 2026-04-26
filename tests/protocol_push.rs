@@ -546,3 +546,104 @@ async fn nonexistent_local_ref_emits_error() {
     let text = std::str::from_utf8(&out).unwrap();
     assert!(text.contains("not found"), "got {text:?}");
 }
+
+#[tokio::test]
+async fn force_push_protected_with_ancestor_remote_proceeds() {
+    // The acceptance branch of force-protected demotion: `+` flag is
+    // dropped because PROTECTED# is set, the ancestor check applies,
+    // and remote IS an ancestor of local — so the push proceeds.
+    // Without this test the protected-fallback code path is only
+    // exercised on the rejection side.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, shas) = make_seed_repo(2, "primary");
+    let ancestor = &shas[0];
+    let descendant = &shas[1];
+
+    let store = Arc::new(MockStore::new());
+    // Pre-existing remote bundle for the ancestor commit.
+    store.insert(
+        format!("repo/refs/heads/main/{ancestor}.bundle"),
+        Bytes::from_static(b"old"),
+    );
+    // Protect the ref. With `+`, force should be demoted; ancestor
+    // check will then accept because ancestor IS an ancestor of
+    // descendant.
+    store.insert("repo/refs/heads/main/PROTECTED#", Bytes::from_static(b""));
+
+    let (out, result) = drive_in(
+        s3_url(Some("repo"), false),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push +refs/heads/main:refs/heads/main\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    result.expect("force-protected fast-forward should succeed");
+    assert_eq!(std::str::from_utf8(&out).unwrap(), "ok refs/heads/main\n\n");
+    assert!(store.contains(&format!("repo/refs/heads/main/{descendant}.bundle")));
+    // Old bundle replaced.
+    assert!(!store.contains(&format!("repo/refs/heads/main/{ancestor}.bundle")));
+    // PROTECTED# marker untouched.
+    assert!(store.contains("repo/refs/heads/main/PROTECTED#"));
+}
+
+#[tokio::test]
+async fn batched_push_continues_after_per_push_transport_failure() {
+    // Pin the contract that operational failures on push N do not
+    // erase the outcome lines for pushes 1..N-1. Without per-push
+    // error catching, a 5xx during push #2's bundles_for_ref would
+    // abort the whole batch and silently lose push #1's `ok` line.
+    use git_remote_object_store::object_store::mock::Fault;
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, shas) = make_seed_repo(1, "primary");
+    let sha = &shas[0];
+    git(
+        &["update-ref", "refs/heads/feature", "refs/heads/main"],
+        seed.path(),
+    );
+
+    let store = Arc::new(MockStore::new());
+    // Trigger a transport-style failure on push #2's pre-lock listing
+    // (the first store.list call in push_one for refs/heads/feature).
+    store.arm(Fault::AccessDeniedOnList {
+        prefix: "repo/refs/heads/feature/".into(),
+    });
+
+    let script = "push refs/heads/main:refs/heads/main\n\
+                  push refs/heads/feature:refs/heads/feature\n\n";
+    let (out, result) = drive_in(
+        s3_url(Some("repo"), false),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        script,
+        seed.path().to_path_buf(),
+    )
+    .await;
+    result.expect("batch with one failing push should not abort the helper");
+
+    let text = std::str::from_utf8(&out).unwrap();
+    let mut lines = text.split_inclusive('\n');
+    assert_eq!(lines.next(), Some("ok refs/heads/main\n"));
+    let second = lines.next().expect("error line for push #2");
+    assert!(
+        second.starts_with("error refs/heads/feature "),
+        "expected error for second push, got {second:?}",
+    );
+    assert!(
+        second.contains("access denied"),
+        "error message must surface the underlying failure: {second:?}",
+    );
+    assert_eq!(lines.next(), Some("\n"), "trailing batch terminator");
+    assert!(lines.next().is_none(), "no extra output: {text:?}");
+
+    // Push #1 actually completed against the store — the upload is durable.
+    assert!(store.contains(&format!("repo/refs/heads/main/{sha}.bundle")));
+    // Push #2 was rejected before it could upload anything.
+    assert!(!store.contains(&format!("repo/refs/heads/feature/{sha}.bundle")));
+    // The fault fired exactly once.
+    assert_eq!(store.pending_faults(), 0);
+}
