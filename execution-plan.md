@@ -408,8 +408,14 @@ to disambiguate hostnames that don't follow either convention.
   (`localhost`, `127.0.0.1`, `::1`) **or** when
   `GIT_REMOTE_OBJECT_STORE_ALLOW_HTTP=1` is set. This prevents
   accidental cleartext credentials against production.
-- Bucket charset matches S3 rules: `[a-z0-9][a-z0-9.\-]{2,62}`.
-- Azure account: `[a-z0-9]{3,24}`; container: `[a-z0-9-]{3,63}`.
+- Bucket name follows the full AWS S3 General Purpose rules: 3–63 chars
+  in `[a-z0-9.\-]`, must begin and end with a letter or digit, no
+  consecutive periods, not formatted as an IPv4 dotted-quad, and none of
+  the AWS reserved prefixes (`xn--`, `sthree-`, `amzn-s3-demo-`) or
+  suffixes (`-s3alias`, `--ol-s3`, `.mrap`, `--x-s3`, `--table-s3`).
+- Azure account: `[a-z0-9]{3,24}`. Azure container: 3–63 chars in
+  `[a-z0-9-]`, must begin and end with a letter or digit, no consecutive
+  hyphens.
 - Trailing `/` on the prefix is stripped; missing prefix is
   allowed (single-bucket repo at the root).
 

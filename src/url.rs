@@ -485,42 +485,105 @@ fn detect_azure_addressing(host: &str) -> AzureAddressing {
 // Validation (§3.5)
 // ---------------------------------------------------------------------------
 
-/// `[a-z0-9][a-z0-9.\-]{2,62}` — total length 3..=63.
+/// AWS-reserved bucket-name prefixes. See
+/// <https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html>.
+const FORBIDDEN_BUCKET_PREFIXES: &[&str] = &["xn--", "sthree-", "amzn-s3-demo-"];
+
+/// AWS-reserved bucket-name suffixes. See the same AWS doc.
+const FORBIDDEN_BUCKET_SUFFIXES: &[&str] =
+    &["-s3alias", "--ol-s3", ".mrap", "--x-s3", "--table-s3"];
+
+/// AWS S3 General Purpose bucket-naming rules: 3–63 chars, lowercase
+/// alphanumerics plus `.` and `-`, must begin and end with a letter or
+/// digit, no consecutive periods, not formatted as an IPv4 address, and
+/// none of the AWS reserved prefixes or suffixes.
 fn is_valid_bucket(s: &str) -> bool {
     let bytes = s.as_bytes();
     if !(3..=63).contains(&bytes.len()) {
         return false;
     }
-    let Some((&first, rest)) = bytes.split_first() else {
+    let (Some(&first), Some(&last)) = (bytes.first(), bytes.last()) else {
         return false;
     };
-    let first_ok = first.is_ascii_lowercase() || first.is_ascii_digit();
-    let rest_ok = rest
+    if !is_ascii_alphanum_lower(first) || !is_ascii_alphanum_lower(last) {
+        return false;
+    }
+    let charset_ok = bytes
         .iter()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'.' || *b == b'-');
-    first_ok && rest_ok
+        .all(|b| is_ascii_alphanum_lower(*b) || *b == b'.' || *b == b'-');
+    if !charset_ok {
+        return false;
+    }
+    if s.contains("..") {
+        return false;
+    }
+    if is_ipv4_formatted(s) {
+        return false;
+    }
+    if FORBIDDEN_BUCKET_PREFIXES.iter().any(|p| s.starts_with(p)) {
+        return false;
+    }
+    if FORBIDDEN_BUCKET_SUFFIXES.iter().any(|p| s.ends_with(p)) {
+        return false;
+    }
+    true
 }
 
-/// `[a-z0-9]{3,24}`.
+/// `[a-z0-9]{3,24}` — Azure storage-account naming rule.
 fn is_valid_account(s: &str) -> bool {
     let bytes = s.as_bytes();
     if !(3..=24).contains(&bytes.len()) {
         return false;
     }
-    bytes
-        .iter()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    bytes.iter().copied().all(is_ascii_alphanum_lower)
 }
 
-/// `[a-z0-9-]{3,63}`.
+/// Azure container-naming rule: 3–63 chars, lowercase alphanumerics plus
+/// `-`, must begin and end with a letter or digit, and no consecutive
+/// hyphens. See
+/// <https://learn.microsoft.com/en-us/rest/api/storageservices/naming-and-referencing-containers--blobs--and-metadata>.
 fn is_valid_container(s: &str) -> bool {
     let bytes = s.as_bytes();
     if !(3..=63).contains(&bytes.len()) {
         return false;
     }
-    bytes
+    let (Some(&first), Some(&last)) = (bytes.first(), bytes.last()) else {
+        return false;
+    };
+    if !is_ascii_alphanum_lower(first) || !is_ascii_alphanum_lower(last) {
+        return false;
+    }
+    let charset_ok = bytes
         .iter()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+        .all(|b| is_ascii_alphanum_lower(*b) || *b == b'-');
+    if !charset_ok {
+        return false;
+    }
+    if s.contains("--") {
+        return false;
+    }
+    true
+}
+
+fn is_ascii_alphanum_lower(b: u8) -> bool {
+    b.is_ascii_lowercase() || b.is_ascii_digit()
+}
+
+/// True iff `s` looks like a dotted-quad IPv4 address (four non-empty
+/// digit-only segments separated by `.`). AWS rejects bucket names with
+/// this shape regardless of whether the address is routable.
+fn is_ipv4_formatted(s: &str) -> bool {
+    let mut parts = 0usize;
+    for part in s.split('.') {
+        parts += 1;
+        if parts > 4 {
+            return false;
+        }
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+    }
+    parts == 4
 }
 
 #[cfg(test)]
@@ -543,10 +606,57 @@ mod tests {
     fn validates_bucket_charset() {
         assert!(is_valid_bucket("my-bucket"));
         assert!(is_valid_bucket("a23"));
+        assert!(is_valid_bucket("a.b.c"));
         assert!(!is_valid_bucket("ab"));
         assert!(!is_valid_bucket("-leading-dash"));
+        assert!(!is_valid_bucket("trailing-dash-"));
+        assert!(!is_valid_bucket(".leading-dot"));
+        assert!(!is_valid_bucket("trailing-dot."));
         assert!(!is_valid_bucket("UPPER"));
         assert!(!is_valid_bucket(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn rejects_bucket_with_consecutive_dots() {
+        assert!(!is_valid_bucket("ab..cd"));
+        assert!(!is_valid_bucket("a..b"));
+    }
+
+    #[test]
+    fn rejects_bucket_formatted_like_ipv4() {
+        assert!(!is_valid_bucket("192.168.1.1"));
+        assert!(!is_valid_bucket("1.2.3.4"));
+        assert!(!is_valid_bucket("999.999.999.999"));
+        // Three or five segments are not IPv4-shaped.
+        assert!(is_valid_bucket("1.2.3"));
+        assert!(is_valid_bucket("1.2.3.4.5"));
+    }
+
+    #[test]
+    fn rejects_forbidden_bucket_prefixes() {
+        assert!(!is_valid_bucket("xn--abc"));
+        assert!(!is_valid_bucket("sthree-foo"));
+        assert!(!is_valid_bucket("amzn-s3-demo-bucket"));
+    }
+
+    #[test]
+    fn rejects_forbidden_bucket_suffixes() {
+        assert!(!is_valid_bucket("my-bucket-s3alias"));
+        assert!(!is_valid_bucket("my-bucket--ol-s3"));
+        assert!(!is_valid_bucket("my-bucket--x-s3"));
+        assert!(!is_valid_bucket("my-bucket--table-s3"));
+        assert!(!is_valid_bucket("ab.mrap"));
+    }
+
+    #[test]
+    fn ipv4_formatted_helper() {
+        assert!(is_ipv4_formatted("0.0.0.0"));
+        assert!(is_ipv4_formatted("10.20.30.40"));
+        assert!(!is_ipv4_formatted("a.b.c.d"));
+        assert!(!is_ipv4_formatted("1.2.3"));
+        assert!(!is_ipv4_formatted("1.2.3.4.5"));
+        assert!(!is_ipv4_formatted("1..2.3"));
+        assert!(!is_ipv4_formatted(".1.2.3.4"));
     }
 
     #[test]
@@ -560,9 +670,22 @@ mod tests {
     #[test]
     fn validates_container_charset() {
         assert!(is_valid_container("my-container"));
+        assert!(is_valid_container("a-b-c"));
         assert!(!is_valid_container("ab"));
         assert!(!is_valid_container("UPPER"));
         assert!(!is_valid_container(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn rejects_container_with_dash_at_boundary() {
+        assert!(!is_valid_container("-leading"));
+        assert!(!is_valid_container("trailing-"));
+    }
+
+    #[test]
+    fn rejects_container_with_consecutive_dashes() {
+        assert!(!is_valid_container("a--b"));
+        assert!(!is_valid_container("foo--bar"));
     }
 
     #[test]
