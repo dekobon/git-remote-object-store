@@ -332,20 +332,27 @@ async fn invalid_command_returns_error() {
 }
 
 #[tokio::test]
-async fn push_command_returns_not_implemented() {
+async fn push_with_malformed_args_returns_parse_error() {
+    use git_remote_object_store::protocol::push::PushError;
+
+    // Drain on the trailing blank line so push_batch is invoked. A
+    // malformed refspec aborts the batch with `PushError::Parse` before
+    // any stdout traffic — a regression that emitted partial protocol
+    // output before erroring would corrupt git's parser.
     let (out, result) = drive(
         s3_url(Some("repo")),
         Arc::new(MockStore::new()),
-        "push refs/heads/main:refs/heads/main\n",
+        "push not-a-refspec\n\n",
     )
     .await;
     match result {
-        Err(ProtocolError::Push(_)) => {}
-        other => panic!("expected Push error, got {other:?}"),
+        Err(ProtocolError::Push(PushError::Parse { .. })) => {}
+        other => panic!("expected Push(Parse) error, got {other:?}"),
     }
-    // The stub bails before writing anything; a regression that emitted
-    // partial protocol output before erroring would corrupt git's parser.
-    assert!(out.is_empty(), "stub must not write to stdout: {out:?}");
+    assert!(
+        out.is_empty(),
+        "push must not write on parse error: {out:?}"
+    );
 }
 
 #[tokio::test]

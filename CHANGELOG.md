@@ -19,6 +19,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Phase 8 `push` handler with per-ref locking (`src/protocol/push.rs`): the
+  REPL now batches `push <refspec>` lines until a blank line and processes
+  them sequentially under per-ref locks at `<prefix>/<ref>/LOCK#.lock`,
+  acquired via the trait's `put_if_absent` (S3 `If-None-Match: *` /
+  Azure `If-None-Match: *`). On contention the handler `head`s the lock
+  and, if its `LastModified` exceeds the TTL (default 60 s, override via
+  `GIT_REMOTE_S3_LOCK_TTL_SECONDS` per upstream parity), deletes and
+  retries once; otherwise it surfaces a "lock held" error line. After
+  acquiring the lock the handler re-lists bundles and rejects the push if
+  another client wrote a different bundle ("stale remote") or left the
+  ref in a multi-bundle state. Force pushes against a ref carrying a
+  `PROTECTED#` marker are demoted to non-force and re-checked against
+  `merge-base --is-ancestor`. The `?zip=1` URL flag triggers an
+  additional `repo.zip` upload alongside the bundle, with
+  `Content-Disposition: attachment; filename=repo-<short-sha>.zip` and
+  `codepipeline-artifact-revision-summary` user metadata. Per-push
+  outcomes (`ok <ref>` / `error <ref> <reason>`) are written one line per
+  command, followed by the protocol's blank-line terminator. Closes #8.
+- `git::bundle_at(cwd, …)`: path-only variant of `git::bundle` so the
+  push handler does not have to hold `gix::Repository` (which is `!Sync`)
+  across `.await`, mirroring the path-only `unbundle_at` Phase 7
+  introduced.
+
 - Phase 7 parallel `fetch` handler (`src/protocol/fetch.rs`): the REPL now
   collects `fetch <sha> <ref>` lines until a blank line and dispatches them
   through a `tokio::task::JoinSet` bounded by a `tokio::sync::Semaphore`
@@ -35,6 +58,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `protocol::ProtocolError::Push` now wraps a structured `push::PushError`
+  enum (`Parse` / `InvalidLocalSpec` / `RemoteRef` / `Sha` / `Store` /
+  `Git` / `Io`) instead of the Phase 6 `PushNotImplemented` placeholder.
+  The REPL acquired a `Mode::Push` accumulator alongside the existing
+  `Mode::Fetch` one; switching modes mid-batch resets the opposite
+  accumulator (mirrors upstream `process_cmd`).
+- `git::bundle` and `git::archive` now take `spec: &str` (a permissive
+  rev-spec) instead of `&RefName`. Storage-key types remain strict; the
+  rev-spec passed to git itself is just a string git already validates.
 - `protocol::ProtocolError::Fetch` now wraps a structured `fetch::FetchError`
   enum (`Parse` / `Sha` / `Ref` / `Store` / `Io` / `Git` / `Join`) instead
   of the Phase 6 `FetchNotImplemented` placeholder.
