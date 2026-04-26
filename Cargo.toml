@@ -30,6 +30,11 @@ test-util = []
 # Requires Docker on the host running `cargo test --features integration-s3`.
 integration-s3 = []
 
+# Enables the Azurite-backed integration tests in
+# `tests/azure_store_integration.rs`. Requires Docker on the host running
+# `cargo test --features integration-azure`.
+integration-azure = []
+
 [dependencies]
 # Async traits via Boxed futures. `async_trait` keeps `dyn ObjectStore +
 # Send + Sync` ergonomic; native AFIT (stable since 1.75) is awkward
@@ -135,6 +140,24 @@ futures = "0.3"
 # before being passed in.
 percent-encoding = "2"
 
+# Azure SDK for the Blob backend (Phase 11). The SDK is in beta (0.12)
+# and does NOT support shared-key authentication out of the box — only
+# `Arc<dyn TokenCredential>` (Entra ID). We implement a custom shared-key
+# signing `Policy` ourselves so users can authenticate with account keys
+# (the only auth Azurite supports without HTTPS + OAuth) and so the
+# documented `AZSTORE_<NAME>_KEY` / `AZSTORE_<NAME>_CONNECTION_STRING`
+# credential aliases work. Tracking issue: Azure/azure-sdk-for-rust#2975.
+azure_core = "0.35"
+azure_storage_blob = "0.12"
+azure_identity = "0.35"
+
+# Required for the shared-key signing policy: HMAC-SHA256 over the
+# Azure canonicalized string-to-sign, base64-encoded for the
+# `Authorization: SharedKey <account>:<sig>` header.
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
 [dev-dependencies]
 # Property-based testing for URL round-trip parse/format.
 proptest = "1"
@@ -157,9 +180,18 @@ proptest = "1"
 # and would silently drift across alpha releases.
 testcontainers = { version = "0.27", features = ["blocking", "http_wait_plain"] }
 
-# SHA-256 for byte-equality assertions on the multipart-download integration test
-# (avoids holding the 50 MiB body twice in memory).
-sha2 = "0.10"
+# Used only by `tests/azure_store_integration.rs` (gated on the
+# `integration-azure` Cargo feature) to issue the one-off
+# Create-Container setup request signed via our shared-key policy.
+# Pulling in the full Azure SDK transport just to call PUT-container
+# is overkill; reqwest is already in the dependency tree via
+# `testcontainers`. Default features (TLS + json + gzip) are not
+# required for plain HTTP setup against Azurite.
+reqwest = { version = "0.13", default-features = false, features = ["http2"] }
+
+# Note: `sha2` is now a runtime dep (Phase 11 shared-key signing) so the
+# integration tests can reuse the same crate version for byte-equality
+# assertions on the multipart-download path.
 
 # Remote-helper shims. Git invokes them by scheme as `git-remote-<scheme>`,
 # so the installed binary names must be `git-remote-s3+https` etc.
