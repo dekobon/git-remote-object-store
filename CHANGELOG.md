@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Management CLI (`git-remote-object-store`) with `doctor`,
+  `delete-branch`, `protect`, and `unprotect` subcommands. Each accepts a
+  remote URL (`s3+https://…`, `az+https://…`) or the name of a git remote
+  configured in the current repository, and dispatches to the right
+  backend through the `ObjectStore` trait. The doctor analyzes the
+  on-bucket layout, offers to keep or quarantine duplicate bundles per
+  ref (`<ref>_<uuid8>` quarantine refs by default; `--delete-bundle`
+  switches to outright deletion), prompts for a replacement when `HEAD`
+  is invalid, and scans `*.lock` keys against a TTL (`--lock-ttl`,
+  defaults to 60 s) with optional `--delete-stale-locks`. Interactive
+  prompts go through a `Prompter` trait so unit tests drive the same
+  code path with a scripted prompter against `MockStore`. (#9)
+
 ### Fixed
 
 - `release_lock` now propagates non-`NotFound` delete failures instead of
