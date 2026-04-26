@@ -39,6 +39,11 @@ pub struct ObjectMeta {
     pub size: u64,
     /// Server-side last-modified timestamp.
     pub last_modified: OffsetDateTime,
+    /// Opaque entity-tag returned by `HEAD` / `GET`. S3 returns a
+    /// quoted MD5 (e.g. `"d41d8…"`); Azure returns a similar `ETag`.
+    /// `None` when the backend does not expose one (e.g. `list` results
+    /// on some backends omit it).
+    pub etag: Option<String>,
 }
 
 /// Optional `put_bytes` knobs.

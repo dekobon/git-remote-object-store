@@ -28,6 +28,19 @@ use time::OffsetDateTime;
 
 use super::{Error, ObjectMeta, ObjectStore, PutOpts};
 
+/// Produce a deterministic, content-derived `ETag` string that mimics the
+/// `"<hex>"` format returned by S3 `HeadObject`. Uses a simple FNV-1a
+/// hash — sufficient for test-time identity checks without pulling in a
+/// crypto dependency.
+fn mock_etag(body: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in body {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("\"{h:016x}\"")
+}
+
 /// Single-call fault recipes consumed FIFO by [`MockStore`].
 ///
 /// Each variant matches one trait method + key/prefix; when the matching
@@ -59,6 +72,15 @@ pub enum Fault {
     /// Force `delete(key)` to return [`Error::Network`].
     NetworkOnDelete {
         /// Key being deleted.
+        key: String,
+    },
+    /// Force `get_to_file(key, _)` to return
+    /// [`Error::PreconditionFailed`], simulating an object that was
+    /// mutated between the `head` and the body download in the S3
+    /// backend. Higher-layer protocol tests use this to verify that
+    /// fetch surfaces a structured error rather than a corrupted bundle.
+    PreconditionFailedOnGetToFile {
+        /// Key being downloaded.
         key: String,
     },
 }
@@ -218,12 +240,21 @@ impl ObjectStore for MockStore {
                     key: key.clone(),
                     size: object.body.len() as u64,
                     last_modified: object.last_modified,
+                    etag: Some(mock_etag(&object.body)),
                 })
                 .collect())
         })
     }
 
     async fn get_to_file(&self, key: &str, dest: &Path) -> Result<(), Error> {
+        self.with_state(|s| {
+            Self::check_fault(s, |f| match f {
+                Fault::PreconditionFailedOnGetToFile { key: k } if k == key => {
+                    Some(Error::PreconditionFailed(k.clone()))
+                }
+                _ => None,
+            })
+        })?;
         let bytes = self.get_bytes(key).await?;
         tokio::fs::write(dest, &bytes)
             .await
@@ -286,6 +317,7 @@ impl ObjectStore for MockStore {
                     key: key.to_string(),
                     size: o.body.len() as u64,
                     last_modified: o.last_modified,
+                    etag: Some(mock_etag(&o.body)),
                 })
                 .ok_or_else(|| Error::NotFound(key.to_string()))
         })
@@ -621,6 +653,48 @@ mod tests {
         // Second call without a fault succeeds.
         store.delete("k").await.unwrap();
         assert!(!store.contains("k"));
+    }
+
+    #[tokio::test]
+    async fn get_to_file_precondition_fault_fires_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.bin");
+        let store = MockStore::new();
+        store.insert("k", body(b"payload"));
+        store.arm(Fault::PreconditionFailedOnGetToFile { key: "k".into() });
+        let err = store.get_to_file("k", &path).await.unwrap_err();
+        assert!(matches!(err, Error::PreconditionFailed(ref k) if k == "k"));
+        assert!(!path.exists(), "file must not be written on fault");
+        assert_eq!(store.pending_faults(), 0);
+        // Second call without a fault succeeds.
+        store.get_to_file("k", &path).await.unwrap();
+        let read = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(read, b"payload");
+    }
+
+    #[tokio::test]
+    async fn head_returns_deterministic_etag() {
+        let store = MockStore::new();
+        store.insert("k", body(b"hello"));
+        let m1 = store.head("k").await.unwrap();
+        let m2 = store.head("k").await.unwrap();
+        assert!(m1.etag.is_some(), "etag must be present");
+        assert_eq!(m1.etag, m2.etag, "same content ⇒ same etag");
+        // Different content ⇒ different etag.
+        store.insert("k", body(b"world"));
+        let m3 = store.head("k").await.unwrap();
+        assert_ne!(m1.etag, m3.etag, "different content ⇒ different etag");
+    }
+
+    #[test]
+    fn mock_etag_is_deterministic() {
+        let a = mock_etag(b"abc");
+        let b = mock_etag(b"abc");
+        assert_eq!(a, b);
+        // Quoted format mimicking S3.
+        assert!(a.starts_with('"') && a.ends_with('"'));
+        // Different input ⇒ different output.
+        assert_ne!(mock_etag(b"abc"), mock_etag(b"xyz"));
     }
 
     #[test]

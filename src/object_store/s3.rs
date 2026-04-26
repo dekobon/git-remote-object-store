@@ -30,6 +30,12 @@
 //! failure cannot leave a corrupt destination for the Phase 7 unbundle
 //! step.
 //!
+//! Every GET carries `If-Match: <etag>` derived from the preceding
+//! `HeadObject` call. If the object is overwritten between `head` and
+//! the body download, S3 returns 412 and `get_to_file` retries once
+//! with a fresh `head`/`ETag`. After one retry the 412 propagates as
+//! [`Error::PreconditionFailed`].
+//!
 //! ## Stdout discipline
 //!
 //! Per `.claude/rules/protocol-stdout.md`, this module never writes to
@@ -353,6 +359,10 @@ pub(crate) fn object_to_meta(obj: &aws_sdk_s3::types::Object) -> Result<ObjectMe
         key,
         size,
         last_modified,
+        // ListObjectsV2 does return ETags, but they are not consumed
+        // by any current caller; keep `None` to avoid inflating the
+        // per-object metadata for list results.
+        etag: None,
     })
 }
 
@@ -413,26 +423,43 @@ impl ObjectStore for S3Store {
         let parent = dest.parent().ok_or_else(|| {
             Error::Other(format!("destination `{}` has no parent directory", dest.display()).into())
         })?;
-        let temp = NamedTempFile::new_in(parent).map_err(other_boxed)?;
 
-        let size = self.head(key).await?.size;
-        if size == 0 {
-            // Already a zero-byte file from NamedTempFile::new_in; just
-            // rename it into place.
-            temp.persist(dest)
-                .map_err(|e| Error::Other(Box::new(e.error)))?;
-            return Ok(());
+        // Attempt the head→download cycle up to twice: if the object is
+        // mutated between `head` and the body GET, the `If-Match` guard
+        // returns 412 and we retry with the new ETag/size.
+        let mut last_err: Option<Error> = None;
+        for _attempt in 0..2 {
+            let meta = self.head(key).await?;
+            if meta.size == 0 {
+                let temp = NamedTempFile::new_in(parent).map_err(other_boxed)?;
+                temp.persist(dest)
+                    .map_err(|e| Error::Other(Box::new(e.error)))?;
+                return Ok(());
+            }
+
+            let temp = NamedTempFile::new_in(parent).map_err(other_boxed)?;
+            let result = if meta.size <= MULTIPART_THRESHOLD {
+                self.download_single(key, temp.path(), meta.etag.as_deref())
+                    .await
+            } else {
+                self.download_multipart(key, temp.path(), meta.size, meta.etag.as_deref())
+                    .await
+            };
+
+            match result {
+                Ok(()) => {
+                    temp.persist(dest)
+                        .map_err(|e| Error::Other(Box::new(e.error)))?;
+                    return Ok(());
+                }
+                Err(e @ Error::PreconditionFailed(_)) => {
+                    tracing::warn!(key, "object changed between head and GET; retrying");
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
         }
-
-        if size <= MULTIPART_THRESHOLD {
-            self.download_single(key, temp.path()).await?;
-        } else {
-            self.download_multipart(key, temp.path(), size).await?;
-        }
-
-        temp.persist(dest)
-            .map_err(|e| Error::Other(Box::new(e.error)))?;
-        Ok(())
+        Err(last_err.expect("loop ran at least once"))
     }
 
     async fn get_bytes(&self, key: &str) -> Result<Bytes, Error> {
@@ -512,10 +539,12 @@ impl ObjectStore for S3Store {
             })?
             .to_time()
             .map_err(other_boxed)?;
+        let etag = resp.e_tag().map(str::to_owned);
         Ok(ObjectMeta {
             key: key.to_owned(),
             size,
             last_modified,
+            etag,
         })
     }
 
@@ -556,15 +585,20 @@ impl ObjectStore for S3Store {
 impl S3Store {
     /// Stream a small (<= [`MULTIPART_THRESHOLD`]) object directly to the
     /// temp-file path. Caller is responsible for `persist`-ing the file.
-    async fn download_single(&self, key: &str, temp_path: &Path) -> Result<(), Error> {
-        let mut resp = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| classify(e, key))?;
+    ///
+    /// When `etag` is `Some`, the request carries `If-Match` so S3
+    /// returns 412 if the object was overwritten since the `head` call.
+    async fn download_single(
+        &self,
+        key: &str,
+        temp_path: &Path,
+        etag: Option<&str>,
+    ) -> Result<(), Error> {
+        let mut req = self.client.get_object().bucket(&self.bucket).key(key);
+        if let Some(etag) = etag {
+            req = req.if_match(etag);
+        }
+        let mut resp = req.send().await.map_err(|e| classify(e, key))?;
 
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -583,11 +617,15 @@ impl S3Store {
 
     /// Download a large object via parallel ranged GETs, writing each
     /// range at its absolute offset into the pre-allocated temp file.
+    ///
+    /// When `etag` is `Some`, every ranged GET carries `If-Match` so
+    /// S3 returns 412 if the object is overwritten mid-download.
     async fn download_multipart(
         &self,
         key: &str,
         temp_path: &Path,
         size: u64,
+        etag: Option<&str>,
     ) -> Result<(), Error> {
         let async_file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -601,22 +639,25 @@ impl S3Store {
         let semaphore = Arc::new(Semaphore::new(MULTIPART_MAX_CONCURRENCY));
         let mut tasks: JoinSet<Result<(), Error>> = JoinSet::new();
 
+        let etag_owned = etag.map(str::to_owned);
         for (start, end) in plan_ranges(size, MULTIPART_CHUNK_SIZE) {
             let client = self.client.clone();
             let bucket = self.bucket.clone();
             let key = key.to_owned();
+            let etag = etag_owned.clone();
             let file = Arc::clone(&file);
             let semaphore = Arc::clone(&semaphore);
             tasks.spawn(async move {
                 let _permit = semaphore.acquire_owned().await.map_err(other_boxed)?;
-                let resp = client
+                let mut req = client
                     .get_object()
                     .bucket(&bucket)
                     .key(&key)
-                    .range(format!("bytes={start}-{end}"))
-                    .send()
-                    .await
-                    .map_err(|e| classify(e, &key))?;
+                    .range(format!("bytes={start}-{end}"));
+                if let Some(etag) = &etag {
+                    req = req.if_match(etag);
+                }
+                let resp = req.send().await.map_err(|e| classify(e, &key))?;
                 let bytes = resp
                     .body
                     .collect()
