@@ -10,77 +10,19 @@
 
 #![cfg(feature = "test-util")]
 
+mod common;
+
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::path::Path;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use git_remote_object_store::object_store::ObjectStore;
 use git_remote_object_store::object_store::mock::MockStore;
-use git_remote_object_store::protocol::{ProtocolError, run};
-use git_remote_object_store::url::{self, RemoteUrl};
+use git_remote_object_store::protocol::ProtocolError;
 use tempfile::TempDir;
-use tokio::io::AsyncWriteExt;
 
-fn git_available() -> bool {
-    static AVAIL: OnceLock<bool> = OnceLock::new();
-    *AVAIL.get_or_init(|| {
-        std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .is_ok()
-    })
-}
-
-fn s3_url(prefix: Option<&str>) -> RemoteUrl {
-    let raw = match prefix {
-        Some(p) => format!("s3+https://my-bucket.s3.us-west-2.amazonaws.com/{p}"),
-        None => "s3+https://my-bucket.s3.us-west-2.amazonaws.com/".to_string(),
-    };
-    url::parse(&raw).expect("test URL must parse")
-}
-
-async fn drive_in(
-    remote: RemoteUrl,
-    store: Arc<dyn ObjectStore>,
-    script: &str,
-    repo_dir: PathBuf,
-) -> (Vec<u8>, Result<(), ProtocolError>) {
-    let (client_side, helper_side) = tokio::io::duplex(64 * 1024);
-    let (helper_in, helper_out) = tokio::io::split(helper_side);
-    let (client_reader, mut client_writer) = tokio::io::split(client_side);
-
-    let script_bytes = script.as_bytes().to_owned();
-    let writer_task = tokio::spawn(async move {
-        client_writer.write_all(&script_bytes).await.unwrap();
-        client_writer.shutdown().await.unwrap();
-    });
-
-    let reader_task = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut buf = Vec::new();
-        client_reader
-            .take(u64::MAX)
-            .read_to_end(&mut buf)
-            .await
-            .unwrap();
-        buf
-    });
-
-    let result = run(
-        remote,
-        store,
-        tokio::io::BufReader::new(helper_in),
-        helper_out,
-        None,
-        repo_dir,
-    )
-    .await;
-
-    writer_task.await.unwrap();
-    let output = reader_task.await.unwrap();
-    (output, result)
-}
+use common::{drive_in, git, git_available, git_capture, s3_url};
 
 /// Initialise a fresh repo, commit a single blob, and return the dir +
 /// commit SHA.
@@ -109,34 +51,6 @@ fn bundle_ref(seed_dir: &Path, sha: &str, ref_name: &str) -> Bytes {
         seed_dir,
     );
     Bytes::from(std::fs::read(&bundle_path).expect("read bundle"))
-}
-
-fn git(args: &[&str], cwd: &Path) {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("spawn git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
-
-fn git_capture(args: &[&str], cwd: &Path) -> String {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("spawn git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr),
-    );
-    String::from_utf8(output.stdout).expect("git stdout utf-8")
 }
 
 fn make_dst_repo() -> TempDir {

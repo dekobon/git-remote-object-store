@@ -10,28 +10,23 @@
 
 #![cfg(feature = "test-util")]
 
+mod common;
+
 use std::sync::Arc;
 
 use bytes::Bytes;
 use git_remote_object_store::object_store::mock::MockStore;
 use git_remote_object_store::object_store::{ObjectStore, PutOpts};
-use git_remote_object_store::protocol::{ProtocolError, run};
-use git_remote_object_store::url::{self, RemoteUrl};
+use git_remote_object_store::protocol::ProtocolError;
+use git_remote_object_store::url::RemoteUrl;
 use time::Duration;
 use time::OffsetDateTime;
-use tokio::io::AsyncWriteExt;
+
+use common::{drive_in, s3_url};
 
 const SHA_A: &str = "0000000000000000000000000000000000000001";
 const SHA_B: &str = "0000000000000000000000000000000000000002";
 const SHA_C: &str = "0000000000000000000000000000000000000003";
-
-fn s3_url(prefix: Option<&str>) -> RemoteUrl {
-    let raw = match prefix {
-        Some(p) => format!("s3+https://my-bucket.s3.us-west-2.amazonaws.com/{p}"),
-        None => "s3+https://my-bucket.s3.us-west-2.amazonaws.com/".to_string(),
-    };
-    url::parse(&raw).expect("test URL must parse")
-}
 
 async fn drive(
     remote: RemoteUrl,
@@ -39,45 +34,6 @@ async fn drive(
     script: &str,
 ) -> (Vec<u8>, Result<(), ProtocolError>) {
     drive_in(remote, store, script, std::env::temp_dir()).await
-}
-
-async fn drive_in(
-    remote: RemoteUrl,
-    store: Arc<dyn ObjectStore>,
-    script: &str,
-    repo_dir: std::path::PathBuf,
-) -> (Vec<u8>, Result<(), ProtocolError>) {
-    let (client_side, helper_side) = tokio::io::duplex(64 * 1024);
-    let (helper_in, helper_out) = tokio::io::split(helper_side);
-    let (client_reader, mut client_writer) = tokio::io::split(client_side);
-
-    let script_bytes = script.as_bytes().to_owned();
-    let writer_task = tokio::spawn(async move {
-        client_writer.write_all(&script_bytes).await.unwrap();
-        client_writer.shutdown().await.unwrap();
-    });
-
-    let reader_task = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut reader = client_reader;
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).await.unwrap();
-        buf
-    });
-
-    let result = run(
-        remote,
-        store,
-        tokio::io::BufReader::new(helper_in),
-        helper_out,
-        None,
-        repo_dir,
-    )
-    .await;
-
-    writer_task.await.unwrap();
-    let output = reader_task.await.unwrap();
-    (output, result)
 }
 
 #[tokio::test]
