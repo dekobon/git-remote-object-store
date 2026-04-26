@@ -433,6 +433,72 @@ fn rejects_invalid_container_charset() {
 }
 
 #[test]
+fn rejects_forbidden_bucket_prefixes_path_style() {
+    for bad in ["xn--abcdef", "sthree-foo", "amzn-s3-demo-bucket"] {
+        let url = format!("s3+https://s3.us-west-2.amazonaws.com/{bad}/repo");
+        let err = parse(&url).unwrap_err();
+        assert!(
+            matches!(&err, ParseError::InvalidBucket(s) if s == bad),
+            "expected InvalidBucket({bad}), got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_forbidden_bucket_suffixes_path_style() {
+    for bad in [
+        "my-bucket-s3alias",
+        "my-bucket--ol-s3",
+        "my-bucket--x-s3",
+        "my-bucket--table-s3",
+        "ab.mrap",
+    ] {
+        let url = format!("s3+https://s3.us-west-2.amazonaws.com/{bad}/repo");
+        let err = parse(&url).unwrap_err();
+        assert!(
+            matches!(&err, ParseError::InvalidBucket(s) if s == bad),
+            "expected InvalidBucket({bad}), got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_bucket_formatted_as_ipv4() {
+    let err = parse("s3+https://s3.us-west-2.amazonaws.com/192.168.1.1/repo").unwrap_err();
+    assert!(matches!(err, ParseError::InvalidBucket(s) if s == "192.168.1.1"));
+}
+
+#[test]
+fn rejects_bucket_with_consecutive_periods() {
+    let err = parse("s3+https://s3.us-west-2.amazonaws.com/ab..cd/repo").unwrap_err();
+    assert!(matches!(err, ParseError::InvalidBucket(s) if s == "ab..cd"));
+}
+
+#[test]
+fn rejects_bucket_ending_with_dash() {
+    let err = parse("s3+https://s3.us-west-2.amazonaws.com/bucket-/repo").unwrap_err();
+    assert!(matches!(err, ParseError::InvalidBucket(s) if s == "bucket-"));
+}
+
+#[test]
+fn rejects_container_with_leading_dash() {
+    let err = parse("az+https://myaccount.blob.core.windows.net/-leading/repo").unwrap_err();
+    assert!(matches!(err, ParseError::InvalidContainer(s) if s == "-leading"));
+}
+
+#[test]
+fn rejects_container_with_trailing_dash() {
+    let err = parse("az+https://myaccount.blob.core.windows.net/trailing-/repo").unwrap_err();
+    assert!(matches!(err, ParseError::InvalidContainer(s) if s == "trailing-"));
+}
+
+#[test]
+fn rejects_container_with_consecutive_dashes() {
+    let err = parse("az+https://myaccount.blob.core.windows.net/foo--bar/repo").unwrap_err();
+    assert!(matches!(err, ParseError::InvalidContainer(s) if s == "foo--bar"));
+}
+
+#[test]
 fn rejects_unknown_flag() {
     let err = parse("s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?bogus=1").unwrap_err();
     assert!(matches!(err, ParseError::UnknownFlag(s) if s == "bogus"));
@@ -484,20 +550,38 @@ fn display_round_trip_concrete() {
 // Property-based round-trip
 // ---------------------------------------------------------------------------
 
-/// S3 bucket strategy that excludes `.` so that the bucket is a single
-/// hostname label. Buckets with dots break the virtual-hosted heuristic
-/// (and are discouraged by AWS for the same reason); users with dotted
-/// buckets use `?addressing=path`.
+/// AWS-reserved bucket-name prefixes mirrored from `src/url.rs` so the
+/// proptest generator can avoid emitting them. Kept independent of the
+/// production constants on purpose: the proptest is meant to exercise
+/// the production validator, not borrow its definitions.
+const FORBIDDEN_BUCKET_PREFIXES: &[&str] = &["xn--", "sthree-", "amzn-s3-demo-"];
+
+/// AWS-reserved bucket-name suffixes (see comment above).
+const FORBIDDEN_BUCKET_SUFFIXES: &[&str] = &["-s3alias", "--ol-s3", "--x-s3", "--table-s3"];
+
+/// S3 bucket strategy that excludes `.` so the bucket is a single
+/// hostname label, requires the first and last bytes to be alphanumeric
+/// per AWS rules, and filters out the AWS reserved prefixes/suffixes so
+/// every generated value is a valid AWS bucket name.
 fn arb_bucket() -> impl Strategy<Value = String> {
-    proptest::string::string_regex("[a-z0-9][a-z0-9-]{2,30}").expect("valid bucket regex")
+    proptest::string::string_regex("[a-z0-9][a-z0-9-]{1,28}[a-z0-9]")
+        .expect("valid bucket regex")
+        .prop_filter("excludes AWS reserved prefix/suffix", |s| {
+            !FORBIDDEN_BUCKET_PREFIXES.iter().any(|p| s.starts_with(p))
+                && !FORBIDDEN_BUCKET_SUFFIXES.iter().any(|p| s.ends_with(p))
+        })
 }
 
 fn arb_account() -> impl Strategy<Value = String> {
     proptest::string::string_regex("[a-z0-9]{3,24}").expect("valid account regex")
 }
 
+/// Azure container strategy: alphanumeric bookends, no consecutive
+/// hyphens, lowercase only.
 fn arb_container() -> impl Strategy<Value = String> {
-    proptest::string::string_regex("[a-z0-9-]{3,30}").expect("valid container regex")
+    proptest::string::string_regex("[a-z0-9][a-z0-9-]{1,28}[a-z0-9]")
+        .expect("valid container regex")
+        .prop_filter("no consecutive hyphens", |s| !s.contains("--"))
 }
 
 fn arb_prefix() -> impl Strategy<Value = Option<String>> {

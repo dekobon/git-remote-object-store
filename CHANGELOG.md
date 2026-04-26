@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `url::is_valid_bucket` now rejects the AWS-reserved bucket prefixes
+  (`xn--`, `sthree-`, `amzn-s3-demo-`) and suffixes (`-s3alias`,
+  `--ol-s3`, `.mrap`, `--x-s3`, `--table-s3`), enforces the
+  begin-and-end-with-alphanumeric rule, rejects consecutive periods, and
+  rejects names formatted as IPv4 dotted-quads. `url::is_valid_container`
+  now enforces the matching Azure rules: alphanumeric bookends and no
+  consecutive hyphens. Closes #17.
+
 ### Added
 
 - Phase 7 parallel `fetch` handler (`src/protocol/fetch.rs`): the REPL now
