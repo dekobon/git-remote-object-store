@@ -10,7 +10,7 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tracing::warn;
 
-use super::ManageError;
+use super::{ManageError, key_under_prefix};
 use crate::object_store::{ObjectMeta, ObjectStore};
 
 /// One bundle object listed under a ref.
@@ -69,7 +69,10 @@ impl RepoSnapshot {
 ///
 /// `prefix` must be the full repository prefix from the parsed remote
 /// URL (e.g. `acme/myrepo`), without a trailing `/` — this function
-/// appends one to match the upstream listing semantics.
+/// appends one to match the upstream listing semantics. An empty
+/// `prefix` means "list the entire bucket/container" (root-of-bucket
+/// repository) and skips the trailing `/` to avoid emitting a
+/// leading-slash list prefix.
 ///
 /// Performs one `list` call. Callers that already have a listing of
 /// `<prefix>/` should call [`analyze_objects`] instead to avoid a
@@ -78,7 +81,7 @@ pub async fn analyze(
     store: &Arc<dyn ObjectStore>,
     prefix: &str,
 ) -> Result<RepoSnapshot, ManageError> {
-    let list_prefix = format!("{prefix}/");
+    let list_prefix = key_under_prefix(prefix, "");
     let objects = store.list(&list_prefix).await?;
     analyze_objects(&objects, &list_prefix, store).await
 }
@@ -294,6 +297,24 @@ mod tests {
             entry.bundles[0].key,
             "myrepo/refs/heads/feature/x/aaa.bundle"
         );
+    }
+
+    #[tokio::test]
+    async fn root_prefix_lists_bucket_without_leading_slash() {
+        // Empty prefix == repository at the bucket root. The on-bucket
+        // layout drops the leading `<prefix>/` segment entirely.
+        let mock = MockStore::new();
+        mock.insert("HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("refs/heads/main/abc.bundle", Bytes::from("body"));
+        mock.insert("refs/heads/main/PROTECTED#", Bytes::new());
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "").await.expect("analyze at root");
+        assert_eq!(snap.head.as_deref(), Some("refs/heads/main"));
+        let main = snap.refs.get("refs/heads/main").expect("main present");
+        assert_eq!(main.bundles.len(), 1);
+        assert_eq!(main.bundles[0].sha, "abc");
+        assert_eq!(main.bundles[0].key, "refs/heads/main/abc.bundle");
+        assert!(main.is_protected);
     }
 
     #[tokio::test]

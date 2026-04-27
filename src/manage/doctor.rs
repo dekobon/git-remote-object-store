@@ -30,7 +30,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use super::snapshot::{BundleEntry, RepoSnapshot, analyze_objects};
-use super::{DEFAULT_LOCK_TTL_SECONDS, ManageError, Prompter};
+use super::{DEFAULT_LOCK_TTL_SECONDS, ManageError, Prompter, key_under_prefix};
 use crate::object_store::{ObjectMeta, ObjectStore, PutOpts};
 
 /// Tunables for [`Doctor::run`]. Field names match the equivalent
@@ -69,7 +69,8 @@ pub struct Doctor<'a> {
 
 impl<'a> Doctor<'a> {
     /// Construct a new runner. `prefix` is the parsed remote URL's
-    /// repository prefix without a trailing `/`.
+    /// repository prefix without a trailing `/`. Pass an empty string
+    /// for repositories stored at the bucket/container root.
     #[must_use]
     pub fn new(
         store: Arc<dyn ObjectStore>,
@@ -93,8 +94,9 @@ impl<'a> Doctor<'a> {
     pub async fn run(&self) -> Result<(), ManageError> {
         // Share one LIST between snapshot analysis and stale-lock
         // scanning so a doctor run is a single bucket walk regardless
-        // of repo size.
-        let list_prefix = format!("{}/", self.prefix);
+        // of repo size. Empty `prefix` (root-of-bucket repo) collapses
+        // to a bucket-wide list.
+        let list_prefix = key_under_prefix(&self.prefix, "");
         let objects = self.store.list(&list_prefix).await?;
         let mut snapshot = analyze_objects(&objects, &list_prefix, &self.store).await?;
         print!("{}", self.report(&snapshot));
@@ -125,7 +127,7 @@ impl<'a> Doctor<'a> {
     fn report(&self, snapshot: &RepoSnapshot) -> String {
         use std::fmt::Write;
         let mut out = String::new();
-        let _ = writeln!(out, "{}:", self.prefix);
+        let _ = writeln!(out, "{}:", self.report_label());
         for (ref_path, r) in &snapshot.refs {
             let star = if r.is_protected { "*" } else { "" };
             let status = match r.bundles.len() {
@@ -144,6 +146,17 @@ impl<'a> Doctor<'a> {
         out
     }
 
+    /// Human-readable label for the repo in printed output. Empty
+    /// `prefix` (root-of-bucket repo) renders as `(root)` so the report
+    /// header isn't a bare colon.
+    fn report_label(&self) -> &str {
+        if self.prefix.is_empty() {
+            "(root)"
+        } else {
+            &self.prefix
+        }
+    }
+
     async fn fix_multiple_bundles(
         &self,
         snapshot: &mut RepoSnapshot,
@@ -151,7 +164,7 @@ impl<'a> Doctor<'a> {
     ) -> Result<(), ManageError> {
         println!(
             "\nFix multiple bundles for repo {} and ref {ref_path}",
-            self.prefix
+            self.report_label()
         );
 
         // The caller filtered for refs with `bundles.len() > 1`; if the
@@ -220,7 +233,8 @@ impl<'a> Doctor<'a> {
             let mut buf = [0u8; uuid::fmt::Simple::LENGTH];
             let suffix = &Uuid::new_v4().simple().encode_lower(&mut buf)[..8];
             let new_ref = format!("{ref_path}_{suffix}");
-            let dst_key = format!("{}/{new_ref}/{}.bundle", self.prefix, losing.sha);
+            let dst_key =
+                key_under_prefix(&self.prefix, &format!("{new_ref}/{}.bundle", losing.sha));
             println!("Moving {} to new branch {new_ref}", losing.sha);
             self.store.copy(&losing.key, &dst_key).await?;
             self.store.delete(&losing.key).await?;
@@ -229,7 +243,7 @@ impl<'a> Doctor<'a> {
     }
 
     async fn fix_head(&self, snapshot: &mut RepoSnapshot) -> Result<(), ManageError> {
-        println!("\nFix invalid HEAD for repo {}", self.prefix);
+        println!("\nFix invalid HEAD for repo {}", self.report_label());
 
         let candidates: Vec<&str> = snapshot
             .refs
@@ -258,7 +272,7 @@ impl<'a> Doctor<'a> {
             .expect("Prompter::select returned out-of-range index")
             .to_owned();
 
-        let head_key = format!("{}/HEAD", self.prefix);
+        let head_key = key_under_prefix(&self.prefix, "HEAD");
         println!("Setting {new_head} as HEAD");
         self.store
             .put_bytes(&head_key, Bytes::from(new_head.clone()), PutOpts::default())
@@ -551,6 +565,87 @@ mod tests {
         assert_eq!(
             report,
             "myrepo:\n  refs/heads/main: Ok\n  HEAD: refs/heads/main\n",
+        );
+    }
+
+    // --- Root-of-bucket (empty prefix) coverage --------------------------
+
+    #[tokio::test]
+    async fn root_prefix_clean_run_does_not_mutate_bucket() {
+        // Repo lives at the bucket root — keys have no `<prefix>/`
+        // segment. A regression that re-introduces the leading slash
+        // would surface either as "no objects found" (the doctor's
+        // listing key would be `/`, which matches nothing) or as the
+        // doctor failing to identify the bundle by its relative path.
+        let mock = MockStore::new();
+        mock.insert("HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("refs/heads/main/abc.bundle", Bytes::from("body"));
+        let initial_keys = mock.keys();
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "", DoctorOpts::default(), &prompter);
+        doctor.run().await.expect("doctor.run at root");
+        assert_eq!(mock.keys(), initial_keys);
+    }
+
+    #[tokio::test]
+    async fn root_prefix_fix_head_writes_to_root_head_key() {
+        // No HEAD object → fix_head writes one. The key must be the
+        // bare `HEAD`, not `/HEAD`.
+        let mock = MockStore::new();
+        mock.insert("refs/heads/main/abc.bundle", Bytes::from("b"));
+        let prompter = ScriptedPrompter::new([Answer::Select(0)]);
+        let doctor = Doctor::new(store_arc(&mock), "", DoctorOpts::default(), &prompter);
+        doctor.run().await.expect("doctor.run at root");
+
+        let head_bytes = mock.get_bytes("HEAD").await.expect("HEAD at root");
+        assert_eq!(&head_bytes[..], b"refs/heads/main");
+        assert!(!mock.contains("/HEAD"), "no leading-slash HEAD key");
+    }
+
+    #[tokio::test]
+    async fn root_prefix_fix_multiple_bundles_quarantines_at_root() {
+        let mock = MockStore::new();
+        mock.insert("HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("refs/heads/main/aaa.bundle", Bytes::from("a"));
+        mock.insert("refs/heads/main/bbb.bundle", Bytes::from("b"));
+        let prompter = ScriptedPrompter::new([Answer::Select(0), Answer::Confirm(true)]);
+        let doctor = Doctor::new(store_arc(&mock), "", DoctorOpts::default(), &prompter);
+        doctor.run().await.expect("doctor.run at root");
+
+        // Loser was moved to a quarantine ref `refs/heads/main_<uuid8>`,
+        // and the destination key has no leading slash.
+        let moved = mock
+            .keys()
+            .into_iter()
+            .find(|k| k.starts_with("refs/heads/main_") && k.ends_with("/bbb.bundle"))
+            .expect("quarantine key created at root");
+        assert!(
+            !moved.starts_with('/'),
+            "quarantine key must not have a leading slash: {moved:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_prefix_report_renders_root_label() {
+        // The first line of the report uses `(root)` so the empty
+        // prefix doesn't produce a bare `:` header.
+        let mock = MockStore::new();
+        mock.insert("HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("refs/heads/main/abc.bundle", Bytes::from("b"));
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "", DoctorOpts::default(), &prompter);
+        let snapshot = super::analyze_objects(
+            &mock.list("").await.expect("list at root"),
+            "",
+            &store_arc(&mock),
+        )
+        .await
+        .expect("analyze");
+
+        let report = doctor.report(&snapshot);
+        assert_eq!(
+            report,
+            "(root):\n  refs/heads/main: Ok\n  HEAD: refs/heads/main\n",
         );
     }
 }
