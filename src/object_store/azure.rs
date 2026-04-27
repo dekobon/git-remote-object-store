@@ -229,6 +229,39 @@ fn classify_status(status: u16, key: &str) -> Option<Error> {
     }
 }
 
+/// Convert the relevant `Get Blob Properties` headers into the trait's
+/// [`ObjectMeta`].
+///
+/// Extracted so unit tests can drive the missing-content-length and
+/// missing-last-modified guard branches without synthesising a full
+/// `BlobClientGetPropertiesResultHeaders` value.
+///
+/// A missing `Content-Length` is an error rather than silent zero: a
+/// 0-byte size is semantically meaningful (lock files are intentionally
+/// empty) and downstream `head_then_download` takes a fast path on
+/// `size == 0` that writes an empty destination file. Treating "header
+/// absent" as 0 would silently produce empty bundles instead of
+/// surfacing the malformed response. See `execution-plan.md` §5.1.
+fn properties_to_meta(
+    key: &str,
+    content_length: Option<u64>,
+    last_modified: Option<OffsetDateTime>,
+    etag: Option<&str>,
+) -> Result<ObjectMeta, Error> {
+    let size = content_length.ok_or_else(|| {
+        Error::Other(format!("get_properties on `{key}` returned no content-length").into())
+    })?;
+    let last_modified = last_modified.ok_or_else(|| {
+        Error::Other(format!("get_properties on `{key}` returned no last-modified").into())
+    })?;
+    Ok(ObjectMeta {
+        key: key.to_owned(),
+        size,
+        last_modified,
+        etag: etag.map(str::to_owned),
+    })
+}
+
 /// Convert a `BlobItem`-shaped record into the trait's [`ObjectMeta`].
 ///
 /// Extracted so unit tests can drive the missing-field guards without
@@ -356,20 +389,12 @@ impl ObjectStore for AzureBlobStore {
             .await
             .map_err(|e| classify(e, key))?;
         let headers = resp.headers();
-        let size = header_u64(headers, &HeaderName::from_static("content-length")).unwrap_or(0);
-        let last_modified = header_http_date(headers, &HeaderName::from_static("last-modified"))
-            .ok_or_else(|| {
-                Error::Other(format!("get_properties on `{key}` returned no last-modified").into())
-            })?;
-        let etag = headers
-            .get_optional_str(&HeaderName::from_static("etag"))
-            .map(str::to_owned);
-        Ok(ObjectMeta {
-            key: key.to_owned(),
-            size,
-            last_modified,
-            etag,
-        })
+        properties_to_meta(
+            key,
+            header_u64(headers, &HeaderName::from_static("content-length")),
+            header_http_date(headers, &HeaderName::from_static("last-modified")),
+            headers.get_optional_str(&HeaderName::from_static("etag")),
+        )
     }
 
     async fn copy(&self, src: &str, dst: &str) -> Result<(), Error> {
@@ -576,6 +601,59 @@ mod tests {
     fn classify_unrecognised_status_returns_none() {
         assert!(classify_status(500, "k").is_none());
         assert!(classify_status(429, "k").is_none());
+    }
+
+    // --- properties_to_meta ------------------------------------------
+
+    #[test]
+    fn properties_to_meta_round_trips_well_formed_response() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let meta = properties_to_meta("k", Some(42), Some(now), Some("\"abc\""))
+            .expect("conversion succeeds");
+        assert_eq!(meta.key, "k");
+        assert_eq!(meta.size, 42);
+        assert_eq!(meta.last_modified.unix_timestamp(), 1_700_000_000);
+        assert_eq!(meta.etag.as_deref(), Some("\"abc\""));
+    }
+
+    #[test]
+    fn properties_to_meta_preserves_legitimate_zero_size() {
+        // Zero-byte lock files are legitimate; a present
+        // `Content-Length: 0` header (`Some(0)`) must round-trip as
+        // `size == 0`, distinct from the missing-header error.
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let meta =
+            properties_to_meta("LOCK", Some(0), Some(now), None).expect("conversion succeeds");
+        assert_eq!(meta.size, 0);
+    }
+
+    #[test]
+    fn properties_to_meta_rejects_missing_content_length() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let err = properties_to_meta("k", None, Some(now), None)
+            .expect_err("missing content-length must error");
+        match err {
+            Error::Other(inner) => {
+                let msg = inner.to_string();
+                assert!(msg.contains("no content-length"), "names failure: {msg}");
+                assert!(msg.contains("`k`"), "includes the key for context: {msg}");
+            }
+            other => panic!("expected Error::Other for missing content-length, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn properties_to_meta_rejects_missing_last_modified() {
+        let err = properties_to_meta("k", Some(0), None, None)
+            .expect_err("missing last_modified must error");
+        match err {
+            Error::Other(inner) => {
+                let msg = inner.to_string();
+                assert!(msg.contains("no last-modified"), "names failure: {msg}");
+                assert!(msg.contains("`k`"), "includes the key for context: {msg}");
+            }
+            other => panic!("expected Error::Other for missing last_modified, got {other:?}"),
+        }
     }
 
     // --- item_to_meta -------------------------------------------------
