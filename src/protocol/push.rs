@@ -21,7 +21,7 @@ use bytes::Bytes;
 use time::{Duration, OffsetDateTime};
 use tracing::{debug, warn};
 
-use crate::git::{self, GitError, RefName, RefNameError, Sha, ShaError, validate_ref_name};
+use crate::git::{self, GitError, RefName, RefNameError, Sha, ShaError, is_valid_ref_name};
 use crate::object_store::{Error as ObjectStoreError, ObjectMeta, ObjectStore, PutOpts};
 
 /// Default per-ref lock TTL, in seconds. Matches upstream
@@ -134,7 +134,7 @@ fn parse_push_args(args: &str) -> Result<PushSpec, PushError> {
         Some(rest) => (true, rest),
         None => (false, local),
     };
-    if !local.is_empty() && !validate_ref_name(local) {
+    if !local.is_empty() && !is_valid_ref_name(local) {
         return Err(PushError::InvalidLocalSpec(local.to_owned()));
     }
     let remote_ref = RefName::new(remote)?;

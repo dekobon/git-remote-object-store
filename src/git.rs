@@ -141,7 +141,7 @@ pub enum RefNameError {
 /// upstream Python regex's permissiveness; for the strict, fully-qualified
 /// form used when constructing a [`RefName`], use [`RefName::new`] instead.
 #[must_use]
-pub fn validate_ref_name(name: &str) -> bool {
+pub fn is_valid_ref_name(name: &str) -> bool {
     gix_validate::reference::name_partial(BStr::new(name)).is_ok()
 }
 
@@ -307,7 +307,7 @@ fn repo_cwd(repo: &Repository) -> &Path {
 ///
 /// `spec` is a rev-spec passed verbatim to `git bundle create` — a
 /// fully-qualified ref (`refs/heads/main`), a short branch (`main`),
-/// `HEAD`, or even a SHA. Callers should run [`validate_ref_name`] on
+/// `HEAD`, or even a SHA. Callers should run [`is_valid_ref_name`] on
 /// untrusted input first; git itself enforces the same invariants and
 /// will fail the subprocess otherwise.
 ///
@@ -619,7 +619,7 @@ mod tests {
         assert!(matches!(Sha::from_hex(""), Err(ShaError::Empty)));
     }
 
-    // --- RefName / validate_ref_name ----------------------------------
+    // --- RefName / is_valid_ref_name ----------------------------------
 
     const INVALID_REF_NAMES: &[&str] = &[
         "",
@@ -658,15 +658,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_ref_name_partial_accepts_single_component_head() {
+    fn is_valid_ref_name_partial_accepts_single_component_head() {
         // The partial validator accepts `HEAD`, matching the upstream
         // permissive regex; the strict `RefName::new` would reject it
         // because it isn't fully qualified.
-        assert!(validate_ref_name("HEAD"));
+        assert!(is_valid_ref_name("HEAD"));
     }
 
     #[test]
-    fn validate_ref_name_partial_rejects_each_invalid_category() {
+    fn is_valid_ref_name_partial_rejects_each_invalid_category() {
         // Empty and trailing-slash are rejected by `name_partial`.
         for name in &[
             "",
@@ -674,7 +674,7 @@ mod tests {
             "refs/heads/foo..bar",
             "refs/heads/main.lock",
         ] {
-            assert!(!validate_ref_name(name), "expected !{name:?}");
+            assert!(!is_valid_ref_name(name), "expected !{name:?}");
         }
     }
 

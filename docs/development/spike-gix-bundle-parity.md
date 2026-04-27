@@ -31,7 +31,7 @@ exists today.
 
 Decision: keep a subprocess fallback for `bundle()` and `unbundle()`
 only. All other helpers (`rev_parse`, `is_ancestor`, `archive`,
-`validate_ref_name`, `last_commit_message`, `remote_url`) go through
+`is_valid_ref_name`, `last_commit_message`, `remote_url`) go through
 `gix` natively.
 
 The fallback is implemented through a single private helper,
