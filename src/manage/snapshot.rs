@@ -10,7 +10,8 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tracing::warn;
 
-use super::{ManageError, key_under_prefix};
+use super::ManageError;
+use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore};
 
 /// One bundle object listed under a ref.
@@ -81,7 +82,7 @@ pub async fn analyze(
     store: &Arc<dyn ObjectStore>,
     prefix: &str,
 ) -> Result<RepoSnapshot, ManageError> {
-    let list_prefix = key_under_prefix(prefix, "");
+    let list_prefix = keys::join(prefix, "");
     let objects = store.list(&list_prefix).await?;
     analyze_objects(&objects, &list_prefix, store).await
 }

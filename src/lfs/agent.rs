@@ -16,6 +16,7 @@ use thiserror::Error;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 
+use crate::keys;
 use crate::lfs::oid::LfsOid;
 use crate::lfs::protocol::{CompleteEvent, EventError, ProgressEvent};
 use crate::object_store::{ObjectStore, ObjectStoreError};
@@ -70,11 +71,7 @@ impl Agent {
     /// Destination key for an LFS object: `<prefix>/lfs/<oid>` (or
     /// `lfs/<oid>` when there is no prefix).
     fn key(&self, oid: &LfsOid) -> String {
-        if self.prefix.is_empty() {
-            format!("lfs/{oid}")
-        } else {
-            format!("{}/lfs/{oid}", self.prefix)
-        }
+        keys::join(&self.prefix, &format!("lfs/{oid}"))
     }
 
     /// Handle an `upload` event: skip when the key already exists,

@@ -60,7 +60,7 @@ use url::Url;
 
 use crate::url::{RemoteUrl, S3Addressing};
 
-use super::error::other_boxed;
+use super::error::{network_boxed, other_boxed};
 use super::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts, persist_temp};
 
 /// Object-size cutoff above which `get_to_file` switches from a single
@@ -324,10 +324,8 @@ where
         }
     }
     match &err {
-        SdkError::DispatchFailure(_) | SdkError::TimeoutError(_) => {
-            ObjectStoreError::Network(Box::new(err))
-        }
-        _ => ObjectStoreError::Other(Box::new(err)),
+        SdkError::DispatchFailure(_) | SdkError::TimeoutError(_) => network_boxed(err),
+        _ => other_boxed(err),
     }
 }
 
@@ -521,11 +519,7 @@ impl ObjectStore for S3Store {
             .send()
             .await
             .map_err(|e| classify(e, key))?;
-        let aggregated = resp
-            .body
-            .collect()
-            .await
-            .map_err(|e| ObjectStoreError::Network(Box::new(e)))?;
+        let aggregated = resp.body.collect().await.map_err(network_boxed)?;
         Ok(aggregated.into_bytes())
     }
 
@@ -686,7 +680,7 @@ impl S3Store {
             .map_err(other_boxed)?;
 
         while let Some(chunk) = resp.body.next().await {
-            let bytes = chunk.map_err(|e| ObjectStoreError::Network(Box::new(e)))?;
+            let bytes = chunk.map_err(network_boxed)?;
             file.write_all(&bytes).await.map_err(other_boxed)?;
         }
         file.flush().await.map_err(other_boxed)?;
@@ -740,7 +734,7 @@ impl S3Store {
                     .body
                     .collect()
                     .await
-                    .map_err(|e| ObjectStoreError::Network(Box::new(e)))?
+                    .map_err(network_boxed)?
                     .into_bytes();
                 let expected = end - start + 1;
                 if bytes.len() as u64 != expected {

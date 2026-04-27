@@ -30,7 +30,8 @@ use tracing::info;
 use uuid::Uuid;
 
 use super::snapshot::{BundleEntry, RepoSnapshot, analyze_objects};
-use super::{DEFAULT_LOCK_TTL_SECONDS, ManageError, Prompter, key_under_prefix};
+use super::{DEFAULT_LOCK_TTL_SECONDS, ManageError, Prompter};
+use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, PutOpts};
 
 /// Tunables for [`Doctor::run`]. Field names match the equivalent
@@ -96,7 +97,7 @@ impl<'a> Doctor<'a> {
         // scanning so a doctor run is a single bucket walk regardless
         // of repo size. Empty `prefix` (root-of-bucket repo) collapses
         // to a bucket-wide list.
-        let list_prefix = key_under_prefix(&self.prefix, "");
+        let list_prefix = keys::join(&self.prefix, "");
         let objects = self.store.list(&list_prefix).await?;
         let mut snapshot = analyze_objects(&objects, &list_prefix, &self.store).await?;
         print!("{}", self.report(&snapshot));
@@ -239,8 +240,7 @@ impl<'a> Doctor<'a> {
             let mut buf = [0u8; uuid::fmt::Simple::LENGTH];
             let suffix = &Uuid::new_v4().simple().encode_lower(&mut buf)[..8];
             let new_ref = format!("{ref_path}_{suffix}");
-            let dst_key =
-                key_under_prefix(&self.prefix, &format!("{new_ref}/{}.bundle", losing.sha));
+            let dst_key = keys::join(&self.prefix, &format!("{new_ref}/{}.bundle", losing.sha));
             println!("Moving {} to new branch {new_ref}", losing.sha);
             self.store.copy(&losing.key, &dst_key).await?;
             self.store.delete(&losing.key).await?;
@@ -284,7 +284,7 @@ impl<'a> Doctor<'a> {
             })?
             .to_owned();
 
-        let head_key = key_under_prefix(&self.prefix, "HEAD");
+        let head_key = keys::join(&self.prefix, "HEAD");
         println!("Setting {new_head} as HEAD");
         self.store
             .put_bytes(&head_key, Bytes::from(new_head.clone()), PutOpts::default())

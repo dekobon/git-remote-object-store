@@ -15,8 +15,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tracing::info;
 
-use super::{ManageError, Prompter, key_under_prefix};
+use super::{ManageError, Prompter};
 use crate::git::RefName;
+use crate::keys;
 use crate::object_store::{ObjectStore, ObjectStoreError, PutOpts};
 
 /// Operations on a single branch within a repository.
@@ -62,11 +63,11 @@ impl<'a> ManageBranch<'a> {
     }
 
     fn branch_prefix(&self) -> String {
-        key_under_prefix(&self.prefix, &format!("refs/heads/{}/", self.branch))
+        keys::join(&self.prefix, &format!("refs/heads/{}/", self.branch))
     }
 
     fn protected_key(&self) -> String {
-        key_under_prefix(
+        keys::join(
             &self.prefix,
             &format!("refs/heads/{}/PROTECTED#", self.branch),
         )
