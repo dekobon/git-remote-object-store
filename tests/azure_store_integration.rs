@@ -486,3 +486,316 @@ async fn get_to_file_zero_byte_blob_round_trips() {
         .expect("get_to_file empty");
     assert_eq!(std::fs::metadata(&dest).expect("metadata").len(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// End-to-end binary tests (Phase 12)
+//
+// Drive `git push` / `git clone` against the actual `git-remote-az+http`
+// helper binary, with Azurite as the backend. These complement the
+// trait-level tests above by exercising the protocol REPL, the URL
+// dispatch in `protocol::backend::build`, and the LFS custom-transfer
+// agent.
+//
+// Cargo bin names cannot contain `+` (execution-plan.md §5.6), so each
+// helper is built as `git-remote-az-http` and we symlink the binary to
+// `git-remote-az+http` in a tempdir prepended to PATH for the duration
+// of these tests.
+// ---------------------------------------------------------------------------
+
+use std::path::Path;
+use std::process::Command;
+use tempfile::TempDir;
+
+/// Cargo bin path for the Azure HTTP helper. `CARGO_BIN_EXE_<name>` is
+/// populated by cargo for any `[[bin]]` defined in this package, and
+/// triggers a build of that binary before the integration test runs.
+const HELPER_BIN: &str = env!("CARGO_BIN_EXE_git-remote-az-http");
+/// Cargo bin path for the LFS custom-transfer agent.
+const LFS_BIN: &str = env!("CARGO_BIN_EXE_git-lfs-object-store");
+
+/// On-disk name git looks up when dispatching `az+http://…` URLs. Must
+/// be exactly `git-remote-az+http` per `git help gitremote-helpers`.
+const HELPER_GIT_NAME: &str = "git-remote-az+http";
+/// Same for the LFS agent — registered under `lfs.standalonetransferagent`
+/// in [`crate::lfs::install`], which uses the unhyphenated name.
+const LFS_GIT_NAME: &str = "git-lfs-object-store";
+
+/// Tempdir holding `+`-named symlinks to the cargo binaries. Held in a
+/// `OnceLock` so it survives for the lifetime of the test process; the
+/// inner [`TempDir`] cleans up at process exit.
+static HELPER_BIN_DIR: OnceLock<TempDir> = OnceLock::new();
+
+/// Build (once) a directory containing the helper symlinks, prepend it
+/// to PATH for child processes, and return the absolute path.
+fn helper_bin_dir() -> &'static Path {
+    HELPER_BIN_DIR
+        .get_or_init(|| {
+            let tmp = tempfile::tempdir().expect("helper bin tempdir");
+            // Symlink each cargo-built binary under the name git looks up.
+            // `+` is legal in POSIX filenames, so the symlink target name
+            // is straightforward.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                symlink(Path::new(HELPER_BIN), tmp.path().join(HELPER_GIT_NAME))
+                    .expect("symlink helper bin");
+                symlink(Path::new(LFS_BIN), tmp.path().join(LFS_GIT_NAME))
+                    .expect("symlink lfs bin");
+            }
+            #[cfg(not(unix))]
+            {
+                compile_error!("Phase 12 E2E tests are unix-only (symlink-based PATH shim)");
+            }
+            tmp
+        })
+        .path()
+}
+
+/// Whether `git` is on PATH. The whole binary suite assumes git is
+/// available, but skip rather than panic when it isn't.
+fn git_available() -> bool {
+    Command::new("git").arg("--version").output().is_ok()
+}
+
+/// Whether `git lfs` is on PATH. Required only by the LFS round-trip
+/// test; skip when missing rather than failing the suite.
+fn git_lfs_available() -> bool {
+    Command::new("git")
+        .args(["lfs", "version"])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Build a `PATH` value with [`helper_bin_dir`] prepended to the host's
+/// existing `PATH`. Shared by [`run_git_capture`] and the direct
+/// LFS-agent-install spawn.
+fn path_with_bin_dir() -> std::ffi::OsString {
+    let bin_dir = helper_bin_dir();
+    match std::env::var_os("PATH") {
+        Some(existing) => {
+            let mut prefixed = std::ffi::OsString::from(bin_dir);
+            prefixed.push(":");
+            prefixed.push(&existing);
+            prefixed
+        }
+        None => bin_dir.as_os_str().to_owned(),
+    }
+}
+
+/// Run `git-lfs-object-store install` in `cwd`, exercising the
+/// production install path that wires the agent into git config.
+fn run_lfs_agent_install(cwd: &Path) {
+    let status = Command::new(helper_bin_dir().join(LFS_GIT_NAME))
+        .arg("install")
+        .current_dir(cwd)
+        .env("PATH", path_with_bin_dir())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .status()
+        .expect("spawn git-lfs-object-store install");
+    assert!(
+        status.success(),
+        "lfs agent install failed in {}",
+        cwd.display()
+    );
+}
+
+/// Run a `git` subcommand against `cwd` with hermetic configuration:
+///
+/// - PATH prepended with the helper-symlink directory so git finds the
+///   `+`-named binaries.
+/// - User / system git config redirected to `/dev/null` so the host's
+///   `~/.gitconfig` cannot leak into the test.
+/// - `GIT_TERMINAL_PROMPT=0` so any unexpected credential prompt fails
+///   fast instead of hanging.
+///
+/// Asserts the command succeeds.
+fn run_git(args: &[&str], cwd: &Path) {
+    let output = run_git_capture(args, cwd);
+    assert!(
+        output.status.success(),
+        "git {args:?} (cwd={}) failed: stdout={} stderr={}",
+        cwd.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// Like [`run_git`] but returns the raw [`std::process::Output`] (does
+/// not assert success).
+fn run_git_capture(args: &[&str], cwd: &Path) -> std::process::Output {
+    Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("PATH", path_with_bin_dir())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("spawn git")
+}
+
+/// Initialise an empty repo, configure a deterministic identity, and
+/// return its tempdir.
+fn init_seed_repo() -> TempDir {
+    let dir = tempfile::tempdir().expect("seed repo tempdir");
+    run_git(&["init", "--quiet", "--initial-branch=main"], dir.path());
+    run_git(&["config", "user.email", "test@example.com"], dir.path());
+    run_git(&["config", "user.name", "Test"], dir.path());
+    run_git(&["config", "commit.gpgsign", "false"], dir.path());
+    dir
+}
+
+/// Allocate a fresh container in Azurite (used by E2E tests that drive
+/// the helper binary rather than the [`AzureBlobStore`] API directly)
+/// and return `(host_port, container_name)`.
+async fn fresh_container_endpoint() -> (u16, String) {
+    let fixture = fixture();
+    let n = CONTAINER_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let container = format!("e2e-{}-{}", std::process::id(), n);
+    create_container(fixture.port, &container).await;
+    (fixture.port, container)
+}
+
+/// Build the helper URL for the given Azurite endpoint, container, and
+/// repository prefix. Path-style addressing is required for Azurite.
+fn helper_url(port: u16, container: &str, prefix: &str) -> String {
+    format!(
+        "az+http://127.0.0.1:{port}/{TEST_ACCOUNT}/{container}/{prefix}\
+         ?addressing=path&credential={CREDENTIAL_ALIAS}"
+    )
+}
+
+#[tokio::test]
+async fn helper_binary_round_trips_init_push_clone_fetch() {
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+
+    let (port, container) = fresh_container_endpoint().await;
+    let url = helper_url(port, &container, "repo");
+
+    // Source repo: one commit on main.
+    let seed = init_seed_repo();
+    std::fs::write(seed.path().join("hello.txt"), b"hello phase 12\n").expect("write seed file");
+    run_git(&["add", "hello.txt"], seed.path());
+    run_git(
+        &["commit", "--quiet", "-m", "seed", "--no-gpg-sign"],
+        seed.path(),
+    );
+
+    // Allow the +http scheme inside this repo's submodule resolution
+    // path (defensive — `protocol.az+http.allow` is irrelevant for the
+    // top-level remote, but mirrors the documented config) and add the
+    // remote.
+    run_git(&["config", "protocol.az+http.allow", "always"], seed.path());
+    run_git(&["remote", "add", "origin", &url], seed.path());
+
+    // Push: drives the helper binary end-to-end. A failure here means
+    // the protocol REPL or backend wiring is broken.
+    run_git(&["push", "origin", "main"], seed.path());
+
+    // Clone into a fresh directory. The clone must come up with the
+    // same commit and the seed file.
+    let dest_parent = tempfile::tempdir().expect("dest tempdir");
+    let dest = dest_parent.path().join("clone");
+    let dest_str = dest.to_str().expect("dest path utf-8");
+    let clone_args: &[&str] = &[
+        "-c",
+        "protocol.az+http.allow=always",
+        "clone",
+        "--quiet",
+        &url,
+        dest_str,
+    ];
+    run_git(clone_args, dest_parent.path());
+
+    let cloned_body = std::fs::read(dest.join("hello.txt")).expect("cloned file readable");
+    assert_eq!(cloned_body, b"hello phase 12\n");
+
+    // Second commit + fetch round-trip: confirms incremental fetch
+    // works as well as the first-clone path.
+    std::fs::write(seed.path().join("hello.txt"), b"hello phase 12 v2\n")
+        .expect("rewrite seed file");
+    run_git(&["add", "hello.txt"], seed.path());
+    run_git(
+        &["commit", "--quiet", "-m", "v2", "--no-gpg-sign"],
+        seed.path(),
+    );
+    run_git(&["push", "origin", "main"], seed.path());
+
+    run_git(&["fetch", "origin", "main"], &dest);
+    run_git(&["reset", "--hard", "origin/main"], &dest);
+
+    let updated = std::fs::read(dest.join("hello.txt")).expect("updated file");
+    assert_eq!(updated, b"hello phase 12 v2\n");
+}
+
+#[tokio::test]
+async fn lfs_round_trips_upload_and_download_through_helper() {
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    if !git_lfs_available() {
+        eprintln!("skipping: git lfs not on PATH");
+        return;
+    }
+
+    let (port, container) = fresh_container_endpoint().await;
+    let url = helper_url(port, &container, "repo");
+
+    // Build a repo with one LFS-tracked binary file.
+    let seed = init_seed_repo();
+    run_git(&["config", "protocol.az+http.allow", "always"], seed.path());
+    run_git(&["lfs", "install", "--local"], seed.path());
+    // Register our custom-transfer agent via the production binary —
+    // exercises `lfs::install::install` end-to-end.
+    run_lfs_agent_install(seed.path());
+
+    run_git(&["lfs", "track", "*.bin"], seed.path());
+    let body: Vec<u8> = (0u8..=255).cycle().take(64 * 1024).collect();
+    std::fs::write(seed.path().join("payload.bin"), &body).expect("write LFS payload");
+    run_git(&["add", ".gitattributes", "payload.bin"], seed.path());
+    run_git(
+        &["commit", "--quiet", "-m", "lfs payload", "--no-gpg-sign"],
+        seed.path(),
+    );
+
+    run_git(&["remote", "add", "origin", &url], seed.path());
+    // Push: triggers an LFS upload via our standalone transfer agent
+    // and a bundle push via the helper REPL.
+    run_git(&["push", "origin", "main"], seed.path());
+
+    // Fresh clone — must register the LFS agent again because
+    // `lfs.customtransfer.*` config lives in the per-repo config of the
+    // clone, which `git clone` initialises empty.
+    let dest_parent = tempfile::tempdir().expect("dest tempdir");
+    let dest = dest_parent.path().join("clone");
+    let dest_str = dest.to_str().expect("dest path utf-8");
+    run_git(
+        &[
+            "-c",
+            "protocol.az+http.allow=always",
+            "clone",
+            "--quiet",
+            "--no-checkout",
+            &url,
+            dest_str,
+        ],
+        dest_parent.path(),
+    );
+    run_git(&["lfs", "install", "--local"], &dest);
+    run_lfs_agent_install(&dest);
+    run_git(&["checkout", "main"], &dest);
+
+    let downloaded = std::fs::read(dest.join("payload.bin")).expect("LFS payload restored");
+    assert_eq!(
+        downloaded,
+        body,
+        "LFS round-trip body mismatch ({} vs {} bytes)",
+        downloaded.len(),
+        body.len()
+    );
+}

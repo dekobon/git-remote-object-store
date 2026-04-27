@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `README.md` covering install, URL grammar, the
+  `protocol.s3+https.allow always` / `protocol.az+https.allow always`
+  config required for submodule URLs, AWS credential resolution, the
+  Azure `AZSTORE_<NAME>_KEY` / `_CONNECTION_STRING` / `_SAS` aliases,
+  and the LFS custom-transfer agent install flow. (#12)
+- End-to-end binary tests (Phase 12) in
+  `tests/azure_store_integration.rs`: drive `git push` / `git clone` /
+  `git fetch` against the real `git-remote-az+http` helper binary
+  through Azurite, plus an LFS round-trip exercising
+  `git-lfs-object-store install`. The cargo bin name
+  (`git-remote-az-http`) is symlinked to the `+`-form git looks up in a
+  per-process tempdir prepended to `PATH`. Gated on
+  `--features integration-azure` alongside the trait-level coverage.
+  (#12)
 - Azure Blob Storage backend (`AzureBlobStore`, Phase 11): full
   `ObjectStore` trait implementation against the official
   `azure_storage_blob` 0.12 crate. `list` paginates through
