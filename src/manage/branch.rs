@@ -1,8 +1,10 @@
 //! `delete-branch`, `protect`, `unprotect` subcommands.
 //!
 //! Each operation is anchored at `<prefix>/refs/heads/<branch>/`, the same
-//! key space the protocol REPL writes bundles into. Mirrors upstream
-//! `ManageBranch` in `../git-remote-s3/git_remote_s3/manage.py`.
+//! key space the protocol REPL writes bundles into. When the URL has no
+//! repository prefix (root-of-bucket repos, `<prefix>` is empty), keys
+//! collapse to `refs/heads/<branch>/...` with no leading slash. Mirrors
+//! upstream `ManageBranch` in `../git-remote-s3/git_remote_s3/manage.py`.
 
 // User-facing output is owned by the management CLI; see the matching
 // note in `doctor.rs` for the rationale behind the lint exception.
@@ -13,7 +15,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tracing::info;
 
-use super::{ManageError, Prompter};
+use super::{ManageError, Prompter, key_under_prefix};
 use crate::git::RefName;
 use crate::object_store::{Error as ObjectStoreError, ObjectStore, PutOpts};
 
@@ -27,8 +29,9 @@ pub struct ManageBranch<'a> {
 
 impl<'a> ManageBranch<'a> {
     /// Open a branch handle, verifying it exists by listing
-    /// `<prefix>/refs/heads/<branch>/`. Returns
-    /// [`ManageError::BranchNotFound`] when no objects are present.
+    /// `<prefix>/refs/heads/<branch>/` (or `refs/heads/<branch>/` when
+    /// `prefix` is empty). Returns [`ManageError::BranchNotFound`] when
+    /// no objects are present.
     pub async fn open(
         store: Arc<dyn ObjectStore>,
         prefix: impl Into<String>,
@@ -59,11 +62,14 @@ impl<'a> ManageBranch<'a> {
     }
 
     fn branch_prefix(&self) -> String {
-        format!("{}/refs/heads/{}/", self.prefix, self.branch)
+        key_under_prefix(&self.prefix, &format!("refs/heads/{}/", self.branch))
     }
 
     fn protected_key(&self) -> String {
-        format!("{}/refs/heads/{}/PROTECTED#", self.prefix, self.branch)
+        key_under_prefix(
+            &self.prefix,
+            &format!("refs/heads/{}/PROTECTED#", self.branch),
+        )
     }
 
     /// Delete every object under the branch's prefix after a `yes/no`
@@ -269,5 +275,70 @@ mod tests {
         assert!(!mock.contains("myrepo/refs/heads/main/aaa.bundle"));
         assert!(mock.contains("myrepo/refs/heads/main/bbb.bundle"));
         assert!(mock.contains("myrepo/refs/heads/main/ccc.bundle"));
+    }
+
+    // --- Root-of-bucket (empty prefix) coverage --------------------------
+
+    #[tokio::test]
+    async fn root_prefix_delete_removes_keys_without_leading_slash() {
+        // Repo lives at the bucket root: keys have no `<prefix>/`
+        // segment. A leading-slash regression here would surface as
+        // `BranchNotFound` (the list of `/refs/heads/main/` returns
+        // nothing) or as a delete that fails to match the real keys.
+        let mock = MockStore::new();
+        mock.insert("refs/heads/main/abc.bundle", Bytes::from("body"));
+        mock.insert("refs/heads/main/PROTECTED#", Bytes::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(store, "", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open at root");
+        mb.delete_branch().await.expect("delete at root");
+        assert!(mock.keys().is_empty(), "all root keys removed");
+    }
+
+    #[tokio::test]
+    async fn root_prefix_protect_writes_marker_at_root_layout() {
+        let mock = MockStore::new();
+        mock.insert("refs/heads/main/abc.bundle", Bytes::from("body"));
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([]);
+
+        let mb = ManageBranch::open(store, "", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open at root");
+        mb.protect_branch().await.expect("protect at root");
+        // Exactly the upstream layout for a root-of-bucket repo: no
+        // leading slash, no synthetic prefix.
+        assert!(mock.contains("refs/heads/main/PROTECTED#"));
+        assert!(!mock.contains("/refs/heads/main/PROTECTED#"));
+    }
+
+    #[tokio::test]
+    async fn root_prefix_unprotect_removes_marker_at_root_layout() {
+        let mock = MockStore::new();
+        mock.insert("refs/heads/main/abc.bundle", Bytes::from("body"));
+        mock.insert("refs/heads/main/PROTECTED#", Bytes::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([]);
+
+        let mb = ManageBranch::open(store, "", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open at root");
+        mb.unprotect_branch().await.expect("unprotect at root");
+        assert!(!mock.contains("refs/heads/main/PROTECTED#"));
+    }
+
+    #[tokio::test]
+    async fn root_prefix_open_reports_branch_not_found_for_missing_branch() {
+        let mock = MockStore::new();
+        let store: Arc<dyn ObjectStore> = Arc::new(mock);
+        let prompter = ScriptedPrompter::new([]);
+        match ManageBranch::open(store, "", "missing", &prompter).await {
+            Err(ManageError::BranchNotFound(name)) => assert_eq!(name, "missing"),
+            Err(other) => panic!("expected BranchNotFound, got {other:?}"),
+            Ok(_) => panic!("expected open at root to fail with BranchNotFound"),
+        }
     }
 }

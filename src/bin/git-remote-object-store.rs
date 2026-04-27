@@ -181,12 +181,15 @@ async fn run_branch(target: &Target, branch: &str, action: BranchAction) -> Resu
 }
 
 /// Resolve `target.remote` to an `(ObjectStore, prefix)` pair.
+///
+/// The returned `prefix` is empty (`""`) when the parsed URL has no
+/// repository prefix — i.e. the repo is stored at the bucket/container
+/// root. The downstream management surfaces (`Doctor`, `ManageBranch`,
+/// `analyze`) all build keys without a leading slash for empty
+/// prefixes, matching the protocol REPL's on-bucket layout.
 async fn open_target(target: &Target) -> Result<(Arc<dyn ObjectStore>, String)> {
     let url = resolve_remote(&target.remote)?;
-    let prefix = url
-        .prefix()
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow!("remote URL is missing the repository prefix"))?;
+    let prefix = url.prefix().unwrap_or_default().to_owned();
     let store = backend::build(&url)
         .await
         .context("failed to build object-store backend")?;
