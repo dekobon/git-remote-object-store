@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 use git_remote_object_store::object_store::s3::S3Store;
-use git_remote_object_store::object_store::{ObjectStore, ObjectStoreError, PutOpts};
+use git_remote_object_store::object_store::{GetOpts, ObjectStore, ObjectStoreError, PutOpts};
 use git_remote_object_store::url::{ENV_ALLOW_HTTP, RemoteUrl, parse};
 use sha2::{Digest, Sha256};
 use testcontainers::core::wait::HttpWaitStrategy;
@@ -386,7 +386,7 @@ async fn large_object_multipart_download() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dest = tmp.path().join("downloaded");
     store
-        .get_to_file("big", &dest)
+        .get_to_file("big", &dest, GetOpts::default())
         .await
         .expect("get_to_file (multipart)");
 
@@ -444,7 +444,7 @@ async fn put_path_streams_file_and_round_trips() {
     // Download via get_to_file and hash-compare.
     let dest = tmp.path().join("downloaded.bin");
     store
-        .get_to_file("streamed", &dest)
+        .get_to_file("streamed", &dest, GetOpts::default())
         .await
         .expect("get_to_file");
 
@@ -482,6 +482,7 @@ async fn put_path_with_opts_uploads_body() {
     let opts = PutOpts {
         content_disposition: Some("attachment; filename=test.txt".into()),
         user_metadata: vec![("x-custom".into(), "value".into())],
+        progress: None,
     };
     store
         .put_path("meta-test", &src, opts)
@@ -532,7 +533,7 @@ async fn get_to_file_failure_does_not_corrupt_dest() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dest: PathBuf = tmp.path().join("nope");
     let err = store
-        .get_to_file("missing-key", &dest)
+        .get_to_file("missing-key", &dest, GetOpts::default())
         .await
         .expect_err("get_to_file on missing key");
     assert!(matches!(err, ObjectStoreError::NotFound(_)));

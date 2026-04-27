@@ -136,7 +136,9 @@ use url::Url;
 use crate::url::{AzureAddressing, RemoteUrl};
 
 use super::error::{network_boxed, other_boxed};
-use super::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts, persist_temp};
+use super::{
+    GetOpts, ObjectMeta, ObjectStore, ObjectStoreError, ProgressSink, PutOpts, persist_temp,
+};
 
 /// Bound on how long an idle pooled HTTPS connection lingers before
 /// the [`reqwest`] connection pool drops it. Short enough that DNS
@@ -418,7 +420,12 @@ impl ObjectStore for AzureStore {
         Ok(out)
     }
 
-    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<(), ObjectStoreError> {
+    async fn get_to_file(
+        &self,
+        key: &str,
+        dest: &Path,
+        opts: GetOpts,
+    ) -> Result<(), ObjectStoreError> {
         let parent = dest.parent().ok_or_else(|| {
             ObjectStoreError::Other(
                 format!("destination `{}` has no parent directory", dest.display()).into(),
@@ -428,10 +435,11 @@ impl ObjectStore for AzureStore {
         // Mirror S3: try once, retry once on 412 (the head→GET race).
         // After the second attempt any error — including a repeated
         // 412 — propagates.
-        match self.head_then_download(key, dest, parent).await {
+        let progress = opts.progress.as_ref();
+        match self.head_then_download(key, dest, parent, progress).await {
             Err(ObjectStoreError::PreconditionFailed(_)) => {
                 tracing::warn!(key, "blob changed between head and GET; retrying");
-                self.head_then_download(key, dest, parent).await
+                self.head_then_download(key, dest, parent, progress).await
             }
             other => other,
         }
@@ -478,6 +486,13 @@ impl ObjectStore for AzureStore {
     /// which `SeekableStream` reports faithfully via `len()`.
     async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), ObjectStoreError> {
         let file = tokio::fs::File::open(src).await.map_err(other_boxed)?;
+        // `tokio::fs::File::metadata` is the cheap source of truth for
+        // file length; the SDK's `FileStream` knows it internally, but
+        // does not expose it. We need it to drive a final progress
+        // event after the SDK upload completes (the SDK does block-
+        // upload internally without exposing per-block hooks — see
+        // module-level docs).
+        let body_len = file.metadata().await.map_err(other_boxed)?.len();
         let stream = FileStream::builder(file)
             .build()
             .await
@@ -485,10 +500,16 @@ impl ObjectStore for AzureStore {
         let body: azure_core::http::Body = stream.into();
 
         let blob = self.blob_client(key);
+        let progress = opts.progress.clone();
         let upload_opts = upload_options_from(opts);
         blob.upload(body.into(), Some(upload_opts))
             .await
             .map_err(|e| classify(e, key))?;
+        if let Some(sink) = progress
+            && body_len > 0
+        {
+            sink.report(body_len);
+        }
         Ok(())
     }
 
@@ -536,7 +557,8 @@ impl ObjectStore for AzureStore {
         let temp = NamedTempFile::new().map_err(other_boxed)?;
         // `get_to_file` propagates `NotFound(src)` if the source is
         // absent — exactly the trait contract for `copy`.
-        self.get_to_file(src, temp.path()).await?;
+        self.get_to_file(src, temp.path(), GetOpts::default())
+            .await?;
         // A NotFound on the upload is destination-side — re-shape it
         // so callers don't mistake it for "src absent".
         match self.put_path(dst, temp.path(), PutOpts::default()).await {
@@ -567,6 +589,7 @@ impl AzureStore {
         key: &str,
         dest: &Path,
         parent: &Path,
+        progress: Option<&ProgressSink>,
     ) -> Result<(), ObjectStoreError> {
         let meta = self.head(key).await?;
         let temp = NamedTempFile::new_in(parent).map_err(other_boxed)?;
@@ -575,18 +598,20 @@ impl AzureStore {
             // Range fetches against an empty blob return 416.
             return persist_temp(temp, dest);
         }
-        self.download_streaming(key, temp.path(), meta.etag.as_deref())
+        self.download_streaming(key, temp.path(), meta.etag.as_deref(), progress)
             .await?;
         persist_temp(temp, dest)
     }
 
     /// Stream a blob body to `temp_path` with optional `If-Match`
-    /// guarding against mid-download mutation.
+    /// guarding against mid-download mutation. When `progress` is
+    /// `Some`, fires once per SDK body chunk read off the wire.
     async fn download_streaming(
         &self,
         key: &str,
         temp_path: &Path,
         etag: Option<&str>,
+        progress: Option<&ProgressSink>,
     ) -> Result<(), ObjectStoreError> {
         let blob = self.blob_client(key);
         let mut opts = BlobClientDownloadOptions::default();
@@ -607,7 +632,13 @@ impl AzureStore {
 
         while let Some(chunk) = result.body.next().await {
             let bytes = chunk.map_err(network_boxed)?;
+            let chunk_len = bytes.len() as u64;
             file.write_all(&bytes).await.map_err(other_boxed)?;
+            if let Some(sink) = progress
+                && chunk_len > 0
+            {
+                sink.report(chunk_len);
+            }
         }
         file.flush().await.map_err(other_boxed)?;
         Ok(())
@@ -864,6 +895,7 @@ mod tests {
         let opts = PutOpts {
             content_disposition: Some("attachment; filename=x".into()),
             user_metadata: Vec::new(),
+            progress: None,
         };
         let out = upload_options_from(opts);
         let cd: String = out
@@ -877,6 +909,7 @@ mod tests {
         let opts = PutOpts {
             content_disposition: None,
             user_metadata: vec![("x-foo".into(), "1".into()), ("x-bar".into(), "2".into())],
+            progress: None,
         };
         let out = upload_options_from(opts);
         let map = out.metadata.expect("metadata set");

@@ -638,6 +638,7 @@ async fn perform_push_under_lock(
                 "codepipeline-artifact-revision-summary".to_owned(),
                 artifacts.commit_msg,
             )],
+            progress: None,
         };
         let zip_dest = archive_key(prefix, remote_ref);
         store

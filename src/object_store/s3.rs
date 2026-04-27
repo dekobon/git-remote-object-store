@@ -82,7 +82,9 @@ use url::Url;
 use crate::url::{RemoteUrl, S3Addressing};
 
 use super::error::{network_boxed, other_boxed};
-use super::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts, persist_temp};
+use super::{
+    GetOpts, ObjectMeta, ObjectStore, ObjectStoreError, ProgressSink, PutOpts, persist_temp,
+};
 
 /// Object-size cutoff above which `get_to_file` switches from a single
 /// streaming GET to parallel ranged GETs. Matches upstream
@@ -503,7 +505,12 @@ impl ObjectStore for S3Store {
         Ok(out)
     }
 
-    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<(), ObjectStoreError> {
+    async fn get_to_file(
+        &self,
+        key: &str,
+        dest: &Path,
+        opts: GetOpts,
+    ) -> Result<(), ObjectStoreError> {
         let parent = dest.parent().ok_or_else(|| {
             ObjectStoreError::Other(
                 format!("destination `{}` has no parent directory", dest.display()).into(),
@@ -525,11 +532,22 @@ impl ObjectStore for S3Store {
 
             let temp = NamedTempFile::new_in(parent).map_err(other_boxed)?;
             let result = if meta.size <= MULTIPART_THRESHOLD {
-                self.download_single(key, temp.path(), meta.etag.as_deref())
-                    .await
+                self.download_single(
+                    key,
+                    temp.path(),
+                    meta.etag.as_deref(),
+                    opts.progress.as_ref(),
+                )
+                .await
             } else {
-                self.download_multipart(key, temp.path(), meta.size, meta.etag.as_deref())
-                    .await
+                self.download_multipart(
+                    key,
+                    temp.path(),
+                    meta.size,
+                    meta.etag.as_deref(),
+                    opts.progress.as_ref(),
+                )
+                .await
             };
 
             match result {
@@ -585,8 +603,27 @@ impl ObjectStore for S3Store {
         // (see `azure.rs` `put_path`), giving cross-backend parity on
         // the memory bound for large LFS / bundle uploads (issue #21
         // closed for S3, issue #42 for Azure).
+        //
+        // Progress reporting is a single end-of-transfer event (the
+        // SDK's PutObject body is opaque — there's no per-part hook
+        // short of the in-development `aws-s3-transfer-manager` crate).
+        // `git-lfs` accepts any number of progress events including
+        // one; the multipart download path above is what gives long
+        // *fetches* live progress.
+        // Read the file length up front for the post-transfer progress
+        // event. `tokio::fs::metadata` is the cheap source of truth;
+        // `ByteStream::size_hint()` returns a `(lower, upper)` tuple
+        // whose semantics are the SDK's, not the body's.
+        let body_len = tokio::fs::metadata(src).await.map_err(other_boxed)?.len();
         let stream = ByteStream::from_path(src).await.map_err(other_boxed)?;
-        self.put_body(key, stream, opts).await
+        let progress = opts.progress.clone();
+        self.put_body(key, stream, opts).await?;
+        if let Some(sink) = progress
+            && body_len > 0
+        {
+            sink.report(body_len);
+        }
+        Ok(())
     }
 
     async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
@@ -694,11 +731,15 @@ impl S3Store {
     ///
     /// When `etag` is `Some`, the request carries `If-Match` so S3
     /// returns 412 if the object was overwritten since the `head` call.
+    /// When `progress` is `Some`, fires once per SDK body chunk read
+    /// off the wire — chunk sizes follow the SDK's internal aggregation
+    /// (typically 1 MiB-ish for HTTPS).
     async fn download_single(
         &self,
         key: &str,
         temp_path: &Path,
         etag: Option<&str>,
+        progress: Option<&ProgressSink>,
     ) -> Result<(), ObjectStoreError> {
         let mut req = self.client.get_object().bucket(&self.bucket).key(key);
         if let Some(etag) = etag {
@@ -715,7 +756,13 @@ impl S3Store {
 
         while let Some(chunk) = resp.body.next().await {
             let bytes = chunk.map_err(network_boxed)?;
+            let chunk_len = bytes.len() as u64;
             file.write_all(&bytes).await.map_err(other_boxed)?;
+            if let Some(sink) = progress
+                && chunk_len > 0
+            {
+                sink.report(chunk_len);
+            }
         }
         file.flush().await.map_err(other_boxed)?;
         Ok(())
@@ -725,13 +772,18 @@ impl S3Store {
     /// range at its absolute offset into the pre-allocated temp file.
     ///
     /// When `etag` is `Some`, every ranged GET carries `If-Match` so
-    /// S3 returns 412 if the object is overwritten mid-download.
+    /// S3 returns 412 if the object is overwritten mid-download. When
+    /// `progress` is `Some`, fires once per completed range with the
+    /// range's byte count — events arrive out of order, matching the
+    /// concurrent-GET schedule, but cumulative bytes equal `size` after
+    /// the last event.
     async fn download_multipart(
         &self,
         key: &str,
         temp_path: &Path,
         size: u64,
         etag: Option<&str>,
+        progress: Option<&ProgressSink>,
     ) -> Result<(), ObjectStoreError> {
         let async_file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -746,6 +798,7 @@ impl S3Store {
         let mut tasks: JoinSet<Result<(), ObjectStoreError>> = JoinSet::new();
 
         let etag_owned = etag.map(str::to_owned);
+        let progress_owned = progress.cloned();
         for (start, end) in plan_ranges(size, MULTIPART_CHUNK_SIZE) {
             let client = self.client.clone();
             let bucket = self.bucket.clone();
@@ -753,6 +806,7 @@ impl S3Store {
             let etag = etag_owned.clone();
             let file = Arc::clone(&file);
             let semaphore = Arc::clone(&semaphore);
+            let progress = progress_owned.clone();
             tasks.spawn(async move {
                 let _permit = semaphore.acquire_owned().await.map_err(other_boxed)?;
                 let mut req = client
@@ -780,9 +834,14 @@ impl S3Store {
                         .into(),
                     ));
                 }
+                let chunk_len = bytes.len() as u64;
                 let mut f = file.lock().await;
                 f.seek(SeekFrom::Start(start)).await.map_err(other_boxed)?;
                 f.write_all(&bytes).await.map_err(other_boxed)?;
+                drop(f);
+                if let Some(sink) = &progress {
+                    sink.report(chunk_len);
+                }
                 Ok(())
             });
         }

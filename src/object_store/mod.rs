@@ -20,6 +20,7 @@ pub mod s3;
 pub mod mock;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use tempfile::NamedTempFile;
@@ -28,6 +29,43 @@ use tracing::debug;
 
 use self::error::other_boxed;
 pub use self::error::{BoxError, ObjectStoreError};
+
+/// Progress callback invoked by streaming put/get operations.
+///
+/// `report(bytes_just_transferred)` fires at chunk boundaries — each
+/// multipart-upload part for `put_path`, each ranged GET / chunk read
+/// for `get_to_file`. Callers accumulate `bytes_so_far` themselves.
+/// Matches upstream `ProgressPercentage.__call__` in
+/// `../git-remote-s3/git_remote_s3/lfs.py:25-41` (one event per network
+/// chunk).
+///
+/// The callback runs on the backend's task and may be invoked from a
+/// spawned worker, so it must be cheap and non-blocking. The LFS agent
+/// forwards `report` calls into an `mpsc` channel that the agent drains
+/// into protocol `progress` events.
+#[derive(Clone)]
+pub struct ProgressSink(Arc<dyn Fn(u64) + Send + Sync>);
+
+impl ProgressSink {
+    /// Build a sink from any cheap, thread-safe callback.
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(u64) + Send + Sync + 'static,
+    {
+        Self(Arc::new(f))
+    }
+
+    /// Report `bytes_amount` newly transferred bytes.
+    pub fn report(&self, bytes_amount: u64) {
+        (self.0)(bytes_amount);
+    }
+}
+
+impl std::fmt::Debug for ProgressSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProgressSink").finish_non_exhaustive()
+    }
+}
 
 /// Atomically rename a [`NamedTempFile`] to `dest`, mapping the
 /// [`tempfile::PersistError`] into [`ObjectStoreError::Other`].
@@ -61,13 +99,16 @@ pub struct ObjectMeta {
     pub etag: Option<String>,
 }
 
-/// Optional `put_bytes` knobs.
+/// Optional `put_bytes` / `put_path` knobs.
 ///
-/// Both fields are populated only by the zip-archive push path
-/// (`../git-remote-s3/git_remote_s3/remote.py:275-281`), where upstream
-/// supplies `Content-Disposition` and the
-/// `codepipeline-artifact-revision-summary` user metadata. Defaults to
-/// "no extras", which covers every other write.
+/// `content_disposition` and `user_metadata` are populated only by the
+/// zip-archive push path (`../git-remote-s3/git_remote_s3/remote.py:275-281`),
+/// where upstream supplies `Content-Disposition` and the
+/// `codepipeline-artifact-revision-summary` user metadata. `progress`
+/// is populated by the LFS agent so long uploads can drive the
+/// `git-lfs` progress bar; left `None` for bundle / lock / HEAD writes
+/// where progress reporting is not useful. Defaults to "no extras",
+/// which covers every other write.
 #[derive(Debug, Clone, Default)]
 pub struct PutOpts {
     /// HTTP `Content-Disposition` header to associate with the object.
@@ -75,6 +116,23 @@ pub struct PutOpts {
     /// Backend user-defined metadata (key/value pairs). Backends should
     /// preserve insertion order; key case-folding is backend-defined.
     pub user_metadata: Vec<(String, String)>,
+    /// Optional progress sink invoked at chunk boundaries during the
+    /// upload. Backends that do single-shot uploads (small bodies)
+    /// emit one `report(size)` call after the transfer completes.
+    pub progress: Option<ProgressSink>,
+}
+
+/// Optional `get_to_file` knobs.
+///
+/// `progress` is populated by the LFS agent (the only consumer that
+/// needs live download progress); bundle fetches leave it `None`.
+#[derive(Debug, Clone, Default)]
+pub struct GetOpts {
+    /// Optional progress sink invoked at chunk boundaries during the
+    /// download. Multipart download paths emit one `report(chunk_size)`
+    /// call per completed range; the small-object path emits one
+    /// `report(chunk.len())` per body chunk read off the wire.
+    pub progress: Option<ProgressSink>,
 }
 
 /// Backend-neutral cloud object-store surface.
@@ -85,8 +143,10 @@ pub struct PutOpts {
 /// - **`list(prefix)`** — byte-prefix match (matches S3 `Prefix=`
 ///   semantics; `list("a")` returns `a`, `a/1`, and `aaa`). Returns full
 ///   keys; ordering is backend-defined.
-/// - **`get_to_file(key, dest)`** — caller must ensure `dest`'s parent
-///   directory exists.
+/// - **`get_to_file(key, dest, opts)`** — caller must ensure `dest`'s
+///   parent directory exists. `opts.progress`, if set, fires at chunk
+///   boundaries so callers (notably the LFS agent) can render a live
+///   progress bar.
 /// - **`put_bytes`** — overwrites if the key already exists.
 /// - **`put_path`** — streams a local file to the key, overwriting if
 ///   present. Default reads the file into memory; backends should
@@ -106,8 +166,14 @@ pub trait ObjectStore: Send + Sync {
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, ObjectStoreError>;
 
     /// Stream the object body to `dest`. The destination's parent
-    /// directory must already exist.
-    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<(), ObjectStoreError>;
+    /// directory must already exist. `opts.progress`, when set, fires
+    /// at chunk boundaries with the count of bytes just received.
+    async fn get_to_file(
+        &self,
+        key: &str,
+        dest: &Path,
+        opts: GetOpts,
+    ) -> Result<(), ObjectStoreError>;
 
     /// Read the entire object body into memory.
     async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError>;
@@ -129,7 +195,25 @@ pub trait ObjectStore: Send + Sync {
     async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), ObjectStoreError> {
         debug!(key, path = %src.display(), "put_path: default read-then-put_bytes fallback");
         let body = tokio::fs::read(src).await.map_err(other_boxed)?;
-        self.put_bytes(key, Bytes::from(body), opts).await
+        let len = body.len() as u64;
+        let progress = opts.progress.clone();
+        // Strip progress from the inner `put_bytes` call so the sink
+        // doesn't fire twice — once during put_bytes' own reporting and
+        // again on our final end-of-transfer event below.
+        let inner_opts = PutOpts {
+            progress: None,
+            ..opts
+        };
+        self.put_bytes(key, Bytes::from(body), inner_opts).await?;
+        // Single-shot fallback emits a final progress event with the
+        // full body size so the LFS agent's "saw at least one event"
+        // post-condition holds even on backends without chunking.
+        if let Some(sink) = progress
+            && len > 0
+        {
+            sink.report(len);
+        }
+        Ok(())
     }
 
     /// Create `key` if and only if it does not exist. Returns `Ok(true)`
