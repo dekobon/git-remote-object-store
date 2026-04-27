@@ -471,6 +471,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fix_head_out_of_range_select_returns_internal_error() {
+        // Sibling guard for the HEAD-candidate prompter path (#33). The
+        // doctor reaches `fix_head` when the existing HEAD is invalid (or
+        // the bucket has no HEAD object) AND there is at least one
+        // `refs/heads/*` candidate to assign. An out-of-range script
+        // index from a bad test prompter must surface as
+        // `ManageError::Internal`, not panic the process.
+        let mock = MockStore::new();
+        // No HEAD object → snapshot.is_head_valid() is false.
+        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert("myrepo/refs/heads/dev/def.bundle", Bytes::from("c"));
+        // Two HEAD candidates → valid indices are 0 and 1; 42 is out of
+        // range. No prior bundle-fix prompts because no ref has > 1
+        // bundle.
+        let prompter = ScriptedPrompter::new([Answer::Select(42)]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let err = doctor
+            .run()
+            .await
+            .expect_err("out-of-range HEAD index propagates");
+        assert!(
+            matches!(err, ManageError::Internal(ref msg) if msg.contains("HEAD candidate")),
+            "expected ManageError::Internal naming HEAD candidate, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
     async fn fix_head_writes_chosen_branch() {
         let mock = MockStore::new();
         mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));

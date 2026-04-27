@@ -668,9 +668,15 @@ async fn pre_lock_multi_bundle_rejection_surfaces_unchanged() {
     result.expect("push should produce an error outcome, not abort");
 
     let text = std::str::from_utf8(&out).unwrap();
-    assert!(
-        text.contains("multiple bundles"),
-        "multi-bundle rejection must appear on the wire: {text:?}",
+    // Pin the byte-exact wire format including the trailing `?` — git
+    // treats `error <ref> "..."?` as recoverable and the inverse as
+    // fatal (#34). A loose `contains("multiple bundles")` would have
+    // missed that regression.
+    assert_eq!(
+        text,
+        "error refs/heads/main \"multiple bundles exists on server. \
+         Run git-remote-object-store doctor to fix.\"?\n\n",
+        "got {text:?}",
     );
     // The lock was never acquired — the pre-lock check returned early.
     assert!(
