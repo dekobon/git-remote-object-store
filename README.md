@@ -104,11 +104,24 @@ done
 ## Status
 
 `0.1.0`. Phases 1–14 of the [execution plan](execution-plan.md) are
-shipped: URL parser, gitoxide-backed git operations, the
-`ObjectStore` trait with S3 and Azure backends, the helper-protocol
-REPL, parallel `fetch`, locked `push`, the management CLI
-(`doctor` / `delete-branch` / `protect` / `unprotect`), the LFS
-custom-transfer agent, and the release pipeline.
+shipped: URL parser; the `ObjectStore` trait with S3 and Azure
+backends; the helper-protocol REPL; parallel `fetch`; locked `push`;
+the management CLI (`doctor` / `delete-branch` / `protect` /
+`unprotect`); the LFS custom-transfer agent; and the release
+pipeline.
+
+Git operations are gitoxide-backed where `gix` 0.82 has the surface
+we need — rev-parse, is-ancestor, ref-name validation, remote-URL
+inspection, archive / last-commit-message, ref discovery, object
+resolution. Bundle `create` and `unbundle` still shell out to the
+user's `git` binary through a single `run_git` helper because `gix`
+does not yet expose a public bundle API; this is documented in
+[execution-plan.md §6](execution-plan.md#6-resolved-decisions-and-remaining-open-questions)
+and the spike notes at
+[`docs/development/spike-gix-bundle-parity.md`](docs/development/spike-gix-bundle-parity.md).
+The fallback is contained: `run_git` is the only place in the crate
+that spawns a subprocess, and it enforces the helper-protocol stdout
+discipline (stdin closed, stdout/stderr captured, never inherited).
 
 ## License
 
