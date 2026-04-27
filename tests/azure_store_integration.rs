@@ -229,6 +229,59 @@ async fn create_container(port: u16, container: &str) {
     );
 }
 
+/// Issue a signed HEAD request against `<account>/<container>/<blob>`
+/// and return the response headers. Used by tests that need to inspect
+/// blob properties the [`ObjectStore`] trait does not surface
+/// (`content-disposition`, `x-ms-meta-*`, etc.) — analogous to the
+/// direct SDK `head_object` call the S3 integration tests use.
+async fn head_blob_signed(port: u16, container: &str, blob: &str) -> reqwest::header::HeaderMap {
+    use std::time::Duration;
+
+    let endpoint = format!("http://127.0.0.1:{port}/{TEST_ACCOUNT}/{container}/{blob}");
+    let url = ::url::Url::parse(&endpoint).expect("HEAD URL parses");
+
+    let now = time::OffsetDateTime::now_utc();
+    let date = now
+        .format(&time::format_description::well_known::Rfc2822)
+        .expect("format date")
+        .replace("+0000", "GMT");
+
+    let mut headers = Headers::new();
+    headers.insert(HeaderName::from_static("x-ms-version"), "2025-11-05");
+    headers.insert(HeaderName::from_static("x-ms-date"), date.clone());
+
+    let secret = azure_core::credentials::Secret::new(TEST_KEY.to_owned());
+    let auth = git_remote_object_store::object_store::azure::auth::compute_authorization(
+        TEST_ACCOUNT,
+        &secret,
+        Method::Head,
+        &url,
+        &headers,
+        None,
+    )
+    .expect("signs HEAD blob");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("reqwest client");
+    let resp = client
+        .head(endpoint)
+        .header("x-ms-version", "2025-11-05")
+        .header("x-ms-date", date)
+        .header("authorization", auth)
+        .send()
+        .await
+        .expect("HEAD blob request");
+    let status = resp.status().as_u16();
+    assert!(
+        status == 200,
+        "unexpected HEAD blob status {status}: {:?}",
+        resp.text().await.ok(),
+    );
+    resp.headers().clone()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -629,7 +682,22 @@ async fn put_path_streams_file_and_round_trips() {
 
 #[tokio::test]
 async fn put_path_with_opts_uploads_body() {
-    let store = fresh_container().await;
+    // Construct the store via the same URL → from_remote_url path that
+    // fresh_container() uses, but hold on to the port + container so
+    // the test can verify metadata + content-disposition via a signed
+    // HEAD (the trait's `head()` does not surface those properties).
+    // Mirrors the structure of the S3 sibling test in
+    // tests/s3_store_integration.rs::put_path_with_opts_uploads_body.
+    let (port, container) = fresh_container_endpoint().await;
+    let url_str = format!(
+        "az+http://127.0.0.1:{port}/{TEST_ACCOUNT}/{container}\
+         ?addressing=path&credential={CREDENTIAL_ALIAS}"
+    );
+    let url = parse(&url_str).expect("URL parses");
+    let store = AzureStore::from_remote_url(&url)
+        .await
+        .expect("AzureStore::from_remote_url");
+
     let tmp = tempfile::tempdir().expect("tempdir");
     let src = tmp.path().join("small.txt");
     tokio::fs::write(&src, b"hello via path")
@@ -650,6 +718,26 @@ async fn put_path_with_opts_uploads_body() {
 
     let body = store.get_bytes("meta-test").await.expect("get_bytes");
     assert_eq!(&body[..], b"hello via path");
+
+    // Verify the opts actually made it onto the wire — the body-only
+    // assertion above would still pass if `put_path` silently dropped
+    // both fields. A signed HEAD reads the underlying blob's response
+    // headers (`Content-Disposition`, `x-ms-meta-customkey`).
+    let headers = head_blob_signed(port, &container, "meta-test").await;
+    assert_eq!(
+        headers
+            .get("content-disposition")
+            .and_then(|v| v.to_str().ok()),
+        Some("attachment; filename=test.txt"),
+        "content_disposition must survive put_path",
+    );
+    assert_eq!(
+        headers
+            .get("x-ms-meta-customkey")
+            .and_then(|v| v.to_str().ok()),
+        Some("value"),
+        "user metadata must survive put_path",
+    );
 }
 
 #[tokio::test]
