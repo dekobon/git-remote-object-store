@@ -28,7 +28,7 @@ use tokio::task::{JoinError, JoinSet};
 use tracing::debug;
 
 use crate::git::{self, GitError, RefName, RefNameError, Sha, ShaError};
-use crate::object_store::{Error as ObjectStoreError, ObjectStore};
+use crate::object_store::{ObjectStore, ObjectStoreError};
 
 /// Maximum number of in-flight bundle fetches per batch. Matches
 /// upstream `boto3.s3.transfer.TransferConfig(max_concurrency=8)` from

@@ -14,7 +14,7 @@
 //!
 //! Fault injection is FIFO: tests call [`MockStore::arm`] to queue a
 //! [`Fault`]; the next matching operation consumes it and returns the
-//! corresponding [`Error`]. This drives Phase 8's stale-lock recovery and
+//! corresponding [`ObjectStoreError`]. This drives Phase 8's stale-lock recovery and
 //! similar error-path tests deterministically.
 
 use std::collections::BTreeMap;
@@ -27,7 +27,7 @@ use bytes::Bytes;
 use time::OffsetDateTime;
 
 use super::error::other_boxed;
-use super::{Error, ObjectMeta, ObjectStore, PutOpts};
+use super::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
 
 /// Produce a deterministic, content-derived `ETag` string that mimics the
 /// `"<hex>"` format returned by S3 `HeadObject`. Uses a simple FNV-1a
@@ -47,34 +47,34 @@ fn mock_etag(body: &[u8]) -> String {
 /// is returned.
 #[derive(Debug, Clone)]
 pub enum Fault {
-    /// Force `put_if_absent(key, _)` to return [`Error::PreconditionFailed`]
+    /// Force `put_if_absent(key, _)` to return [`ObjectStoreError::PreconditionFailed`]
     /// without writing.
     PreconditionFailedOnPutIfAbsent {
         /// Key being written.
         key: String,
     },
-    /// Force `head(key)` to return [`Error::NotFound`].
+    /// Force `head(key)` to return [`ObjectStoreError::NotFound`].
     NotFoundOnHead {
         /// Key being inspected.
         key: String,
     },
-    /// Force `get_bytes(key)` to return [`Error::Network`].
+    /// Force `get_bytes(key)` to return [`ObjectStoreError::Network`].
     NetworkOnGetBytes {
         /// Key being read.
         key: String,
     },
-    /// Force `list(prefix)` to return [`Error::AccessDenied`].
+    /// Force `list(prefix)` to return [`ObjectStoreError::AccessDenied`].
     AccessDeniedOnList {
         /// Prefix being listed.
         prefix: String,
     },
-    /// Force `delete(key)` to return [`Error::Network`].
+    /// Force `delete(key)` to return [`ObjectStoreError::Network`].
     NetworkOnDelete {
         /// Key being deleted.
         key: String,
     },
     /// Force `get_to_file(key, _)` to return
-    /// [`Error::PreconditionFailed`], simulating an object that was
+    /// [`ObjectStoreError::PreconditionFailed`], simulating an object that was
     /// mutated between the `head` and the body download in the S3
     /// backend. Higher-layer protocol tests use this to verify that
     /// fetch surfaces a structured error rather than a corrupted bundle.
@@ -191,8 +191,8 @@ impl MockStore {
     /// destructured payload through the callsite.
     fn check_fault(
         state: &mut MockState,
-        map: impl Fn(&Fault) -> Option<Error>,
-    ) -> Result<(), Error> {
+        map: impl Fn(&Fault) -> Option<ObjectStoreError>,
+    ) -> Result<(), ObjectStoreError> {
         let Some(position) = state.faults.iter().position(|f| map(f).is_some()) else {
             return Ok(());
         };
@@ -224,11 +224,11 @@ fn next_lex(prefix: &str) -> Bound<String> {
 
 #[async_trait]
 impl ObjectStore for MockStore {
-    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, Error> {
+    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, ObjectStoreError> {
         self.with_state(|s| {
             Self::check_fault(s, |f| match f {
                 Fault::AccessDeniedOnList { prefix: p } if p == prefix => {
-                    Some(Error::AccessDenied(p.clone()))
+                    Some(ObjectStoreError::AccessDenied(p.clone()))
                 }
                 _ => None,
             })?;
@@ -248,11 +248,11 @@ impl ObjectStore for MockStore {
         })
     }
 
-    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<(), Error> {
+    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<(), ObjectStoreError> {
         self.with_state(|s| {
             Self::check_fault(s, |f| match f {
                 Fault::PreconditionFailedOnGetToFile { key: k } if k == key => {
-                    Some(Error::PreconditionFailed(k.clone()))
+                    Some(ObjectStoreError::PreconditionFailed(k.clone()))
                 }
                 _ => None,
             })
@@ -261,31 +261,36 @@ impl ObjectStore for MockStore {
         tokio::fs::write(dest, &bytes).await.map_err(other_boxed)
     }
 
-    async fn get_bytes(&self, key: &str) -> Result<Bytes, Error> {
+    async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
         self.with_state(|s| {
             Self::check_fault(s, |f| match f {
-                Fault::NetworkOnGetBytes { key: k } if k == key => Some(Error::Network(Box::new(
-                    std::io::Error::other(format!("mock network: {k}")),
-                ))),
+                Fault::NetworkOnGetBytes { key: k } if k == key => Some(ObjectStoreError::Network(
+                    Box::new(std::io::Error::other(format!("mock network: {k}"))),
+                )),
                 _ => None,
             })?;
             s.objects
                 .get(key)
                 .map(|o| o.body.clone())
-                .ok_or_else(|| Error::NotFound(key.to_string()))
+                .ok_or_else(|| ObjectStoreError::NotFound(key.to_string()))
         })
     }
 
-    async fn put_bytes(&self, key: &str, body: Bytes, opts: PutOpts) -> Result<(), Error> {
+    async fn put_bytes(
+        &self,
+        key: &str,
+        body: Bytes,
+        opts: PutOpts,
+    ) -> Result<(), ObjectStoreError> {
         self.insert_with(key, body, OffsetDateTime::now_utc(), opts);
         Ok(())
     }
 
-    async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, Error> {
+    async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
         self.with_state(|s| {
             Self::check_fault(s, |f| match f {
                 Fault::PreconditionFailedOnPutIfAbsent { key: k } if k == key => {
-                    Some(Error::PreconditionFailed(k.clone()))
+                    Some(ObjectStoreError::PreconditionFailed(k.clone()))
                 }
                 _ => None,
             })?;
@@ -305,10 +310,12 @@ impl ObjectStore for MockStore {
         })
     }
 
-    async fn head(&self, key: &str) -> Result<ObjectMeta, Error> {
+    async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
         self.with_state(|s| {
             Self::check_fault(s, |f| match f {
-                Fault::NotFoundOnHead { key: k } if k == key => Some(Error::NotFound(k.clone())),
+                Fault::NotFoundOnHead { key: k } if k == key => {
+                    Some(ObjectStoreError::NotFound(k.clone()))
+                }
                 _ => None,
             })?;
             s.objects
@@ -319,17 +326,17 @@ impl ObjectStore for MockStore {
                     last_modified: o.last_modified,
                     etag: Some(mock_etag(&o.body)),
                 })
-                .ok_or_else(|| Error::NotFound(key.to_string()))
+                .ok_or_else(|| ObjectStoreError::NotFound(key.to_string()))
         })
     }
 
-    async fn copy(&self, src: &str, dst: &str) -> Result<(), Error> {
+    async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
         self.with_state(|s| {
             let mut copied = s
                 .objects
                 .get(src)
                 .cloned()
-                .ok_or_else(|| Error::NotFound(src.to_string()))?;
+                .ok_or_else(|| ObjectStoreError::NotFound(src.to_string()))?;
             // Copy gets a fresh server-side timestamp, matching S3's
             // copy_object semantics.
             copied.last_modified = OffsetDateTime::now_utc();
@@ -338,18 +345,20 @@ impl ObjectStore for MockStore {
         })
     }
 
-    async fn delete(&self, key: &str) -> Result<(), Error> {
+    async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
         self.with_state(|s| {
             Self::check_fault(s, |f| match f {
-                Fault::NetworkOnDelete { key: k } if k == key => Some(Error::Network(Box::new(
-                    std::io::Error::other(format!("mock network on delete: {k}")),
-                ))),
+                Fault::NetworkOnDelete { key: k } if k == key => {
+                    Some(ObjectStoreError::Network(Box::new(std::io::Error::other(
+                        format!("mock network on delete: {k}"),
+                    ))))
+                }
                 _ => None,
             })?;
             s.objects
                 .remove(key)
                 .map(|_| ())
-                .ok_or_else(|| Error::NotFound(key.to_string()))
+                .ok_or_else(|| ObjectStoreError::NotFound(key.to_string()))
         })
     }
 }
@@ -433,7 +442,7 @@ mod tests {
         store.arm(Fault::PreconditionFailedOnPutIfAbsent { key: "k".into() });
 
         let err = store.put_if_absent("k", body(b"x")).await.unwrap_err();
-        assert!(matches!(err, Error::PreconditionFailed(ref k) if k == "k"));
+        assert!(matches!(err, ObjectStoreError::PreconditionFailed(ref k) if k == "k"));
         // Body unchanged.
         assert_eq!(&store.get_bytes("k").await.unwrap()[..], b"existing");
         assert_eq!(store.pending_faults(), 0);
@@ -463,7 +472,7 @@ mod tests {
         store.arm(Fault::PreconditionFailedOnPutIfAbsent { key: "k".into() });
 
         let err = store.put_if_absent("k", body(b"x")).await.unwrap_err();
-        assert!(matches!(err, Error::PreconditionFailed(ref k) if k == "k"));
+        assert!(matches!(err, ObjectStoreError::PreconditionFailed(ref k) if k == "k"));
         assert!(!store.contains("k"));
         assert_eq!(store.pending_faults(), 0);
 
@@ -475,7 +484,7 @@ mod tests {
     async fn delete_missing_key_is_not_found() {
         let store = MockStore::new();
         let err = store.delete("missing").await.unwrap_err();
-        assert!(matches!(err, Error::NotFound(ref k) if k == "missing"));
+        assert!(matches!(err, ObjectStoreError::NotFound(ref k) if k == "missing"));
     }
 
     #[tokio::test]
@@ -516,7 +525,7 @@ mod tests {
     async fn copy_missing_source_is_not_found() {
         let store = MockStore::new();
         let err = store.copy("nope", "dst").await.unwrap_err();
-        assert!(matches!(err, Error::NotFound(ref k) if k == "nope"));
+        assert!(matches!(err, ObjectStoreError::NotFound(ref k) if k == "nope"));
         assert!(!store.contains("dst"));
     }
 
@@ -550,7 +559,7 @@ mod tests {
         let store = MockStore::new();
         store.insert("k", body(b"x"));
         let err = store.get_to_file("k", &path).await.unwrap_err();
-        assert!(matches!(err, Error::Other(_)));
+        assert!(matches!(err, ObjectStoreError::Other(_)));
     }
 
     #[tokio::test]
@@ -594,7 +603,7 @@ mod tests {
             prefix: "secret/".into(),
         });
         let err = store.list("secret/").await.unwrap_err();
-        assert!(matches!(err, Error::AccessDenied(ref p) if p == "secret/"));
+        assert!(matches!(err, ObjectStoreError::AccessDenied(ref p) if p == "secret/"));
         // Second call without a queued fault returns empty.
         assert!(store.list("secret/").await.unwrap().is_empty());
     }
@@ -605,7 +614,7 @@ mod tests {
         store.insert("k", body(b"abc"));
         store.arm(Fault::NotFoundOnHead { key: "k".into() });
         let err = store.head("k").await.unwrap_err();
-        assert!(matches!(err, Error::NotFound(ref k) if k == "k"));
+        assert!(matches!(err, ObjectStoreError::NotFound(ref k) if k == "k"));
         // Without a queued fault, head returns the inserted object's
         // metadata (key + size). Inspecting the payload guards against
         // regressions that swap the returned key or size.
@@ -620,7 +629,7 @@ mod tests {
         store.insert("k", body(b"x"));
         store.arm(Fault::NetworkOnGetBytes { key: "k".into() });
         let err = store.get_bytes("k").await.unwrap_err();
-        assert!(matches!(err, Error::Network(_)));
+        assert!(matches!(err, ObjectStoreError::Network(_)));
         assert_eq!(&store.get_bytes("k").await.unwrap()[..], b"x");
     }
 
@@ -647,7 +656,7 @@ mod tests {
         store.insert("k", body(b"x"));
         store.arm(Fault::NetworkOnDelete { key: "k".into() });
         let err = store.delete("k").await.unwrap_err();
-        assert!(matches!(err, Error::Network(_)));
+        assert!(matches!(err, ObjectStoreError::Network(_)));
         // Object was not removed because the fault fired first.
         assert!(store.contains("k"));
         // Second call without a fault succeeds.
@@ -663,7 +672,7 @@ mod tests {
         store.insert("k", body(b"payload"));
         store.arm(Fault::PreconditionFailedOnGetToFile { key: "k".into() });
         let err = store.get_to_file("k", &path).await.unwrap_err();
-        assert!(matches!(err, Error::PreconditionFailed(ref k) if k == "k"));
+        assert!(matches!(err, ObjectStoreError::PreconditionFailed(ref k) if k == "k"));
         assert!(!path.exists(), "file must not be written on fault");
         assert_eq!(store.pending_faults(), 0);
         // Second call without a fault succeeds.
@@ -749,8 +758,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, Error::Other(_)),
-            "expected Error::Other, got {err:?}"
+            matches!(err, ObjectStoreError::Other(_)),
+            "expected ObjectStoreError::Other, got {err:?}"
         );
     }
 

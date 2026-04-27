@@ -27,17 +27,17 @@ use time::OffsetDateTime;
 use tracing::debug;
 
 use self::error::other_boxed;
-pub use self::error::{BoxError, Error};
+pub use self::error::{BoxError, ObjectStoreError};
 
 /// Atomically rename a [`NamedTempFile`] to `dest`, mapping the
-/// [`tempfile::PersistError`] into [`Error::Other`].
+/// [`tempfile::PersistError`] into [`ObjectStoreError::Other`].
 ///
 /// Shared between the S3 and Azure backends — both write `get_to_file`
 /// results to a sibling tempfile and persist on success so a partial
 /// download cannot leave a corrupt destination for the unbundle step.
-pub(crate) fn persist_temp(temp: NamedTempFile, dest: &Path) -> Result<(), Error> {
+pub(crate) fn persist_temp(temp: NamedTempFile, dest: &Path) -> Result<(), ObjectStoreError> {
     temp.persist(dest)
-        .map_err(|e| Error::Other(Box::new(e.error)))?;
+        .map_err(|e| ObjectStoreError::Other(Box::new(e.error)))?;
     Ok(())
 }
 
@@ -103,17 +103,22 @@ pub struct PutOpts {
 #[async_trait::async_trait]
 pub trait ObjectStore: Send + Sync {
     /// Enumerate every object whose key has `prefix` as a byte prefix.
-    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, Error>;
+    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, ObjectStoreError>;
 
     /// Stream the object body to `dest`. The destination's parent
     /// directory must already exist.
-    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<(), Error>;
+    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<(), ObjectStoreError>;
 
     /// Read the entire object body into memory.
-    async fn get_bytes(&self, key: &str) -> Result<Bytes, Error>;
+    async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError>;
 
     /// Write `body` to `key`, overwriting any existing object.
-    async fn put_bytes(&self, key: &str, body: Bytes, opts: PutOpts) -> Result<(), Error>;
+    async fn put_bytes(
+        &self,
+        key: &str,
+        body: Bytes,
+        opts: PutOpts,
+    ) -> Result<(), ObjectStoreError>;
 
     /// Stream a local file to `key`, overwriting any existing object.
     ///
@@ -121,7 +126,7 @@ pub trait ObjectStore: Send + Sync {
     /// the entire file in process memory. The default implementation reads
     /// the file into memory and delegates to [`put_bytes`](Self::put_bytes);
     /// this is correct but defeats the streaming intent for large files.
-    async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), Error> {
+    async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), ObjectStoreError> {
         debug!(key, path = %src.display(), "put_path: default read-then-put_bytes fallback");
         let body = tokio::fs::read(src).await.map_err(other_boxed)?;
         self.put_bytes(key, Bytes::from(body), opts).await
@@ -130,15 +135,15 @@ pub trait ObjectStore: Send + Sync {
     /// Create `key` if and only if it does not exist. Returns `Ok(true)`
     /// when the object was created, `Ok(false)` when the key was already
     /// present.
-    async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, Error>;
+    async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError>;
 
     /// Fetch metadata for an exact key.
-    async fn head(&self, key: &str) -> Result<ObjectMeta, Error>;
+    async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError>;
 
     /// Copy `src` to `dst` server-side, including body and user metadata.
-    async fn copy(&self, src: &str, dst: &str) -> Result<(), Error>;
+    async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError>;
 
-    /// Delete `key`. Returns `Err(Error::NotFound)` if the key was not
-    /// present.
-    async fn delete(&self, key: &str) -> Result<(), Error>;
+    /// Delete `key`. Returns `Err(ObjectStoreError::NotFound)` if the key was
+    /// not present.
+    async fn delete(&self, key: &str) -> Result<(), ObjectStoreError>;
 }

@@ -17,7 +17,7 @@ use tracing::info;
 
 use super::{ManageError, Prompter, key_under_prefix};
 use crate::git::RefName;
-use crate::object_store::{Error as ObjectStoreError, ObjectStore, PutOpts};
+use crate::object_store::{ObjectStore, ObjectStoreError, PutOpts};
 
 /// Operations on a single branch within a repository.
 pub struct ManageBranch<'a> {

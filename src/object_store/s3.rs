@@ -34,7 +34,7 @@
 //! `HeadObject` call. If the object is overwritten between `head` and
 //! the body download, S3 returns 412 and `get_to_file` retries once
 //! with a fresh `head`/`ETag`. After one retry the 412 propagates as
-//! [`Error::PreconditionFailed`].
+//! [`ObjectStoreError::PreconditionFailed`].
 //!
 //! ## Stdout discipline
 //!
@@ -61,7 +61,7 @@ use url::Url;
 use crate::url::{RemoteUrl, S3Addressing};
 
 use super::error::other_boxed;
-use super::{Error, ObjectMeta, ObjectStore, PutOpts, persist_temp};
+use super::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts, persist_temp};
 
 /// Object-size cutoff above which `get_to_file` switches from a single
 /// streaming GET to parallel ranged GETs. Matches upstream
@@ -130,7 +130,7 @@ impl ResolvedS3Config {
         addressing: S3Addressing,
         profile: Option<&str>,
         region_flag: Option<&str>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, ObjectStoreError> {
         Ok(Self {
             endpoint_url: normalize_endpoint(endpoint, addressing)?,
             region: resolve_region(endpoint, region_flag),
@@ -143,12 +143,12 @@ impl ResolvedS3Config {
 impl S3Store {
     /// Build an `S3Store` from a parsed [`RemoteUrl`].
     ///
-    /// Returns `Err(Error::Other)` if `url` is not the S3 variant or if
+    /// Returns `Err(ObjectStoreError::Other)` if `url` is not the S3 variant or if
     /// the endpoint URL cannot be normalised for virtual-hosted
     /// addressing. The [`RemoteUrl::S3::prefix`] field is intentionally
     /// **not** consumed here; callers compose it into keys themselves
     /// per the module-level docs.
-    pub async fn from_remote_url(url: &RemoteUrl) -> Result<Self, Error> {
+    pub async fn from_remote_url(url: &RemoteUrl) -> Result<Self, ObjectStoreError> {
         let RemoteUrl::S3 {
             endpoint,
             bucket,
@@ -157,7 +157,7 @@ impl S3Store {
             ..
         } = url
         else {
-            return Err(Error::Other(
+            return Err(ObjectStoreError::Other(
                 format!("S3Store::from_remote_url called with non-S3 URL: {url}").into(),
             ));
         };
@@ -209,7 +209,10 @@ pub(crate) async fn build_s3_config(resolved: &ResolvedS3Config) -> aws_sdk_s3::
 /// either as a path segment (`force_path_style(true)`) or as a host
 /// subdomain (`force_path_style(false)`) — so we must strip both
 /// before handing the URL off.
-pub(crate) fn normalize_endpoint(endpoint: &Url, addressing: S3Addressing) -> Result<Url, Error> {
+pub(crate) fn normalize_endpoint(
+    endpoint: &Url,
+    addressing: S3Addressing,
+) -> Result<Url, ObjectStoreError> {
     let mut rewritten = endpoint.clone();
     rewritten.set_path("");
     rewritten.set_query(None);
@@ -218,12 +221,12 @@ pub(crate) fn normalize_endpoint(endpoint: &Url, addressing: S3Addressing) -> Re
     if matches!(addressing, S3Addressing::VirtualHosted) {
         let host = rewritten
             .host_str()
-            .ok_or_else(|| Error::Other("endpoint URL has no host".into()))?;
+            .ok_or_else(|| ObjectStoreError::Other("endpoint URL has no host".into()))?;
         let regional_host = host
             .split_once('.')
             .map(|(_bucket, rest)| rest)
             .ok_or_else(|| {
-                Error::Other(
+                ObjectStoreError::Other(
                     format!("virtual-hosted endpoint host `{host}` has no dot separator").into(),
                 )
             })?
@@ -299,17 +302,17 @@ pub(crate) fn encode_copy_source(bucket: &str, key: &str) -> String {
     format!("{bucket_enc}/{key_enc}")
 }
 
-/// Map a typed `aws-sdk-s3` error into the trait's [`Error`] enum.
+/// Map a typed `aws-sdk-s3` error into the trait's [`ObjectStoreError`] enum.
 ///
 /// `key` is the operation's key/prefix context — it appears in the
-/// resulting [`Error::NotFound`] / [`Error::AccessDenied`] /
-/// [`Error::PreconditionFailed`] / [`Error::Conflict`] payload.
+/// resulting [`ObjectStoreError::NotFound`] / [`ObjectStoreError::AccessDenied`] /
+/// [`ObjectStoreError::PreconditionFailed`] / [`ObjectStoreError::Conflict`] payload.
 ///
 /// Note that this also covers typed `NotFound` / `NoSuchKey` variants
 /// the SDK constructs from 404 responses: those carry HTTP 404 on
 /// `svc.raw().status()` and so route through the status-based branch
 /// of [`classify_status_and_code`].
-fn classify<E>(err: SdkError<E>, key: &str) -> Error
+fn classify<E>(err: SdkError<E>, key: &str) -> ObjectStoreError
 where
     E: std::error::Error + Send + Sync + 'static + ProvideErrorMetadata,
 {
@@ -321,8 +324,10 @@ where
         }
     }
     match &err {
-        SdkError::DispatchFailure(_) | SdkError::TimeoutError(_) => Error::Network(Box::new(err)),
-        _ => Error::Other(Box::new(err)),
+        SdkError::DispatchFailure(_) | SdkError::TimeoutError(_) => {
+            ObjectStoreError::Network(Box::new(err))
+        }
+        _ => ObjectStoreError::Other(Box::new(err)),
     }
 }
 
@@ -332,16 +337,20 @@ where
 /// Extracted so unit tests can drive the missing-key and
 /// missing-last-modified guard branches via `Object`'s builder
 /// without synthesising a full `ListObjectsV2Output`.
-pub(crate) fn object_to_meta(obj: &aws_sdk_s3::types::Object) -> Result<ObjectMeta, Error> {
+pub(crate) fn object_to_meta(
+    obj: &aws_sdk_s3::types::Object,
+) -> Result<ObjectMeta, ObjectStoreError> {
     let key = obj
         .key()
-        .ok_or_else(|| Error::Other("list_objects_v2 returned an object without a key".into()))?
+        .ok_or_else(|| {
+            ObjectStoreError::Other("list_objects_v2 returned an object without a key".into())
+        })?
         .to_owned();
     let size = u64::try_from(obj.size().unwrap_or(0)).unwrap_or(0);
     let last_modified = obj
         .last_modified()
         .ok_or_else(|| {
-            Error::Other(
+            ObjectStoreError::Other(
                 format!("list_objects_v2 returned object `{key}` without last_modified").into(),
             )
         })?
@@ -378,16 +387,18 @@ pub(crate) fn head_output_to_meta(
     content_length: Option<i64>,
     last_modified: Option<&aws_sdk_s3::primitives::DateTime>,
     etag: Option<&str>,
-) -> Result<ObjectMeta, Error> {
+) -> Result<ObjectMeta, ObjectStoreError> {
     let raw_size = content_length.ok_or_else(|| {
-        Error::Other(format!("head_object on `{key}` returned no content-length").into())
+        ObjectStoreError::Other(format!("head_object on `{key}` returned no content-length").into())
     })?;
     // `i64` is the SDK's wire type; clamp a (legally impossible) negative
     // value to 0 rather than wrap to a huge u64. Mirrors `object_to_meta`.
     let size = u64::try_from(raw_size).unwrap_or(0);
     let last_modified = last_modified
         .ok_or_else(|| {
-            Error::Other(format!("head_object on `{key}` returned no last_modified").into())
+            ObjectStoreError::Other(
+                format!("head_object on `{key}` returned no last_modified").into(),
+            )
         })?
         .to_time()
         .map_err(other_boxed)?;
@@ -401,26 +412,32 @@ pub(crate) fn head_output_to_meta(
 
 /// Pure classifier core (no `SdkError` involvement) so unit tests can
 /// exercise every branch without synthesising SDK error types.
-fn classify_status_and_code(status: u16, code: Option<&str>, key: &str) -> Option<Error> {
+fn classify_status_and_code(
+    status: u16,
+    code: Option<&str>,
+    key: &str,
+) -> Option<ObjectStoreError> {
     match status {
-        404 => return Some(Error::NotFound(key.to_owned())),
-        403 => return Some(Error::AccessDenied(key.to_owned())),
-        412 => return Some(Error::PreconditionFailed(key.to_owned())),
-        409 => return Some(Error::Conflict(key.to_owned())),
+        404 => return Some(ObjectStoreError::NotFound(key.to_owned())),
+        403 => return Some(ObjectStoreError::AccessDenied(key.to_owned())),
+        412 => return Some(ObjectStoreError::PreconditionFailed(key.to_owned())),
+        409 => return Some(ObjectStoreError::Conflict(key.to_owned())),
         _ => {}
     }
     match code {
-        Some("NoSuchKey" | "NoSuchBucket" | "NotFound") => Some(Error::NotFound(key.to_owned())),
-        Some("AccessDenied") => Some(Error::AccessDenied(key.to_owned())),
-        Some("PreconditionFailed") => Some(Error::PreconditionFailed(key.to_owned())),
-        Some("ConditionalRequestConflict") => Some(Error::Conflict(key.to_owned())),
+        Some("NoSuchKey" | "NoSuchBucket" | "NotFound") => {
+            Some(ObjectStoreError::NotFound(key.to_owned()))
+        }
+        Some("AccessDenied") => Some(ObjectStoreError::AccessDenied(key.to_owned())),
+        Some("PreconditionFailed") => Some(ObjectStoreError::PreconditionFailed(key.to_owned())),
+        Some("ConditionalRequestConflict") => Some(ObjectStoreError::Conflict(key.to_owned())),
         _ => None,
     }
 }
 
 #[async_trait::async_trait]
 impl ObjectStore for S3Store {
-    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, Error> {
+    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, ObjectStoreError> {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         loop {
@@ -452,9 +469,11 @@ impl ObjectStore for S3Store {
         Ok(out)
     }
 
-    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<(), Error> {
+    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<(), ObjectStoreError> {
         let parent = dest.parent().ok_or_else(|| {
-            Error::Other(format!("destination `{}` has no parent directory", dest.display()).into())
+            ObjectStoreError::Other(
+                format!("destination `{}` has no parent directory", dest.display()).into(),
+            )
         })?;
 
         // Attempt the head→download cycle up to twice: if the object is
@@ -484,7 +503,7 @@ impl ObjectStore for S3Store {
                     persist_temp(temp, dest)?;
                     return Ok(());
                 }
-                Err(Error::PreconditionFailed(_)) if attempt == 0 => {
+                Err(ObjectStoreError::PreconditionFailed(_)) if attempt == 0 => {
                     tracing::warn!(key, "object changed between head and GET; retrying");
                 }
                 Err(e) => return Err(e),
@@ -493,7 +512,7 @@ impl ObjectStore for S3Store {
         unreachable!("both loop iterations return from within the match")
     }
 
-    async fn get_bytes(&self, key: &str) -> Result<Bytes, Error> {
+    async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
         let resp = self
             .client
             .get_object()
@@ -506,11 +525,16 @@ impl ObjectStore for S3Store {
             .body
             .collect()
             .await
-            .map_err(|e| Error::Network(Box::new(e)))?;
+            .map_err(|e| ObjectStoreError::Network(Box::new(e)))?;
         Ok(aggregated.into_bytes())
     }
 
-    async fn put_bytes(&self, key: &str, body: Bytes, opts: PutOpts) -> Result<(), Error> {
+    async fn put_bytes(
+        &self,
+        key: &str,
+        body: Bytes,
+        opts: PutOpts,
+    ) -> Result<(), ObjectStoreError> {
         // Note: aws-sdk-s3 1.x rejects PutObject bodies > 5 GiB; larger
         // payloads need multipart upload. Bundle objects in our schema
         // do not approach that limit; LFS-driven needs may extend the
@@ -518,7 +542,7 @@ impl ObjectStore for S3Store {
         self.put_body(key, ByteStream::from(body), opts).await
     }
 
-    async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), Error> {
+    async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), ObjectStoreError> {
         // `ByteStream::from_path` streams from disk via tokio's async
         // file I/O, avoiding a full in-memory copy. Note: the 5 GiB
         // single-PUT ceiling still applies — `aws-sdk-s3` PutObject
@@ -535,7 +559,7 @@ impl ObjectStore for S3Store {
         self.put_body(key, stream, opts).await
     }
 
-    async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, Error> {
+    async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
         let resp = self
             .client
             .put_object()
@@ -548,13 +572,15 @@ impl ObjectStore for S3Store {
         match resp {
             Ok(_) => Ok(true),
             Err(e) => match classify(e, key) {
-                Error::PreconditionFailed(_) | Error::Conflict(_) => Ok(false),
+                ObjectStoreError::PreconditionFailed(_) | ObjectStoreError::Conflict(_) => {
+                    Ok(false)
+                }
                 other => Err(other),
             },
         }
     }
 
-    async fn head(&self, key: &str) -> Result<ObjectMeta, Error> {
+    async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
         let resp = self
             .client
             .head_object()
@@ -571,7 +597,7 @@ impl ObjectStore for S3Store {
         )
     }
 
-    async fn copy(&self, src: &str, dst: &str) -> Result<(), Error> {
+    async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
         let copy_source = encode_copy_source(&self.bucket, src);
         // Pass `src` as the key context so a 404 surfaces as
         // `NotFound(src)` — that's what the trait promises.
@@ -586,7 +612,7 @@ impl ObjectStore for S3Store {
         Ok(())
     }
 
-    async fn delete(&self, key: &str) -> Result<(), Error> {
+    async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
         // S3 DeleteObject is idempotent (returns 204 even for missing
         // keys), but the trait contract demands `Err(NotFound)` on a
         // missing key — so HEAD first. Concurrent deletion between this
@@ -610,7 +636,12 @@ impl S3Store {
     /// optional `Content-Disposition` and user metadata from [`PutOpts`].
     /// Shared by `put_bytes` (in-memory) and `put_path` (streamed from
     /// disk).
-    async fn put_body(&self, key: &str, body: ByteStream, opts: PutOpts) -> Result<(), Error> {
+    async fn put_body(
+        &self,
+        key: &str,
+        body: ByteStream,
+        opts: PutOpts,
+    ) -> Result<(), ObjectStoreError> {
         let mut req = self
             .client
             .put_object()
@@ -640,7 +671,7 @@ impl S3Store {
         key: &str,
         temp_path: &Path,
         etag: Option<&str>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ObjectStoreError> {
         let mut req = self.client.get_object().bucket(&self.bucket).key(key);
         if let Some(etag) = etag {
             req = req.if_match(etag);
@@ -655,7 +686,7 @@ impl S3Store {
             .map_err(other_boxed)?;
 
         while let Some(chunk) = resp.body.next().await {
-            let bytes = chunk.map_err(|e| Error::Network(Box::new(e)))?;
+            let bytes = chunk.map_err(|e| ObjectStoreError::Network(Box::new(e)))?;
             file.write_all(&bytes).await.map_err(other_boxed)?;
         }
         file.flush().await.map_err(other_boxed)?;
@@ -673,7 +704,7 @@ impl S3Store {
         temp_path: &Path,
         size: u64,
         etag: Option<&str>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ObjectStoreError> {
         let async_file = tokio::fs::OpenOptions::new()
             .write(true)
             .truncate(false)
@@ -684,7 +715,7 @@ impl S3Store {
 
         let file = Arc::new(Mutex::new(async_file));
         let semaphore = Arc::new(Semaphore::new(MULTIPART_MAX_CONCURRENCY));
-        let mut tasks: JoinSet<Result<(), Error>> = JoinSet::new();
+        let mut tasks: JoinSet<Result<(), ObjectStoreError>> = JoinSet::new();
 
         let etag_owned = etag.map(str::to_owned);
         for (start, end) in plan_ranges(size, MULTIPART_CHUNK_SIZE) {
@@ -709,11 +740,11 @@ impl S3Store {
                     .body
                     .collect()
                     .await
-                    .map_err(|e| Error::Network(Box::new(e)))?
+                    .map_err(|e| ObjectStoreError::Network(Box::new(e)))?
                     .into_bytes();
                 let expected = end - start + 1;
                 if bytes.len() as u64 != expected {
-                    return Err(Error::Other(
+                    return Err(ObjectStoreError::Other(
                         format!(
                             "range bytes={start}-{end} returned {} bytes, expected {expected}",
                             bytes.len()
@@ -777,13 +808,13 @@ mod tests {
             .build();
         let err = object_to_meta(&obj).expect_err("missing key must error");
         match err {
-            Error::Other(inner) => {
+            ObjectStoreError::Other(inner) => {
                 assert!(
                     inner.to_string().contains("without a key"),
                     "error message names the failure: {inner}"
                 );
             }
-            other => panic!("expected Error::Other for missing key, got {other:?}"),
+            other => panic!("expected ObjectStoreError::Other for missing key, got {other:?}"),
         }
     }
 
@@ -792,7 +823,7 @@ mod tests {
         let obj = Object::builder().key("k").size(0).build();
         let err = object_to_meta(&obj).expect_err("missing last_modified must error");
         match err {
-            Error::Other(inner) => {
+            ObjectStoreError::Other(inner) => {
                 let msg = inner.to_string();
                 assert!(
                     msg.contains("without last_modified"),
@@ -800,7 +831,9 @@ mod tests {
                 );
                 assert!(msg.contains("`k`"), "includes the key for context: {msg}");
             }
-            other => panic!("expected Error::Other for missing last_modified, got {other:?}"),
+            other => {
+                panic!("expected ObjectStoreError::Other for missing last_modified, got {other:?}")
+            }
         }
     }
 
@@ -834,12 +867,14 @@ mod tests {
         let err = head_output_to_meta("k", None, Some(&modified), None)
             .expect_err("missing content-length must error");
         match err {
-            Error::Other(inner) => {
+            ObjectStoreError::Other(inner) => {
                 let msg = inner.to_string();
                 assert!(msg.contains("no content-length"), "names failure: {msg}");
                 assert!(msg.contains("`k`"), "includes the key for context: {msg}");
             }
-            other => panic!("expected Error::Other for missing content-length, got {other:?}"),
+            other => {
+                panic!("expected ObjectStoreError::Other for missing content-length, got {other:?}")
+            }
         }
     }
 
@@ -848,12 +883,14 @@ mod tests {
         let err = head_output_to_meta("k", Some(0), None, None)
             .expect_err("missing last_modified must error");
         match err {
-            Error::Other(inner) => {
+            ObjectStoreError::Other(inner) => {
                 let msg = inner.to_string();
                 assert!(msg.contains("no last_modified"), "names failure: {msg}");
                 assert!(msg.contains("`k`"), "includes the key for context: {msg}");
             }
-            other => panic!("expected Error::Other for missing last_modified, got {other:?}"),
+            other => {
+                panic!("expected ObjectStoreError::Other for missing last_modified, got {other:?}")
+            }
         }
     }
 
@@ -1069,7 +1106,7 @@ mod tests {
     fn classify_404_status_is_not_found() {
         assert!(matches!(
             classify_status_and_code(404, None, "k"),
-            Some(Error::NotFound(s)) if s == "k"
+            Some(ObjectStoreError::NotFound(s)) if s == "k"
         ));
     }
 
@@ -1077,7 +1114,7 @@ mod tests {
     fn classify_403_status_is_access_denied() {
         assert!(matches!(
             classify_status_and_code(403, None, "k"),
-            Some(Error::AccessDenied(s)) if s == "k"
+            Some(ObjectStoreError::AccessDenied(s)) if s == "k"
         ));
     }
 
@@ -1085,7 +1122,7 @@ mod tests {
     fn classify_412_status_is_precondition_failed() {
         assert!(matches!(
             classify_status_and_code(412, None, "k"),
-            Some(Error::PreconditionFailed(s)) if s == "k"
+            Some(ObjectStoreError::PreconditionFailed(s)) if s == "k"
         ));
     }
 
@@ -1097,7 +1134,7 @@ mod tests {
         // racing-write contention as a hard error instead of Ok(false).
         assert!(matches!(
             classify_status_and_code(409, None, "k"),
-            Some(Error::Conflict(s)) if s == "k"
+            Some(ObjectStoreError::Conflict(s)) if s == "k"
         ));
     }
 
@@ -1105,7 +1142,7 @@ mod tests {
     fn classify_no_such_key_code_falls_back_to_not_found() {
         assert!(matches!(
             classify_status_and_code(500, Some("NoSuchKey"), "k"),
-            Some(Error::NotFound(s)) if s == "k"
+            Some(ObjectStoreError::NotFound(s)) if s == "k"
         ));
     }
 
@@ -1113,7 +1150,7 @@ mod tests {
     fn classify_conditional_request_conflict_code_is_conflict() {
         assert!(matches!(
             classify_status_and_code(500, Some("ConditionalRequestConflict"), "k"),
-            Some(Error::Conflict(s)) if s == "k"
+            Some(ObjectStoreError::Conflict(s)) if s == "k"
         ));
     }
 
@@ -1140,8 +1177,8 @@ mod tests {
     async fn from_remote_url_rejects_azure() {
         let result = S3Store::from_remote_url(&azure_url()).await;
         match result {
-            Err(Error::Other(_)) => {}
-            Err(other) => panic!("expected Error::Other, got {other:?}"),
+            Err(ObjectStoreError::Other(_)) => {}
+            Err(other) => panic!("expected ObjectStoreError::Other, got {other:?}"),
             Ok(_) => panic!("expected Azure URL to be rejected"),
         }
     }

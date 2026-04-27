@@ -102,7 +102,7 @@ use url::Url;
 use crate::url::{AzureAddressing, RemoteUrl};
 
 use super::error::other_boxed;
-use super::{Error, ObjectMeta, ObjectStore, PutOpts, persist_temp};
+use super::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts, persist_temp};
 
 /// Production [`ObjectStore`] backed by `azure_storage_blob`.
 pub struct AzureBlobStore {
@@ -123,7 +123,7 @@ impl std::fmt::Debug for AzureBlobStore {
 impl AzureBlobStore {
     /// Build an `AzureBlobStore` from a parsed [`RemoteUrl`].
     ///
-    /// Returns `Err(Error::Other)` if `url` is not the Azure variant or
+    /// Returns `Err(ObjectStoreError::Other)` if `url` is not the Azure variant or
     /// if credential resolution fails. Like the S3 backend, the
     /// [`RemoteUrl::Azure::prefix`] field is intentionally **not**
     /// consumed here; callers compose it into keys themselves.
@@ -134,7 +134,7 @@ impl AzureBlobStore {
     /// future credential providers (e.g. one that fetches an OIDC
     /// token at construction) can plug in without breaking callers.
     #[allow(clippy::unused_async)]
-    pub async fn from_remote_url(url: &RemoteUrl) -> Result<Self, Error> {
+    pub async fn from_remote_url(url: &RemoteUrl) -> Result<Self, ObjectStoreError> {
         let RemoteUrl::Azure {
             endpoint,
             account,
@@ -144,7 +144,7 @@ impl AzureBlobStore {
             ..
         } = url
         else {
-            return Err(Error::Other(
+            return Err(ObjectStoreError::Other(
                 format!("AzureBlobStore::from_remote_url called with non-Azure URL: {url}").into(),
             ));
         };
@@ -201,31 +201,31 @@ pub(crate) fn build_account_url(
     rewritten.to_string()
 }
 
-/// Map an [`azure_core::Error`] into the trait's [`Error`] enum.
+/// Map an [`azure_core::Error`] into the trait's [`ObjectStoreError`] enum.
 ///
 /// `key` is the operation's key/prefix context; it appears in the
-/// resulting [`Error::NotFound`] / [`Error::AccessDenied`] /
-/// [`Error::PreconditionFailed`] / [`Error::Conflict`] payload.
-fn classify(err: azure_core::Error, key: &str) -> Error {
+/// resulting [`ObjectStoreError::NotFound`] / [`ObjectStoreError::AccessDenied`] /
+/// [`ObjectStoreError::PreconditionFailed`] / [`ObjectStoreError::Conflict`] payload.
+fn classify(err: azure_core::Error, key: &str) -> ObjectStoreError {
     if let Some(status) = err.http_status()
         && let Some(mapped) = classify_status(u16::from(status), key)
     {
         return mapped;
     }
     if matches!(err.kind(), azure_core::error::ErrorKind::Io) {
-        return Error::Network(Box::new(err));
+        return ObjectStoreError::Network(Box::new(err));
     }
-    Error::Other(Box::new(err))
+    ObjectStoreError::Other(Box::new(err))
 }
 
 /// Pure status-code classifier (key context, no SDK types) so unit
 /// tests can exercise every branch without synthesising an SDK error.
-fn classify_status(status: u16, key: &str) -> Option<Error> {
+fn classify_status(status: u16, key: &str) -> Option<ObjectStoreError> {
     match status {
-        404 => Some(Error::NotFound(key.to_owned())),
-        403 => Some(Error::AccessDenied(key.to_owned())),
-        412 => Some(Error::PreconditionFailed(key.to_owned())),
-        409 => Some(Error::Conflict(key.to_owned())),
+        404 => Some(ObjectStoreError::NotFound(key.to_owned())),
+        403 => Some(ObjectStoreError::AccessDenied(key.to_owned())),
+        412 => Some(ObjectStoreError::PreconditionFailed(key.to_owned())),
+        409 => Some(ObjectStoreError::Conflict(key.to_owned())),
         _ => None,
     }
 }
@@ -248,12 +248,16 @@ fn properties_to_meta(
     content_length: Option<u64>,
     last_modified: Option<OffsetDateTime>,
     etag: Option<&str>,
-) -> Result<ObjectMeta, Error> {
+) -> Result<ObjectMeta, ObjectStoreError> {
     let size = content_length.ok_or_else(|| {
-        Error::Other(format!("get_properties on `{key}` returned no content-length").into())
+        ObjectStoreError::Other(
+            format!("get_properties on `{key}` returned no content-length").into(),
+        )
     })?;
     let last_modified = last_modified.ok_or_else(|| {
-        Error::Other(format!("get_properties on `{key}` returned no last-modified").into())
+        ObjectStoreError::Other(
+            format!("get_properties on `{key}` returned no last-modified").into(),
+        )
     })?;
     Ok(ObjectMeta {
         key: key.to_owned(),
@@ -272,13 +276,15 @@ fn item_to_meta(
     content_length: Option<u64>,
     last_modified: Option<OffsetDateTime>,
     etag: Option<&str>,
-) -> Result<ObjectMeta, Error> {
+) -> Result<ObjectMeta, ObjectStoreError> {
     let key = name
-        .ok_or_else(|| Error::Other("list_blobs returned a blob without a name".into()))?
+        .ok_or_else(|| ObjectStoreError::Other("list_blobs returned a blob without a name".into()))?
         .to_owned();
     let size = content_length.unwrap_or(0);
     let last_modified = last_modified.ok_or_else(|| {
-        Error::Other(format!("list_blobs returned blob `{key}` without last_modified").into())
+        ObjectStoreError::Other(
+            format!("list_blobs returned blob `{key}` without last_modified").into(),
+        )
     })?;
     Ok(ObjectMeta {
         key,
@@ -290,7 +296,7 @@ fn item_to_meta(
 
 #[async_trait::async_trait]
 impl ObjectStore for AzureBlobStore {
-    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, Error> {
+    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, ObjectStoreError> {
         // Pass `None` for an empty prefix: Azure list_blobs URL-encodes
         // `prefix=` and Azurite signs an empty value differently than
         // an absent one (treats it as a tampered query and returns
@@ -331,16 +337,18 @@ impl ObjectStore for AzureBlobStore {
         Ok(out)
     }
 
-    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<(), Error> {
+    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<(), ObjectStoreError> {
         let parent = dest.parent().ok_or_else(|| {
-            Error::Other(format!("destination `{}` has no parent directory", dest.display()).into())
+            ObjectStoreError::Other(
+                format!("destination `{}` has no parent directory", dest.display()).into(),
+            )
         })?;
 
         // Mirror S3: try once, retry once on 412 (the head→GET race).
         // After the second attempt any error — including a repeated
         // 412 — propagates.
         match self.head_then_download(key, dest, parent).await {
-            Err(Error::PreconditionFailed(_)) => {
+            Err(ObjectStoreError::PreconditionFailed(_)) => {
                 tracing::warn!(key, "blob changed between head and GET; retrying");
                 self.head_then_download(key, dest, parent).await
             }
@@ -348,18 +356,23 @@ impl ObjectStore for AzureBlobStore {
         }
     }
 
-    async fn get_bytes(&self, key: &str) -> Result<Bytes, Error> {
+    async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
         let blob = self.blob_client(key);
         let result = blob.download(None).await.map_err(|e| classify(e, key))?;
         let bytes = result
             .body
             .collect()
             .await
-            .map_err(|e| Error::Network(Box::new(e)))?;
+            .map_err(|e| ObjectStoreError::Network(Box::new(e)))?;
         Ok(bytes)
     }
 
-    async fn put_bytes(&self, key: &str, body: Bytes, opts: PutOpts) -> Result<(), Error> {
+    async fn put_bytes(
+        &self,
+        key: &str,
+        body: Bytes,
+        opts: PutOpts,
+    ) -> Result<(), ObjectStoreError> {
         let blob = self.blob_client(key);
         let upload_opts = upload_options_from(opts);
         blob.upload(bytes_to_request_content(body), Some(upload_opts))
@@ -386,7 +399,7 @@ impl ObjectStore for AzureBlobStore {
     /// `put_bytes`. Auth (shared-key / SAS / token) is unchanged
     /// because the per-try signing policy reads `request.body().len()`,
     /// which `SeekableStream` reports faithfully via `len()`.
-    async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), Error> {
+    async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), ObjectStoreError> {
         let file = tokio::fs::File::open(src).await.map_err(other_boxed)?;
         let stream = FileStream::builder(file)
             .build()
@@ -402,7 +415,7 @@ impl ObjectStore for AzureBlobStore {
         Ok(())
     }
 
-    async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, Error> {
+    async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
         let blob = self.blob_client(key);
         let upload_opts = BlockBlobClientUploadOptions::default().with_if_not_exists();
         let resp = blob
@@ -411,13 +424,15 @@ impl ObjectStore for AzureBlobStore {
         match resp {
             Ok(_) => Ok(true),
             Err(e) => match classify(e, key) {
-                Error::PreconditionFailed(_) | Error::Conflict(_) => Ok(false),
+                ObjectStoreError::PreconditionFailed(_) | ObjectStoreError::Conflict(_) => {
+                    Ok(false)
+                }
                 other => Err(other),
             },
         }
     }
 
-    async fn head(&self, key: &str) -> Result<ObjectMeta, Error> {
+    async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
         let blob = self.blob_client(key);
         let resp = blob
             .get_properties(None::<BlobClientGetPropertiesOptions<'_>>)
@@ -432,7 +447,7 @@ impl ObjectStore for AzureBlobStore {
         )
     }
 
-    async fn copy(&self, src: &str, dst: &str) -> Result<(), Error> {
+    async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
         // Server-side copy via PutBlobFromURL requires a SAS-tokened
         // source URL or `x-ms-copy-source-authorization`, neither of
         // which integrates with our credential model in a clean way
@@ -444,14 +459,14 @@ impl ObjectStore for AzureBlobStore {
         // so callers don't mistake it for "src absent".
         match self.put_bytes(dst, body, PutOpts::default()).await {
             Ok(()) => Ok(()),
-            Err(Error::NotFound(_)) => Err(Error::Other(
+            Err(ObjectStoreError::NotFound(_)) => Err(ObjectStoreError::Other(
                 format!("copy `{src}` → `{dst}`: upload returned NotFound").into(),
             )),
             Err(other) => Err(other),
         }
     }
 
-    async fn delete(&self, key: &str) -> Result<(), Error> {
+    async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
         let blob = self.blob_client(key);
         blob.delete(None::<BlobClientDeleteOptions<'_>>)
             .await
@@ -465,7 +480,12 @@ impl AzureBlobStore {
     ///
     /// Factored out so [`get_to_file`](ObjectStore::get_to_file) can
     /// invoke it twice: once normally, once more on a 412 retry.
-    async fn head_then_download(&self, key: &str, dest: &Path, parent: &Path) -> Result<(), Error> {
+    async fn head_then_download(
+        &self,
+        key: &str,
+        dest: &Path,
+        parent: &Path,
+    ) -> Result<(), ObjectStoreError> {
         let meta = self.head(key).await?;
         let temp = NamedTempFile::new_in(parent).map_err(other_boxed)?;
         if meta.size == 0 {
@@ -485,7 +505,7 @@ impl AzureBlobStore {
         key: &str,
         temp_path: &Path,
         etag: Option<&str>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ObjectStoreError> {
         let blob = self.blob_client(key);
         let mut opts = BlobClientDownloadOptions::default();
         if let Some(etag) = etag {
@@ -504,7 +524,7 @@ impl AzureBlobStore {
             .map_err(other_boxed)?;
 
         while let Some(chunk) = result.body.next().await {
-            let bytes = chunk.map_err(|e| Error::Network(Box::new(e)))?;
+            let bytes = chunk.map_err(|e| ObjectStoreError::Network(Box::new(e)))?;
             file.write_all(&bytes).await.map_err(other_boxed)?;
         }
         file.flush().await.map_err(other_boxed)?;
@@ -601,7 +621,7 @@ mod tests {
     fn classify_404_is_not_found() {
         assert!(matches!(
             classify_status(404, "k"),
-            Some(Error::NotFound(s)) if s == "k"
+            Some(ObjectStoreError::NotFound(s)) if s == "k"
         ));
     }
 
@@ -609,7 +629,7 @@ mod tests {
     fn classify_403_is_access_denied() {
         assert!(matches!(
             classify_status(403, "k"),
-            Some(Error::AccessDenied(s)) if s == "k"
+            Some(ObjectStoreError::AccessDenied(s)) if s == "k"
         ));
     }
 
@@ -617,7 +637,7 @@ mod tests {
     fn classify_412_is_precondition_failed() {
         assert!(matches!(
             classify_status(412, "k"),
-            Some(Error::PreconditionFailed(s)) if s == "k"
+            Some(ObjectStoreError::PreconditionFailed(s)) if s == "k"
         ));
     }
 
@@ -628,7 +648,7 @@ mod tests {
         // surface contention as a hard error instead of `Ok(false)`.
         assert!(matches!(
             classify_status(409, "k"),
-            Some(Error::Conflict(s)) if s == "k"
+            Some(ObjectStoreError::Conflict(s)) if s == "k"
         ));
     }
 
@@ -668,12 +688,14 @@ mod tests {
         let err = properties_to_meta("k", None, Some(now), None)
             .expect_err("missing content-length must error");
         match err {
-            Error::Other(inner) => {
+            ObjectStoreError::Other(inner) => {
                 let msg = inner.to_string();
                 assert!(msg.contains("no content-length"), "names failure: {msg}");
                 assert!(msg.contains("`k`"), "includes the key for context: {msg}");
             }
-            other => panic!("expected Error::Other for missing content-length, got {other:?}"),
+            other => {
+                panic!("expected ObjectStoreError::Other for missing content-length, got {other:?}")
+            }
         }
     }
 
@@ -682,12 +704,14 @@ mod tests {
         let err = properties_to_meta("k", Some(0), None, None)
             .expect_err("missing last_modified must error");
         match err {
-            Error::Other(inner) => {
+            ObjectStoreError::Other(inner) => {
                 let msg = inner.to_string();
                 assert!(msg.contains("no last-modified"), "names failure: {msg}");
                 assert!(msg.contains("`k`"), "includes the key for context: {msg}");
             }
-            other => panic!("expected Error::Other for missing last_modified, got {other:?}"),
+            other => {
+                panic!("expected ObjectStoreError::Other for missing last_modified, got {other:?}")
+            }
         }
     }
 
@@ -708,13 +732,13 @@ mod tests {
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let err = item_to_meta(None, Some(0), Some(now), None).unwrap_err();
         match err {
-            Error::Other(inner) => {
+            ObjectStoreError::Other(inner) => {
                 assert!(
                     inner.to_string().contains("without a name"),
                     "names failure: {inner}"
                 );
             }
-            other => panic!("expected Error::Other, got {other:?}"),
+            other => panic!("expected ObjectStoreError::Other, got {other:?}"),
         }
     }
 
@@ -722,7 +746,7 @@ mod tests {
     fn item_to_meta_rejects_missing_last_modified() {
         let err = item_to_meta(Some("k"), Some(0), None, None).unwrap_err();
         match err {
-            Error::Other(inner) => {
+            ObjectStoreError::Other(inner) => {
                 let msg = inner.to_string();
                 assert!(
                     msg.contains("without last_modified"),
@@ -730,7 +754,7 @@ mod tests {
                 );
                 assert!(msg.contains("`k`"), "includes the key: {msg}");
             }
-            other => panic!("expected Error::Other, got {other:?}"),
+            other => panic!("expected ObjectStoreError::Other, got {other:?}"),
         }
     }
 
@@ -784,8 +808,8 @@ mod tests {
     async fn from_remote_url_rejects_s3() {
         let result = AzureBlobStore::from_remote_url(&s3_url()).await;
         match result {
-            Err(Error::Other(_)) => {}
-            Err(other) => panic!("expected Error::Other, got {other:?}"),
+            Err(ObjectStoreError::Other(_)) => {}
+            Err(other) => panic!("expected ObjectStoreError::Other, got {other:?}"),
             Ok(_) => panic!("expected S3 URL to be rejected"),
         }
     }

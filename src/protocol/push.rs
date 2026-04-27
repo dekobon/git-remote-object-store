@@ -22,7 +22,7 @@ use time::{Duration, OffsetDateTime};
 use tracing::{debug, warn};
 
 use crate::git::{self, GitError, RefName, RefNameError, Sha, ShaError, is_valid_ref_name};
-use crate::object_store::{Error as ObjectStoreError, ObjectMeta, ObjectStore, PutOpts};
+use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
 
 /// Default per-ref lock TTL, in seconds. Matches upstream
 /// (`DEFAULT_LOCK_TTL_SECONDS = 60`,

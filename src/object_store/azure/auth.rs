@@ -45,7 +45,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc2822;
 use url::Url;
 
-use crate::object_store::Error;
+use crate::object_store::ObjectStoreError;
 use crate::object_store::error::other_boxed;
 use crate::url::RemoteFlags;
 
@@ -59,7 +59,10 @@ pub(crate) struct ResolvedCredentials {
 }
 
 /// Resolve credentials for a parsed Azure URL.
-pub(crate) fn resolve(account: &str, flags: &RemoteFlags) -> Result<ResolvedCredentials, Error> {
+pub(crate) fn resolve(
+    account: &str,
+    flags: &RemoteFlags,
+) -> Result<ResolvedCredentials, ObjectStoreError> {
     if let Some(alias) = flags.credential.as_deref() {
         return resolve_alias(account, alias);
     }
@@ -70,9 +73,9 @@ pub(crate) fn resolve(account: &str, flags: &RemoteFlags) -> Result<ResolvedCred
     })
 }
 
-fn resolve_alias(account: &str, alias: &str) -> Result<ResolvedCredentials, Error> {
+fn resolve_alias(account: &str, alias: &str) -> Result<ResolvedCredentials, ObjectStoreError> {
     if !is_valid_alias(alias) {
-        return Err(Error::Other(
+        return Err(ObjectStoreError::Other(
             format!(
                 "invalid credential alias `{alias}`: \
                  must match [A-Za-z0-9_]+ (used to build env var names)"
@@ -99,7 +102,7 @@ fn resolve_alias(account: &str, alias: &str) -> Result<ResolvedCredentials, Erro
         return Ok(policy_only(Arc::new(policy)));
     }
 
-    Err(Error::Other(
+    Err(ObjectStoreError::Other(
         format!(
             "credential alias `{alias}` has no env var set: \
              expected {key_var}, {conn_var}, or {sas_var}"
@@ -134,7 +137,9 @@ pub(crate) struct ConnectionStringParts {
 /// ignored. The endpoint URL is taken from the parsed `RemoteUrl`,
 /// not from the connection string, so the URL is the single source
 /// of truth for endpoint/host/port.
-pub(crate) fn parse_connection_string(input: &str) -> Result<ConnectionStringParts, Error> {
+pub(crate) fn parse_connection_string(
+    input: &str,
+) -> Result<ConnectionStringParts, ObjectStoreError> {
     let mut account = None;
     let mut key_b64 = None;
     for segment in input.split(';') {
@@ -147,7 +152,7 @@ pub(crate) fn parse_connection_string(input: &str) -> Result<ConnectionStringPar
         // and reported as "missing AccountKey", which sends the user
         // chasing the wrong field.
         let Some((k, v)) = segment.split_once('=') else {
-            return Err(Error::Other(
+            return Err(ObjectStoreError::Other(
                 format!("connection string segment `{segment}` is missing `=`").into(),
             ));
         };
@@ -161,10 +166,10 @@ pub(crate) fn parse_connection_string(input: &str) -> Result<ConnectionStringPar
             _ => {}
         }
     }
-    let account =
-        account.ok_or_else(|| Error::Other("connection string missing AccountName".into()))?;
-    let key_b64 =
-        key_b64.ok_or_else(|| Error::Other("connection string missing AccountKey".into()))?;
+    let account = account
+        .ok_or_else(|| ObjectStoreError::Other("connection string missing AccountName".into()))?;
+    let key_b64 = key_b64
+        .ok_or_else(|| ObjectStoreError::Other("connection string missing AccountKey".into()))?;
     Ok(ConnectionStringParts { account, key_b64 })
 }
 
@@ -189,12 +194,12 @@ impl std::fmt::Debug for SharedKeySigningPolicy {
 }
 
 impl SharedKeySigningPolicy {
-    pub(crate) fn new(account: &str, key_b64: &str) -> Result<Self, Error> {
+    pub(crate) fn new(account: &str, key_b64: &str) -> Result<Self, ObjectStoreError> {
         // Validate base64-decodability up front so a malformed key
         // surfaces at construction, not on the first request.
-        BASE64
-            .decode(key_b64.as_bytes())
-            .map_err(|e| Error::Other(format!("AccountKey is not valid base64: {e}").into()))?;
+        BASE64.decode(key_b64.as_bytes()).map_err(|e| {
+            ObjectStoreError::Other(format!("AccountKey is not valid base64: {e}").into())
+        })?;
         Ok(Self {
             account: account.to_owned(),
             key: Secret::new(key_b64.to_owned()),
@@ -434,19 +439,21 @@ pub(crate) struct SasSigningPolicy {
 }
 
 impl SasSigningPolicy {
-    pub(crate) fn new(sas: &str) -> Result<Self, Error> {
+    pub(crate) fn new(sas: &str) -> Result<Self, ObjectStoreError> {
         let trimmed = sas.trim().trim_start_matches('?');
         if trimmed.is_empty() {
-            return Err(Error::Other("SAS token is empty".into()));
+            return Err(ObjectStoreError::Other("SAS token is empty".into()));
         }
         let parsed = Url::parse(&format!("https://example.invalid/?{trimmed}"))
-            .map_err(|e| Error::Other(format!("malformed SAS token: {e}").into()))?;
+            .map_err(|e| ObjectStoreError::Other(format!("malformed SAS token: {e}").into()))?;
         let pairs: Vec<(String, String)> = parsed
             .query_pairs()
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
         if pairs.is_empty() {
-            return Err(Error::Other("SAS token has no query parameters".into()));
+            return Err(ObjectStoreError::Other(
+                "SAS token has no query parameters".into(),
+            ));
         }
         Ok(Self { pairs })
     }
