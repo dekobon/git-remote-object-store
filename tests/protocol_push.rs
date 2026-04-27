@@ -244,7 +244,16 @@ async fn multi_bundle_pre_lock_rejects_push() {
     .await;
     result.expect("push should produce a refusal");
     let text = std::str::from_utf8(&out).unwrap();
-    assert!(text.contains("multiple bundles"), "got {text:?}");
+    // Assert the exact wire bytes — the trailing `?` matters because git
+    // treats `error <ref> "..."?` as recoverable and the inverse as fatal.
+    // The pre-lock and under-lock duplicate-bundle errors must both end
+    // in `?` so operators see a consistent format across branches.
+    assert_eq!(
+        text,
+        "error refs/heads/main \"multiple bundles exists on server. \
+         Run git-remote-object-store doctor to fix.\"?\n\n",
+        "got {text:?}",
+    );
     // Pre-existing bundles must remain — a regression that stealth-deleted
     // before the early return would still satisfy the message check.
     assert!(store.contains(&primary_key));

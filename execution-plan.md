@@ -908,3 +908,21 @@ so reviewers can diff against the source of truth.
   semantics, or LFS transfer protocol.
 - **Affected sections**: Relates to §5 (S3 object-store
   implementation); the canonical record lives in this section.
+
+### #34 — push: normalize duplicate-bundle error wire format (2026-04-26)
+
+- **Upstream behavior**: `cmd_push` emits the under-lock duplicate-bundle
+  rejection without the trailing `?` suffix
+  (`../git-remote-s3/git_remote_s3/remote.py:245`), even though the
+  surrounding `error <ref> "..."?` messages do include it.
+- **New behavior**: Both duplicate-bundle paths in `src/protocol/push.rs`
+  (pre-lock and under-lock) end with `"?\n` so the wire output is
+  consistent across branches.
+- **Rationale**: Git treats `error <ref> "..."?` as recoverable and
+  `error <ref> "..."` as fatal. Mixing the two formats inside the same
+  binary is a footgun for operators reading helper output and for
+  future code that copies one branch's wording into another. The
+  one-character normalization keeps the helper's user-visible error
+  surface internally consistent at no behavioral cost.
+- **Affected sections**: Relates to §4 (helper protocol); the
+  canonical record lives in this section.

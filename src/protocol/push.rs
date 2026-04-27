@@ -599,7 +599,7 @@ async fn perform_push_under_lock(
     if current.len() > 1 {
         return Ok(PushOutcome::Error {
             remote_ref: remote_ref.as_str().to_owned(),
-            message: r#""multiple bundles exists for the same ref on server. Run git-remote-object-store doctor to fix.""#.to_owned(),
+            message: r#""multiple bundles exists for the same ref on server. Run git-remote-object-store doctor to fix."?"#.to_owned(),
         });
     }
     let current_key = current.into_iter().next().map(|m| m.key);
@@ -1087,6 +1087,40 @@ mod tests {
         }
         .as_protocol_line();
         assert_eq!(line, "error refs/heads/main \"bad\"?\n");
+    }
+
+    /// Both duplicate-bundle paths (pre-lock at ~line 482 and under-lock
+    /// at ~line 600) must produce wire output ending in `"?\n`. The `?`
+    /// suffix is the project-wide Rust convention for `error <ref> "..."`
+    /// messages — git treats `"..."?` as recoverable and `"..."` as
+    /// fatal. Upstream Python omits the `?` on the under-lock branch
+    /// (../git-remote-s3/git_remote_s3/remote.py:245); this is a
+    /// deliberate normalization documented in `execution-plan.md`.
+    #[test]
+    fn duplicate_bundle_errors_use_consistent_wire_format() {
+        let pre_lock_line = PushOutcome::Error {
+            remote_ref: "refs/heads/main".into(),
+            message: r#""multiple bundles exists on server. Run git-remote-object-store doctor to fix."?"#.to_owned(),
+        }
+        .as_protocol_line();
+        let under_lock_line = PushOutcome::Error {
+            remote_ref: "refs/heads/main".into(),
+            message: r#""multiple bundles exists for the same ref on server. Run git-remote-object-store doctor to fix."?"#.to_owned(),
+        }
+        .as_protocol_line();
+
+        assert_eq!(
+            pre_lock_line,
+            "error refs/heads/main \"multiple bundles exists on server. \
+             Run git-remote-object-store doctor to fix.\"?\n",
+        );
+        assert_eq!(
+            under_lock_line,
+            "error refs/heads/main \"multiple bundles exists for the same ref on server. \
+             Run git-remote-object-store doctor to fix.\"?\n",
+        );
+        assert!(pre_lock_line.ends_with("\"?\n"));
+        assert!(under_lock_line.ends_with("\"?\n"));
     }
 
     // --- lock_ttl_from_env --------------------------------------------
