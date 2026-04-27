@@ -24,22 +24,36 @@ Parity QA against the Python upstream (Phase 13) and packaging
 
 ## Installing
 
+Cargo rejects `+` in `[[bin]] name`, so the package ships hyphenated
+binary names. Git looks helpers up by their `+`-form scheme name, so
+each remote-helper binary needs a `+`-named symlink alongside the
+cargo-installed file. (A future `xtask` packaging step will automate
+this — tracked for Phase 14, see
+[`execution-plan.md`](execution-plan.md) §5.6 / §6.)
+
 ```bash
 cargo install --path .
+
+# Bridge cargo's hyphen names to the `+` form git invokes. Pick any
+# directory on PATH for the symlinks; ~/.local/bin is shown here.
+mkdir -p ~/.local/bin
+for s in s3+https s3+http az+https az+http; do
+    ln -sf "$HOME/.cargo/bin/git-remote-${s/+/-}" \
+           "$HOME/.local/bin/git-remote-$s"
+done
 ```
 
-This builds and installs every binary the helper needs:
+The non-helper binaries (`git-remote-object-store` and
+`git-lfs-object-store`) are looked up under their literal cargo names
+and need no rename.
+
+The full set of installed binaries:
 
 - `git-remote-s3+https` / `git-remote-s3+http` — S3 helpers
   (the `+http` variant is loopback-only by design)
 - `git-remote-az+https` / `git-remote-az+http` — Azure Blob helpers
 - `git-remote-object-store` — management CLI
 - `git-lfs-object-store` — LFS custom-transfer agent
-
-> Cargo rejects `+` in `[[bin]] name`, so the package builds the
-> binaries with hyphenated names (`git-remote-s3-https` etc.) and a
-> packaging step renames them to the `+` form git looks for. See
-> [`execution-plan.md`](execution-plan.md) §5.6 / §6.
 
 ## URL grammar
 
@@ -75,21 +89,18 @@ local development against MinIO / Azurite.
 
 Standard AWS credential resolution applies — the SDK consults
 environment variables, the shared credentials file, IMDS, ECS task
-metadata, and so on. To pin a named profile per remote:
+metadata, and so on. To pin a named profile per remote, set
+`?profile=<NAME>` on the URL:
 
 ```bash
-git remote add origin 's3+https://my-bucket.s3.us-west-2.amazonaws.com/my-repo?profile=prod'
-# or, to keep the URL clean:
-git config remote.origin.profile prod
+git remote add origin \
+    's3+https://my-bucket.s3.us-west-2.amazonaws.com/my-repo?profile=prod'
 ```
-
-The per-remote `git config` value wins over the URL.
 
 ### Azure Blob Storage
 
 Three credential shapes are supported, in priority order when
-`?credential=<NAME>` (or the `git config remote.<name>.credential`
-override) is set:
+`?credential=<NAME>` is set on the URL:
 
 1. `AZSTORE_<NAME>_KEY` — shared-key (storage account key). The
    helper signs each request with Azure Storage shared-key v2.

@@ -781,11 +781,5 @@ async fn lfs_round_trips_upload_and_download_through_helper() {
     run_git(&["checkout", "main"], &dest);
 
     let downloaded = std::fs::read(dest.join("payload.bin")).expect("LFS payload restored");
-    assert_eq!(
-        downloaded,
-        body,
-        "LFS round-trip body mismatch ({} vs {} bytes)",
-        downloaded.len(),
-        body.len()
-    );
+    assert_eq!(downloaded, body, "LFS round-trip body mismatch");
 }
