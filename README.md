@@ -27,9 +27,9 @@ Parity QA against the Python upstream (Phase 13) and packaging
 Cargo rejects `+` in `[[bin]] name`, so the package ships hyphenated
 binary names. Git looks helpers up by their `+`-form scheme name, so
 each remote-helper binary needs a `+`-named symlink alongside the
-cargo-installed file. (A future `xtask` packaging step will automate
-this — tracked for Phase 14, see
-[`execution-plan.md`](execution-plan.md) §5.6 / §6.)
+cargo-installed file. An `xtask install` step that automates this is
+tracked as a separate issue; see
+[`execution-plan.md`](execution-plan.md) §5.6 for the rationale.
 
 ```bash
 cargo install --path .
@@ -66,6 +66,25 @@ az+http://<host>[:port]/<account>/<container>/<prefix>[?flags]   # Azurite
 
 Concrete examples and the full validation rules live in
 [`execution-plan.md`](execution-plan.md) §3.
+
+## Backend matrix
+
+Both backends share the same on-bucket object layout, lock file
+semantics, ref listing, and helper-protocol surface — the only
+differences are how each SDK transports bytes and how credentials are
+discovered.
+
+| Aspect              | S3 (`s3+https://`, `s3+http://`)                                 | Azure Blob (`az+https://`, `az+http://`)                                              |
+|---------------------|------------------------------------------------------------------|---------------------------------------------------------------------------------------|
+| Authentication      | AWS credential chain; `?profile=<NAME>` to pin a named profile   | `AZSTORE_<NAME>_KEY` / `_CONNECTION_STRING` / `_SAS` via `?credential=`, else Entra ID |
+| Multipart download  | Hand-rolled ranged GETs in parallel                              | `BlobClient::download` (parallelised by the SDK)                                      |
+| Locking             | `PUT … If-None-Match: *` against `<ref>/LOCK#.lock`              | `PUT … If-None-Match: *` against `<ref>/LOCK#.lock`                                   |
+| Stale-lock recovery | TTL-driven `head` + `delete` + retry once                        | TTL-driven `head` + `delete` + retry once                                             |
+| Optional zip mirror | `?zip=1` writes `<ref>/repo.zip` alongside the bundle            | `?zip=1` writes `<ref>/repo.zip` alongside the bundle                                 |
+| LFS                 | `git-lfs-object-store` writes `<prefix>/lfs/<oid>`               | `git-lfs-object-store` writes `<prefix>/lfs/<oid>`                                    |
+| Cleartext HTTP      | Loopback-only unless `GIT_REMOTE_OBJECT_STORE_ALLOW_HTTP=1`      | Loopback-only unless `GIT_REMOTE_OBJECT_STORE_ALLOW_HTTP=1`                           |
+| S3-compatible       | MinIO, RustFS, R2, Wasabi, B2, etc.                              | n/a (use the S3 helpers against an S3-compatible endpoint)                            |
+| Azurite             | n/a                                                              | Supported via `az+http://127.0.0.1:10000/devstoreaccount1/...`                        |
 
 ## Submodule allowance
 
@@ -127,6 +146,46 @@ export AZSTORE_AZURITE_KEY='Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2U
 export GIT_REMOTE_OBJECT_STORE_ALLOW_HTTP=1   # loopback gate; redundant for 127.0.0.1
 git remote add origin \
     'az+http://127.0.0.1:10000/devstoreaccount1/my-container/my-repo?addressing=path&credential=AZURITE'
+```
+
+## S3 vs Azure examples
+
+The same git workflow drives both backends — only the URL changes.
+
+Clone:
+
+```bash
+# S3
+git clone 's3+https://my-bucket.s3.us-west-2.amazonaws.com/my-repo?profile=prod'
+
+# Azure
+export AZSTORE_PROD_KEY='<base64 storage-account key>'
+git clone 'az+https://myaccount.blob.core.windows.net/my-container/my-repo?credential=PROD'
+```
+
+Push:
+
+```bash
+# S3
+git remote add origin 's3+https://my-bucket.s3.us-west-2.amazonaws.com/my-repo?profile=prod'
+git push -u origin main
+
+# Azure
+git remote add origin 'az+https://myaccount.blob.core.windows.net/my-container/my-repo?credential=PROD'
+git push -u origin main
+```
+
+Management (the management CLI takes either a URL or a configured
+remote name and dispatches to the right backend automatically):
+
+```bash
+# S3
+git-remote-object-store doctor 's3+https://my-bucket.s3.us-west-2.amazonaws.com/my-repo?profile=prod'
+git-remote-object-store protect main 's3+https://my-bucket.s3.us-west-2.amazonaws.com/my-repo?profile=prod'
+
+# Azure
+git-remote-object-store doctor 'az+https://myaccount.blob.core.windows.net/my-container/my-repo?credential=PROD'
+git-remote-object-store protect main 'az+https://myaccount.blob.core.windows.net/my-container/my-repo?credential=PROD'
 ```
 
 ## LFS
