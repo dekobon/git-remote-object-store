@@ -25,6 +25,7 @@
 //! string-to-sign / canonicalised-resource layout is documented at
 //! <https://learn.microsoft.com/en-us/rest/api/storageservices/authorize-with-shared-key>.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::env;
 use std::sync::Arc;
@@ -141,12 +142,22 @@ pub(crate) fn parse_connection_string(input: &str) -> Result<ConnectionStringPar
         if segment.is_empty() {
             continue;
         }
+        // Surface malformed segments instead of silently skipping —
+        // a typo like `AccountKeyy=...` would otherwise be ignored
+        // and reported as "missing AccountKey", which sends the user
+        // chasing the wrong field.
         let Some((k, v)) = segment.split_once('=') else {
-            continue;
+            return Err(Error::Other(
+                format!("connection string segment `{segment}` is missing `=`").into(),
+            ));
         };
         match k {
             "AccountName" => account = Some(v.to_owned()),
             "AccountKey" => key_b64 = Some(v.to_owned()),
+            // Tolerate every other documented field (BlobEndpoint,
+            // DefaultEndpointsProtocol, EndpointSuffix, ...) without
+            // demanding we know each one — the URL itself is the
+            // authoritative endpoint source.
             _ => {}
         }
     }
@@ -204,9 +215,12 @@ impl Policy for SharedKeySigningPolicy {
         // `Date` header instead; `x-ms-date` takes precedence per
         // the Azure spec.
         let now = OffsetDateTime::now_utc();
-        let date = now
-            .format(&Rfc2822)
-            .map_err(|e| azure_other_err(format!("failed to format x-ms-date: {e}")))?;
+        let date = now.format(&Rfc2822).map_err(|e| {
+            azure_core::Error::with_message(
+                azure_core::error::ErrorKind::Other,
+                format!("failed to format x-ms-date: {e}"),
+            )
+        })?;
         // RFC 2822 emits `+0000`; Azure expects `GMT` per RFC 1123.
         let date = date.replace("+0000", "GMT");
         request.insert_header(HeaderName::from_static("x-ms-date"), date);
@@ -222,20 +236,35 @@ impl Policy for SharedKeySigningPolicy {
             request.headers(),
             content_length,
         )
-        .map_err(|e| azure_other_err(format!("shared-key signing failed: {e}")))?;
+        .map_err(|e| {
+            azure_core::Error::with_message(
+                azure_core::error::ErrorKind::Other,
+                format!("shared-key signing failed: {e}"),
+            )
+        })?;
         request.insert_header(HeaderName::from_static("authorization"), auth);
 
-        match next.first() {
-            Some(p) => p.send(ctx, request, &next[1..]).await,
-            None => Err(azure_other_err(
-                "shared-key policy installed without a downstream policy".to_owned(),
-            )),
-        }
+        forward_to_next(ctx, request, next, "shared-key").await
     }
 }
 
-fn azure_other_err(msg: String) -> azure_core::Error {
-    azure_core::Error::with_message(azure_core::error::ErrorKind::Other, msg)
+/// Hand the request to the next policy in the chain, returning a clear
+/// error if the chain was empty (the SDK always installs at least the
+/// transport policy as the tail, so an empty chain only fires when the
+/// signing policy is wired wrong).
+async fn forward_to_next(
+    ctx: &Context<'_>,
+    request: &mut Request,
+    next: &[Arc<dyn Policy>],
+    policy_name: &'static str,
+) -> PolicyResult {
+    match next.first() {
+        Some(p) => p.send(ctx, request, &next[1..]).await,
+        None => Err(azure_core::Error::with_message(
+            azure_core::error::ErrorKind::Other,
+            format!("{policy_name} policy installed without a downstream policy"),
+        )),
+    }
 }
 
 /// Pull `Content-Length` from the request, falling back to the body
@@ -327,14 +356,22 @@ fn canonicalized_headers(headers: &Headers) -> String {
         if !name.starts_with("x-ms-") {
             continue;
         }
-        let value = value.as_str().trim().replace('\n', " ");
+        // The spec requires unfolding embedded newlines into single
+        // spaces, but the `\n` case is rare — avoid the unconditional
+        // allocation that `str::replace` performs.
+        let trimmed = value.as_str().trim();
+        let value: Cow<'_, str> = if trimmed.contains('\n') {
+            Cow::Owned(trimmed.replace('\n', " "))
+        } else {
+            Cow::Borrowed(trimmed)
+        };
         sorted
             .entry(name)
             .and_modify(|existing| {
                 existing.push(',');
                 existing.push_str(&value);
             })
-            .or_insert(value);
+            .or_insert_with(|| value.into_owned());
     }
     let mut out = String::new();
     for (name, value) in sorted {
@@ -447,12 +484,7 @@ impl Policy for SasSigningPolicy {
             }
         }
 
-        match next.first() {
-            Some(p) => p.send(ctx, request, &next[1..]).await,
-            None => Err(azure_other_err(
-                "SAS policy installed without a downstream policy".to_owned(),
-            )),
-        }
+        forward_to_next(ctx, request, next, "SAS").await
     }
 }
 
@@ -503,6 +535,16 @@ mod tests {
         let parts = parse_connection_string(s).expect("parses");
         assert_eq!(parts.account, "acct");
         assert_eq!(parts.key_b64, "YWJj");
+    }
+
+    #[test]
+    fn parse_connection_string_rejects_segment_without_equals() {
+        let s = "AccountName=acct;malformed;AccountKey=YWJj";
+        let err = parse_connection_string(s).unwrap_err();
+        assert!(
+            err.to_string().contains("malformed"),
+            "error names the bad segment: {err}"
+        );
     }
 
     // --- canonicalized_resource ---------------------------------------

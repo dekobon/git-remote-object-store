@@ -83,6 +83,7 @@ pub mod auth;
 use std::path::Path;
 
 use azure_core::http::ClientOptions;
+use azure_core::http::headers::{HeaderName, Headers};
 use azure_core::http::request::RequestContent;
 use azure_storage_blob::clients::{BlobClient, BlobContainerClient, BlobContainerClientOptions};
 use azure_storage_blob::models::method_options::BlockBlobClientUploadOptions;
@@ -100,7 +101,7 @@ use url::Url;
 use crate::url::{AzureAddressing, RemoteUrl};
 
 use super::error::other_boxed;
-use super::{Error, ObjectMeta, ObjectStore, PutOpts};
+use super::{Error, ObjectMeta, ObjectStore, PutOpts, persist_temp};
 
 /// Production [`ObjectStore`] backed by `azure_storage_blob`.
 pub struct AzureBlobStore {
@@ -261,12 +262,9 @@ impl ObjectStore for AzureBlobStore {
         // an absent one (treats it as a tampered query and returns
         // 403). Skipping the parameter is the wire-equivalent of "no
         // prefix filter" anyway.
+        let prefix_opt = (!prefix.is_empty()).then(|| prefix.to_owned());
         let opts = BlobContainerClientListBlobsOptions {
-            prefix: if prefix.is_empty() {
-                None
-            } else {
-                Some(prefix.to_owned())
-            },
+            prefix: prefix_opt,
             ..Default::default()
         };
         let mut pages = self
@@ -304,34 +302,16 @@ impl ObjectStore for AzureBlobStore {
             Error::Other(format!("destination `{}` has no parent directory", dest.display()).into())
         })?;
 
-        // Mirror S3: head→download with one retry on 412. The
-        // `attempt == 0` guard means a repeated 412 propagates on the
-        // second iteration, so every path returns inside the loop.
-        for attempt in 0..2 {
-            let meta = self.head(key).await?;
-            if meta.size == 0 {
-                let temp = NamedTempFile::new_in(parent).map_err(other_boxed)?;
-                persist_temp(temp, dest)?;
-                return Ok(());
+        // Mirror S3: try once, retry once on 412 (the head→GET race).
+        // After the second attempt any error — including a repeated
+        // 412 — propagates.
+        match self.head_then_download(key, dest, parent).await {
+            Err(Error::PreconditionFailed(_)) => {
+                tracing::warn!(key, "blob changed between head and GET; retrying");
+                self.head_then_download(key, dest, parent).await
             }
-
-            let temp = NamedTempFile::new_in(parent).map_err(other_boxed)?;
-            let result = self
-                .download_streaming(key, temp.path(), meta.etag.as_deref())
-                .await;
-
-            match result {
-                Ok(()) => {
-                    persist_temp(temp, dest)?;
-                    return Ok(());
-                }
-                Err(Error::PreconditionFailed(_)) if attempt == 0 => {
-                    tracing::warn!(key, "blob changed between head and GET; retrying");
-                }
-                Err(e) => return Err(e),
-            }
+            other => other,
         }
-        unreachable!("both loop iterations return from within the match")
     }
 
     async fn get_bytes(&self, key: &str) -> Result<Bytes, Error> {
@@ -376,12 +356,13 @@ impl ObjectStore for AzureBlobStore {
             .await
             .map_err(|e| classify(e, key))?;
         let headers = resp.headers();
-        let size = header_u64(headers, "content-length").unwrap_or(0);
-        let last_modified = header_http_date(headers, "last-modified").ok_or_else(|| {
-            Error::Other(format!("get_properties on `{key}` returned no last-modified").into())
-        })?;
+        let size = header_u64(headers, &HeaderName::from_static("content-length")).unwrap_or(0);
+        let last_modified = header_http_date(headers, &HeaderName::from_static("last-modified"))
+            .ok_or_else(|| {
+                Error::Other(format!("get_properties on `{key}` returned no last-modified").into())
+            })?;
         let etag = headers
-            .get_optional_str(&azure_core::http::headers::HeaderName::from_static("etag"))
+            .get_optional_str(&HeaderName::from_static("etag"))
             .map(str::to_owned);
         Ok(ObjectMeta {
             key: key.to_owned(),
@@ -420,6 +401,23 @@ impl ObjectStore for AzureBlobStore {
 }
 
 impl AzureBlobStore {
+    /// One head→tempfile→download→persist round trip.
+    ///
+    /// Factored out so [`get_to_file`](ObjectStore::get_to_file) can
+    /// invoke it twice: once normally, once more on a 412 retry.
+    async fn head_then_download(&self, key: &str, dest: &Path, parent: &Path) -> Result<(), Error> {
+        let meta = self.head(key).await?;
+        let temp = NamedTempFile::new_in(parent).map_err(other_boxed)?;
+        if meta.size == 0 {
+            // Skip the GET entirely for zero-byte blobs (lock files).
+            // Range fetches against an empty blob return 416.
+            return persist_temp(temp, dest);
+        }
+        self.download_streaming(key, temp.path(), meta.etag.as_deref())
+            .await?;
+        persist_temp(temp, dest)
+    }
+
     /// Stream a blob body to `temp_path` with optional `If-Match`
     /// guarding against mid-download mutation.
     async fn download_streaming(
@@ -486,25 +484,12 @@ fn upload_options_from(opts: PutOpts) -> BlockBlobClientUploadOptions<'static> {
     out
 }
 
-/// Atomically rename a [`NamedTempFile`] to `dest`, mapping the
-/// [`tempfile::PersistError`] into [`Error::Other`].
-fn persist_temp(temp: NamedTempFile, dest: &Path) -> Result<(), Error> {
-    temp.persist(dest)
-        .map_err(|e| Error::Other(Box::new(e.error)))?;
-    Ok(())
+fn header_u64(headers: &Headers, name: &HeaderName) -> Option<u64> {
+    headers.get_optional_str(name).and_then(|s| s.parse().ok())
 }
 
-fn header_u64(headers: &azure_core::http::headers::Headers, name: &'static str) -> Option<u64> {
-    let h = azure_core::http::headers::HeaderName::from_static(name);
-    headers.get_optional_str(&h).and_then(|s| s.parse().ok())
-}
-
-fn header_http_date(
-    headers: &azure_core::http::headers::Headers,
-    name: &'static str,
-) -> Option<OffsetDateTime> {
-    let h = azure_core::http::headers::HeaderName::from_static(name);
-    let raw = headers.get_optional_str(&h)?;
+fn header_http_date(headers: &Headers, name: &HeaderName) -> Option<OffsetDateTime> {
+    let raw = headers.get_optional_str(name)?;
     OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc2822).ok()
 }
 
