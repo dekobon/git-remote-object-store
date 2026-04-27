@@ -358,6 +358,47 @@ pub(crate) fn object_to_meta(obj: &aws_sdk_s3::types::Object) -> Result<ObjectMe
     })
 }
 
+/// Convert a [`HeadObject`] response's relevant fields into the trait's
+/// [`ObjectMeta`].
+///
+/// Extracted so unit tests can drive the missing-content-length and
+/// missing-last-modified guard branches without standing up a live S3
+/// or constructing a full `HeadObjectOutput` (whose builder is not
+/// trivially mockable).
+///
+/// A missing `Content-Length` is an error rather than silent zero: a
+/// 0-byte size is semantically meaningful in this codebase (lock
+/// files are intentionally empty) and downstream `get_to_file` takes
+/// a fast path on `size == 0` that writes an empty destination file.
+/// Treating "header absent" as 0 would silently produce empty bundles
+/// instead of surfacing the malformed response. See `execution-plan.md`
+/// §5.1 — every backend HEAD must yield `Content-Length`.
+pub(crate) fn head_output_to_meta(
+    key: &str,
+    content_length: Option<i64>,
+    last_modified: Option<&aws_sdk_s3::primitives::DateTime>,
+    etag: Option<&str>,
+) -> Result<ObjectMeta, Error> {
+    let raw_size = content_length.ok_or_else(|| {
+        Error::Other(format!("head_object on `{key}` returned no content-length").into())
+    })?;
+    // `i64` is the SDK's wire type; clamp a (legally impossible) negative
+    // value to 0 rather than wrap to a huge u64. Mirrors `object_to_meta`.
+    let size = u64::try_from(raw_size).unwrap_or(0);
+    let last_modified = last_modified
+        .ok_or_else(|| {
+            Error::Other(format!("head_object on `{key}` returned no last_modified").into())
+        })?
+        .to_time()
+        .map_err(other_boxed)?;
+    Ok(ObjectMeta {
+        key: key.to_owned(),
+        size,
+        last_modified,
+        etag: etag.map(str::to_owned),
+    })
+}
+
 /// Pure classifier core (no `SdkError` involvement) so unit tests can
 /// exercise every branch without synthesising SDK error types.
 fn classify_status_and_code(status: u16, code: Option<&str>, key: &str) -> Option<Error> {
@@ -516,21 +557,12 @@ impl ObjectStore for S3Store {
             .send()
             .await
             .map_err(|e| classify(e, key))?;
-        let size = u64::try_from(resp.content_length().unwrap_or(0)).unwrap_or(0);
-        let last_modified = resp
-            .last_modified()
-            .ok_or_else(|| {
-                Error::Other(format!("head_object on `{key}` returned no last_modified").into())
-            })?
-            .to_time()
-            .map_err(other_boxed)?;
-        let etag = resp.e_tag().map(str::to_owned);
-        Ok(ObjectMeta {
-            key: key.to_owned(),
-            size,
-            last_modified,
-            etag,
-        })
+        head_output_to_meta(
+            key,
+            resp.content_length(),
+            resp.last_modified(),
+            resp.e_tag(),
+        )
     }
 
     async fn copy(&self, src: &str, dst: &str) -> Result<(), Error> {
@@ -764,6 +796,70 @@ mod tests {
             }
             other => panic!("expected Error::Other for missing last_modified, got {other:?}"),
         }
+    }
+
+    // --- head_output_to_meta -------------------------------------------
+
+    #[test]
+    fn head_output_to_meta_round_trips_well_formed_response() {
+        let modified = DateTime::from_secs(1_700_000_000);
+        let meta = head_output_to_meta("k", Some(42), Some(&modified), Some("\"abc\""))
+            .expect("conversion succeeds");
+        assert_eq!(meta.key, "k");
+        assert_eq!(meta.size, 42);
+        assert_eq!(meta.last_modified.unix_timestamp(), 1_700_000_000);
+        assert_eq!(meta.etag.as_deref(), Some("\"abc\""));
+    }
+
+    #[test]
+    fn head_output_to_meta_preserves_legitimate_zero_size() {
+        // Zero-byte lock files are legitimate in this codebase; a
+        // `Content-Length: 0` header (i.e. `Some(0)`) must round-trip
+        // as `size == 0`, distinct from the missing-header error.
+        let modified = DateTime::from_secs(1_700_000_000);
+        let meta = head_output_to_meta("LOCK", Some(0), Some(&modified), None)
+            .expect("conversion succeeds");
+        assert_eq!(meta.size, 0);
+    }
+
+    #[test]
+    fn head_output_to_meta_rejects_missing_content_length() {
+        let modified = DateTime::from_secs(1_700_000_000);
+        let err = head_output_to_meta("k", None, Some(&modified), None)
+            .expect_err("missing content-length must error");
+        match err {
+            Error::Other(inner) => {
+                let msg = inner.to_string();
+                assert!(msg.contains("no content-length"), "names failure: {msg}");
+                assert!(msg.contains("`k`"), "includes the key for context: {msg}");
+            }
+            other => panic!("expected Error::Other for missing content-length, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn head_output_to_meta_rejects_missing_last_modified() {
+        let err = head_output_to_meta("k", Some(0), None, None)
+            .expect_err("missing last_modified must error");
+        match err {
+            Error::Other(inner) => {
+                let msg = inner.to_string();
+                assert!(msg.contains("no last_modified"), "names failure: {msg}");
+                assert!(msg.contains("`k`"), "includes the key for context: {msg}");
+            }
+            other => panic!("expected Error::Other for missing last_modified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn head_output_to_meta_clamps_negative_size_to_zero() {
+        // The SDK types content_length as `Option<i64>`; a (legally
+        // impossible) negative value clamps to 0 rather than wrapping
+        // to a huge u64. Mirrors `object_to_meta` behavior.
+        let modified = DateTime::from_secs(1_700_000_000);
+        let meta =
+            head_output_to_meta("k", Some(-1), Some(&modified), None).expect("conversion succeeds");
+        assert_eq!(meta.size, 0);
     }
 
     #[test]
