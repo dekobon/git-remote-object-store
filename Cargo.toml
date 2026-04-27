@@ -127,6 +127,22 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
     "rt-tokio",
 ] }
 
+# Direct dep on the smithy HTTP client so `S3Store::from_remote_url`
+# can install a custom connector with `pool_idle_timeout(30s)`. The
+# default-built client keeps idle connections in the pool indefinitely,
+# which wedges long-running LFS sessions on rotated VIPs (#26 / #27).
+# `rustls-aws-lc` is the same TLS provider feature `aws-sdk-s3`'s
+# `default-https-client` enables transitively (via
+# `aws-smithy-runtime/default-https-client`), so cargo unifies on a
+# single rustls 0.23 + aws-lc-rs stack — matching the existing tree.
+#
+# After bumping `aws-config` or `aws-sdk-s3`, run:
+#   cargo tree -e normal -d | rg rustls
+# A duplicate rustls major (or any rustls 0.21 entry) means the SDK's
+# `default-https-client` selected a different provider; update the
+# `CryptoMode` in `src/object_store/s3.rs` to match.
+aws-smithy-http-client = { version = "1", features = ["rustls-aws-lc"] }
+
 # Bridges `aws_smithy_types::DateTime` → `time::OffsetDateTime` for the
 # `ObjectMeta::last_modified` conversion.
 aws-smithy-types-convert = { version = "0.60", features = ["convert-time"] }

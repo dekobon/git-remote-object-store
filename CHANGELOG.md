@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `S3Store::from_remote_url` now installs a custom
+  `aws-smithy-http-client` with `pool_idle_timeout(30s)` so DNS
+  rotation no longer wedges a long-running LFS session until the
+  OS-level TCP timeout fires (~15 minutes on Linux). The same TLS
+  provider as the SDK's `default-https-client` (`rustls-aws-lc`) is
+  selected explicitly so cargo unifies on a single rustls stack. TCP
+  keepalive is **not** wired here: `aws-smithy-http-client` 1.1.12's
+  public `Builder` API exposes `pool_idle_timeout` but does not
+  expose `tcp_keepalive`; the dominant pool-reuse-of-dead-VIP
+  failure is fixed by the idle timeout alone. (#26, #27)
 - `AzureStore::from_remote_url` now configures the SDK's HTTP transport
   with `pool_idle_timeout(30s)` and `tcp_keepalive(30s)`. Pooled
   connections to a rotated VIP can no longer wedge a long-running LFS

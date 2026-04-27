@@ -36,6 +36,25 @@
 //! with a fresh `head`/`ETag`. After one retry the 412 propagates as
 //! [`ObjectStoreError::PreconditionFailed`].
 //!
+//! ## HTTP transport tuning
+//!
+//! `aws-sdk-s3`'s default HTTP client keeps idle pooled connections
+//! indefinitely, so a pooled connection to a rotated VIP would wedge
+//! an in-flight request until the OS-level TCP retransmit timeout
+//! fires (~15 minutes on Linux). [`S3Store::from_remote_url`] installs
+//! a custom HTTP client built via [`aws_smithy_http_client::Builder`]
+//! with [`POOL_IDLE_TIMEOUT`] bounded to 30 s, so a rotation costs at
+//! most one short-circuited request rather than minutes of wedged
+//! transfer. Tracking issue: #26.
+//!
+//! TCP keepalive (the second knob suggested in #27) is **not** wired
+//! on the S3 path: `aws-smithy-http-client` 1.1.12's public `Builder`
+//! / `ConnectorBuilder` API exposes `pool_idle_timeout` but does not
+//! expose `tcp_keepalive`. The dominant DNS-rotation failure in #26 is
+//! pool reuse of a dead VIP, which `pool_idle_timeout` already fixes;
+//! the gap relative to the Azure backend (which uses `reqwest` and
+//! gets keepalive for free) is documented in `CHANGELOG.md`.
+//!
 //! ## Stdout discipline
 //!
 //! Per `.claude/rules/protocol-stdout.md`, this module never writes to
@@ -45,10 +64,12 @@
 use std::io::SeekFrom;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
+use aws_smithy_http_client::tls::{Provider as TlsProvider, rustls_provider::CryptoMode};
 use aws_smithy_types_convert::date_time::DateTimeExt;
 use bytes::Bytes;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -104,6 +125,13 @@ const COPY_SOURCE_ENCODE: &AsciiSet = &CONTROLS
     .add(b'{')
     .add(b'|')
     .add(b'}');
+
+/// Bound on how long an idle pooled HTTPS connection lingers before
+/// the smithy connection pool drops it. Short enough that DNS rotation
+/// rarely hits a stale pooled connection; long enough that bursty
+/// fetch / push batches still benefit from connection reuse. See the
+/// module-level "HTTP transport tuning" docs and issue #26.
+pub(crate) const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Production [`ObjectStore`] backed by `aws-sdk-s3`.
 #[derive(Debug)]
@@ -181,10 +209,18 @@ impl S3Store {
 /// Build the `aws-sdk-s3` config from a [`ResolvedS3Config`].
 ///
 /// 1. Load the AWS SDK provider chain with `BehaviorVersion::latest()`.
-/// 2. Apply `endpoint_url`, `profile`, `region` from the resolved decisions.
-/// 3. Override `force_path_style` on the resulting `aws_sdk_s3::Config`.
+/// 2. Install a custom HTTP client with [`POOL_IDLE_TIMEOUT`] so DNS
+///    rotation does not wedge long-running sessions (#26).
+/// 3. Apply `endpoint_url`, `profile`, `region` from the resolved decisions.
+/// 4. Override `force_path_style` on the resulting `aws_sdk_s3::Config`.
 pub(crate) async fn build_s3_config(resolved: &ResolvedS3Config) -> aws_sdk_s3::Config {
     let mut loader = aws_config::defaults(BehaviorVersion::latest())
+        .http_client(
+            aws_smithy_http_client::Builder::new()
+                .tls_provider(TlsProvider::Rustls(CryptoMode::AwsLc))
+                .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+                .build_https(),
+        )
         .endpoint_url(resolved.endpoint_url.as_str());
     if let Some(p) = &resolved.profile {
         loader = loader.profile_name(p);
@@ -1240,10 +1276,32 @@ mod tests {
         // SDK 1.x patch releases, so just confirm the build call accepts
         // every decision shape without panicking. The decisions
         // themselves are tested via `ResolvedS3Config` above.
+        //
+        // Coverage scope: this test catches a panic during
+        // `Builder::build_https()` construction (e.g. a missing TLS
+        // provider feature), but does NOT catch a regression that
+        // silently drops `.http_client(...)` from the loader chain —
+        // that call is optional, so removing it still compiles and
+        // returns a config. The constant-pin test below guards the
+        // value; only an integration test against a real server with
+        // observable connection-pool timing would catch a regression
+        // in the wiring itself.
         let endpoint = parse_endpoint("http://127.0.0.1:9000/my-bucket");
         let resolved =
             ResolvedS3Config::from_url_parts(&endpoint, S3Addressing::PathStyle, None, None)
                 .expect("resolves");
         let _config = build_s3_config(&resolved).await;
+    }
+
+    /// Pin the timeout value. A future copy-paste mistake (`from_millis`
+    /// instead of `from_secs`, an accidental zero) silently disables
+    /// the very behaviour the constant exists for; fail fast instead.
+    /// If the constant is deliberately changed, update the expected
+    /// value on the right-hand side together — the test exists to make
+    /// such a change deliberate, not to lock the value forever. See
+    /// the matching Azure-side test for the same rationale.
+    #[test]
+    fn pool_idle_timeout_constant_has_expected_value() {
+        assert_eq!(POOL_IDLE_TIMEOUT, Duration::from_secs(30));
     }
 }
