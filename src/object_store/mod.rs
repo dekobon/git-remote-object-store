@@ -22,11 +22,24 @@ pub mod mock;
 use std::path::Path;
 
 use bytes::Bytes;
+use tempfile::NamedTempFile;
 use time::OffsetDateTime;
 use tracing::debug;
 
 use self::error::other_boxed;
 pub use self::error::{BoxError, Error};
+
+/// Atomically rename a [`NamedTempFile`] to `dest`, mapping the
+/// [`tempfile::PersistError`] into [`Error::Other`].
+///
+/// Shared between the S3 and Azure backends — both write `get_to_file`
+/// results to a sibling tempfile and persist on success so a partial
+/// download cannot leave a corrupt destination for the unbundle step.
+pub(crate) fn persist_temp(temp: NamedTempFile, dest: &Path) -> Result<(), Error> {
+    temp.persist(dest)
+        .map_err(|e| Error::Other(Box::new(e.error)))?;
+    Ok(())
+}
 
 /// Metadata returned by `list` and `head`.
 ///

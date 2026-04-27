@@ -61,7 +61,7 @@ use url::Url;
 use crate::url::{RemoteUrl, S3Addressing};
 
 use super::error::other_boxed;
-use super::{Error, ObjectMeta, ObjectStore, PutOpts};
+use super::{Error, ObjectMeta, ObjectStore, PutOpts, persist_temp};
 
 /// Object-size cutoff above which `get_to_file` switches from a single
 /// streaming GET to parallel ranged GETs. Matches upstream
@@ -565,14 +565,6 @@ impl ObjectStore for S3Store {
             .map_err(|e| classify(e, key))?;
         Ok(())
     }
-}
-
-/// Atomically rename a [`NamedTempFile`] to `dest`, mapping the
-/// [`tempfile::PersistError`] into [`Error::Other`].
-fn persist_temp(temp: NamedTempFile, dest: &Path) -> Result<(), Error> {
-    temp.persist(dest)
-        .map_err(|e| Error::Other(Box::new(e.error)))?;
-    Ok(())
 }
 
 impl S3Store {
