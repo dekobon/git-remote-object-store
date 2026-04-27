@@ -7,8 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-04-26
+
+Initial release. Phases 1–14 of the [execution plan](execution-plan.md)
+are complete: URL parser, gitoxide-backed git operations, the
+`ObjectStore` trait with S3 and Azure Blob backends, the helper
+protocol REPL, parallel `fetch`, locked `push`, the management CLI
+(`doctor` / `delete-branch` / `protect` / `unprotect`), the LFS
+custom-transfer agent, the helper-binary shims for both schemes, and
+the documentation / packaging / release pipeline.
+
 ### Added
 
+- README backend matrix and side-by-side S3/Azure examples covering
+  clone, push, and management commands. (#14)
+- `cargo install` instructions plus the `+`-form symlink workaround
+  for git's helper lookup (xtask automation tracked as a follow-up
+  issue). (#14)
+- GitHub Actions CI jobs for the `integration-s3` and
+  `integration-azure` features (Docker-backed RustFS / Azurite
+  fixtures), plus a `markdownlint-cli2` job and an `--all-features`
+  clippy pass so feature-gated code paths are linted. (#14)
+- Tag-triggered release workflow (`.github/workflows/release.yml`)
+  that builds release binaries on Linux x86_64 and macOS arm64,
+  splits debug info into separate `.debug` / `.dSYM` artefacts via
+  `objcopy --only-keep-debug` / `dsymutil`, strips the primary
+  binary, and publishes both tarballs to a GitHub Release per the
+  comment in `Cargo.toml`. (#14)
 - `README.md` covering install, URL grammar, the
   `protocol.s3+https.allow always` / `protocol.az+https.allow always`
   config required for submodule URLs, AWS credential resolution, the
@@ -75,64 +100,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defaults to 60 s) with optional `--delete-stale-locks`. Interactive
   prompts go through a `Prompter` trait so unit tests drive the same
   code path with a scripted prompter against `MockStore`. (#9)
-
-### Security
-
-- Disable `aws-sdk-s3`'s default `rustls` feature to drop the legacy
-  `rustls 0.21` / `rustls-webpki 0.101.x` dependency chain pulled in by
-  `aws-smithy-runtime/tls-rustls`. The crate now uses the modern
-  `default-https-client` path (`rustls 0.23` / `rustls-webpki 0.103.x`),
-  resolving GHSA-4p46-pwfr-66x6 (high — DoS via panic on malformed CRL
-  BIT STRING) and the two webpki name-constraint advisories
-  (GHSA-fjxv-7rqg-78g4, GHSA-fhc7-32rr-h57g).
-
-### Fixed
-
-- `release_lock` now propagates non-`NotFound` delete failures instead of
-  silently swallowing them. When the push itself succeeds but the lock
-  cannot be released, the outcome is replaced with
-  `error <ref> "failed to release lock. ..."` matching upstream
-  `cmd_push`'s `finally` block. A genuine push error is never masked by
-  a release failure. (#18)
-
-- `S3Store::get_to_file` now guards against concurrent object mutation:
-  every GET carries `If-Match: <etag>` from the preceding `HeadObject`.
-  If the object is overwritten mid-download, S3 returns 412 and the
-  operation retries once before propagating `Error::PreconditionFailed`.
-  (#20)
-
-- Push batches no longer abort on the first per-push transport, git, or
-  local-I/O failure. `push_batch` now catches `PushError::Store`, `Git`,
-  `Io`, and `Sha` per-push and converts them to `error <ref> "..."` outcome
-  lines so the batch continues, mirroring upstream `cmd_push`'s
-  try/except shape (`../git-remote-s3/git_remote_s3/remote.py:286-296`).
-  Without this, a single 5xx blip mid-batch would silently drop the
-  outcome lines for already-completed pushes and leave git's local
-  ref-tracking inconsistent with the remote. `PushError::Parse`,
-  `InvalidLocalSpec`, and `RemoteRef` still abort the batch — those mean
-  subsequent commands cannot be trusted.
-
-- `url::is_valid_bucket` now rejects the AWS-reserved bucket prefixes
-  (`xn--`, `sthree-`, `amzn-s3-demo-`) and suffixes (`-s3alias`,
-  `--ol-s3`, `.mrap`, `--x-s3`, `--table-s3`), enforces the
-  begin-and-end-with-alphanumeric rule, rejects consecutive periods, and
-  rejects names formatted as IPv4 dotted-quads. `url::is_valid_container`
-  now enforces the matching Azure rules: alphanumeric bookends and no
-  consecutive hyphens. Closes #17.
-
-### Added
-
 - `ObjectStore::put_path` streams local files to the backend without
   buffering in process memory. The push handler now uses it for bundle
   and zip artifact uploads, removing OOM risk for large repos and the
   5 GiB single-PUT ceiling. (#21)
-
 - Shared protocol-test helpers extracted into `tests/common/mod.rs`,
   eliminating ~100 lines of duplicated `git()`, `git_capture()`,
   `s3_url()`, `drive_in()`, and `git_available()` across
   `protocol_smoke.rs`, `protocol_fetch.rs`, and `protocol_push.rs`.
   (#19)
-
 - Phase 8 `push` handler with per-ref locking (`src/protocol/push.rs`): the
   REPL now batches `push <refspec>` lines until a blank line and processes
   them sequentially under per-ref locks at `<prefix>/<ref>/LOCK#.lock`,
@@ -155,7 +131,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   push handler does not have to hold `gix::Repository` (which is `!Sync`)
   across `.await`, mirroring the path-only `unbundle_at` Phase 7
   introduced.
-
 - Phase 7 parallel `fetch` handler (`src/protocol/fetch.rs`): the REPL now
   collects `fetch <sha> <ref>` lines until a blank line and dispatches them
   through a `tokio::task::JoinSet` bounded by a `tokio::sync::Semaphore`
@@ -169,26 +144,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot leave zombies running into a closing helper. `protocol::run` now
   takes a `repo_dir: PathBuf` parameter; `run_main` derives it from the
   process cwd (set by git when it invokes the helper).
-
-### Changed
-
-- `protocol::ProtocolError::Push` now wraps a structured `push::PushError`
-  enum (`Parse` / `InvalidLocalSpec` / `RemoteRef` / `Sha` / `Store` /
-  `Git` / `Io`) instead of the Phase 6 `PushNotImplemented` placeholder.
-  The REPL acquired a `Mode::Push` accumulator alongside the existing
-  `Mode::Fetch` one; switching modes mid-batch resets the opposite
-  accumulator (mirrors upstream `process_cmd`).
-- `git::bundle` and `git::archive` now take `spec: &str` (a permissive
-  rev-spec) instead of `&RefName`. Storage-key types remain strict; the
-  rev-spec passed to git itself is just a string git already validates.
-- `protocol::ProtocolError::Fetch` now wraps a structured `fetch::FetchError`
-  enum (`Parse` / `Sha` / `Ref` / `Store` / `Io` / `Git` / `Join`) instead
-  of the Phase 6 `FetchNotImplemented` placeholder.
-- `git::unbundle` is now a thin wrapper over a new
-  `git::unbundle_at(cwd, …)` path-only variant. The parallel fetch path
-  uses the path variant because `gix::Repository` is `!Sync` and cannot be
-  shared across spawned tasks.
-
 - Phase 6 remote-helper protocol skeleton (`src/protocol/`): asynchronous
   REPL (`protocol::run`) generic over its reader/writer so tests can drive
   it via `tokio::io::duplex`, plus a shared `protocol::run_main` entry that
@@ -261,21 +216,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   download path, percent-encoded copy, atomic-fail behaviour of
   `get_to_file`, and `AccessDenied` mapping.
 - Phase 4 object-store seam (`src/object_store/`): backend-neutral
-  `ObjectStore` async trait (eight methods covering list / head / get /
-  put / put-if-absent / copy / delete), shared `Error` enum mapping S3
+  `ObjectStore` async trait covering list / head / get / put /
+  put-if-absent / copy / delete, shared `Error` enum mapping S3
   and Azure failure codes onto `NotFound` / `AccessDenied` /
   `PreconditionFailed` / `Conflict` / `Network` / `Other`, and the
   `ObjectMeta` / `PutOpts` value types. The trait is dispatched via
   `Arc<dyn ObjectStore>` (`async_trait` macro keeps `dyn + Send + Sync`
   ergonomic). An in-memory `MockStore` lives behind a new `test-util`
   Cargo feature (also active under `cfg(test)`) so unit tests in this
-  crate AND integration tests for phases 5–9 can drive push, fetch,
+  crate AND integration tests for higher phases can drive push, fetch,
   locking, and doctor logic without MinIO/Azurite. The mock supports
   FIFO fault injection (`PreconditionFailed` on `put_if_absent`,
   `NotFound` on `head`, `Network` on `get_bytes`, `AccessDenied` on
   `list`) so Phase 8's stale-lock retry path is deterministic, and
   `insert_with` back-dates `last_modified` for the staleness check.
-- Phase 3 git wrapper (`src/git.rs`): the eight helpers from upstream
+- Phase 3 git wrapper (`src/git.rs`): the helpers from upstream
   `git_remote_s3/git.py` ported onto `gix` (gitoxide) with two newtypes
   (`Sha`, `RefName`), a `GitError` aggregate, and a single private
   `run_git` helper that funnels every `git` subprocess through one
@@ -283,15 +238,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   zip writer; `bundle`/`unbundle` retain a subprocess fallback because
   `gix` 0.82 has no public bundle API. Spike result captured in
   `docs/development/spike-gix-bundle-parity.md`.
-- Phase 1 scaffolding: Cargo manifest with the dependency set called out in
-  `execution-plan.md` (tokio, thiserror/anyhow, tracing, time, serde,
-  clap v4, url, gix and selected sub-crates, bytes, tempfile).
-- Empty module skeleton matching §2 of the execution plan
-  (`url`, `git`, `protocol/*`, `object_store/*`, `lfs`, `manage/*`).
-- Placeholder `[[bin]]` shims for the four remote-helper schemes plus
-  the management and LFS binaries.
-- GitHub Actions CI workflow running `cargo fmt --check`,
-  `cargo clippy --all-targets -- -D warnings`, and `cargo test`.
 - Phase 2 URL parser (`src/url.rs`): `parse(&str) -> Result<RemoteUrl, ParseError>`
   for the `s3+https`, `s3+http`, `az+https`, `az+http` grammar in
   `execution-plan.md` §3.1. Includes addressing-style auto-detection
@@ -304,15 +250,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   container charsets, missing segments, unknown flags, illegal flag
   values, and cleartext-HTTP rejection. `proptest` round-trip
   (parse → display → parse) for the legal grammar.
+- Phase 1 scaffolding: Cargo manifest with the dependency set called out
+  in `execution-plan.md` (tokio, thiserror/anyhow, tracing, time, serde,
+  clap v4, url, gix and selected sub-crates, bytes, tempfile).
+- Empty module skeleton matching §2 of the execution plan
+  (`url`, `git`, `protocol/*`, `object_store/*`, `lfs`, `manage/*`).
+- Placeholder `[[bin]]` shims for the remote-helper schemes plus the
+  management and LFS binaries.
+- GitHub Actions CI workflow running `cargo fmt --check`,
+  `cargo clippy --all-targets -- -D warnings`, and `cargo test`.
 
 ### Changed
 
+- `protocol::ProtocolError::Push` now wraps a structured `push::PushError`
+  enum (`Parse` / `InvalidLocalSpec` / `RemoteRef` / `Sha` / `Store` /
+  `Git` / `Io`) instead of the Phase 6 `PushNotImplemented` placeholder.
+  The REPL acquired a `Mode::Push` accumulator alongside the existing
+  `Mode::Fetch` one; switching modes mid-batch resets the opposite
+  accumulator (mirrors upstream `process_cmd`).
+- `git::bundle` and `git::archive` now take `spec: &str` (a permissive
+  rev-spec) instead of `&RefName`. Storage-key types remain strict; the
+  rev-spec passed to git itself is just a string git already validates.
+- `protocol::ProtocolError::Fetch` now wraps a structured `fetch::FetchError`
+  enum (`Parse` / `Sha` / `Ref` / `Store` / `Io` / `Git` / `Join`) instead
+  of the Phase 6 `FetchNotImplemented` placeholder.
+- `git::unbundle` is now a thin wrapper over a new
+  `git::unbundle_at(cwd, …)` path-only variant. The parallel fetch path
+  uses the path variant because `gix::Repository` is `!Sync` and cannot be
+  shared across spawned tasks.
 - Fixed §3.1 Azure example to use `myaccount` rather than `my-account`;
   the previous form contradicted the §3.5 account charset rule
   `[a-z0-9]{3,24}` (no hyphens).
-
-### Changed
-
 - Phase-1 spike result: `cargo` rejects `+` in `[[bin]] name` (it derives
   a crate name from the bin name and `+` is not a legal crate-name
   character). The cargo bins therefore use hyphenated names
@@ -320,3 +288,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `git-remote-az-http`) and a later `xtask` step will rename / hardlink
   them to the `+` form expected by `git` at install time
   (see `execution-plan.md` §5.6 / §6).
+
+### Fixed
+
+- `release_lock` now propagates non-`NotFound` delete failures instead of
+  silently swallowing them. When the push itself succeeds but the lock
+  cannot be released, the outcome is replaced with
+  `error <ref> "failed to release lock. ..."` matching upstream
+  `cmd_push`'s `finally` block. A genuine push error is never masked by
+  a release failure. (#18)
+- `S3Store::get_to_file` now guards against concurrent object mutation:
+  every GET carries `If-Match: <etag>` from the preceding `HeadObject`.
+  If the object is overwritten mid-download, S3 returns 412 and the
+  operation retries once before propagating `Error::PreconditionFailed`.
+  (#20)
+- Push batches no longer abort on the first per-push transport, git, or
+  local-I/O failure. `push_batch` now catches `PushError::Store`, `Git`,
+  `Io`, and `Sha` per-push and converts them to `error <ref> "..."` outcome
+  lines so the batch continues, mirroring upstream `cmd_push`'s
+  try/except shape (`../git-remote-s3/git_remote_s3/remote.py:286-296`).
+  Without this, a single 5xx blip mid-batch would silently drop the
+  outcome lines for already-completed pushes and leave git's local
+  ref-tracking inconsistent with the remote. `PushError::Parse`,
+  `InvalidLocalSpec`, and `RemoteRef` still abort the batch — those mean
+  subsequent commands cannot be trusted.
+- `url::is_valid_bucket` now rejects the AWS-reserved bucket prefixes
+  (`xn--`, `sthree-`, `amzn-s3-demo-`) and suffixes (`-s3alias`,
+  `--ol-s3`, `.mrap`, `--x-s3`, `--table-s3`), enforces the
+  begin-and-end-with-alphanumeric rule, rejects consecutive periods, and
+  rejects names formatted as IPv4 dotted-quads. `url::is_valid_container`
+  now enforces the matching Azure rules: alphanumeric bookends and no
+  consecutive hyphens. Closes #17.
+
+### Security
+
+- Disable `aws-sdk-s3`'s default `rustls` feature to drop the legacy
+  `rustls 0.21` / `rustls-webpki 0.101.x` dependency chain pulled in by
+  `aws-smithy-runtime/tls-rustls`. The crate now uses the modern
+  `default-https-client` path (`rustls 0.23` / `rustls-webpki 0.103.x`),
+  resolving GHSA-4p46-pwfr-66x6 (high — DoS via panic on malformed CRL
+  BIT STRING) and the two webpki name-constraint advisories
+  (GHSA-fjxv-7rqg-78g4, GHSA-fhc7-32rr-h57g).

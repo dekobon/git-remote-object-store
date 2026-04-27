@@ -1,0 +1,162 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            split-tool: objcopy
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            split-tool: dsymutil
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} --bins
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          PACKAGE="git-remote-object-store-${VERSION}-${{ matrix.target }}"
+          DEBUG_PACKAGE="${PACKAGE}-debug"
+          STAGE="$(mktemp -d)/stage"
+          DEBUG_STAGE="$(mktemp -d)/stage-debug"
+          mkdir -p "${STAGE}" "${DEBUG_STAGE}"
+          {
+            echo "version=${VERSION}"
+            echo "package=${PACKAGE}"
+            echo "debug_package=${DEBUG_PACKAGE}"
+            echo "stage=${STAGE}"
+            echo "debug_stage=${DEBUG_STAGE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Split debug info and strip (Linux)
+        if: matrix.split-tool == 'objcopy'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN_DIR="target/${{ matrix.target }}/release"
+          STAGE="${{ steps.meta.outputs.stage }}"
+          DEBUG_STAGE="${{ steps.meta.outputs.debug_stage }}"
+          for bin in git-remote-s3-https git-remote-s3-http \
+                     git-remote-az-https git-remote-az-http \
+                     git-remote-object-store git-lfs-object-store; do
+              cp "${BIN_DIR}/${bin}" "${STAGE}/${bin}"
+              objcopy --only-keep-debug "${STAGE}/${bin}" "${DEBUG_STAGE}/${bin}.debug"
+              objcopy --strip-debug "${STAGE}/${bin}"
+              objcopy --add-gnu-debuglink="${DEBUG_STAGE}/${bin}.debug" "${STAGE}/${bin}"
+              chmod 0644 "${DEBUG_STAGE}/${bin}.debug"
+          done
+
+      - name: Split debug info and strip (macOS)
+        if: matrix.split-tool == 'dsymutil'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN_DIR="target/${{ matrix.target }}/release"
+          STAGE="${{ steps.meta.outputs.stage }}"
+          DEBUG_STAGE="${{ steps.meta.outputs.debug_stage }}"
+          for bin in git-remote-s3-https git-remote-s3-http \
+                     git-remote-az-https git-remote-az-http \
+                     git-remote-object-store git-lfs-object-store; do
+              cp "${BIN_DIR}/${bin}" "${STAGE}/${bin}"
+              dsymutil "${STAGE}/${bin}" -o "${DEBUG_STAGE}/${bin}.dSYM"
+              strip -S "${STAGE}/${bin}"
+          done
+
+      - name: Package release artifacts
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE="${{ steps.meta.outputs.package }}"
+          DEBUG_PACKAGE="${{ steps.meta.outputs.debug_package }}"
+          STAGE="${{ steps.meta.outputs.stage }}"
+          DEBUG_STAGE="${{ steps.meta.outputs.debug_stage }}"
+          OUT="$(pwd)/dist"
+          mkdir -p "${OUT}"
+          tar -C "${STAGE}" -czf "${OUT}/${PACKAGE}.tar.gz" .
+          tar -C "${DEBUG_STAGE}" -czf "${OUT}/${DEBUG_PACKAGE}.tar.gz" .
+          (cd "${OUT}" && shasum -a 256 "${PACKAGE}.tar.gz" "${DEBUG_PACKAGE}.tar.gz" > "${PACKAGE}.sha256")
+          echo "out=${OUT}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ steps.package.outputs.out }}/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          NOTES_FILE="$(pwd)/release-notes.md"
+          awk -v ver="${VERSION}" '
+              $0 ~ "^## \\[" ver "\\]" { found = 1; next }
+              found && $0 ~ "^## \\[" { exit }
+              found { print }
+          ' CHANGELOG.md > "${NOTES_FILE}"
+          if ! [ -s "${NOTES_FILE}" ]; then
+              echo "no release notes for ${VERSION} in CHANGELOG.md" >&2
+              exit 1
+          fi
+          echo "file=${NOTES_FILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          VERSION="${GITHUB_REF_NAME#v}"
+          ASSETS=( dist/*/*.tar.gz dist/*/*.sha256 )
+          if [ "${#ASSETS[@]}" -eq 0 ]; then
+              echo "no release artifacts found under dist/" >&2
+              exit 1
+          fi
+          gh release create "${GITHUB_REF_NAME}" \
+              --title "v${VERSION}" \
+              --notes-file "${{ steps.notes.outputs.file }}" \
+              "${ASSETS[@]}"
