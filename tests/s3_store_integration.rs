@@ -942,16 +942,16 @@ async fn build_against_missing_bucket_returns_bucket_not_found() {
     let Err(err) = backend::build(&url).await else {
         panic!("missing bucket must error");
     };
+    // Render the *actual* returned error — a manually-constructed
+    // value would not catch a regression where `backend::build`
+    // populates the variant with the wrong name or kind.
+    assert_eq!(
+        backend::fatal_message(&err),
+        format!("fatal: bucket not found {bucket}"),
+    );
     let BackendError::BucketNotFound { kind, name } = err else {
         panic!("expected BucketNotFound, got {err:?}");
     };
     assert_eq!(kind, BackendKind::S3);
     assert_eq!(name, bucket);
-    assert_eq!(
-        backend::fatal_message(&BackendError::BucketNotFound {
-            kind: BackendKind::S3,
-            name: bucket.clone(),
-        }),
-        format!("fatal: bucket not found {bucket}"),
-    );
 }

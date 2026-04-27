@@ -213,13 +213,25 @@ mod tests {
 
     #[test]
     fn classify_maps_network_to_invalid_credentials() {
+        use std::error::Error as _;
         let err = classify(
             BackendKind::S3,
             "mybucket",
             "ListObjectsV2",
             ObjectStoreError::Network(boxed("dns failure")),
         );
-        assert!(matches!(err, BackendError::InvalidCredentials { .. }));
+        let BackendError::InvalidCredentials { source } = err else {
+            panic!("expected InvalidCredentials, got {err:?}");
+        };
+        // Source must round-trip the original error so operators see
+        // the underlying cause (e.g. "dns failure"), not a placeholder.
+        assert!(matches!(source, ObjectStoreError::Network(_)));
+        assert!(
+            source
+                .source()
+                .is_some_and(|s| s.to_string() == "dns failure"),
+            "Network source must preserve the original error chain",
+        );
     }
 
     #[test]
