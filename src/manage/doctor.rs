@@ -194,7 +194,7 @@ impl<'a> Doctor<'a> {
             .clone();
 
         if !self.prompter.confirm("Confirm and apply changes")? {
-            // Match `delete_branch`: an interactive "no" is the user
+            // Match `ManageBranch::delete`: an interactive "no" is the user
             // declining this fix, not an abort of the whole run. Doctor
             // continues to the next ref / stale-lock scan with exit 0.
             println!("Aborted");

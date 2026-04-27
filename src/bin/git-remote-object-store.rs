@@ -173,9 +173,9 @@ async fn run_branch(target: &Target, branch: &str, action: BranchAction) -> Resu
     let prompter = DialoguerPrompter;
     let mb = ManageBranch::open(store, prefix, branch.to_owned(), &prompter).await?;
     let outcome = match action {
-        BranchAction::Delete => mb.delete_branch().await,
-        BranchAction::Protect => mb.protect_branch().await,
-        BranchAction::Unprotect => mb.unprotect_branch().await,
+        BranchAction::Delete => mb.delete().await,
+        BranchAction::Protect => mb.protect().await,
+        BranchAction::Unprotect => mb.unprotect().await,
     };
     Ok(outcome?)
 }
