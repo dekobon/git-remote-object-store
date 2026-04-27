@@ -494,7 +494,7 @@ async fn push_one(
                 return Ok(PushOutcome::Error {
                     remote_ref: remote_ref_str,
                     message: format!(
-                        r#""unable to parse remote bundle key {key:?}; run doctor."?"#,
+                        r#""unable to parse remote bundle key {key:?}; run git-remote-object-store doctor to fix."?"#,
                     ),
                 });
             }

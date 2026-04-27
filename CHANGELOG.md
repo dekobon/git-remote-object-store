@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `push.rs` parse-error message now names the full
+  `git-remote-object-store doctor` binary instead of the bare word
+  `doctor`, matching the wording of the other doctor-pointing error
+  paths. (#22)
+
 ## [0.1.0] - 2026-04-26
 
 Initial release. Phases 1–14 of the [execution plan](execution-plan.md)
