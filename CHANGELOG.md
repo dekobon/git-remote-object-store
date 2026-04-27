@@ -13,14 +13,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `git-remote-object-store doctor` binary instead of the bare word
   `doctor`, matching the wording of the other doctor-pointing error
   paths. (#22)
+- Management CLI (`doctor`, `delete-branch`, `protect`, `unprotect`)
+  now accepts root-of-bucket remotes (empty repository prefix)
+  end-to-end, building keys like `refs/heads/main/...` and `HEAD`
+  without a leading slash. (#29, #32)
+- `AzureStore::copy` now streams through a tempfile via
+  `get_to_file` + `put_path` instead of buffering the whole body in
+  RAM. Memory is bounded by the SDK's per-block partition size
+  regardless of blob size, so `Doctor::evict_losing_bundle`'s
+  duplicate-bundle quarantine no longer pulls multi-GiB bundles
+  through the helper process. (#30)
+- Replaced production `expect()` panics in `manage::doctor`,
+  `protocol::fetch`, and `object_store::s3` with structured error
+  propagation. Snapshot-lookup invariants now surface as
+  `ManageError::Internal`; mutex poisoning is recovered via
+  `PoisonError::into_inner`; the `JoinSet`/`Arc::try_unwrap` flush
+  path falls back to a locked-flush instead of aborting. (#33)
 - Under-lock duplicate-bundle push error now ends with the trailing
   `?` suffix used by every other `error <ref> "..."` message in the
   helper, so the wire format is consistent across the pre-lock and
   under-lock branches. Deliberate divergence from upstream Python,
   which omits the `?` on this path. (#34)
+- Both `S3Store` and `AzureStore` now error with
+  `ObjectStoreError::Other` when a `head_object` response omits
+  `Content-Length`, instead of treating the missing header as
+  `size = 0` and silently writing an empty file at the destination.
+  Mirrors the existing `last_modified` guard. (#43)
+- `AzureStore::put_path` streams files from disk via the SDK's
+  `FileStream` + `BlockBlobClient::upload` (auto-partitioned
+  `stage_block` + `commit_block_list`), restoring the cross-backend
+  streaming guarantee from #21 that the Azure side had been silently
+  inheriting from the trait's read-then-`put_bytes` default. Memory
+  is bounded by `parallel × partition_size` (≈16 MiB by default)
+  regardless of file size. (#42)
+
+### Changed
+
+- Renamed `crate::object_store::Error` to `ObjectStoreError`. Every
+  importer previously aliased it via `use ... as ObjectStoreError`;
+  the rename pushes the action prefix into the type so pattern
+  matches read `ObjectStoreError::NotFound(_)` natively. Breaking
+  for external library consumers (none in-tree besides the helper /
+  management binaries). (#37)
+- Renamed `PushOutcome::as_protocol_line` to `to_protocol_line`
+  (allocates `String` via `format!`, so `to_*` matches Rust API
+  Guidelines C-CONV). Replaced the free helper
+  `into_dialoguer_error` with `impl From<dialoguer::Error> for
+  ManageError`, dropping the `map_err(...)` boilerplate at both
+  call sites in favour of `?`. (#38)
+- Renamed `ManageBranch::delete_branch`/`protect_branch`/
+  `unprotect_branch` to `delete`/`protect`/`unprotect` — the
+  receiver type already names the subject; the method-side
+  `_branch` was redundant noise. The CLI subcommand names
+  (`delete-branch`, `protect`, `unprotect`) are unchanged. (#39)
+- Renamed `AzureBlobStore` to `AzureStore` (symmetric with
+  `S3Store`); renamed `AzureAddressing::Subdomain` to
+  `AzureAddressing::VirtualHosted` (symmetric with
+  `S3Addressing::VirtualHosted` and matches AWS-canonical
+  terminology); renamed the private `protocol::list::BundleEntry`
+  to `ListedBundle` so it no longer collides with the public
+  `manage::snapshot::BundleEntry`. (#40)
+- Renamed `git::validate_ref_name` to `is_valid_ref_name` so the
+  `bool`-returning predicate carries the `is_*` prefix per the
+  project naming rules. (#41)
+
+### Tests
+
+- Tightened protocol-test coverage: dropped the stale
+  `bucket = "0.a"` proptest seed (no longer reachable from
+  `arb_bucket()`), replaced placeholder `aaaa.bundle` /
+  `bbbb.bundle` fixtures with realistic 40-hex SHAs, added a
+  regression test for the previously-untested
+  `parse_remote_sha_from_key` failure arm in `protocol::push`,
+  added end-to-end S3 helper-binary coverage modeled on the
+  existing Azure pattern (push / clone / fetch / LFS), and pinned
+  `option verbosity` behaviour for `n >= 2`. (#35)
 
 ### Documentation
 
+- Removed the stale "Azure backend wired in Phase 11 — until then
+  the REPL exits early with a 'not yet implemented' error" note
+  from both Azure helper shim binaries; the wrappers now describe
+  the current shape symmetrically with the S3 shims. (#31)
 - `execution-plan.md` §1.1 ls-remote description now matches the
   actual `cmd_list` wire output: one line per bundle (not per ref),
   sorted by `LastModified` descending, with the `@<head> HEAD` line
