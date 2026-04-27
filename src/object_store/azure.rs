@@ -347,9 +347,8 @@ impl ObjectStore for AzureBlobStore {
 
     async fn put_bytes(&self, key: &str, body: Bytes, opts: PutOpts) -> Result<(), Error> {
         let blob = self.blob_client(key);
-        let content = RequestContent::from(body.to_vec());
         let upload_opts = upload_options_from(opts);
-        blob.upload(content, Some(upload_opts))
+        blob.upload(bytes_to_request_content(body), Some(upload_opts))
             .await
             .map_err(|e| classify(e, key))?;
         Ok(())
@@ -357,9 +356,10 @@ impl ObjectStore for AzureBlobStore {
 
     async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, Error> {
         let blob = self.blob_client(key);
-        let content = RequestContent::from(body.to_vec());
         let upload_opts = BlockBlobClientUploadOptions::default().with_if_not_exists();
-        let resp = blob.upload(content, Some(upload_opts)).await;
+        let resp = blob
+            .upload(bytes_to_request_content(body), Some(upload_opts))
+            .await;
         match resp {
             Ok(_) => Ok(true),
             Err(e) => match classify(e, key) {
@@ -452,6 +452,22 @@ impl AzureBlobStore {
         file.flush().await.map_err(other_boxed)?;
         Ok(())
     }
+}
+
+/// Wrap `Bytes` in a `RequestContent` without copying the buffer.
+///
+/// `RequestContent` has an inherent `from(Vec<u8>)` constructor that
+/// shadows the generic `From<Bytes>` trait impl, so a bare
+/// `RequestContent::from(body)` resolves to the `Vec<u8>` overload and
+/// re-allocates. Going through `Into` instead picks up the trait impl
+/// and keeps the `Bytes` payload zero-copy. The return type is left
+/// generic so the call site (which pins `Bytes` + `NoFormat` via the
+/// `BlobClient::upload` signature) drives type inference.
+fn bytes_to_request_content<F>(body: Bytes) -> RequestContent<Bytes, F>
+where
+    Bytes: Into<RequestContent<Bytes, F>>,
+{
+    body.into()
 }
 
 /// Build a [`BlockBlobClientUploadOptions`] from the trait's [`PutOpts`].
