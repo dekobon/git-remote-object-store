@@ -146,10 +146,16 @@ returns 404, write `HEAD` with body = the ref being pushed. Subsequent
 pushes do not update `HEAD` (it is the *initial* default ref, not the
 *current* tip).
 
-**ls-remote output.** The git remote helper writes one line per ref to
-stdout in the format `<sha> <ref>\n`, plus a `@<head_ref> HEAD\n` line
-indicating the symbolic-ref target. Output ends with an empty line.
-This is the standard `list` capability of the git remote-helper protocol.
+**ls-remote output.** The git remote helper writes **one line per
+bundle** to stdout in the format `<sha> <ref>\n`, sorted by
+`LastModified` descending. A given ref may appear on multiple
+consecutive lines when more than one `<sha>.bundle` is present (e.g.
+mid-rotation, before the previous bundle is deleted under lock); the
+freshest bundle comes first because of the sort. A `@<head_ref> HEAD\n`
+line is prepended only when not `list for-push`, the remote `HEAD`
+object is present, and the ref it points at appears in the listed
+bundles. Output ends with an empty line. This is the standard `list`
+capability of the git remote-helper protocol.
 
 **Encoding.** All keys, ref names, and HEAD bodies are UTF-8 byte
 strings. No BOM, no normalization. Git itself constrains ref names to a

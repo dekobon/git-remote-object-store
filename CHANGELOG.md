@@ -19,6 +19,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under-lock branches. Deliberate divergence from upstream Python,
   which omits the `?` on this path. (#34)
 
+### Documentation
+
+- `execution-plan.md` §1.1 ls-remote description now matches the
+  actual `cmd_list` wire output: one line per bundle (not per ref),
+  sorted by `LastModified` descending, with the `@<head> HEAD` line
+  prepended only when not `list for-push` and the head ref appears
+  in the listed bundles. (#36)
+- `README.md` "Status" section now describes the gitoxide /
+  subprocess split honestly: gitoxide is used for rev-parse,
+  is-ancestor, ref-name validation, remote-URL inspection, archive,
+  last-commit-message, ref discovery, and object resolution; bundle
+  `create` and `unbundle` still shell out via the single `run_git`
+  helper because `gix` 0.82 has no public bundle API. (#36)
+
 ## [0.1.0] - 2026-04-26
 
 Initial release. Phases 1–14 of the [execution plan](execution-plan.md)
