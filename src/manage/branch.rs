@@ -328,6 +328,10 @@ mod tests {
             .expect("open at root");
         mb.unprotect_branch().await.expect("unprotect at root");
         assert!(!mock.contains("refs/heads/main/PROTECTED#"));
+        // The bundle alongside the marker must survive — `unprotect` is
+        // a marker-only delete and a regression that broadened the
+        // delete scope would leave the bundle missing.
+        assert!(mock.contains("refs/heads/main/abc.bundle"));
     }
 
     #[tokio::test]
