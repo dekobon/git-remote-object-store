@@ -36,11 +36,16 @@ pub enum BackendKind {
 /// Errors surfaced by [`build`]. The three variants line up with the
 /// three categorical fatal lines upstream's Python helper emits at
 /// `../git-remote-s3/git_remote_s3/remote.py:574-593`.
+///
+/// The `Display` strings deliberately match upstream's wording (no
+/// colons, "user" prefix on `NotAuthorized`) so that
+/// [`fatal_message`] is just `format!("fatal: {err}")` — a single
+/// source of truth for the operator-facing wording.
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
     /// Bucket (S3) or container (Azure) does not exist. Maps from a
     /// 404 / `NoSuchBucket` on the construction-time probe.
-    #[error("{} not found: {name}", container_word(*kind))]
+    #[error("{} not found {name}", container_word(*kind))]
     BucketNotFound {
         /// Which backend reported the failure.
         kind: BackendKind,
@@ -51,7 +56,7 @@ pub enum BackendError {
     /// Authentication succeeded but the principal lacks the listed
     /// `action` on the named bucket/container. Maps from a 403 /
     /// `AccessDenied` on the probe.
-    #[error("not authorized to perform {action} on {name}")]
+    #[error("user not authorized to perform {action} on {name}")]
     NotAuthorized {
         /// Which backend reported the failure.
         kind: BackendKind,
@@ -66,7 +71,7 @@ pub enum BackendError {
     /// transport-level failures during the probe. Mirrors upstream's
     /// `(ClientError, ProfileNotFound, CredentialRetrievalError,
     /// NoCredentialsError, UnknownCredentialError)` arm at `remote.py:586-593`.
-    #[error("invalid credentials: {source}")]
+    #[error("invalid credentials {source}")]
     InvalidCredentials {
         /// The underlying [`ObjectStoreError`] preserved as `#[source]`.
         #[source]
@@ -86,20 +91,12 @@ const fn container_word(kind: BackendKind) -> &'static str {
 ///
 /// The S3 wording matches `../git-remote-s3/git_remote_s3/remote.py:584-593`
 /// byte-for-byte; the Azure wording substitutes "container" for "bucket"
-/// (no upstream Python equivalent — Azure support is Rust-port-only).
+/// (no upstream Python equivalent — Azure support is Rust-port-only). The
+/// upstream wording lives in [`BackendError`]'s `Display` derive — see the
+/// type-level doc comment.
 #[must_use]
 pub fn fatal_message(err: &BackendError) -> String {
-    match err {
-        BackendError::BucketNotFound { kind, name } => {
-            format!("fatal: {} not found {name}", container_word(*kind))
-        }
-        BackendError::NotAuthorized { name, action, .. } => {
-            format!("fatal: user not authorized to perform {action} on {name}")
-        }
-        BackendError::InvalidCredentials { source } => {
-            format!("fatal: invalid credentials {source}")
-        }
-    }
+    format!("fatal: {err}")
 }
 
 /// Fold an [`ObjectStoreError`] from backend construction or the eager
