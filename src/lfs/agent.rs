@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 
 use crate::lfs::oid::LfsOid;
 use crate::lfs::protocol::{CompleteEvent, EventError, ProgressEvent};
-use crate::object_store::{Error as ObjectStoreError, ObjectStore};
+use crate::object_store::{ObjectStore, ObjectStoreError};
 
 /// Generic error code surfaced in `complete` event payloads. Matches
 /// upstream `git_remote_s3/lfs.py:write_error_event` (`code=2`).

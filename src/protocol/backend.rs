@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::object_store::azure::AzureBlobStore;
 use crate::object_store::s3::S3Store;
-use crate::object_store::{Error as ObjectStoreError, ObjectStore};
+use crate::object_store::{ObjectStore, ObjectStoreError};
 use crate::url::RemoteUrl;
 
 /// Errors surfaced by [`build`].

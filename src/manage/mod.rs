@@ -19,7 +19,7 @@ use std::io;
 
 use thiserror::Error;
 
-use crate::object_store::Error as ObjectStoreError;
+use crate::object_store::ObjectStoreError;
 
 /// Default lock TTL in seconds, matching the upstream Python value.
 ///

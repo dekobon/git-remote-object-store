@@ -15,7 +15,8 @@
 
 use std::error::Error as StdError;
 
-/// Boxed source error used by [`Error::Network`] and [`Error::Other`].
+/// Boxed source error used by [`ObjectStoreError::Network`] and
+/// [`ObjectStoreError::Other`].
 ///
 /// `Send + Sync + 'static` so the error can cross task boundaries; this
 /// matches the bounds `tokio::task::JoinHandle` and friends impose.
@@ -28,7 +29,7 @@ pub type BoxError = Box<dyn StdError + Send + Sync + 'static>;
 /// `tracing::error!` lines remain actionable without the caller adding
 /// context.
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
+pub enum ObjectStoreError {
     /// Object (or, for `list`, every object under the prefix) is absent.
     #[error("object not found: {0}")]
     NotFound(String),
@@ -62,13 +63,13 @@ pub enum Error {
     Other(BoxError),
 }
 
-/// Wrap any concrete `std::error::Error` into [`Error::Other`].
+/// Wrap any concrete `std::error::Error` into [`ObjectStoreError::Other`].
 ///
-/// Replaces the open-coded `|e| Error::Other(Box::new(e))` closure
+/// Replaces the open-coded `|e| ObjectStoreError::Other(Box::new(e))` closure
 /// that otherwise repeats at every I/O / time-conversion / persist
 /// call site.
-pub(crate) fn other_boxed<E: StdError + Send + Sync + 'static>(e: E) -> Error {
-    Error::Other(Box::new(e))
+pub(crate) fn other_boxed<E: StdError + Send + Sync + 'static>(e: E) -> ObjectStoreError {
+    ObjectStoreError::Other(Box::new(e))
 }
 
 #[cfg(test)]
@@ -82,23 +83,26 @@ mod tests {
     #[test]
     fn display_names_the_key() {
         assert_eq!(
-            Error::NotFound("a/b".into()).to_string(),
+            ObjectStoreError::NotFound("a/b".into()).to_string(),
             "object not found: a/b"
         );
         assert_eq!(
-            Error::AccessDenied("a/b".into()).to_string(),
+            ObjectStoreError::AccessDenied("a/b".into()).to_string(),
             "access denied: a/b"
         );
         assert_eq!(
-            Error::PreconditionFailed("a/b".into()).to_string(),
+            ObjectStoreError::PreconditionFailed("a/b".into()).to_string(),
             "precondition failed: a/b"
         );
-        assert_eq!(Error::Conflict("a/b".into()).to_string(), "conflict: a/b");
+        assert_eq!(
+            ObjectStoreError::Conflict("a/b".into()).to_string(),
+            "conflict: a/b"
+        );
     }
 
     #[test]
     fn network_preserves_source_chain() {
-        let err = Error::Network(boxed_io("dns failure"));
+        let err = ObjectStoreError::Network(boxed_io("dns failure"));
         assert_eq!(err.to_string(), "network error");
         let source = err.source().expect("Network exposes its #[source]");
         assert_eq!(source.to_string(), "dns failure");
@@ -106,7 +110,7 @@ mod tests {
 
     #[test]
     fn other_is_transparent() {
-        let err = Error::Other(boxed_io("boom"));
+        let err = ObjectStoreError::Other(boxed_io("boom"));
         // `transparent` forwards Display to the inner error.
         assert_eq!(err.to_string(), "boom");
     }

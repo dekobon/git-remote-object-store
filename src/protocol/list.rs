@@ -16,7 +16,7 @@
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::warn;
 
-use crate::object_store::{Error as ObjectStoreError, ObjectStore};
+use crate::object_store::{ObjectStore, ObjectStoreError};
 
 /// Errors specific to the list path that the dispatcher converts into
 /// fatal exits.
