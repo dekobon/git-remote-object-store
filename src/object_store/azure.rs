@@ -371,8 +371,10 @@ impl ObjectStore for AzureBlobStore {
     /// Stream a local file to `key` without buffering its full body.
     ///
     /// Mirrors `S3Store::put_path`'s streaming guarantee (issue #21):
-    /// memory usage stays bounded by the SDK's per-block buffer
-    /// (`partition_size`, default 4 MiB) regardless of file size.
+    /// memory usage stays bounded by `parallel × partition_size`
+    /// (defaults to 4 × 4 MiB = 16 MiB) regardless of file size — the
+    /// SDK runs up to `parallel` block uploads concurrently and each
+    /// holds a `partition_size`-sized buffer.
     ///
     /// Implementation: wrap `tokio::fs::File` in
     /// [`FileStream`] so the body is delivered as
