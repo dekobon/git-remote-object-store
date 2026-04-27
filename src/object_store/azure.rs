@@ -89,6 +89,21 @@
 //! SDK call against a known-empty blob, which sidesteps the issue
 //! entirely.
 //!
+//! ## HTTP transport tuning
+//!
+//! `azure_core` 0.35's default transport keeps idle pooled connections
+//! forever and never sets TCP keepalive, so a pooled connection to a
+//! rotated VIP would hang an in-flight request until the OS-level TCP
+//! retransmit timeout fires (~15 minutes on Linux). [`AzureStore`]
+//! installs a custom [`reqwest::Client`] via [`Transport`] on
+//! [`ClientOptions::transport`] with [`POOL_IDLE_TIMEOUT`] and
+//! [`TCP_KEEPALIVE`] bounded to 30 s, so a rotation costs at most one
+//! short-circuited request rather than minutes of wedged transfer. The
+//! custom transport leaves [`ClientOptions::per_try_policies`] (where
+//! the shared-key signing lives) untouched — the SDK pipeline runs
+//! per-try policies independently of the transport. Tracking
+//! issue: #26.
+//!
 //! ## Stdout discipline
 //!
 //! Per `.claude/rules/protocol-stdout.md`, this module never writes to
@@ -98,10 +113,12 @@
 pub mod auth;
 
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
-use azure_core::http::ClientOptions;
 use azure_core::http::headers::{HeaderName, Headers};
 use azure_core::http::request::RequestContent;
+use azure_core::http::{ClientOptions, Transport};
 use azure_storage_blob::clients::{BlobClient, BlobContainerClient, BlobContainerClientOptions};
 use azure_storage_blob::models::method_options::BlockBlobClientUploadOptions;
 use azure_storage_blob::models::{
@@ -120,6 +137,19 @@ use crate::url::{AzureAddressing, RemoteUrl};
 
 use super::error::{network_boxed, other_boxed};
 use super::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts, persist_temp};
+
+/// Bound on how long an idle pooled HTTPS connection lingers before
+/// the [`reqwest`] connection pool drops it. Short enough that DNS
+/// rotation rarely hits a stale pooled connection; long enough that
+/// bursty fetch / push batches still benefit from connection reuse.
+/// See module-level "HTTP transport tuning" docs and issue #26.
+pub(crate) const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// TCP keepalive interval for the custom [`reqwest`] transport.
+/// Detects dead-but-not-closed sessions in seconds rather than the
+/// 2-hour Linux default. See module-level "HTTP transport tuning"
+/// docs and issue #26.
+pub(crate) const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 
 /// Production [`ObjectStore`] backed by `azure_storage_blob`.
 pub struct AzureStore {
@@ -169,10 +199,7 @@ impl AzureStore {
         let account_url = build_account_url(endpoint, account, *addressing);
         let resolved = auth::resolve(account, flags)?;
 
-        let mut client_options = ClientOptions::default();
-        if let Some(policy) = resolved.per_try_policy {
-            client_options.per_try_policies.push(policy);
-        }
+        let client_options = build_client_options(&resolved)?;
 
         let container_options = BlobContainerClientOptions {
             client_options,
@@ -194,6 +221,43 @@ impl AzureStore {
     fn blob_client(&self, key: &str) -> BlobClient {
         self.container.blob_client(key)
     }
+}
+
+/// Build the [`reqwest::Client`] used by [`AzureStore`]'s custom
+/// [`Transport`].
+///
+/// Bounds the connection pool's idle window and enables TCP keepalive
+/// (see [`POOL_IDLE_TIMEOUT`] / [`TCP_KEEPALIVE`] for rationale).
+/// Returns [`ObjectStoreError::Other`] if the TLS / DNS resolver layer
+/// fails to initialise, which the SDK would otherwise surface as a
+/// cryptic per-request error.
+pub(crate) fn build_http_client() -> Result<Arc<reqwest::Client>, ObjectStoreError> {
+    reqwest::Client::builder()
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .tcp_keepalive(TCP_KEEPALIVE)
+        .build()
+        .map(Arc::new)
+        .map_err(other_boxed)
+}
+
+/// Build the [`ClientOptions`] [`AzureStore`] hands to the SDK.
+///
+/// Installs the custom [`Transport`] (see [`build_http_client`]) and
+/// preserves the credential resolver's per-try signing policy. The
+/// helper is split out (rather than inlined into [`AzureStore::from_remote_url`])
+/// so unit tests can assert that both invariants hold without
+/// constructing a real `BlobContainerClient`.
+pub(crate) fn build_client_options(
+    resolved: &auth::ResolvedCredentials,
+) -> Result<ClientOptions, ObjectStoreError> {
+    let mut opts = ClientOptions {
+        transport: Some(Transport::new(build_http_client()?)),
+        ..Default::default()
+    };
+    if let Some(policy) = &resolved.per_try_policy {
+        opts.per_try_policies.push(Arc::clone(policy));
+    }
+    Ok(opts)
 }
 
 /// Construct the account-level endpoint URL the SDK constructors expect.
@@ -830,5 +894,85 @@ mod tests {
             Err(other) => panic!("expected ObjectStoreError::Other, got {other:?}"),
             Ok(_) => panic!("expected S3 URL to be rejected"),
         }
+    }
+
+    // --- HTTP transport tuning (#26 / #28) ----------------------------
+
+    /// Pin the timeout values. A future copy-paste mistake (`from_millis`
+    /// instead of `from_secs`, an accidental zero) silently disables
+    /// the very behaviour these constants exist for; fail fast instead.
+    /// If the constants are deliberately changed, update the expected
+    /// values on the right-hand side together — the test exists to make
+    /// such changes deliberate, not to lock the values forever.
+    #[test]
+    fn pool_idle_and_keepalive_constants_have_expected_values() {
+        assert_eq!(POOL_IDLE_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(TCP_KEEPALIVE, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn build_http_client_succeeds() {
+        build_http_client().expect("reqwest client builds with the configured timeouts");
+    }
+
+    /// The meaningful regression check: if a future refactor drops the
+    /// `transport = Some(...)` line in `build_client_options`, the
+    /// Azure backend silently reverts to `azure_core`'s default
+    /// (unbounded) HTTP transport. This test fails when that happens.
+    /// Also pins the empty-policies invariant on the no-credential
+    /// branch, so a refactor that injects a fallback policy when
+    /// `per_try_policy` is `None` is caught.
+    #[test]
+    fn build_client_options_installs_custom_transport() {
+        let resolved = auth::ResolvedCredentials {
+            token_credential: None,
+            per_try_policy: None,
+        };
+        let opts = build_client_options(&resolved).expect("client options build");
+        assert!(
+            opts.transport.is_some(),
+            "ClientOptions::transport must be Some so the SDK uses our \
+             pool_idle_timeout / tcp_keepalive client (issue #26)",
+        );
+        assert!(
+            opts.per_try_policies.is_empty(),
+            "no per-try policy was supplied; the helper must not inject \
+             a fallback signer of its own",
+        );
+    }
+
+    /// Issue #28's Notes section explicitly calls out: the per-try
+    /// signing policy must continue to fire after we install a custom
+    /// transport. The SDK pipeline runs them independently of the
+    /// transport, but a future refactor that confuses the two fields
+    /// would silently drop signing — surface that here. The
+    /// [`Arc::ptr_eq`] check pins identity so a refactor that
+    /// silently *replaces* the caller's policy with a fresh one
+    /// (rather than dropping it outright) also fails.
+    #[test]
+    fn build_client_options_preserves_per_try_policy() {
+        // Azurite's published well-known account key — base64-valid
+        // and safe to embed.
+        const AZURITE_KEY: &str = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+        let policy: Arc<dyn azure_core::http::policies::Policy> = Arc::new(
+            auth::SharedKeySigningPolicy::new("devstoreaccount1", AZURITE_KEY)
+                .expect("shared-key policy constructs"),
+        );
+        let resolved = auth::ResolvedCredentials {
+            token_credential: None,
+            per_try_policy: Some(Arc::clone(&policy)),
+        };
+        let opts = build_client_options(&resolved).expect("client options build");
+        assert!(opts.transport.is_some(), "transport still wired");
+        assert_eq!(
+            opts.per_try_policies.len(),
+            1,
+            "exactly one per-try policy is wired",
+        );
+        assert!(
+            Arc::ptr_eq(&policy, &opts.per_try_policies[0]),
+            "the policy at index 0 must be the same Arc the caller \
+             supplied — not a fresh policy constructed inside the helper",
+        );
     }
 }
