@@ -71,7 +71,7 @@ where
 }
 
 /// One listed bundle's parsed parts. Internal — never serialised directly.
-struct BundleEntry {
+struct ListedBundle {
     sha: String,
     ref_path: String,
 }
@@ -79,21 +79,21 @@ struct BundleEntry {
 async fn collect_bundles(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
-) -> Result<Vec<BundleEntry>, ObjectStoreError> {
+) -> Result<Vec<ListedBundle>, ObjectStoreError> {
     // Match upstream: `list_objects_v2(Prefix=prefix)` with no trailing
     // slash. The strip step below disambiguates sibling-prefix collisions.
     let listed = store.list(prefix.unwrap_or("")).await?;
 
     // Parse every match exactly once, carrying the timestamp alongside
     // the parsed entry so the sort below doesn't force a re-parse.
-    let mut parsed: Vec<(time::OffsetDateTime, BundleEntry)> = listed
+    let mut parsed: Vec<(time::OffsetDateTime, ListedBundle)> = listed
         .into_iter()
         .filter_map(|m| {
             let rel = relative_key(prefix, &m.key)?;
             let (ref_path, sha) = parse_bundle_key(rel)?;
             Some((
                 m.last_modified,
-                BundleEntry {
+                ListedBundle {
                     sha: sha.to_owned(),
                     ref_path: ref_path.to_owned(),
                 },

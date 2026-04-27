@@ -1,4 +1,4 @@
-//! Integration tests for [`AzureBlobStore`][a] against a real Azure
+//! Integration tests for [`AzureStore`][a] against a real Azure
 //! Blob–compatible server (the official Microsoft Azurite emulator
 //! via `testcontainers`).
 //!
@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use azure_core::http::Method;
 use azure_core::http::headers::{HeaderName, Headers};
 use bytes::Bytes;
-use git_remote_object_store::object_store::azure::AzureBlobStore;
+use git_remote_object_store::object_store::azure::AzureStore;
 use git_remote_object_store::object_store::{Error, ObjectStore, PutOpts};
 use git_remote_object_store::url::{ENV_ALLOW_HTTP, RemoteUrl, parse};
 use sha2::{Digest, Sha256};
@@ -139,17 +139,17 @@ fn fixture() -> &'static AzuriteFixture {
     })
 }
 
-/// Allocate a fresh container in Azurite and build an `AzureBlobStore`
+/// Allocate a fresh container in Azurite and build an `AzureStore`
 /// pointed at it (via the same `parse(...) → from_remote_url` path
 /// production code uses).
-async fn fresh_container() -> AzureBlobStore {
+async fn fresh_container() -> AzureStore {
     let fixture = fixture();
     let n = CONTAINER_COUNTER.fetch_add(1, Ordering::SeqCst);
     // Azure container names: 3-63 chars, lowercase alphanumeric + `-`,
     // no leading/trailing dashes.
     let container = format!("test-{}-{}", std::process::id(), n);
 
-    // Create the container via a separate AzureBlobStore-like client
+    // Create the container via a separate AzureStore-like client
     // path. We don't currently expose container-creation through the
     // trait, so use a raw azure_storage_blob client just for setup.
     create_container(fixture.port, &container).await;
@@ -164,9 +164,9 @@ async fn fresh_container() -> AzureBlobStore {
     let RemoteUrl::Azure { .. } = &url else {
         panic!("parse returned non-Azure variant");
     };
-    AzureBlobStore::from_remote_url(&url)
+    AzureStore::from_remote_url(&url)
         .await
-        .expect("AzureBlobStore::from_remote_url")
+        .expect("AzureStore::from_remote_url")
 }
 
 /// Create a fresh container in the local Azurite via an authenticated
@@ -746,7 +746,7 @@ fn init_seed_repo() -> TempDir {
 }
 
 /// Allocate a fresh container in Azurite (used by E2E tests that drive
-/// the helper binary rather than the [`AzureBlobStore`] API directly)
+/// the helper binary rather than the [`AzureStore`] API directly)
 /// and return `(host_port, container_name)`.
 async fn fresh_container_endpoint() -> (u16, String) {
     let fixture = fixture();
