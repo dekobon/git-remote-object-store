@@ -3,6 +3,6 @@
 //! Thin wrapper around [`git_remote_object_store::protocol::run_main`].
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
     git_remote_object_store::protocol::run_main().await
 }

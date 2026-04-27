@@ -7,8 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `protocol::backend::build` now runs an eager probe (single
+  `ListObjectsV2` for S3, `ListBlobs` first page for Azure with
+  `maxresults=1`) at backend construction. The probe folds well-known
+  failures into three categorical `BackendError` variants
+  (`BucketNotFound`, `NotAuthorized`, `InvalidCredentials`) so helper
+  binaries can emit single-line `fatal:` diagnostics that match
+  upstream `git_remote_s3/remote.py:574-593`. The probe runs once per
+  helper invocation and is off the per-command hot path. (#45)
+
 ### Changed
 
+- `protocol::run_main` now returns `std::process::ExitCode` instead of
+  `anyhow::Result<()>` so the helper binaries
+  (`git-remote-{s3,az}-{http,https}`) can render categorical
+  `BackendError`s as upstream-style single-line `fatal:` messages
+  without `anyhow`'s `Display` chain layering on top. The
+  management binary (`git-remote-object-store`) downcasts through the
+  anyhow chain to the same effect. (#45)
+- `BackendError` lost its `S3` / `Azure` construction-failure variants
+  in favour of `BucketNotFound { kind, name }`,
+  `NotAuthorized { kind, action, name }`, and
+  `InvalidCredentials { source }`. Greenfield project — no compat
+  shim. (#45)
 - `ObjectStore::get_to_file` now takes a `GetOpts` argument; `PutOpts`
   gains an optional `progress` field. Both carry an
   `Option<ProgressSink>` that backends drive at chunk boundaries

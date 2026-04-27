@@ -12,6 +12,7 @@
 
 use std::io::ErrorKind;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
@@ -208,8 +209,21 @@ where
 /// Git always invokes a remote helper as `git-remote-<scheme> <remote-name>
 /// <url>` — see `git help gitremote-helpers`. We read the URL from
 /// `argv[2]`, matching the upstream Python helper exactly.
-pub async fn run_main() -> anyhow::Result<()> {
-    let remote = parse_remote_arg(std::env::args())?;
+///
+/// Returns [`ExitCode`] rather than `anyhow::Result` so that
+/// credential / missing-bucket / authorization failures from
+/// [`backend::build`] can be rendered as a single-line `fatal:` message
+/// (matching upstream `git-remote-s3` at
+/// `../git-remote-s3/git_remote_s3/remote.py:574-593`) without
+/// `anyhow`'s `Display` chain layering on top.
+pub async fn run_main() -> ExitCode {
+    let remote = match parse_remote_arg(std::env::args()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("fatal: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
     let reload = match tracing_init::init() {
         Ok(handle) => Some(handle),
         Err(e) => {
@@ -225,26 +239,39 @@ pub async fn run_main() -> anyhow::Result<()> {
     #[cfg(unix)]
     install_sigpipe_mask();
 
-    let store = backend::build(&remote)
-        .await
-        .context("failed to build object-store backend")?;
+    let store = match backend::build(&remote).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}", backend::fatal_message(&e));
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Git invokes remote helpers from inside the local repository (cwd
     // is the worktree, with `GIT_DIR` set when relevant). `git bundle
     // unbundle` auto-discovers the git directory from cwd, so the
     // process cwd is the right thing to hand the parallel fetch path.
-    let repo_dir = std::env::current_dir().context("failed to read current working directory")?;
+    let repo_dir = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("fatal: failed to read current working directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let stdin = BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();
 
     match run(remote, store, stdin, stdout, reload, repo_dir).await {
-        Ok(()) => Ok(()),
+        Ok(()) => ExitCode::SUCCESS,
         Err(ProtocolError::Io(e)) if is_broken_pipe(&e) => {
             debug!("stdout closed (BrokenPipe); exiting cleanly");
-            std::process::exit(0);
+            ExitCode::SUCCESS
         }
-        Err(other) => Err(other.into()),
+        Err(other) => {
+            eprintln!("fatal: {other:#}");
+            ExitCode::FAILURE
+        }
     }
 }
 

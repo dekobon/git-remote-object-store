@@ -223,6 +223,36 @@ impl AzureStore {
     fn blob_client(&self, key: &str) -> BlobClient {
         self.container.blob_client(key)
     }
+
+    /// Verify the container is reachable with the configured credentials
+    /// by listing one blob (`maxresults=1`) and consuming only the first
+    /// page of results. Used by [`crate::protocol::backend::build`] to
+    /// fold credential / missing-container / authorization failures into
+    /// categorical [`crate::protocol::backend::BackendError`] variants
+    /// before the helper REPL runs its first command. Counterpart to
+    /// [`crate::object_store::s3::S3Store::probe`].
+    pub(crate) async fn probe(&self, prefix: &str) -> Result<(), ObjectStoreError> {
+        // Pass `None` for an empty prefix per the same Azurite quirk
+        // documented at the top of `list` above: a signed empty prefix
+        // returns 403 from Azurite.
+        let prefix_opt = (!prefix.is_empty()).then(|| prefix.to_owned());
+        let opts = BlobContainerClientListBlobsOptions {
+            prefix: prefix_opt,
+            maxresults: Some(1),
+            ..Default::default()
+        };
+        let mut pages = self
+            .container
+            .list_blobs(Some(opts))
+            .map_err(|e| classify(e, prefix))?
+            .into_pages();
+        // Consume only the first page: probing does not need the full
+        // listing — we only care that the request succeeded.
+        if let Some(page_result) = pages.next().await {
+            page_result.map_err(|e| classify(e, prefix))?;
+        }
+        Ok(())
+    }
 }
 
 /// Build the [`reqwest::Client`] used by [`AzureStore`]'s custom
