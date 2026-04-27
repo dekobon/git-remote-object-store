@@ -112,6 +112,7 @@ Parse `$ARGUMENTS` as: `[target] [--dry-run]`
 ## A. Modern Syntax & Language Features
 
 ### A1. Let chains in `if let` / `while let` (Rust 2024 edition, stable since 1.88)
+
 Combine multiple conditions and pattern matches in a single `if` header.
 
 ```rust
@@ -129,6 +130,7 @@ if let Some(x) = opt && x > 0 {
 ```
 
 ### A2. Inline const blocks (stable since 1.79)
+
 Use `const { ... }` inside expressions to compute values at compile time without
 a separate `const` item.
 
@@ -142,12 +144,14 @@ let masked = value & const { (1u32 << 16) - 1 };
 ```
 
 ### A3. Associated type bounds (basic syntax stable since 1.79; repeated bounds since 1.92)
+
 Write `where T: Trait<Assoc: Debug + Clone>` instead of separate bounds.
 The single-clause `Assoc: A + B` syntax has been stable since 1.79. Since 1.92,
 you can also write multiple separate bounds on the same associated item
 (e.g., `T: Trait<Assoc: Debug> + Trait<Assoc: Clone>`).
 
 ### A4. Irrefutable `let` destructuring
+
 Replace `thing.0`, `thing.1` field access with destructuring.
 
 ```rust
@@ -164,14 +168,17 @@ let (x, y) = pair;
 ## B. Iterator & Closure Patterns
 
 ### B1. Replace manual loops with iterator chains (beyond what clippy catches)
+
 Clippy catches simple cases (`manual_filter_map`, `manual_find_map`, `needless_collect`).
 Focus on the patterns it misses:
+
 - Multi-step accumulations that can become `.fold()` or `.scan()`
 - Nested loops that can become `.flat_map()` chains
 - Loops building multiple collections that can use `.partition()` or `.unzip()`
 - Index-based loops over parallel slices that should use `.zip()`
 
 ### B2. Replace `.windows(N)` + manual indexing with `.array_windows()` (requires 1.94)
+
 The new `array_windows` method yields `&[T; N]` with compile-time length,
 enabling direct destructuring and eliminating bounds checks.
 
@@ -189,12 +196,15 @@ for [a, b, c] in data.array_windows() {
 ```
 
 ### B3. Use `Peekable::next_if_map` (requires 1.94)
+
 Replaces `peek()` + `matches!()` + `next()` patterns.
 
 ### B4. Use `VecDeque::pop_front_if` / `pop_back_if` (requires 1.93)
+
 Replaces `front().map(|v| if cond { pop_front() })` patterns.
 
 ### B5. Turbofish elimination
+
 Remove turbofish (`::<>`) when the type can be inferred from context, e.g.
 `let v: Vec<_> = iter.collect();` instead of `iter.collect::<Vec<_>>()`.
 
@@ -203,6 +213,7 @@ Remove turbofish (`::<>`) when the type can be inferred from context, e.g.
 ## C. Type System & Modeling
 
 ### C1. Newtype pattern for domain safety
+
 When two or more `String`, `u64`, `usize`, etc. parameters could be confused,
 wrap them in newtypes. Use `derive_more` to minimize boilerplate.
 
@@ -221,6 +232,7 @@ fn fetch(user_id: UserId, org_id: OrgId) -> Result<Data> { ... }
 ```
 
 ### C2. Enum state machines over boolean flags
+
 Replace `is_active: bool, is_verified: bool` with a `Status` enum.
 This makes illegal states unrepresentable.
 
@@ -234,20 +246,25 @@ struct User { status: AccountStatus }
 ```
 
 ### C3. Builder → struct with `Default` + update syntax
+
 When a builder only sets fields (no validation), replace with `..Default::default()`.
 
 ### C4. Collapse trivial `From` / `Into` chains
+
 If a conversion is just wrapping/unwrapping a newtype, use `#[derive(From, Into)]`
 from `derive_more` or `#[nutype]` instead of manual impls.
 
 ### C5. Replace `Box<dyn Error>` with `thiserror` enums
+
 Enumerating error variants removes the need for `.downcast()` and string matching.
 
 ### C6. Phantom types for state encoding
+
 Use generic phantom-type parameters to encode compile-time state (e.g.
 `Connection<Authenticated>` vs `Connection<Anonymous>`) instead of runtime checks.
 
 ### C7. Use `LazyCell::get` / `LazyLock::get` (requires 1.94)
+
 Check initialization status of lazy values without forcing evaluation.
 Replaces manual `Option` + `is_some()` wrappers around lazy-init patterns.
 
@@ -256,6 +273,7 @@ Replaces manual `Option` + `is_some()` wrappers around lazy-init patterns.
 ## D. Standard Library API Upgrades
 
 ### D1. `<[T]>::as_array` / `as_mut_array` (requires 1.93)
+
 Convert a slice to a fixed-size array reference without `try_into().unwrap()`.
 
 ```rust
@@ -267,6 +285,7 @@ let Some(arr) = chunk.as_array::<4>() else { panic!("wrong size") };
 ```
 
 ### D2. `fmt::from_fn` (requires 1.93)
+
 Create a `Display` impl from a closure, eliminating single-use wrapper structs.
 
 ```rust
@@ -288,13 +307,16 @@ println!("{}", fmt::from_fn(|f| {
 ```
 
 ### D3. `element_offset` on slices (requires 1.94)
+
 Find the index of an element by reference without pointer arithmetic.
 
 ### D4. Zeroed allocation helpers (stable since 1.92)
+
 Use `Box::new_zeroed()`, `Rc::new_zeroed()`, `Arc::new_zeroed()` for large
 zero-initialized allocations instead of `vec![0; N]` followed by boxing.
 
 ### D5. `RwLockWriteGuard::downgrade` (stable since 1.92)
+
 Downgrade a write guard to a read guard without releasing and re-acquiring.
 
 ---
@@ -302,12 +324,15 @@ Downgrade a write guard to a read guard without releasing and re-acquiring.
 ## E. Macro & Derive Reduction
 
 ### E1. Use `derive_more` for forwarding traits on newtypes
+
 Display, From, Into, Deref, DerefMut, AsRef, Index — one line replaces ~10.
 
 ### E2. Use `#[serde(transparent)]` for newtype serialization
+
 Eliminates custom `Serialize`/`Deserialize` impls on single-field wrappers.
 
 ### E3. Replace repetitive `impl` blocks with declarative macros
+
 If 3+ types share identical method implementations differing only in type name,
 extract a `macro_rules!` to generate them.
 
@@ -316,12 +341,15 @@ extract a `macro_rules!` to generate them.
 ## F. Module & Visibility Cleanup
 
 ### F1. Flatten single-variant re-exports
+
 If `mod foo` only re-exports one item, inline it or use `pub use`.
 
 ### F2. Merge tiny modules
+
 If a module has <20 lines and one public item, inline into the parent.
 
 ### F3. Use `pub(crate)` / `pub(super)` precision
+
 Replace `pub` with the narrowest visibility that compiles.
 
 ---
@@ -329,12 +357,15 @@ Replace `pub` with the narrowest visibility that compiles.
 ## G. Cargo.toml & Project-Level
 
 ### G1. TOML 1.1 inline tables (requires 1.94 toolchain for Cargo)
+
 Multi-line inline tables with trailing commas for cleaner dependency specs.
 
 ### G2. Cargo config `include` (requires 1.94 toolchain)
+
 Share config across workspaces with `include = ["shared.toml"]`.
 
 ### G3. Feature-gate heavy optional deps
+
 Move rarely-used dependencies behind feature flags to reduce default compile scope.
 
 ---
