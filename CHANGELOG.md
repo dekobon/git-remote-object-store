@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `git-remote-object-store doctor` binary instead of the bare word
   `doctor`, matching the wording of the other doctor-pointing error
   paths. (#22)
+- Under-lock duplicate-bundle push error now ends with the trailing
+  `?` suffix used by every other `error <ref> "..."` message in the
+  helper, so the wire format is consistent across the pre-lock and
+  under-lock branches. Deliberate divergence from upstream Python,
+  which omits the `?` on this path. (#34)
 
 ## [0.1.0] - 2026-04-26
 
