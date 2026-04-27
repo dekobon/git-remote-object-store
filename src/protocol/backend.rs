@@ -90,14 +90,9 @@ const fn container_word(kind: BackendKind) -> &'static str {
 #[must_use]
 pub fn fatal_message(err: &BackendError) -> String {
     match err {
-        BackendError::BucketNotFound {
-            kind: BackendKind::S3,
-            name,
-        } => format!("fatal: bucket not found {name}"),
-        BackendError::BucketNotFound {
-            kind: BackendKind::Azure,
-            name,
-        } => format!("fatal: container not found {name}"),
+        BackendError::BucketNotFound { kind, name } => {
+            format!("fatal: {} not found {name}", container_word(*kind))
+        }
         BackendError::NotAuthorized { name, action, .. } => {
             format!("fatal: user not authorized to perform {action} on {name}")
         }
