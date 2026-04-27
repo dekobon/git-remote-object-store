@@ -74,7 +74,7 @@ the documentation / packaging / release pipeline.
   per-process tempdir prepended to `PATH`. Gated on
   `--features integration-azure` alongside the trait-level coverage.
   (#12)
-- Azure Blob Storage backend (`AzureBlobStore`, Phase 11): full
+- Azure Blob Storage backend (`AzureStore`, Phase 11): full
   `ObjectStore` trait implementation against the official
   `azure_storage_blob` 0.12 crate. `list` paginates through
   `BlobContainerClient::list_blobs`; `get_to_file` streams via the

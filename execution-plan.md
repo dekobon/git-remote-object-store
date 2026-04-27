@@ -379,7 +379,7 @@ pub enum RemoteUrl {
         account: String,
         container: String,
         prefix: Option<String>,
-        addressing: AzureAddressing,     // Subdomain | PathStyle (auto-detected)
+        addressing: AzureAddressing,     // VirtualHosted | PathStyle (auto-detected)
         flags: RemoteFlags,
     },
 }
@@ -641,7 +641,7 @@ and document the constraint.
 
 ### Phase 11 — Azure Blob backend
 
-- Implement `object_store::azure::AzureBlobStore` against
+- Implement `object_store::azure::AzureStore` against
   `azure_storage_blob` 0.12 (the actively maintained official
   crate; still in beta as of 2026-04).
 - Map the trait verbatim where the SDK supports it:
