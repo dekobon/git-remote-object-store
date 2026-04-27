@@ -56,12 +56,29 @@
 //! method (only `BlockBlobClient::upload_blob_from_url`, which requires
 //! a SAS-tokened source URL or an `x-ms-copy-source-authorization`
 //! header — neither integrates cleanly with our credential model). We
-//! implement `copy` as a download-then-upload round trip. The trait's
-//! only consumer is the per-ref locking algorithm (§5.2 of the plan)
-//! which copies zero-byte lock files, so the round trip is fast in
-//! practice. Body is preserved; user metadata is not propagated for
-//! parity with the upstream `git-remote-s3` Python lock-copy path
-//! which similarly only carries body bytes.
+//! implement `copy` as a stream-through-tempfile round trip:
+//! `get_to_file` writes `src` to a `NamedTempFile`, then `put_path`
+//! uploads it to `dst`. Both legs already stream — `get_to_file`
+//! consumes the SDK's chunked download into the file without buffering
+//! the body, and `put_path` wraps the file in a `SeekableStream` that
+//! the SDK uploads via `stage_block` + `commit_block_list` for large
+//! bodies. Memory stays bounded by the SDK's per-block partition size
+//! (4 MiB by default) regardless of blob size, which matters for
+//! `manage doctor`'s duplicate-bundle quarantine path
+//! (`Doctor::evict_losing_bundle`) — that path can copy multi-GiB
+//! bundles. Zero-byte lock files (the original §5.2 consumer) still
+//! round-trip fast: `get_to_file` short-circuits the GET on `size == 0`
+//! and `put_path` issues a single zero-byte `Put Blob`. Body is
+//! preserved; user metadata is not propagated, mirroring upstream
+//! `git-remote-s3`'s S3 `CopyObject` and Python lock-copy paths which
+//! similarly only carry body bytes.
+//!
+//! This is asymmetric with the S3 backend, which uses `CopyObject` for
+//! a true server-side copy — Azure's equivalent (`Copy Blob`,
+//! `Put Blob From URL`) requires a SAS-signed source URL or an
+//! `x-ms-copy-source-authorization` header that the 0.12 SDK does not
+//! ergonomically expose. The download+reupload path is the safe
+//! correct fallback until the SDK closes that gap.
 //!
 //! ## A note on `Range` and zero-byte blobs
 //!
@@ -448,16 +465,23 @@ impl ObjectStore for AzureStore {
     }
 
     async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
-        // Server-side copy via PutBlobFromURL requires a SAS-tokened
+        // Server-side copy via `Put Blob From URL` requires a SAS-tokened
         // source URL or `x-ms-copy-source-authorization`, neither of
         // which integrates with our credential model in a clean way
-        // for the SDK 0.12 surface. Use a download-then-upload round
-        // trip; lock files (zero bytes) round-trip in <1 RTT and
-        // bundles fit comfortably under the single-PUT 256 MiB ceiling.
-        let body = self.get_bytes(src).await?;
+        // for the SDK 0.12 surface. Stream `src` to a temp file via
+        // `get_to_file` (chunked download, no body buffer), then
+        // `put_path` it back to `dst` (block-uploaded for large
+        // bodies). Memory stays bounded by the SDK's partition size
+        // regardless of blob size — necessary because
+        // `manage doctor`'s duplicate-bundle quarantine path uses
+        // `copy()` and bundles can be multi-GiB.
+        let temp = NamedTempFile::new().map_err(other_boxed)?;
+        // `get_to_file` propagates `NotFound(src)` if the source is
+        // absent — exactly the trait contract for `copy`.
+        self.get_to_file(src, temp.path()).await?;
         // A NotFound on the upload is destination-side — re-shape it
         // so callers don't mistake it for "src absent".
-        match self.put_bytes(dst, body, PutOpts::default()).await {
+        match self.put_path(dst, temp.path(), PutOpts::default()).await {
             Ok(()) => Ok(()),
             Err(ObjectStoreError::NotFound(_)) => Err(ObjectStoreError::Other(
                 format!("copy `{src}` → `{dst}`: upload returned NotFound").into(),

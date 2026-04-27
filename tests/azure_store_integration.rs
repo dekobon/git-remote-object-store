@@ -372,6 +372,87 @@ async fn copy_replicates_body() {
 }
 
 #[tokio::test]
+async fn copy_streams_large_body_through_tempfile() {
+    // Regression test for issue #30: `AzureStore::copy` previously
+    // buffered the full source body into a `Bytes` allocation via
+    // `get_bytes` + `put_bytes`. `manage doctor`'s duplicate-bundle
+    // quarantine path uses `copy()`, so a multi-GiB bundle would force
+    // the whole body through RAM. The fix streams `src → tempfile →
+    // dst`, bounded by the SDK's per-block partition size. This test
+    // exercises a body well past the 4 MiB default partition so the
+    // streaming `stage_block` + `commit_block_list` upload route runs
+    // end-to-end and round-trips byte-identical.
+    let store = fresh_container().await;
+
+    let size: usize = 32 * 1024 * 1024;
+    let mut payload = vec![0u8; size];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = u8::try_from(i.wrapping_mul(2_654_435_761) & 0xff).unwrap_or(0);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(&payload);
+    let expected_hash = hasher.finalize();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src_path = tmp.path().join("big-src.bin");
+    tokio::fs::write(&src_path, &payload).await.expect("write");
+
+    // Use `put_path` to seed the source so we don't pay for a
+    // throwaway 32 MiB allocation in the test.
+    store
+        .put_path("big-src", &src_path, PutOpts::default())
+        .await
+        .expect("put_path src");
+
+    store.copy("big-src", "big-dst").await.expect("copy");
+
+    let dest = tmp.path().join("downloaded.bin");
+    store
+        .get_to_file("big-dst", &dest)
+        .await
+        .expect("get_to_file");
+
+    let actual_hash = {
+        use std::io::Read;
+        let mut file = std::fs::File::open(&dest).expect("open downloaded");
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = file.read(&mut buf).expect("read");
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        hasher.finalize()
+    };
+    assert_eq!(actual_hash, expected_hash, "copy round-trip corrupted body");
+    assert_eq!(
+        std::fs::metadata(&dest).expect("metadata").len(),
+        size as u64,
+    );
+}
+
+#[tokio::test]
+async fn copy_zero_byte_blob_round_trips() {
+    // Lock files (the original `copy` consumer) are zero bytes. The
+    // streaming path must keep them fast and correct: `get_to_file`
+    // short-circuits the GET on `size == 0` and writes an empty
+    // tempfile, then `put_path` issues a single zero-byte `Put Blob`.
+    let store = fresh_container().await;
+    store
+        .put_bytes("lock-src", Bytes::new(), PutOpts::default())
+        .await
+        .expect("put empty src");
+    store.copy("lock-src", "lock-dst").await.expect("copy");
+
+    let meta = store.head("lock-dst").await.expect("head dst");
+    assert_eq!(meta.size, 0);
+    let body = store.get_bytes("lock-dst").await.expect("get dst");
+    assert!(body.is_empty(), "expected empty body, got {body:?}");
+}
+
+#[tokio::test]
 async fn copy_missing_source_is_not_found() {
     let store = fresh_container().await;
     let err = store
