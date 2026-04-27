@@ -158,6 +158,22 @@ hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
 
+# HTTP transport for the Azure Blob backend. `azure_core` 0.35's default
+# transport pools connections forever and never sets TCP keepalive, so a
+# rotated VIP can hang a long-running LFS session until the OS-level TCP
+# timeout fires (issue #26). We build our own `reqwest::Client` with
+# bounded `pool_idle_timeout` / `tcp_keepalive` and install it via
+# `ClientOptions::transport`. `rustls` keeps HTTPS to
+# `*.blob.core.windows.net` explicit rather than relying on
+# `azure_core`'s transitive feature set; cargo unifies with the
+# additional `gzip`/`deflate`/`stream` features `azure_core` already
+# enables on its own `reqwest` dep, so no decompression/streaming
+# capability is lost.
+reqwest = { version = "0.13", default-features = false, features = [
+    "http2",
+    "rustls",
+] }
+
 [dev-dependencies]
 # Property-based testing for URL round-trip parse/format.
 proptest = "1"
@@ -180,18 +196,13 @@ proptest = "1"
 # and would silently drift across alpha releases.
 testcontainers = { version = "0.27", features = ["blocking", "http_wait_plain"] }
 
-# Used only by `tests/azure_store_integration.rs` (gated on the
-# `integration-azure` Cargo feature) to issue the one-off
-# Create-Container setup request signed via our shared-key policy.
-# Pulling in the full Azure SDK transport just to call PUT-container
-# is overkill; reqwest is already in the dependency tree via
-# `testcontainers`. Default features (TLS + json + gzip) are not
-# required for plain HTTP setup against Azurite.
-reqwest = { version = "0.13", default-features = false, features = ["http2"] }
-
-# Note: `sha2` is now a runtime dep (Phase 11 shared-key signing) so the
-# integration tests can reuse the same crate version for byte-equality
-# assertions on the multipart-download path.
+# Note: `reqwest` is a regular dependency (above) — used in production
+# by the Azure backend's transport tuning (#26 / #28) and reused here by
+# `tests/azure_store_integration.rs` (gated on `integration-azure`) for
+# the one-off Create-Container setup request signed via our shared-key
+# policy. `sha2` is similarly a runtime dep (Phase 11 shared-key
+# signing) so the integration tests can reuse the same crate version
+# for byte-equality assertions on the multipart-download path.
 
 # Remote-helper shims. Git invokes them by scheme as `git-remote-<scheme>`,
 # so the installed binary names must be `git-remote-s3+https` etc.

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `AzureStore::from_remote_url` now configures the SDK's HTTP transport
+  with `pool_idle_timeout(30s)` and `tcp_keepalive(30s)`. Pooled
+  connections to a rotated VIP can no longer wedge a long-running LFS
+  session until the OS-level TCP timeout fires (~15 minutes on Linux).
+  The custom transport leaves `ClientOptions::per_try_policies`
+  untouched, so shared-key / SAS signing continues to fire on every
+  request. (#26, #28)
 - `push.rs` parse-error message now names the full
   `git-remote-object-store doctor` binary instead of the bare word
   `doctor`, matching the wording of the other doctor-pointing error
