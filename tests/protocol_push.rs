@@ -708,7 +708,7 @@ async fn pre_existing_malformed_bundle_key_surfaces_parse_error() {
     .await;
     result.expect("push should produce an error outcome, not abort");
 
-    // Wire format: `error <ref> "<msg>"?\n` — see PushOutcome::as_protocol_line
+    // Wire format: `error <ref> "<msg>"?\n` — see PushOutcome::to_protocol_line
     // and push.rs:494-499. The message embeds `{key:?}`, which renders
     // the key with surrounding literal quote bytes (no escaping needed
     // because the key contains no `"` characters).
