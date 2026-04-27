@@ -33,7 +33,7 @@ use azure_core::http::Method;
 use azure_core::http::headers::{HeaderName, Headers};
 use bytes::Bytes;
 use git_remote_object_store::object_store::azure::AzureStore;
-use git_remote_object_store::object_store::{Error, ObjectStore, PutOpts};
+use git_remote_object_store::object_store::{ObjectStore, ObjectStoreError, PutOpts};
 use git_remote_object_store::url::{ENV_ALLOW_HTTP, RemoteUrl, parse};
 use sha2::{Digest, Sha256};
 use testcontainers::core::wait::HttpWaitStrategy;
@@ -379,7 +379,7 @@ async fn copy_missing_source_is_not_found() {
         .await
         .expect_err("copy of missing source");
     assert!(
-        matches!(err, Error::NotFound(ref s) if s == "missing-src"),
+        matches!(err, ObjectStoreError::NotFound(ref s) if s == "missing-src"),
         "expected NotFound(missing-src), got {err:?}"
     );
 }
@@ -394,7 +394,7 @@ async fn delete_existing_then_delete_missing_is_not_found() {
     store.delete("k").await.expect("first delete");
 
     let err = store.delete("k").await.expect_err("second delete");
-    assert!(matches!(err, Error::NotFound(ref s) if s == "k"));
+    assert!(matches!(err, ObjectStoreError::NotFound(ref s) if s == "k"));
 }
 
 #[tokio::test]
@@ -402,7 +402,7 @@ async fn get_missing_key_is_not_found() {
     let store = fresh_container().await;
     let err = store.get_bytes("absent").await.expect_err("get missing");
     assert!(
-        matches!(err, Error::NotFound(ref s) if s == "absent"),
+        matches!(err, ObjectStoreError::NotFound(ref s) if s == "absent"),
         "expected NotFound, got {err:?}"
     );
 }
@@ -416,7 +416,7 @@ async fn get_to_file_failure_does_not_corrupt_dest() {
         .get_to_file("missing-key", &dest)
         .await
         .expect_err("get_to_file on missing key");
-    assert!(matches!(err, Error::NotFound(_)));
+    assert!(matches!(err, ObjectStoreError::NotFound(_)));
     assert!(
         !dest.exists(),
         "destination must not exist after a failed get_to_file"
