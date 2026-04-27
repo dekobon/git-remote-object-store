@@ -95,7 +95,7 @@ impl PushOutcome {
     /// Format `self` as the single line emitted on stdout (terminator
     /// included).
     #[must_use]
-    pub(crate) fn as_protocol_line(&self) -> String {
+    pub(crate) fn to_protocol_line(&self) -> String {
         match self {
             PushOutcome::Ok { remote_ref } => format!("ok {remote_ref}\n"),
             PushOutcome::Error {
@@ -1075,7 +1075,7 @@ mod tests {
         let line = PushOutcome::Ok {
             remote_ref: "refs/heads/main".into(),
         }
-        .as_protocol_line();
+        .to_protocol_line();
         assert_eq!(line, "ok refs/heads/main\n");
     }
 
@@ -1085,7 +1085,7 @@ mod tests {
             remote_ref: "refs/heads/main".into(),
             message: r#""bad"?"#.into(),
         }
-        .as_protocol_line();
+        .to_protocol_line();
         assert_eq!(line, "error refs/heads/main \"bad\"?\n");
     }
 
@@ -1102,12 +1102,12 @@ mod tests {
             remote_ref: "refs/heads/main".into(),
             message: r#""multiple bundles exists on server. Run git-remote-object-store doctor to fix."?"#.to_owned(),
         }
-        .as_protocol_line();
+        .to_protocol_line();
         let under_lock_line = PushOutcome::Error {
             remote_ref: "refs/heads/main".into(),
             message: r#""multiple bundles exists for the same ref on server. Run git-remote-object-store doctor to fix."?"#.to_owned(),
         }
-        .as_protocol_line();
+        .to_protocol_line();
 
         assert_eq!(
             pre_lock_line,

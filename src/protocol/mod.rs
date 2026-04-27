@@ -190,7 +190,7 @@ where
                     .await?;
                     for outcome in &outcomes {
                         writer
-                            .write_all(outcome.as_protocol_line().as_bytes())
+                            .write_all(outcome.to_protocol_line().as_bytes())
                             .await?;
                     }
                     mode = None;

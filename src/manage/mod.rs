@@ -147,29 +147,29 @@ pub struct DialoguerPrompter;
 
 impl Prompter for DialoguerPrompter {
     fn select(&self, prompt: &str, options: &[String]) -> Result<usize, ManageError> {
-        dialoguer::Select::new()
+        Ok(dialoguer::Select::new()
             .with_prompt(prompt)
             .items(options)
             .default(0)
-            .interact()
-            .map_err(into_dialoguer_error)
+            .interact()?)
     }
 
     fn confirm(&self, prompt: &str) -> Result<bool, ManageError> {
-        dialoguer::Confirm::new()
+        Ok(dialoguer::Confirm::new()
             .with_prompt(prompt)
             .default(false)
-            .interact()
-            .map_err(into_dialoguer_error)
+            .interact()?)
     }
 }
 
-fn into_dialoguer_error(err: dialoguer::Error) -> ManageError {
-    match err {
-        dialoguer::Error::IO(io_err) if io_err.kind() == io::ErrorKind::Interrupted => {
-            ManageError::Cancelled
+impl From<dialoguer::Error> for ManageError {
+    fn from(err: dialoguer::Error) -> Self {
+        match err {
+            dialoguer::Error::IO(io_err) if io_err.kind() == io::ErrorKind::Interrupted => {
+                ManageError::Cancelled
+            }
+            dialoguer::Error::IO(io_err) => ManageError::Io(io_err),
         }
-        dialoguer::Error::IO(io_err) => ManageError::Io(io_err),
     }
 }
 
