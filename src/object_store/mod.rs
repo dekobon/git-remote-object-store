@@ -140,7 +140,17 @@ pub trait ObjectStore: Send + Sync {
     /// Fetch metadata for an exact key.
     async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError>;
 
-    /// Copy `src` to `dst` server-side, including body and user metadata.
+    /// Copy `src` to `dst`. The body is preserved on every backend.
+    ///
+    /// User metadata propagation is **best-effort**: backends that
+    /// implement copy as a true server-side operation
+    /// (`S3Store::copy` via `CopyObject`) do propagate it, but backends
+    /// that emulate copy via download-then-upload (`AzureStore::copy`,
+    /// because `azure_storage_blob` 0.12 does not ergonomically expose
+    /// `Copy Blob` with shared-key auth) currently drop it. Callers
+    /// must not depend on metadata round-tripping through `copy`. The
+    /// trait's only in-tree consumer is `Doctor::evict_losing_bundle`,
+    /// which carries no user metadata on bundle objects.
     async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError>;
 
     /// Delete `key`. Returns `Err(ObjectStoreError::NotFound)` if the key was
