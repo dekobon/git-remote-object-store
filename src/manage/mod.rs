@@ -109,7 +109,7 @@ pub enum ManageError {
 
     /// User cancelled an interactive prompt via Ctrl+C or EOF. A
     /// deliberate "no" on a confirmation prompt is not an error —
-    /// callers (`delete_branch`, `fix_multiple_bundles`) print
+    /// callers (`ManageBranch::delete`, `fix_multiple_bundles`) print
     /// "Aborted" and return `Ok(())`.
     #[error("operation cancelled")]
     Cancelled,

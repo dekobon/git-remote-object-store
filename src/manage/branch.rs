@@ -75,7 +75,7 @@ impl<'a> ManageBranch<'a> {
     /// Delete every object under the branch's prefix after a `yes/no`
     /// confirmation. Aborts (returns `Ok(())`) if the user answers no;
     /// the `Cancelled` variant is reserved for prompt I/O failures.
-    pub async fn delete_branch(&self) -> Result<(), ManageError> {
+    pub async fn delete(&self) -> Result<(), ManageError> {
         let objects = self.store.list(&self.branch_prefix()).await?;
         let prompt = format!("Delete branch {} ({} objects)?", self.branch, objects.len());
         if !self.prompter.confirm(&prompt)? {
@@ -92,7 +92,7 @@ impl<'a> ManageBranch<'a> {
 
     /// Mark the branch as protected by writing the `PROTECTED#` sentinel.
     /// Idempotent — overwrites any existing marker.
-    pub async fn protect_branch(&self) -> Result<(), ManageError> {
+    pub async fn protect(&self) -> Result<(), ManageError> {
         self.store
             .put_bytes(&self.protected_key(), Bytes::new(), PutOpts::default())
             .await?;
@@ -102,7 +102,7 @@ impl<'a> ManageBranch<'a> {
 
     /// Remove the `PROTECTED#` sentinel. A missing marker is treated as
     /// already-unprotected rather than an error.
-    pub async fn unprotect_branch(&self) -> Result<(), ManageError> {
+    pub async fn unprotect(&self) -> Result<(), ManageError> {
         match self.store.delete(&self.protected_key()).await {
             Ok(()) | Err(ObjectStoreError::NotFound(_)) => {
                 println!("Branch {} is now unprotected", self.branch);
@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_branch_removes_every_key_when_confirmed() {
+    async fn delete_removes_every_key_when_confirmed() {
         let mock = seed_with_branch("main");
         mock.insert("myrepo/refs/heads/main/PROTECTED#", Bytes::new());
         mock.insert("myrepo/refs/heads/main/LOCK#.lock", Bytes::new());
@@ -152,7 +152,7 @@ mod tests {
         let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
             .await
             .expect("open");
-        mb.delete_branch().await.expect("delete");
+        mb.delete().await.expect("delete");
         assert!(
             mock.keys().is_empty(),
             "all keys removed: {:?}",
@@ -162,7 +162,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_branch_no_keeps_keys() {
+    async fn delete_no_keeps_keys() {
         let mock = seed_with_branch("main");
         let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
         let prompter = ScriptedPrompter::new([Answer::Confirm(false)]);
@@ -170,7 +170,7 @@ mod tests {
         let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
             .await
             .expect("open");
-        mb.delete_branch().await.expect("delete (aborted)");
+        mb.delete().await.expect("delete (aborted)");
         assert_eq!(mock.keys().len(), 1, "branch still present");
     }
 
@@ -183,10 +183,10 @@ mod tests {
         let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
             .await
             .expect("open");
-        mb.protect_branch().await.expect("protect");
+        mb.protect().await.expect("protect");
         assert!(mock.contains("myrepo/refs/heads/main/PROTECTED#"));
         // Second call overwrites without error.
-        mb.protect_branch().await.expect("protect again");
+        mb.protect().await.expect("protect again");
         assert!(mock.contains("myrepo/refs/heads/main/PROTECTED#"));
     }
 
@@ -200,7 +200,7 @@ mod tests {
         let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
             .await
             .expect("open");
-        mb.unprotect_branch().await.expect("unprotect");
+        mb.unprotect().await.expect("unprotect");
         assert!(!mock.contains("myrepo/refs/heads/main/PROTECTED#"));
     }
 
@@ -213,7 +213,7 @@ mod tests {
         let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
             .await
             .expect("open");
-        mb.unprotect_branch()
+        mb.unprotect()
             .await
             .expect("unprotect should be idempotent");
     }
@@ -245,10 +245,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_branch_partial_failure_propagates_error() {
+    async fn delete_partial_failure_propagates_error() {
         // `MockStore::list` returns keys in lexicographic (BTreeMap)
         // order, so the loop deletes aaa, then attempts bbb (armed to
-        // fail), then ccc. `delete_branch` returns the error
+        // fail), then ccc. `delete` returns the error
         // immediately on the failed delete; aaa is gone, bbb and ccc
         // remain.
         let mock = MockStore::new();
@@ -265,7 +265,7 @@ mod tests {
             .await
             .expect("open");
         let err = mb
-            .delete_branch()
+            .delete()
             .await
             .expect_err("partial delete must propagate");
         assert!(
@@ -294,7 +294,7 @@ mod tests {
         let mb = ManageBranch::open(store, "", "main", &prompter as &dyn Prompter)
             .await
             .expect("open at root");
-        mb.delete_branch().await.expect("delete at root");
+        mb.delete().await.expect("delete at root");
         assert!(mock.keys().is_empty(), "all root keys removed");
     }
 
@@ -308,7 +308,7 @@ mod tests {
         let mb = ManageBranch::open(store, "", "main", &prompter as &dyn Prompter)
             .await
             .expect("open at root");
-        mb.protect_branch().await.expect("protect at root");
+        mb.protect().await.expect("protect at root");
         // Exactly the upstream layout for a root-of-bucket repo: no
         // leading slash, no synthetic prefix.
         assert!(mock.contains("refs/heads/main/PROTECTED#"));
@@ -326,7 +326,7 @@ mod tests {
         let mb = ManageBranch::open(store, "", "main", &prompter as &dyn Prompter)
             .await
             .expect("open at root");
-        mb.unprotect_branch().await.expect("unprotect at root");
+        mb.unprotect().await.expect("unprotect at root");
         assert!(!mock.contains("refs/heads/main/PROTECTED#"));
         // The bundle alongside the marker must survive — `unprotect` is
         // a marker-only delete and a regression that broadened the
