@@ -645,8 +645,18 @@ async fn pre_lock_multi_bundle_rejection_surfaces_unchanged() {
 
     // Seed two bundles for the same ref — the pre-lock listing finds >1
     // bundle and returns PushOutcome::Error before lock acquisition.
-    store.insert("repo/refs/heads/main/aaaa.bundle", Bytes::from_static(b"a"));
-    store.insert("repo/refs/heads/main/bbbb.bundle", Bytes::from_static(b"b"));
+    // Use realistic 40-hex names so the fixture survives any future
+    // tightening of `is_bundle_candidate` to match the parser.
+    let sha_a = "1111111111111111111111111111111111111111";
+    let sha_b = "2222222222222222222222222222222222222222";
+    store.insert(
+        format!("repo/refs/heads/main/{sha_a}.bundle"),
+        Bytes::from_static(b"a"),
+    );
+    store.insert(
+        format!("repo/refs/heads/main/{sha_b}.bundle"),
+        Bytes::from_static(b"b"),
+    );
 
     let (out, result) = drive_in(
         s3_url_with_zip(Some("repo"), false),
@@ -666,5 +676,57 @@ async fn pre_lock_multi_bundle_rejection_surfaces_unchanged() {
     assert!(
         !store.contains("repo/refs/heads/main/LOCK#.lock"),
         "lock must not be acquired when the pre-lock check rejects",
+    );
+}
+
+#[tokio::test]
+async fn pre_existing_malformed_bundle_key_surfaces_parse_error() {
+    // When the pre-lock listing finds exactly one bundle whose stem is
+    // not a 40-hex SHA, `parse_remote_sha_from_key` returns None and
+    // push.rs:490-498 emits a `PushOutcome::Error` advising the user to
+    // run `doctor`. Exercises the otherwise-untested malformed-key arm.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, _shas) = make_seed_repo(1, "primary");
+    let store = Arc::new(MockStore::new());
+
+    // `not-a-valid-sha.bundle` passes `is_bundle_candidate` (no
+    // PROTECTED#, no .zip, no /LOCKS/, doesn't end in .lock) but the
+    // stem is not 40 hex chars, so `parse_remote_sha_from_key` returns
+    // None and the malformed-key error path fires.
+    let bad_key = "repo/refs/heads/main/not-a-valid-sha.bundle";
+    store.insert(bad_key, Bytes::from_static(b"junk"));
+
+    let (out, result) = drive_in(
+        s3_url_with_zip(Some("repo"), false),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push refs/heads/main:refs/heads/main\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    result.expect("push should produce an error outcome, not abort");
+
+    // Wire format: `error <ref> "<msg>"?\n` — see PushOutcome::as_protocol_line
+    // and push.rs:494-499. The message embeds `{key:?}`, which renders
+    // the key with surrounding literal quote bytes (no escaping needed
+    // because the key contains no `"` characters).
+    let text = std::str::from_utf8(&out).expect("stdout utf-8");
+    let expected = format!(
+        "error refs/heads/main \"unable to parse remote bundle key \"{bad_key}\"; \
+         run git-remote-object-store doctor to fix.\"?\n\n",
+    );
+    assert_eq!(text, expected, "exact wire bytes for malformed-key error");
+
+    // The lock was never acquired — the pre-lock check returned early.
+    assert!(
+        !store.contains("repo/refs/heads/main/LOCK#.lock"),
+        "lock must not be acquired when the pre-lock check rejects",
+    );
+    // The malformed bundle is still present — push did not delete it.
+    assert!(
+        store.contains(bad_key),
+        "malformed bundle must remain untouched (doctor's job to clean up)",
     );
 }
