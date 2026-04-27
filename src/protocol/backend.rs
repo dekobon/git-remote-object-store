@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use crate::object_store::azure::AzureBlobStore;
+use crate::object_store::azure::AzureStore;
 use crate::object_store::s3::S3Store;
 use crate::object_store::{ObjectStore, ObjectStoreError};
 use crate::url::RemoteUrl;
@@ -34,7 +34,7 @@ pub async fn build(remote: &RemoteUrl) -> Result<Arc<dyn ObjectStore>, BackendEr
             Ok(Arc::new(store))
         }
         RemoteUrl::Azure { .. } => {
-            let store = AzureBlobStore::from_remote_url(remote)
+            let store = AzureStore::from_remote_url(remote)
                 .await
                 .map_err(BackendError::Azure)?;
             Ok(Arc::new(store))

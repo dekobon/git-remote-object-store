@@ -1168,7 +1168,7 @@ mod tests {
             account: "acct".to_owned(),
             container: "container".to_owned(),
             prefix: None,
-            addressing: AzureAddressing::Subdomain,
+            addressing: AzureAddressing::VirtualHosted,
             flags: RemoteFlags::default(),
         }
     }

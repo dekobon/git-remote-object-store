@@ -1,7 +1,7 @@
 //! Azure Blob Storage backend for the [`ObjectStore`][super::ObjectStore]
 //! trait (Phase 11 of `execution-plan.md`).
 //!
-//! `AzureBlobStore` wraps `azure_storage_blob`. Like the S3 backend, this
+//! `AzureStore` wraps `azure_storage_blob`. Like the S3 backend, this
 //! module owns the URL → SDK config translation, the error-code
 //! classifier ([`classify`]), and the credential resolution plumbing.
 //! Unlike S3, the SDK already does parallel range downloads inside
@@ -105,23 +105,23 @@ use super::error::other_boxed;
 use super::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts, persist_temp};
 
 /// Production [`ObjectStore`] backed by `azure_storage_blob`.
-pub struct AzureBlobStore {
+pub struct AzureStore {
     container: BlobContainerClient,
 }
 
-impl std::fmt::Debug for AzureBlobStore {
+impl std::fmt::Debug for AzureStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // `BlobContainerClient` is opaque (private fields, no `Debug`);
         // surface the endpoint instead so error / log lines remain
         // useful.
-        f.debug_struct("AzureBlobStore")
+        f.debug_struct("AzureStore")
             .field("endpoint", &self.container.endpoint().as_str())
             .finish()
     }
 }
 
-impl AzureBlobStore {
-    /// Build an `AzureBlobStore` from a parsed [`RemoteUrl`].
+impl AzureStore {
+    /// Build an `AzureStore` from a parsed [`RemoteUrl`].
     ///
     /// Returns `Err(ObjectStoreError::Other)` if `url` is not the Azure variant or
     /// if credential resolution fails. Like the S3 backend, the
@@ -145,7 +145,7 @@ impl AzureBlobStore {
         } = url
         else {
             return Err(ObjectStoreError::Other(
-                format!("AzureBlobStore::from_remote_url called with non-Azure URL: {url}").into(),
+                format!("AzureStore::from_remote_url called with non-Azure URL: {url}").into(),
             ));
         };
 
@@ -183,8 +183,8 @@ impl AzureBlobStore {
 ///
 /// The SDK takes a separate `container_name` argument, so we strip the
 /// container (and any prefix segments) from the parsed URL. For
-/// subdomain addressing the path becomes `/`; for path-style addressing
-/// (Azurite, custom endpoints) the path becomes `/<account>`.
+/// virtual-hosted addressing the path becomes `/`; for path-style
+/// addressing (Azurite, custom endpoints) the path becomes `/<account>`.
 pub(crate) fn build_account_url(
     endpoint: &Url,
     account: &str,
@@ -194,7 +194,7 @@ pub(crate) fn build_account_url(
     rewritten.set_query(None);
     rewritten.set_fragment(None);
     let path = match addressing {
-        AzureAddressing::Subdomain => "/".to_owned(),
+        AzureAddressing::VirtualHosted => "/".to_owned(),
         AzureAddressing::PathStyle => format!("/{account}"),
     };
     rewritten.set_path(&path);
@@ -295,7 +295,7 @@ fn item_to_meta(
 }
 
 #[async_trait::async_trait]
-impl ObjectStore for AzureBlobStore {
+impl ObjectStore for AzureStore {
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, ObjectStoreError> {
         // Pass `None` for an empty prefix: Azure list_blobs URL-encodes
         // `prefix=` and Azurite signs an empty value differently than
@@ -475,7 +475,7 @@ impl ObjectStore for AzureBlobStore {
     }
 }
 
-impl AzureBlobStore {
+impl AzureStore {
     /// One head→tempfile→download→persist round trip.
     ///
     /// Factored out so [`get_to_file`](ObjectStore::get_to_file) can
@@ -595,9 +595,9 @@ mod tests {
     // --- build_account_url --------------------------------------------
 
     #[test]
-    fn build_account_url_subdomain_strips_path() {
+    fn build_account_url_virtual_hosted_strips_path() {
         let url = parse_endpoint("https://acct.blob.core.windows.net/my-container/some/prefix");
-        let out = build_account_url(&url, "acct", AzureAddressing::Subdomain);
+        let out = build_account_url(&url, "acct", AzureAddressing::VirtualHosted);
         assert_eq!(out, "https://acct.blob.core.windows.net/");
     }
 
@@ -611,7 +611,7 @@ mod tests {
     #[test]
     fn build_account_url_strips_query_and_fragment() {
         let url = parse_endpoint("https://acct.blob.core.windows.net/c/r?credential=foo#frag");
-        let out = build_account_url(&url, "acct", AzureAddressing::Subdomain);
+        let out = build_account_url(&url, "acct", AzureAddressing::VirtualHosted);
         assert_eq!(out, "https://acct.blob.core.windows.net/");
     }
 
@@ -806,7 +806,7 @@ mod tests {
 
     #[tokio::test]
     async fn from_remote_url_rejects_s3() {
-        let result = AzureBlobStore::from_remote_url(&s3_url()).await;
+        let result = AzureStore::from_remote_url(&s3_url()).await;
         match result {
             Err(ObjectStoreError::Other(_)) => {}
             Err(other) => panic!("expected ObjectStoreError::Other, got {other:?}"),

@@ -69,8 +69,10 @@ pub enum S3Addressing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AzureAddressing {
     /// `<account>.blob.<endpoint-suffix>` — account is the leftmost
-    /// hostname label.
-    Subdomain,
+    /// hostname label. Named `VirtualHosted` for symmetry with
+    /// [`S3Addressing::VirtualHosted`]; both describe the
+    /// "leftmost-hostname-label" pattern.
+    VirtualHosted,
     /// `<host>/<account>/...` — account is the first path segment
     /// (Azurite, custom endpoints).
     PathStyle,
@@ -107,7 +109,7 @@ pub enum ParseError {
     /// S3 path-style URL is missing the first path segment (the bucket).
     #[error("URL is missing the bucket segment")]
     MissingBucket,
-    /// Azure subdomain URL is missing the first path segment (the
+    /// Azure virtual-hosted URL is missing the first path segment (the
     /// container) — or path-style is missing the second path segment.
     #[error("URL is missing the container segment")]
     MissingContainer,
@@ -423,12 +425,12 @@ fn finish_azure(
         .to_owned();
     let addressing = match addressing_override {
         Some(AddressingOverride::Path) => AzureAddressing::PathStyle,
-        Some(AddressingOverride::Virtual) => AzureAddressing::Subdomain,
+        Some(AddressingOverride::Virtual) => AzureAddressing::VirtualHosted,
         None => detect_azure_addressing(&host),
     };
 
     let (account, container, prefix_segments) = match addressing {
-        AzureAddressing::Subdomain => {
+        AzureAddressing::VirtualHosted => {
             let account = leftmost_label(&host).ok_or(ParseError::MissingAccount)?;
             match segments.as_slice() {
                 [] => return Err(ParseError::MissingContainer),
@@ -451,7 +453,7 @@ fn finish_azure(
     let prefix = join_prefix(prefix_segments);
 
     let canonical: Vec<&str> = match addressing {
-        AzureAddressing::Subdomain => std::iter::once(container.as_str())
+        AzureAddressing::VirtualHosted => std::iter::once(container.as_str())
             .chain(prefix_segments.iter().map(String::as_str))
             .collect(),
         AzureAddressing::PathStyle => std::iter::once(account.as_str())
@@ -472,10 +474,10 @@ fn finish_azure(
 }
 
 fn detect_azure_addressing(host: &str) -> AzureAddressing {
-    // §3.4: subdomain iff the second hostname label is `blob`. Hosts
-    // are already lowercased by the `url` crate (RFC 3986).
+    // §3.4: virtual-hosted iff the second hostname label is `blob`.
+    // Hosts are already lowercased by the `url` crate (RFC 3986).
     if host.split('.').nth(1) == Some("blob") {
-        AzureAddressing::Subdomain
+        AzureAddressing::VirtualHosted
     } else {
         AzureAddressing::PathStyle
     }
@@ -684,7 +686,7 @@ mod tests {
     fn azure_addressing_heuristic() {
         assert_eq!(
             detect_azure_addressing("my-account.blob.core.windows.net"),
-            AzureAddressing::Subdomain
+            AzureAddressing::VirtualHosted
         );
         assert_eq!(
             detect_azure_addressing("127.0.0.1"),

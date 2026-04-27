@@ -154,7 +154,7 @@ fn azure_public_cloud() {
     assert_eq!(account, "myaccount");
     assert_eq!(container, "my-container");
     assert_eq!(prefix.as_deref(), Some("my-repo"));
-    assert_eq!(addressing, AzureAddressing::Subdomain);
+    assert_eq!(addressing, AzureAddressing::VirtualHosted);
 }
 
 #[test]
@@ -174,7 +174,7 @@ fn azure_us_gov_cloud() {
     assert_eq!(account, "myaccount");
     assert_eq!(container, "my-container");
     assert_eq!(prefix.as_deref(), Some("my-repo"));
-    assert_eq!(addressing, AzureAddressing::Subdomain);
+    assert_eq!(addressing, AzureAddressing::VirtualHosted);
 }
 
 #[test]
@@ -631,7 +631,7 @@ proptest! {
     }
 
     #[test]
-    fn azure_subdomain_round_trip(
+    fn azure_virtual_hosted_round_trip(
         account in arb_account(),
         container in arb_container(),
         prefix in arb_prefix(),
