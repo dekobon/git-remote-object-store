@@ -434,14 +434,12 @@ impl ObjectStore for AzureStore {
         let resp = blob
             .upload(bytes_to_request_content(body), Some(upload_opts))
             .await;
-        match resp {
+        match resp.map_err(|e| classify(e, key)) {
             Ok(_) => Ok(true),
-            Err(e) => match classify(e, key) {
-                ObjectStoreError::PreconditionFailed(_) | ObjectStoreError::Conflict(_) => {
-                    Ok(false)
-                }
-                other => Err(other),
-            },
+            Err(ObjectStoreError::PreconditionFailed(_) | ObjectStoreError::Conflict(_)) => {
+                Ok(false)
+            }
+            Err(other) => Err(other),
         }
     }
 

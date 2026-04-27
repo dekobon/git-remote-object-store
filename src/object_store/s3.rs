@@ -563,14 +563,12 @@ impl ObjectStore for S3Store {
             .body(ByteStream::from(body))
             .send()
             .await;
-        match resp {
+        match resp.map_err(|e| classify(e, key)) {
             Ok(_) => Ok(true),
-            Err(e) => match classify(e, key) {
-                ObjectStoreError::PreconditionFailed(_) | ObjectStoreError::Conflict(_) => {
-                    Ok(false)
-                }
-                other => Err(other),
-            },
+            Err(ObjectStoreError::PreconditionFailed(_) | ObjectStoreError::Conflict(_)) => {
+                Ok(false)
+            }
+            Err(other) => Err(other),
         }
     }
 
