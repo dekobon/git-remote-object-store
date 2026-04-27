@@ -87,16 +87,21 @@ impl FetchedRefs {
     }
 
     fn contains(&self, sha: &Sha) -> bool {
+        // We hold the lock only across `HashSet::contains` / `insert`,
+        // both of which cannot leave the set in a half-modified state.
+        // If a previous holder panicked, the set is still safe to read,
+        // so recover the inner guard rather than escalating to a
+        // process-wide abort.
         self.inner
             .lock()
-            .expect("fetched_refs mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(sha)
     }
 
     fn insert(&self, sha: Sha) {
         self.inner
             .lock()
-            .expect("fetched_refs mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(sha);
     }
 
@@ -105,7 +110,7 @@ impl FetchedRefs {
     pub(crate) fn snapshot(&self) -> HashSet<Sha> {
         self.inner
             .lock()
-            .expect("fetched_refs mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 }

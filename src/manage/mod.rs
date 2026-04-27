@@ -117,6 +117,14 @@ pub enum ManageError {
     /// I/O error from `dialoguer` or other non-store sources.
     #[error(transparent)]
     Io(#[from] io::Error),
+
+    /// A defensive invariant inside the management code was violated —
+    /// for example a snapshot map lookup that the caller had previously
+    /// proven to exist, or a prompter returning an out-of-range index.
+    /// These should not happen in practice; surfacing them as a typed
+    /// error keeps the helper from aborting the process.
+    #[error("internal management error: {0}")]
+    Internal(String),
 }
 
 /// Interactive UI surface used by [`doctor`] and [`branch`].
