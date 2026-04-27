@@ -27,7 +27,7 @@ use bytes::Bytes;
 use time::OffsetDateTime;
 
 use super::error::other_boxed;
-use super::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
+use super::{GetOpts, ObjectMeta, ObjectStore, ObjectStoreError, ProgressSink, PutOpts};
 
 /// Produce a deterministic, content-derived `ETag` string that mimics the
 /// `"<hex>"` format returned by S3 `HeadObject`. Uses a simple FNV-1a
@@ -96,6 +96,13 @@ struct MockObject {
 struct MockState {
     objects: BTreeMap<String, MockObject>,
     faults: Vec<Fault>,
+    /// Chunk size used to slice progress callbacks for `put_path` /
+    /// `get_to_file` / `put_bytes`. `None` means "single end-of-transfer
+    /// event with the full body size", matching the on-the-wire
+    /// behaviour of S3 single-PUT and Azure single-shot upload paths.
+    /// Tests that exercise per-chunk progress (LFS agent) set a small
+    /// chunk size so a multi-byte body produces multiple events.
+    progress_chunk_size: Option<u64>,
 }
 
 /// In-memory [`ObjectStore`] for tests.
@@ -117,6 +124,16 @@ impl MockStore {
     /// Queue `fault` to fire on the next matching operation.
     pub fn arm(&self, fault: Fault) {
         self.with_state(|s| s.faults.push(fault));
+    }
+
+    /// Configure the chunk size used when slicing progress events on
+    /// `put_path` / `get_to_file` / `put_bytes`. `None` (the default)
+    /// produces a single end-of-transfer event with the full body size.
+    /// `Some(n)` produces ⌈len / n⌉ events, each of `min(n, remaining)`
+    /// bytes — used by LFS agent tests to assert that progress flows
+    /// at chunk granularity.
+    pub fn set_progress_chunk_size(&self, chunk_size: Option<u64>) {
+        self.with_state(|s| s.progress_chunk_size = chunk_size);
     }
 
     /// Seed the store with `body` under `key`, stamping `last_modified` to
@@ -175,6 +192,7 @@ impl MockStore {
             s.objects.get(key).map(|o| PutOpts {
                 content_disposition: o.content_disposition.clone(),
                 user_metadata: o.user_metadata.clone(),
+                progress: None,
             })
         })
     }
@@ -182,6 +200,31 @@ impl MockStore {
     fn with_state<R>(&self, f: impl FnOnce(&mut MockState) -> R) -> R {
         let mut guard = self.inner.lock().expect("mock mutex poisoned");
         f(&mut guard)
+    }
+
+    /// Drive `sink` with `body_len` bytes' worth of `report` calls,
+    /// honouring the configured `progress_chunk_size`. Empty bodies
+    /// emit no events (matches the real backends — a 0-byte download
+    /// short-circuits the GET entirely).
+    fn emit_progress(&self, sink: &ProgressSink, body_len: u64) {
+        if body_len == 0 {
+            return;
+        }
+        let chunk_size = self.with_state(|s| s.progress_chunk_size);
+        let Some(chunk_size) = chunk_size else {
+            sink.report(body_len);
+            return;
+        };
+        if chunk_size == 0 {
+            sink.report(body_len);
+            return;
+        }
+        let mut remaining = body_len;
+        while remaining > 0 {
+            let step = remaining.min(chunk_size);
+            sink.report(step);
+            remaining -= step;
+        }
     }
 
     /// Pop the first fault for which `map` returns `Some(err)` and bubble
@@ -248,7 +291,12 @@ impl ObjectStore for MockStore {
         })
     }
 
-    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<(), ObjectStoreError> {
+    async fn get_to_file(
+        &self,
+        key: &str,
+        dest: &Path,
+        opts: GetOpts,
+    ) -> Result<(), ObjectStoreError> {
         self.with_state(|s| {
             Self::check_fault(s, |f| match f {
                 Fault::PreconditionFailedOnGetToFile { key: k } if k == key => {
@@ -258,7 +306,12 @@ impl ObjectStore for MockStore {
             })
         })?;
         let bytes = self.get_bytes(key).await?;
-        tokio::fs::write(dest, &bytes).await.map_err(other_boxed)
+        let body_len = bytes.len() as u64;
+        tokio::fs::write(dest, &bytes).await.map_err(other_boxed)?;
+        if let Some(sink) = opts.progress.as_ref() {
+            self.emit_progress(sink, body_len);
+        }
+        Ok(())
     }
 
     async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
@@ -282,8 +335,23 @@ impl ObjectStore for MockStore {
         body: Bytes,
         opts: PutOpts,
     ) -> Result<(), ObjectStoreError> {
+        let body_len = body.len() as u64;
+        let progress = opts.progress.clone();
         self.insert_with(key, body, OffsetDateTime::now_utc(), opts);
+        if let Some(sink) = progress.as_ref() {
+            self.emit_progress(sink, body_len);
+        }
         Ok(())
+    }
+
+    /// Override the default trait `put_path` so the configured
+    /// `progress_chunk_size` drives multi-event progress callbacks.
+    /// Without this override the default streams the full body to
+    /// `put_bytes` without progress and then emits a single
+    /// end-of-transfer event, defeating the chunk knob.
+    async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), ObjectStoreError> {
+        let body = tokio::fs::read(src).await.map_err(other_boxed)?;
+        self.put_bytes(key, Bytes::from(body), opts).await
     }
 
     async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
@@ -498,6 +566,7 @@ mod tests {
             PutOpts {
                 content_disposition: Some("attachment; filename=foo".into()),
                 user_metadata: vec![("k".into(), "v".into())],
+                progress: None,
             },
         );
 
@@ -545,7 +614,10 @@ mod tests {
         let store = MockStore::new();
         store.insert("k", body(b"file-bytes"));
 
-        store.get_to_file("k", &path).await.unwrap();
+        store
+            .get_to_file("k", &path, GetOpts::default())
+            .await
+            .unwrap();
         let read = tokio::fs::read(&path).await.unwrap();
         assert_eq!(read, b"file-bytes");
     }
@@ -558,7 +630,10 @@ mod tests {
         let path = dir.path().join("missing-subdir").join("out.bin");
         let store = MockStore::new();
         store.insert("k", body(b"x"));
-        let err = store.get_to_file("k", &path).await.unwrap_err();
+        let err = store
+            .get_to_file("k", &path, GetOpts::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ObjectStoreError::Other(_)));
     }
 
@@ -568,6 +643,7 @@ mod tests {
         let opts = PutOpts {
             content_disposition: Some("inline".into()),
             user_metadata: vec![("a".into(), "1".into()), ("b".into(), "2".into())],
+            progress: None,
         };
         store.put_bytes("k", body(b""), opts.clone()).await.unwrap();
         let stored = store.metadata("k").expect("k exists");
@@ -671,12 +747,18 @@ mod tests {
         let store = MockStore::new();
         store.insert("k", body(b"payload"));
         store.arm(Fault::PreconditionFailedOnGetToFile { key: "k".into() });
-        let err = store.get_to_file("k", &path).await.unwrap_err();
+        let err = store
+            .get_to_file("k", &path, GetOpts::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ObjectStoreError::PreconditionFailed(ref k) if k == "k"));
         assert!(!path.exists(), "file must not be written on fault");
         assert_eq!(store.pending_faults(), 0);
         // Second call without a fault succeeds.
-        store.get_to_file("k", &path).await.unwrap();
+        store
+            .get_to_file("k", &path, GetOpts::default())
+            .await
+            .unwrap();
         let read = tokio::fs::read(&path).await.unwrap();
         assert_eq!(read, b"payload");
     }
@@ -717,6 +799,7 @@ mod tests {
         let opts = PutOpts {
             content_disposition: Some("attachment".into()),
             user_metadata: vec![("key".into(), "val".into())],
+            progress: None,
         };
         store
             .put_path("via-path", &file_path, opts.clone())
@@ -767,5 +850,86 @@ mod tests {
     fn mock_store_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<MockStore>();
+    }
+
+    #[tokio::test]
+    async fn put_path_emits_chunked_progress_with_configured_chunk_size() {
+        // Pin the chunk-knob-driven progress contract: with chunk=8 on a
+        // 20-byte body, we get 3 events of sizes 8, 8, 4 totalling 20.
+        // Higher layers (the LFS agent) depend on this for live progress
+        // — see lfs/agent.rs::upload_emits_chunked_progress_for_multipart_body.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("body.bin");
+        let payload = b"abcdefghijklmnopqrst"; // 20 bytes
+        tokio::fs::write(&src, payload).await.unwrap();
+
+        let store = MockStore::new();
+        store.set_progress_chunk_size(Some(8));
+
+        let received = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let received_clone = Arc::clone(&received);
+        let sink = ProgressSink::new(move |amount| {
+            received_clone.lock().expect("lock").push(amount);
+        });
+        let opts = PutOpts {
+            progress: Some(sink),
+            ..PutOpts::default()
+        };
+        store.put_path("k", &src, opts).await.unwrap();
+
+        let chunks = received.lock().unwrap().clone();
+        assert_eq!(chunks, vec![8, 8, 4]);
+        assert_eq!(chunks.iter().sum::<u64>(), payload.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn put_path_default_chunk_emits_single_event_with_full_size() {
+        // With no chunk knob configured, MockStore mirrors S3 single-PUT
+        // / Azure single-shot upload: one report() call with the full
+        // body size. Locks in the "no chunking, but at least one event"
+        // contract so the LFS agent's bytesSoFar==size assertion still
+        // holds for backends without per-chunk hooks.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("body.bin");
+        tokio::fs::write(&src, b"hello").await.unwrap();
+
+        let store = MockStore::new();
+        let received = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let received_clone = Arc::clone(&received);
+        let sink = ProgressSink::new(move |amount| {
+            received_clone.lock().expect("lock").push(amount);
+        });
+        let opts = PutOpts {
+            progress: Some(sink),
+            ..PutOpts::default()
+        };
+        store.put_path("k", &src, opts).await.unwrap();
+
+        assert_eq!(received.lock().unwrap().clone(), vec![5]);
+    }
+
+    #[tokio::test]
+    async fn empty_body_emits_no_progress_events() {
+        // A 0-byte transfer fires no callback. Real backends short-
+        // circuit empty downloads (skip the GET entirely) so no chunk
+        // ever lands on the wire — match that here so the LFS agent
+        // doesn't emit a `"bytesSinceLast":0` stub.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("empty.bin");
+        tokio::fs::write(&src, b"").await.unwrap();
+        let store = MockStore::new();
+        store.set_progress_chunk_size(Some(8));
+
+        let received = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let received_clone = Arc::clone(&received);
+        let sink = ProgressSink::new(move |amount| {
+            received_clone.lock().expect("lock").push(amount);
+        });
+        let opts = PutOpts {
+            progress: Some(sink),
+            ..PutOpts::default()
+        };
+        store.put_path("k", &src, opts).await.unwrap();
+        assert!(received.lock().unwrap().is_empty());
     }
 }

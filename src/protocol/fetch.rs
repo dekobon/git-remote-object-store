@@ -29,7 +29,7 @@ use tracing::debug;
 
 use crate::git::{self, GitError, RefName, RefNameError, Sha, ShaError};
 use crate::keys;
-use crate::object_store::{ObjectStore, ObjectStoreError};
+use crate::object_store::{GetOpts, ObjectStore, ObjectStoreError};
 
 /// Maximum number of in-flight bundle fetches per batch. Matches
 /// upstream `boto3.s3.transfer.TransferConfig(max_concurrency=8)` from
@@ -197,7 +197,9 @@ async fn fetch_one(
         .tempdir()?;
     let bundle_path = temp_dir.path().join(format!("{sha}.bundle"));
     debug!(%sha, ref_name = %ref_name, key = %key, "downloading bundle");
-    store.get_to_file(&key, &bundle_path).await?;
+    store
+        .get_to_file(&key, &bundle_path, GetOpts::default())
+        .await?;
     git::unbundle_at(repo_dir, temp_dir.path(), sha, ref_name).await?;
     fetched_refs.insert(sha);
     Ok(())

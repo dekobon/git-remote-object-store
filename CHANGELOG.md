@@ -7,8 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `ObjectStore::get_to_file` now takes a `GetOpts` argument; `PutOpts`
+  gains an optional `progress` field. Both carry an
+  `Option<ProgressSink>` that backends drive at chunk boundaries
+  (per-range for the S3 multipart download path, per body chunk for
+  the S3 single-PUT and Azure download paths). Bundle / lock / HEAD
+  call sites pass `GetOpts::default()` and `progress: None`; the LFS
+  agent populates the sink. This is a public-API break for callers of
+  `ObjectStore::get_to_file`. (#44)
+
 ### Fixed
 
+- The LFS custom-transfer agent now emits `progress` events at each
+  network-chunk boundary, mirroring upstream
+  `git_remote_s3/lfs.py`'s `ProgressPercentage.__call__` callback.
+  Previously the agent emitted a single end-of-transfer event with
+  `bytesSoFar == size`, which left long uploads / downloads
+  appearing frozen and stripped `git-lfs` of any signal to detect
+  stalled transfers. Backends report bytes through a `ProgressSink`;
+  the agent forwards them through an `mpsc` channel into live
+  `progress` events on stdout. (#44)
 - `S3Store::from_remote_url` now installs a custom
   `aws-smithy-http-client` with `pool_idle_timeout(30s)` so DNS
   rotation no longer wedges a long-running LFS session until the

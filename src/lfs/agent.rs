@@ -8,18 +8,20 @@
 //! the LFS client moves on to the next event).
 
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::keys;
 use crate::lfs::oid::LfsOid;
 use crate::lfs::protocol::{CompleteEvent, EventError, ProgressEvent};
-use crate::object_store::{ObjectStore, ObjectStoreError};
+use crate::object_store::{GetOpts, ObjectStore, ObjectStoreError, ProgressSink, PutOpts};
 
 /// Generic error code surfaced in `complete` event payloads. Matches
 /// upstream `git_remote_s3/lfs.py:write_error_event` (`code=2`).
@@ -75,18 +77,26 @@ impl Agent {
     }
 
     /// Handle an `upload` event: skip when the key already exists,
-    /// otherwise stream the file body and emit progress + complete.
+    /// otherwise stream the file body and emit per-chunk progress plus
+    /// a final complete event. Progress events flow live as the body
+    /// crosses chunk boundaries (matching upstream
+    /// `git_remote_s3/lfs.py:25-41`'s `ProgressPercentage` callback)
+    /// instead of as one trailing event with the full size.
     pub(crate) async fn upload<W: AsyncWrite + Unpin>(
         &self,
         oid_raw: &str,
-        size: u64,
+        _size: u64,
         path: &Path,
         writer: &mut W,
     ) -> Result<(), AgentError> {
-        match self.try_upload(oid_raw, path).await {
+        let oid_for_progress = oid_raw.to_owned();
+        let result = with_progress_stream(writer, oid_for_progress, |sink| async move {
+            self.try_upload(oid_raw, path, sink).await
+        })
+        .await?;
+        match result {
             Ok(UploadOutcome::AlreadyPresent) => write_complete(writer, oid_raw, None, None).await,
             Ok(UploadOutcome::Uploaded { oid }) => {
-                write_progress(writer, oid.as_str(), size, size).await?;
                 write_complete(writer, oid.as_str(), None, None).await
             }
             Err(OpError { oid, message }) => {
@@ -96,16 +106,20 @@ impl Agent {
     }
 
     /// Handle a `download` event: stream the body to
-    /// `<tmp_dir>/<oid>` and emit progress + complete-with-path.
+    /// `<tmp_dir>/<oid>` and emit per-chunk progress + complete-with-path.
     pub(crate) async fn download<W: AsyncWrite + Unpin>(
         &self,
         oid_raw: &str,
-        size: u64,
+        _size: u64,
         writer: &mut W,
     ) -> Result<(), AgentError> {
-        match self.try_download(oid_raw).await {
+        let oid_for_progress = oid_raw.to_owned();
+        let result = with_progress_stream(writer, oid_for_progress, |sink| async move {
+            self.try_download(oid_raw, sink).await
+        })
+        .await?;
+        match result {
             Ok(DownloadOutcome { oid, dest_str }) => {
-                write_progress(writer, oid.as_str(), size, size).await?;
                 write_complete(writer, oid.as_str(), Some(&dest_str), None).await
             }
             Err(OpError { oid, message }) => {
@@ -114,7 +128,12 @@ impl Agent {
         }
     }
 
-    async fn try_upload(&self, oid_raw: &str, path: &Path) -> Result<UploadOutcome, OpError> {
+    async fn try_upload(
+        &self,
+        oid_raw: &str,
+        path: &Path,
+        progress: ProgressSink,
+    ) -> Result<UploadOutcome, OpError> {
         let oid = parse_oid(oid_raw)?;
         let key = self.key(&oid);
         debug!(oid = %oid, key = %key, "lfs upload");
@@ -131,18 +150,23 @@ impl Agent {
             }
         }
 
-        self.store
-            .put_path(&key, path, crate::object_store::PutOpts::default())
-            .await
-            .map_err(|e| {
-                warn!(oid = %oid, error = %e, "upload failed");
-                OpError::with_cause(oid.as_str(), &e)
-            })?;
+        let opts = PutOpts {
+            progress: Some(progress),
+            ..PutOpts::default()
+        };
+        self.store.put_path(&key, path, opts).await.map_err(|e| {
+            warn!(oid = %oid, error = %e, "upload failed");
+            OpError::with_cause(oid.as_str(), &e)
+        })?;
 
         Ok(UploadOutcome::Uploaded { oid })
     }
 
-    async fn try_download(&self, oid_raw: &str) -> Result<DownloadOutcome, OpError> {
+    async fn try_download(
+        &self,
+        oid_raw: &str,
+        progress: ProgressSink,
+    ) -> Result<DownloadOutcome, OpError> {
         let oid = parse_oid(oid_raw)?;
         let key = self.key(&oid);
         let dest = self.tmp_dir.join(oid.as_str());
@@ -155,10 +179,16 @@ impl Agent {
             })?;
         }
 
-        self.store.get_to_file(&key, &dest).await.map_err(|e| {
-            warn!(oid = %oid, error = %e, "download failed");
-            OpError::with_cause(oid.as_str(), &e)
-        })?;
+        let opts = GetOpts {
+            progress: Some(progress),
+        };
+        self.store
+            .get_to_file(&key, &dest, opts)
+            .await
+            .map_err(|e| {
+                warn!(oid = %oid, error = %e, "download failed");
+                OpError::with_cause(oid.as_str(), &e)
+            })?;
 
         let dest_str = dest.to_str().map(str::to_owned).ok_or_else(|| {
             OpError::with_cause(oid.as_str(), &"download destination is not valid UTF-8")
@@ -166,6 +196,73 @@ impl Agent {
 
         Ok(DownloadOutcome { oid, dest_str })
     }
+}
+
+/// Run `op` with a [`ProgressSink`] that forwards `bytes_amount` chunks
+/// into `writer` as `progress` events, emitting them concurrently with
+/// the operation rather than waiting for completion.
+///
+/// The sink ferries reports through an unbounded `mpsc` channel — its
+/// callback is synchronous (it must be — backends like
+/// [`crate::object_store::s3::S3Store`]'s multipart download fire from
+/// `JoinSet`-spawned tasks), and `mpsc::UnboundedSender::send` is the
+/// only common bridge that will not block. Bounded by chunk count —
+/// even a 100 GiB transfer at 16 MiB chunks is ~6400 events — so
+/// "unbounded" here is "one element per network chunk", not unbounded
+/// in the usual sense. Channel closes when the sink and all backend-
+/// internal clones drop, which happens exactly when the operation
+/// future returns.
+async fn with_progress_stream<W, F, Fut, R>(
+    writer: &mut W,
+    oid_raw: String,
+    op: F,
+) -> Result<R, AgentError>
+where
+    W: AsyncWrite + Unpin,
+    F: FnOnce(ProgressSink) -> Fut,
+    Fut: Future<Output = R>,
+{
+    let (tx, mut rx) = mpsc::unbounded_channel::<u64>();
+    let sink = ProgressSink::new(move |amount| {
+        // Send failure means the receiver dropped — only happens if
+        // we've already returned from this function, which can't
+        // happen while the op future is alive. Drop the error.
+        let _ = tx.send(amount);
+    });
+    let op_fut = op(sink);
+    tokio::pin!(op_fut);
+
+    let mut bytes_so_far: u64 = 0;
+    let result = loop {
+        tokio::select! {
+            biased;
+            // Drain progress events first so a backend that fires many
+            // reports between polls of `op_fut` does not get its events
+            // dropped on the floor when `op_fut` happens to be ready.
+            Some(amount) = rx.recv() => {
+                if amount == 0 {
+                    continue;
+                }
+                bytes_so_far = bytes_so_far.saturating_add(amount);
+                write_progress(writer, oid_raw.as_str(), bytes_so_far, amount).await?;
+            }
+            done = &mut op_fut => break done,
+        }
+    };
+
+    // The op future completed — its captured sink (and every backend-
+    // internal clone) is now dropped, so `tx` is closed. Drain any
+    // chunks that were enqueued between our last poll and the future
+    // returning so the user sees every byte's worth of progress.
+    while let Ok(amount) = rx.try_recv() {
+        if amount == 0 {
+            continue;
+        }
+        bytes_so_far = bytes_so_far.saturating_add(amount);
+        write_progress(writer, oid_raw.as_str(), bytes_so_far, amount).await?;
+    }
+
+    Ok(result)
 }
 
 enum UploadOutcome {
@@ -399,5 +496,107 @@ mod tests {
         let mut out = Vec::new();
         a.upload(&oid, 1, &src, &mut out).await.expect("upload");
         assert!(store.contains(&format!("lfs/{oid}")));
+    }
+
+    /// Parse an emitted progress line into `(bytesSoFar, bytesSinceLast)`.
+    /// Field order is fixed by [`ProgressEvent`]'s `Serialize` impl, so a
+    /// regex-free string scan is enough here.
+    fn parse_progress(line: &str) -> (u64, u64) {
+        let so_far = line
+            .split("\"bytesSoFar\":")
+            .nth(1)
+            .and_then(|tail| tail.split([',', '}']).next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("bytesSoFar missing: {line}"));
+        let since = line
+            .split("\"bytesSinceLast\":")
+            .nth(1)
+            .and_then(|tail| tail.split([',', '}']).next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("bytesSinceLast missing: {line}"));
+        (so_far, since)
+    }
+
+    /// When the body crosses the configured chunk threshold, the LFS
+    /// agent must emit at least two `progress` events so `git-lfs` can
+    /// render motion and detect stalls. The previous behaviour
+    /// (single end-of-transfer event) regressed the upstream Python
+    /// per-chunk semantics — see issue #44.
+    #[tokio::test]
+    async fn upload_emits_chunked_progress_for_multipart_body() {
+        let store = MockStore::new();
+        store.set_progress_chunk_size(Some(8));
+        let oid = good_oid();
+        let tmp = TempDir::new().unwrap();
+        let a = agent(store.clone(), Some("repo"), &tmp);
+
+        let src = tmp.path().join("body");
+        let body = b"abcdefghijklmnopqrstuvwxyz0123456789"; // 36 bytes
+        tokio::fs::write(&src, body).await.unwrap();
+
+        let mut out = Vec::new();
+        a.upload(&oid, body.len() as u64, &src, &mut out)
+            .await
+            .expect("upload");
+        let got = String::from_utf8(out).unwrap();
+        let progress_lines: Vec<&str> = got
+            .lines()
+            .filter(|l| l.contains("\"event\":\"progress\""))
+            .collect();
+
+        assert!(
+            progress_lines.len() >= 2,
+            "expected ≥ 2 progress events for a body of {} bytes at chunk=8: {got}",
+            body.len()
+        );
+        let mut last_so_far = 0u64;
+        for line in &progress_lines {
+            let (so_far, since) = parse_progress(line);
+            assert!(
+                so_far >= last_so_far,
+                "bytesSoFar must be monotonic non-decreasing: {got}"
+            );
+            assert!(since > 0, "bytesSinceLast must be positive: {line}");
+            last_so_far = so_far;
+        }
+        assert_eq!(
+            last_so_far,
+            body.len() as u64,
+            "final bytesSoFar must equal size: {got}"
+        );
+        assert!(store.contains(&format!("repo/lfs/{oid}")));
+    }
+
+    #[tokio::test]
+    async fn download_emits_chunked_progress_for_multipart_body() {
+        let store = MockStore::new();
+        store.set_progress_chunk_size(Some(4));
+        let oid = good_oid();
+        let body: Vec<u8> = (0u8..=20).collect(); // 21 bytes
+        store.insert(format!("repo/lfs/{oid}"), Bytes::from(body.clone()));
+        let tmp = TempDir::new().unwrap();
+        let a = agent(store, Some("repo"), &tmp);
+
+        let mut out = Vec::new();
+        a.download(&oid, body.len() as u64, &mut out)
+            .await
+            .expect("download");
+        let got = String::from_utf8(out).unwrap();
+        let progress_lines: Vec<&str> = got
+            .lines()
+            .filter(|l| l.contains("\"event\":\"progress\""))
+            .collect();
+
+        assert!(
+            progress_lines.len() >= 2,
+            "expected ≥ 2 progress events: {got}"
+        );
+        let mut last_so_far = 0u64;
+        for line in &progress_lines {
+            let (so_far, _since) = parse_progress(line);
+            assert!(so_far >= last_so_far, "monotonic: {got}");
+            last_so_far = so_far;
+        }
+        assert_eq!(last_so_far, body.len() as u64, "final equals size: {got}");
     }
 }

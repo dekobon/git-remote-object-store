@@ -33,7 +33,7 @@ use azure_core::http::Method;
 use azure_core::http::headers::{HeaderName, Headers};
 use bytes::Bytes;
 use git_remote_object_store::object_store::azure::AzureStore;
-use git_remote_object_store::object_store::{ObjectStore, ObjectStoreError, PutOpts};
+use git_remote_object_store::object_store::{GetOpts, ObjectStore, ObjectStoreError, PutOpts};
 use git_remote_object_store::url::{ENV_ALLOW_HTTP, RemoteUrl, parse};
 use sha2::{Digest, Sha256};
 use testcontainers::core::wait::HttpWaitStrategy;
@@ -461,7 +461,7 @@ async fn copy_streams_large_body_through_tempfile() {
 
     let dest = tmp.path().join("downloaded.bin");
     store
-        .get_to_file("big-dst", &dest)
+        .get_to_file("big-dst", &dest, GetOpts::default())
         .await
         .expect("get_to_file");
 
@@ -547,7 +547,7 @@ async fn get_to_file_failure_does_not_corrupt_dest() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dest: PathBuf = tmp.path().join("nope");
     let err = store
-        .get_to_file("missing-key", &dest)
+        .get_to_file("missing-key", &dest, GetOpts::default())
         .await
         .expect_err("get_to_file on missing key");
     assert!(matches!(err, ObjectStoreError::NotFound(_)));
@@ -581,7 +581,10 @@ async fn get_to_file_round_trips_streaming() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let dest = tmp.path().join("downloaded");
-    store.get_to_file("big", &dest).await.expect("get_to_file");
+    store
+        .get_to_file("big", &dest, GetOpts::default())
+        .await
+        .expect("get_to_file");
 
     let actual = {
         use std::io::Read;
@@ -615,7 +618,7 @@ async fn get_to_file_zero_byte_blob_round_trips() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dest = tmp.path().join("downloaded");
     store
-        .get_to_file("empty", &dest)
+        .get_to_file("empty", &dest, GetOpts::default())
         .await
         .expect("get_to_file empty");
     assert_eq!(std::fs::metadata(&dest).expect("metadata").len(), 0);
@@ -652,7 +655,7 @@ async fn put_path_streams_file_and_round_trips() {
 
     let dest = tmp.path().join("downloaded.bin");
     store
-        .get_to_file("streamed", &dest)
+        .get_to_file("streamed", &dest, GetOpts::default())
         .await
         .expect("get_to_file");
 
@@ -710,6 +713,7 @@ async fn put_path_with_opts_uploads_body() {
     let opts = PutOpts {
         content_disposition: Some("attachment; filename=test.txt".into()),
         user_metadata: vec![("customkey".into(), "value".into())],
+        progress: None,
     };
     store
         .put_path("meta-test", &src, opts)
