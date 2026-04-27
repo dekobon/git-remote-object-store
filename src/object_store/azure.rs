@@ -118,7 +118,7 @@ use url::Url;
 
 use crate::url::{AzureAddressing, RemoteUrl};
 
-use super::error::other_boxed;
+use super::error::{network_boxed, other_boxed};
 use super::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts, persist_temp};
 
 /// Production [`ObjectStore`] backed by `azure_storage_blob`.
@@ -230,9 +230,9 @@ fn classify(err: azure_core::Error, key: &str) -> ObjectStoreError {
         return mapped;
     }
     if matches!(err.kind(), azure_core::error::ErrorKind::Io) {
-        return ObjectStoreError::Network(Box::new(err));
+        return network_boxed(err);
     }
-    ObjectStoreError::Other(Box::new(err))
+    other_boxed(err)
 }
 
 /// Pure status-code classifier (key context, no SDK types) so unit
@@ -376,11 +376,7 @@ impl ObjectStore for AzureStore {
     async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
         let blob = self.blob_client(key);
         let result = blob.download(None).await.map_err(|e| classify(e, key))?;
-        let bytes = result
-            .body
-            .collect()
-            .await
-            .map_err(|e| ObjectStoreError::Network(Box::new(e)))?;
+        let bytes = result.body.collect().await.map_err(network_boxed)?;
         Ok(bytes)
     }
 
@@ -548,7 +544,7 @@ impl AzureStore {
             .map_err(other_boxed)?;
 
         while let Some(chunk) = result.body.next().await {
-            let bytes = chunk.map_err(|e| ObjectStoreError::Network(Box::new(e)))?;
+            let bytes = chunk.map_err(network_boxed)?;
             file.write_all(&bytes).await.map_err(other_boxed)?;
         }
         file.flush().await.map_err(other_boxed)?;

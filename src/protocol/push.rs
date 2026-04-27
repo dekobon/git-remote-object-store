@@ -22,6 +22,7 @@ use time::{Duration, OffsetDateTime};
 use tracing::{debug, warn};
 
 use crate::git::{self, GitError, RefName, RefNameError, Sha, ShaError, is_valid_ref_name};
+use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
 
 /// Default per-ref lock TTL, in seconds. Matches upstream
@@ -146,13 +147,9 @@ fn parse_push_args(args: &str) -> Result<PushSpec, PushError> {
 }
 
 /// Build the `<prefix>/<ref>/` listing prefix used by lock and bundle
-/// listings. Mirrors the no-prefix special case from
-/// [`crate::protocol::fetch::bundle_key`].
+/// listings. Empty / absent prefix collapses to a bare `<ref>/`.
 fn ref_listing_prefix(prefix: Option<&str>, remote_ref: &RefName) -> String {
-    match prefix {
-        Some(p) if !p.is_empty() => format!("{p}/{remote_ref}/"),
-        _ => format!("{remote_ref}/"),
-    }
+    keys::join(prefix.unwrap_or(""), &format!("{remote_ref}/"))
 }
 
 /// Build the bundle key for `<prefix>/<ref>/<sha>.bundle`.
@@ -172,10 +169,7 @@ fn archive_key(prefix: Option<&str>, remote_ref: &RefName) -> String {
 
 /// Build the HEAD key: `<prefix>/HEAD` (no slash when prefix is absent).
 fn head_key(prefix: Option<&str>) -> String {
-    match prefix {
-        Some(p) if !p.is_empty() => format!("{p}/HEAD"),
-        _ => "HEAD".to_owned(),
-    }
+    keys::join(prefix.unwrap_or(""), "HEAD")
 }
 
 /// Mirror upstream's `get_bundles_for_ref` filter:

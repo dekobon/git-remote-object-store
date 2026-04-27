@@ -72,6 +72,15 @@ pub(crate) fn other_boxed<E: StdError + Send + Sync + 'static>(e: E) -> ObjectSt
     ObjectStoreError::Other(Box::new(e))
 }
 
+/// Wrap any concrete `std::error::Error` into [`ObjectStoreError::Network`].
+///
+/// Replaces the open-coded `|e| ObjectStoreError::Network(Box::new(e))`
+/// closure used at every body-streaming / multipart-chunk site that
+/// surfaces a transport failure.
+pub(crate) fn network_boxed<E: StdError + Send + Sync + 'static>(e: E) -> ObjectStoreError {
+    ObjectStoreError::Network(Box::new(e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

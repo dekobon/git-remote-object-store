@@ -16,6 +16,7 @@
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::warn;
 
+use crate::keys;
 use crate::object_store::{ObjectStore, ObjectStoreError};
 
 /// Errors specific to the list path that the dispatcher converts into
@@ -112,10 +113,9 @@ async fn read_remote_head(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
 ) -> Result<Option<String>, ObjectStoreError> {
-    let key = match prefix {
-        Some(p) => format!("{p}/HEAD"),
-        None => "HEAD".to_owned(),
-    };
+    // `Some("")` collapses to "no prefix" — same shape as `None` — so a
+    // root-of-bucket repo lists `HEAD` rather than `/HEAD`.
+    let key = keys::join(prefix.unwrap_or(""), "HEAD");
     let body = match store.get_bytes(&key).await {
         Ok(body) => body,
         Err(ObjectStoreError::NotFound(_)) => return Ok(None),

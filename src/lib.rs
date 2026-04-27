@@ -8,6 +8,7 @@
 //! [upstream]: https://github.com/awslabs/git-remote-s3
 
 pub mod git;
+pub(crate) mod keys;
 pub mod lfs;
 pub mod manage;
 pub mod object_store;

@@ -28,6 +28,7 @@ use tokio::task::{JoinError, JoinSet};
 use tracing::debug;
 
 use crate::git::{self, GitError, RefName, RefNameError, Sha, ShaError};
+use crate::keys;
 use crate::object_store::{ObjectStore, ObjectStoreError};
 
 /// Maximum number of in-flight bundle fetches per batch. Matches
@@ -206,10 +207,7 @@ async fn fetch_one(
 /// leading `/` when the URL has no prefix (matches the on-bucket layout
 /// used by `list`).
 fn bundle_key(prefix: Option<&str>, ref_name: &RefName, sha: Sha) -> String {
-    match prefix {
-        Some(p) if !p.is_empty() => format!("{p}/{ref_name}/{sha}.bundle"),
-        _ => format!("{ref_name}/{sha}.bundle"),
-    }
+    keys::join(prefix.unwrap_or(""), &format!("{ref_name}/{sha}.bundle"))
 }
 
 /// Parse the payload of a `fetch <sha> <ref>` line (the bytes after the
