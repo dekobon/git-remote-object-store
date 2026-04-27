@@ -28,7 +28,7 @@ use git_remote_object_store::manage::{
     doctor::{Doctor, DoctorOpts},
 };
 use git_remote_object_store::object_store::ObjectStore;
-use git_remote_object_store::protocol::backend;
+use git_remote_object_store::protocol::backend::{self, BackendError};
 use git_remote_object_store::url::{self as remote_url, RemoteUrl};
 
 #[derive(Debug, Parser)]
@@ -114,7 +114,11 @@ fn main() -> ExitCode {
     match runtime.block_on(dispatch(cli)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("fatal: {err:#}");
+            if let Some(be) = err.chain().find_map(|e| e.downcast_ref::<BackendError>()) {
+                eprintln!("{}", backend::fatal_message(be));
+            } else {
+                eprintln!("fatal: {err:#}");
+            }
             ExitCode::FAILURE
         }
     }
@@ -190,9 +194,10 @@ async fn run_branch(target: &Target, branch: &str, action: BranchAction) -> Resu
 async fn open_target(target: &Target) -> Result<(Arc<dyn ObjectStore>, String)> {
     let url = resolve_remote(&target.remote)?;
     let prefix = url.prefix().unwrap_or_default().to_owned();
-    let store = backend::build(&url)
-        .await
-        .context("failed to build object-store backend")?;
+    // No `.context()` wrap: surface the typed `BackendError` so the
+    // catch-all in `main` can downcast and emit a single-line `fatal:`
+    // matching upstream `git-remote-s3`.
+    let store = backend::build(&url).await?;
     Ok((store, prefix))
 }
 

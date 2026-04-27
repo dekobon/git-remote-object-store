@@ -206,6 +206,26 @@ impl S3Store {
             bucket: bucket.clone(),
         })
     }
+
+    /// Verify the bucket is reachable with the configured credentials by
+    /// issuing a single `ListObjectsV2` with `max_keys=1`. Used by
+    /// [`crate::protocol::backend::build`] to fold credential / missing-bucket /
+    /// authorization failures into categorical
+    /// [`crate::protocol::backend::BackendError`] variants before the
+    /// helper REPL runs its first command. Mirrors upstream's
+    /// `S3Remote.__init__` probe at
+    /// `../git-remote-s3/git_remote_s3/remote.py:78-85`.
+    pub(crate) async fn probe(&self, prefix: &str) -> Result<(), ObjectStoreError> {
+        self.client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .max_keys(1)
+            .send()
+            .await
+            .map_err(|e| classify(e, prefix))?;
+        Ok(())
+    }
 }
 
 /// Build the `aws-sdk-s3` config from a [`ResolvedS3Config`].

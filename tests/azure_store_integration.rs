@@ -34,6 +34,7 @@ use azure_core::http::headers::{HeaderName, Headers};
 use bytes::Bytes;
 use git_remote_object_store::object_store::azure::AzureStore;
 use git_remote_object_store::object_store::{GetOpts, ObjectStore, ObjectStoreError, PutOpts};
+use git_remote_object_store::protocol::backend::{self, BackendError, BackendKind};
 use git_remote_object_store::url::{ENV_ALLOW_HTTP, RemoteUrl, parse};
 use sha2::{Digest, Sha256};
 use testcontainers::core::wait::HttpWaitStrategy;
@@ -1058,4 +1059,59 @@ async fn lfs_round_trips_upload_and_download_through_helper() {
 
     let downloaded = std::fs::read(dest.join("payload.bin")).expect("LFS payload restored");
     assert_eq!(downloaded, body, "LFS round-trip body mismatch");
+}
+
+// ---------------------------------------------------------------------------
+// Backend probe: categorical fatal-message mapping (issue #45)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn build_against_existing_container_succeeds() {
+    let _store = fresh_container().await;
+    let fixture = fixture();
+    // Re-derive the URL the same way `fresh_container` does, so the
+    // probe runs through the public `backend::build` entrypoint.
+    let n = CONTAINER_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let container = format!("test-probe-ok-{}-{}", std::process::id(), n);
+    create_container(fixture.port, &container).await;
+    let url_str = format!(
+        "az+http://127.0.0.1:{port}/{TEST_ACCOUNT}/{container}\
+         ?addressing=path&credential={alias}",
+        port = fixture.port,
+        alias = CREDENTIAL_ALIAS,
+    );
+    let url = parse(&url_str).expect("URL parses");
+    backend::build(&url)
+        .await
+        .expect("probe against existing empty container succeeds");
+}
+
+#[tokio::test]
+async fn build_against_missing_container_returns_bucket_not_found() {
+    let fixture = fixture();
+    let n = CONTAINER_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let container = format!("missing-{}-{}", std::process::id(), n);
+    let url_str = format!(
+        "az+http://127.0.0.1:{port}/{TEST_ACCOUNT}/{container}\
+         ?addressing=path&credential={alias}",
+        port = fixture.port,
+        alias = CREDENTIAL_ALIAS,
+    );
+    let url = parse(&url_str).expect("URL parses");
+
+    let Err(err) = backend::build(&url).await else {
+        panic!("missing container must error");
+    };
+    let BackendError::BucketNotFound { kind, name } = err else {
+        panic!("expected BucketNotFound, got {err:?}");
+    };
+    assert_eq!(kind, BackendKind::Azure);
+    assert_eq!(name, container);
+    assert_eq!(
+        backend::fatal_message(&BackendError::BucketNotFound {
+            kind: BackendKind::Azure,
+            name: container.clone(),
+        }),
+        format!("fatal: container not found {container}"),
+    );
 }

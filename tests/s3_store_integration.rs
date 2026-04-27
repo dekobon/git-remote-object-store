@@ -33,6 +33,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 use git_remote_object_store::object_store::s3::S3Store;
 use git_remote_object_store::object_store::{GetOpts, ObjectStore, ObjectStoreError, PutOpts};
+use git_remote_object_store::protocol::backend::{self, BackendError, BackendKind};
 use git_remote_object_store::url::{ENV_ALLOW_HTTP, RemoteUrl, parse};
 use sha2::{Digest, Sha256};
 use testcontainers::core::wait::HttpWaitStrategy;
@@ -905,4 +906,52 @@ async fn lfs_round_trips_upload_and_download_through_helper() {
 
     let downloaded = std::fs::read(dest.join("payload.bin")).expect("LFS payload restored");
     assert_eq!(downloaded, body, "LFS round-trip body mismatch");
+}
+
+// ---------------------------------------------------------------------------
+// Backend probe: categorical fatal-message mapping (issue #45)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn build_against_existing_bucket_succeeds() {
+    // Sanity guard: an empty but real bucket must pass the eager probe
+    // (regression check against false positives from the listing call).
+    let (_store, bucket) = fresh_bucket().await;
+    let fixture = fixture();
+    let url_str = format!(
+        "s3+http://127.0.0.1:{port}/{bucket}/repo?addressing=path",
+        port = fixture.port,
+    );
+    let url = parse(&url_str).expect("URL parses");
+    backend::build(&url)
+        .await
+        .expect("probe against existing empty bucket succeeds");
+}
+
+#[tokio::test]
+async fn build_against_missing_bucket_returns_bucket_not_found() {
+    let fixture = fixture();
+    let n = BUCKET_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let bucket = format!("missing-{}-{}", std::process::id(), n);
+    let url_str = format!(
+        "s3+http://127.0.0.1:{port}/{bucket}/repo?addressing=path",
+        port = fixture.port,
+    );
+    let url = parse(&url_str).expect("URL parses");
+
+    let Err(err) = backend::build(&url).await else {
+        panic!("missing bucket must error");
+    };
+    let BackendError::BucketNotFound { kind, name } = err else {
+        panic!("expected BucketNotFound, got {err:?}");
+    };
+    assert_eq!(kind, BackendKind::S3);
+    assert_eq!(name, bucket);
+    assert_eq!(
+        backend::fatal_message(&BackendError::BucketNotFound {
+            kind: BackendKind::S3,
+            name: bucket.clone(),
+        }),
+        format!("fatal: bucket not found {bucket}"),
+    );
 }
