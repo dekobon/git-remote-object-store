@@ -525,6 +525,12 @@ impl ObjectStore for S3Store {
         // does not auto-switch to multipart (that requires the separate
         // `aws-s3-transfer-manager` crate). Bundles well below 5 GiB;
         // LFS phase may need a multipart wrapper.
+        //
+        // The Azure backend streams via `FileStream` →
+        // `Body::SeekableStream` → `stage_block` + `commit_block_list`
+        // (see `azure.rs` `put_path`), giving cross-backend parity on
+        // the memory bound for large LFS / bundle uploads (issue #21
+        // closed for S3, issue #42 for Azure).
         let stream = ByteStream::from_path(src).await.map_err(other_boxed)?;
         self.put_body(key, stream, opts).await
     }

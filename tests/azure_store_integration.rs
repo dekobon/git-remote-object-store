@@ -487,6 +487,109 @@ async fn get_to_file_zero_byte_blob_round_trips() {
     assert_eq!(std::fs::metadata(&dest).expect("metadata").len(), 0);
 }
 
+#[tokio::test]
+async fn put_path_streams_file_and_round_trips() {
+    let store = fresh_container().await;
+
+    // 32 MiB payload — well past the SDK's 4 MiB default partition size
+    // so this exercises the `stage_block` + `commit_block_list` route
+    // rather than the single-shot `Put Blob` path. A regression to the
+    // trait's default `read-then-put_bytes` shim would still pass byte
+    // identity, but the streaming property is the contract issue #42
+    // restores; this test guards round-trip correctness for the
+    // streaming code path.
+    let size: usize = 32 * 1024 * 1024;
+    let mut payload = vec![0u8; size];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = u8::try_from(i.wrapping_mul(2_654_435_761) & 0xff).unwrap_or(0);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(&payload);
+    let expected_hash = hasher.finalize();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("big-upload.bin");
+    tokio::fs::write(&src, &payload).await.expect("write src");
+
+    store
+        .put_path("streamed", &src, PutOpts::default())
+        .await
+        .expect("put_path");
+
+    let dest = tmp.path().join("downloaded.bin");
+    store
+        .get_to_file("streamed", &dest)
+        .await
+        .expect("get_to_file");
+
+    let actual_hash = {
+        use std::io::Read;
+        let mut file = std::fs::File::open(&dest).expect("open downloaded");
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = file.read(&mut buf).expect("read");
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        hasher.finalize()
+    };
+    assert_eq!(
+        actual_hash, expected_hash,
+        "put_path → get_to_file round-trip corrupted body"
+    );
+    assert_eq!(
+        std::fs::metadata(&dest).expect("metadata").len(),
+        size as u64,
+    );
+}
+
+#[tokio::test]
+async fn put_path_with_opts_uploads_body() {
+    let store = fresh_container().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("small.txt");
+    tokio::fs::write(&src, b"hello via path")
+        .await
+        .expect("write src");
+
+    // Azure metadata names must be valid C# identifiers (no
+    // hyphens), unlike S3's `x-amz-meta-*` style. `customkey` is
+    // accepted by Azurite and the production endpoint alike.
+    let opts = PutOpts {
+        content_disposition: Some("attachment; filename=test.txt".into()),
+        user_metadata: vec![("customkey".into(), "value".into())],
+    };
+    store
+        .put_path("meta-test", &src, opts)
+        .await
+        .expect("put_path");
+
+    let body = store.get_bytes("meta-test").await.expect("get_bytes");
+    assert_eq!(&body[..], b"hello via path");
+}
+
+#[tokio::test]
+async fn put_path_zero_byte_file_round_trips() {
+    // Empty file: must not break the streaming path. The SDK's
+    // `upload` short-circuits to the oneshot `Put Blob` when content
+    // length <= partition size, including length = 0.
+    let store = fresh_container().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("empty.bin");
+    tokio::fs::write(&src, b"").await.expect("write empty src");
+
+    store
+        .put_path("empty-stream", &src, PutOpts::default())
+        .await
+        .expect("put_path empty");
+
+    let body = store.get_bytes("empty-stream").await.expect("get_bytes");
+    assert_eq!(body.len(), 0);
+}
+
 // ---------------------------------------------------------------------------
 // End-to-end binary tests (Phase 12)
 //
