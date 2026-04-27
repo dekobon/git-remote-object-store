@@ -91,6 +91,7 @@ use azure_storage_blob::models::{
     BlobClientDeleteOptions, BlobClientDownloadOptions, BlobClientGetPropertiesOptions,
     BlobContainerClientListBlobsOptions,
 };
+use azure_storage_blob::stream::tokio::FileStream;
 use bytes::Bytes;
 use futures::StreamExt;
 use tempfile::NamedTempFile;
@@ -362,6 +363,38 @@ impl ObjectStore for AzureBlobStore {
         let blob = self.blob_client(key);
         let upload_opts = upload_options_from(opts);
         blob.upload(bytes_to_request_content(body), Some(upload_opts))
+            .await
+            .map_err(|e| classify(e, key))?;
+        Ok(())
+    }
+
+    /// Stream a local file to `key` without buffering its full body.
+    ///
+    /// Mirrors `S3Store::put_path`'s streaming guarantee (issue #21):
+    /// memory usage stays bounded by the SDK's per-block buffer
+    /// (`partition_size`, default 4 MiB) regardless of file size.
+    ///
+    /// Implementation: wrap `tokio::fs::File` in
+    /// [`FileStream`] so the body is delivered as
+    /// `Body::SeekableStream`. `BlockBlobClient::upload` then routes
+    /// large bodies through `stage_block` + `commit_block_list` (one
+    /// request per partition; up to 50000 blocks per blob, ample for
+    /// LFS / bundle sizes), while files smaller than one partition
+    /// take a single `Put Blob` round trip — same wire shape as
+    /// `put_bytes`. Auth (shared-key / SAS / token) is unchanged
+    /// because the per-try signing policy reads `request.body().len()`,
+    /// which `SeekableStream` reports faithfully via `len()`.
+    async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), Error> {
+        let file = tokio::fs::File::open(src).await.map_err(other_boxed)?;
+        let stream = FileStream::builder(file)
+            .build()
+            .await
+            .map_err(other_boxed)?;
+        let body: azure_core::http::Body = stream.into();
+
+        let blob = self.blob_client(key);
+        let upload_opts = upload_options_from(opts);
+        blob.upload(body.into(), Some(upload_opts))
             .await
             .map_err(|e| classify(e, key))?;
         Ok(())
