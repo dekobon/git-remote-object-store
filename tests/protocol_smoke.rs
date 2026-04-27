@@ -255,6 +255,37 @@ async fn option_verbosity_one_responds_unsupported() {
 }
 
 #[tokio::test]
+async fn option_verbosity_three_responds_ok() {
+    // Git may send any non-negative integer for `option verbosity`; the
+    // handler treats `n >= 2` as the "info" threshold, so 3, 4, … must
+    // all behave identically to 2 (`ok\n`). Pinning this prevents a
+    // future refactor from accidentally tightening the predicate to
+    // `== 2`, which would silently break high-verbosity invocations.
+    let (out, result) = drive(
+        s3_url(Some("repo")),
+        Arc::new(MockStore::new()),
+        "option verbosity 3\n",
+    )
+    .await;
+    result.expect("option should succeed");
+    assert_eq!(&out, b"ok\n");
+}
+
+#[tokio::test]
+async fn option_verbosity_four_responds_ok() {
+    // Same threshold as `verbosity 3` — covers a second value above the
+    // boundary so the test isn't married to the exact number 3.
+    let (out, result) = drive(
+        s3_url(Some("repo")),
+        Arc::new(MockStore::new()),
+        "option verbosity 4\n",
+    )
+    .await;
+    result.expect("option should succeed");
+    assert_eq!(&out, b"ok\n");
+}
+
+#[tokio::test]
 async fn option_unknown_key_responds_unsupported() {
     let (out, result) = drive(
         s3_url(Some("repo")),

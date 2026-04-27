@@ -4,4 +4,7 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc bdd6a1cb60ab4d602b0da9f9a81b581ff349a5d00282ce829cf96cf37147306d # shrinks to bucket = "0.a", prefix = None, zip = false
+#
+# Note: a previous seed shrinking to `bucket = "0.a"` was removed when
+# `arb_bucket()` was tightened to exclude `.` — that input is now
+# unreachable from any current strategy, so the seed was a dead replay.
