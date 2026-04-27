@@ -558,7 +558,7 @@ mod tests {
     #[tokio::test]
     async fn copy_replicates_body_and_metadata_with_fresh_timestamp() {
         let store = MockStore::new();
-        let src_time = OffsetDateTime::now_utc() - Duration::from_secs(60);
+        let src_time = OffsetDateTime::now_utc() - Duration::from_mins(1);
         store.insert_with(
             "src",
             body(b"payload"),
@@ -654,7 +654,7 @@ mod tests {
     #[tokio::test]
     async fn insert_with_back_dates_last_modified() {
         let store = MockStore::new();
-        let then = OffsetDateTime::now_utc() - Duration::from_secs(300);
+        let then = OffsetDateTime::now_utc() - Duration::from_mins(5);
         store.insert_with("LOCK", body(b""), then, PutOpts::default());
         let meta = store.head("LOCK").await.unwrap();
         assert_eq!(meta.last_modified, then);

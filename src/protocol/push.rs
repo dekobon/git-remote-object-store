@@ -511,7 +511,7 @@ async fn push_one(
         Err(GitProbeError::NotAncestor) => {
             return Ok(PushOutcome::Error {
                 remote_ref: remote_ref_str,
-                message: format!(r#""remote ref is not ancestor of {local_spec}."?"#,),
+                message: format!(r#""remote ref is not ancestor of {local_spec}."?"#),
             });
         }
     };
