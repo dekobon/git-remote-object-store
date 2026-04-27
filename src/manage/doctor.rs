@@ -168,12 +168,13 @@ impl<'a> Doctor<'a> {
         );
 
         // The caller filtered for refs with `bundles.len() > 1`; if the
-        // map shape changed in between, that's a programming error worth
-        // surfacing rather than papering over.
-        let ref_entry = snapshot
-            .refs
-            .get_mut(ref_path)
-            .expect("fix_multiple_bundles called with ref absent from snapshot");
+        // map shape changed in between, surface a structured internal
+        // error rather than aborting the process.
+        let ref_entry = snapshot.refs.get_mut(ref_path).ok_or_else(|| {
+            ManageError::Internal(format!(
+                "fix_multiple_bundles called with ref {ref_path} absent from snapshot"
+            ))
+        })?;
 
         let labels: Vec<String> = ref_entry
             .bundles
@@ -184,12 +185,17 @@ impl<'a> Doctor<'a> {
         let keep_idx = self.prompter.select("Choose the bundle to keep", &labels)?;
         // `dialoguer::Select` validates the index against the option count
         // before returning, so out-of-range here means a test prompter
-        // queued an invalid script — surface loudly instead of silently
-        // mapping to `Cancelled`.
+        // queued an invalid script. Propagate as a structured internal
+        // error so the helper doesn't abort the whole run.
         let keeper_sha = ref_entry
             .bundles
             .get(keep_idx)
-            .expect("Prompter::select returned out-of-range index")
+            .ok_or_else(|| {
+                ManageError::Internal(format!(
+                    "prompter returned out-of-range index {keep_idx} for {} bundle(s)",
+                    ref_entry.bundles.len()
+                ))
+            })?
             .sha
             .clone();
 
@@ -265,11 +271,17 @@ impl<'a> Doctor<'a> {
             .select("Choose the new HEAD branch", &labels)?;
         // `dialoguer::Select` cannot return an out-of-range index; an
         // out-of-range answer here is a test-script bug (see
-        // `fix_multiple_bundles`).
+        // `fix_multiple_bundles`). Surface as a structured internal
+        // error rather than aborting the process.
         let new_head = candidates
             .get(chosen)
             .copied()
-            .expect("Prompter::select returned out-of-range index")
+            .ok_or_else(|| {
+                ManageError::Internal(format!(
+                    "prompter returned out-of-range index {chosen} for {} HEAD candidate(s)",
+                    candidates.len()
+                ))
+            })?
             .to_owned();
 
         let head_key = key_under_prefix(&self.prefix, "HEAD");
@@ -433,6 +445,29 @@ mod tests {
         doctor.run().await.expect("user-no should not error");
         assert!(mock.contains("myrepo/refs/heads/main/aaa.bundle"));
         assert!(mock.contains("myrepo/refs/heads/main/bbb.bundle"));
+    }
+
+    #[tokio::test]
+    async fn fix_multiple_bundles_out_of_range_select_returns_internal_error() {
+        // A scripted prompter that returns an out-of-range index used to
+        // panic the process via `expect`. The defensive path now returns
+        // a structured `ManageError::Internal` so the helper / management
+        // CLI can surface the bug without aborting (issue #33).
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("myrepo/refs/heads/main/aaa.bundle", Bytes::from("a"));
+        mock.insert("myrepo/refs/heads/main/bbb.bundle", Bytes::from("b"));
+        // Two bundles → valid indices are 0 and 1; 99 is out of range.
+        let prompter = ScriptedPrompter::new([Answer::Select(99)]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let err = doctor
+            .run()
+            .await
+            .expect_err("out-of-range index propagates");
+        assert!(
+            matches!(err, ManageError::Internal(ref msg) if msg.contains("out-of-range")),
+            "expected ManageError::Internal, got {err:?}",
+        );
     }
 
     #[tokio::test]

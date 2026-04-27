@@ -765,11 +765,20 @@ impl S3Store {
 
         // All spawned tasks have been joined above — each task's
         // captured `Arc` clone was dropped when its closure
-        // completed, so this is the only outstanding reference.
-        let mut file = Arc::try_unwrap(file)
-            .expect("file Arc is unique after the JoinSet::join_next loop drains")
-            .into_inner();
-        file.flush().await.map_err(other_boxed)?;
+        // completed, so this is the only outstanding reference. If
+        // some future refactor accidentally leaks a clone, surface a
+        // structured error rather than aborting the process: flush via
+        // the `Mutex` instead of taking sole ownership.
+        match Arc::try_unwrap(file) {
+            Ok(mutex) => {
+                let mut f = mutex.into_inner();
+                f.flush().await.map_err(other_boxed)?;
+            }
+            Err(shared) => {
+                let mut f = shared.lock().await;
+                f.flush().await.map_err(other_boxed)?;
+            }
+        }
         Ok(())
     }
 }
