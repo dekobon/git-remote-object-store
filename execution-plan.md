@@ -493,7 +493,7 @@ on top of `gix`:
   `gix::revision::merge_base` / `is_ancestor` helpers.
 - `archive(folder, ref) -> PathBuf` (zip archive) —
   `gix-archive` (zip writer).
-- `validate_ref_name(name) -> bool` — `gix-validate::reference::name`.
+- `is_valid_ref_name(name) -> bool` — `gix-validate::reference::name`.
 - `last_commit_message() -> String` — `gix::Repository::head_commit`.
 - `remote_url(remote_name) -> String` — read from
   `gix::Repository::config_snapshot` / `remote_url`.
@@ -787,7 +787,7 @@ Both backends therefore satisfy `ObjectStore::get_to_file` with
 parallelism, but the implementation strategies differ — that's
 intentional, not an oversight.
 
-### 5.4 `validate_ref_name` correctness
+### 5.4 `is_valid_ref_name` correctness
 
 The upstream regex at `git_remote_s3/git.py:130` is a partial
 implementation of git's ref-name rules. Port it byte-for-byte for
