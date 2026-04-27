@@ -46,6 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inheriting from the trait's read-then-`put_bytes` default. Memory
   is bounded by `parallel × partition_size` (≈16 MiB by default)
   regardless of file size. (#42)
+- `protocol::list::read_remote_head` now treats `Some("")` as a
+  no-prefix repository, matching the rest of the helper. The previous
+  inline `match` produced a `/HEAD` key for root-of-bucket remotes
+  whose prefix parsed as the empty string, which never resolved
+  on the wire.
 
 ### Changed
 
@@ -76,6 +81,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Renamed `git::validate_ref_name` to `is_valid_ref_name` so the
   `bool`-returning predicate carries the `is_*` prefix per the
   project naming rules. (#41)
+- Hoisted the empty-prefix key builder out of `manage` into a new
+  `crate::keys` module so the protocol, LFS, and management layers
+  all share one source of truth for `<prefix>/<suffix>` joining.
+  Five sites (`push.rs`, `fetch.rs`, `list.rs`, `lfs/agent.rs`, plus
+  three management call sites) previously open-coded the same
+  empty-prefix `match`. Added `network_boxed` next to `other_boxed`
+  in `object_store::error` so the seven open-coded
+  `|e| ObjectStoreError::Network(Box::new(e))` closures collapse to
+  function pointers.
 
 ### Tests
 
@@ -88,9 +102,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   added end-to-end S3 helper-binary coverage modeled on the
   existing Azure pattern (push / clone / fetch / LFS), and pinned
   `option verbosity` behaviour for `n >= 2`. (#35)
+- Strengthened three tests surfaced by the audit-tests pass:
+  `pre_lock_multi_bundle_rejection_surfaces_unchanged` now pins the
+  byte-exact wire bytes (the loose `contains("multiple bundles")`
+  would not have caught the missing `?` that #34 fixed); added
+  `fix_head_out_of_range_select_returns_internal_error` to cover
+  the HEAD-candidate `ManageError::Internal` branch that was
+  structurally identical to the bundle-index branch but lacked
+  coverage; and the Azure `put_path_with_opts_uploads_body` test
+  now verifies `content_disposition` and `x-ms-meta-*` propagate on
+  the wire via a signed HEAD, mirroring its S3 sibling.
 
 ### Documentation
 
+- Clarified the `ObjectStore::copy` trait contract: the body is
+  preserved on every backend, but user-metadata propagation is
+  best-effort. `S3Store::copy` (server-side `CopyObject`) does
+  propagate it; `AzureStore::copy` (download-then-upload, since
+  `azure_storage_blob` 0.12 does not ergonomically expose `Copy
+  Blob` with shared-key auth) currently drops it. Callers must not
+  depend on metadata round-tripping through `copy`.
 - Removed the stale "Azure backend wired in Phase 11 — until then
   the REPL exits early with a 'not yet implemented' error" note
   from both Azure helper shim binaries; the wrappers now describe
