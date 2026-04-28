@@ -9,7 +9,7 @@ doc-valid-idents = ["S3", "Azure", "DoS", "RustFS", ".."]
 # LFS agent legitimately write to stdout — both files carry an explicit
 # `#![allow(clippy::disallowed_macros)]`.
 disallowed-macros = [
-    { path = "std::println", reason = "stdout is the wire protocol; use tracing or eprintln" },
-    { path = "std::print",   reason = "stdout is the wire protocol; use tracing or eprintln" },
-    { path = "std::dbg",     reason = "stdout is the wire protocol; use tracing::debug" },
+  { path = "std::println", reason = "stdout is the wire protocol; use tracing or eprintln" },
+  { path = "std::print", reason = "stdout is the wire protocol; use tracing or eprintln" },
+  { path = "std::dbg", reason = "stdout is the wire protocol; use tracing::debug" },
 ]

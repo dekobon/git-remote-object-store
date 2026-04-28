@@ -43,14 +43,14 @@ async-trait = "0.1"
 
 # Async runtime
 tokio = { version = "1", features = [
-    "rt-multi-thread",
-    "macros",
-    "fs",
-    "io-std",
-    "io-util",
-    "process",
-    "signal",
-    "time",
+  "rt-multi-thread",
+  "macros",
+  "fs",
+  "io-std",
+  "io-util",
+  "process",
+  "signal",
+  "time",
 ] }
 
 # Errors
@@ -121,10 +121,10 @@ tempfile = "3"
 # and re-enable everything except the legacy `rustls` feature.
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = { version = "1", default-features = false, features = [
-    "sigv4a",
-    "http-1x",
-    "default-https-client",
-    "rt-tokio",
+  "sigv4a",
+  "http-1x",
+  "default-https-client",
+  "rt-tokio",
 ] }
 
 # Direct dep on the smithy HTTP client so `S3Store::from_remote_url`
@@ -186,8 +186,8 @@ base64 = "0.22"
 # enables on its own `reqwest` dep, so no decompression/streaming
 # capability is lost.
 reqwest = { version = "0.13", default-features = false, features = [
-    "http2",
-    "rustls",
+  "http2",
+  "rustls",
 ] }
 
 [dev-dependencies]
@@ -210,7 +210,10 @@ proptest = "1"
 # The fixture uses `testcontainers::GenericImage` directly with a pinned
 # RustFS tag rather than `testcontainers-modules`, which hardcodes `:latest`
 # and would silently drift across alpha releases.
-testcontainers = { version = "0.27", features = ["blocking", "http_wait_plain"] }
+testcontainers = { version = "0.27", features = [
+  "blocking",
+  "http_wait_plain",
+] }
 
 # Note: `reqwest` is a regular dependency (above) — used in production
 # by the Azure backend's transport tuning (#26 / #28) and reused here by
