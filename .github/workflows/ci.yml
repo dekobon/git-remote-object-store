@@ -1,88 +1,289 @@
+# CI workflow
+#
+# Jobs:
+#   1. commitsar         - validates commit messages against conventional commits
+#   2. ci                - formatting checks (no auto-fix), linting, tests, build
+#   3. integration-s3    - S3 backend integration tests via testcontainers (RustFS)
+#   4. integration-azure - Azure Blob backend integration tests via testcontainers
+#                          (Azurite)
+#
+# Tool versions are pinned in the env section below. Updating a version
+# automatically invalidates the binary cache.
+#
+# See docs/development/ci.md for details, caching strategy, and troubleshooting.
 name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
-    branches: [main]
+
+# Cancel in-progress runs for the same branch/PR. Prevents duplicate work
+# when a push event and pull_request event both fire for the same commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+# Default to read-only for the workflow; jobs that need to post check runs
+# (dorny/test-reporter) opt in to `checks: write` per-job below.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # MSRV — keep in sync with `rust-version` in Cargo.toml.
+  RUST_TOOLCHAIN: "1.94.0"
+  # Pinned tool versions -- update here to roll forward.
+  COMMITSAR_VERSION: "1.0.3"
+  CARGO_DENY_VERSION: "0.18.4"
+  SHELLSPEC_VERSION: "0.28.1"
+  MARKDOWNLINT_CLI2_VERSION: "0.21.0"
+  TAPLO_VERSION: "0.10.0"
+  # taplo pre-built binary checksum (taplo-linux-x86_64.gz)
+  TAPLO_SHA256_X86_64: "8fe196b894ccf9072f98d4e1013a180306e17d244830b03986ee5e8eabeb6156"
+  SHFMT_VERSION: "3.13.0"
+  # shfmt pre-built binary checksum (shfmt_v{ver}_linux_amd64)
+  SHFMT_SHA256_AMD64: "70aa99784703a8d6569bbf0b1e43e1a91906a4166bf1a79de42050a6d0de7551"
+  CHECKMAKE_VERSION: "0.3.2"
+  # checkmake pre-built binary checksum (checkmake-v{ver}.linux.amd64)
+  CHECKMAKE_SHA256_AMD64: "e2effb876913f3ee2caef0ba35f6202c5e8a3cd55a077d8d2b9ce2034257b6af"
 
 jobs:
-  fmt:
-    name: cargo fmt --check
+  # -------------------------------------------------------------------
+  # Job 1: Validate commit messages against conventional commits spec
+  #
+  # Uses a pre-built binary instead of the Docker action to avoid a
+  # full Go compilation (~30-60s) on every run.
+  # -------------------------------------------------------------------
+  commitsar:
+    name: Commit Messages
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
+          fetch-depth: 0 # Full history for commit validation
 
-  clippy:
-    name: cargo clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache commitsar
+        id: cache-commitsar
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+          path: ~/.local/bin/commitsar
+          key: commitsar-${{ env.COMMITSAR_VERSION }}-linux-amd64
 
-  test:
-    name: cargo test
+      - name: Install commitsar
+        if: steps.cache-commitsar.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.local/bin
+          curl -fsSL \
+            "https://github.com/aevea/commitsar/releases/download/v${COMMITSAR_VERSION}/commitsar_${COMMITSAR_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz -C ~/.local/bin commitsar
+          chmod +x ~/.local/bin/commitsar
+
+      - name: Validate conventional commits
+        run: ~/.local/bin/commitsar
+
+  # -------------------------------------------------------------------
+  # Job 2: Format checks, linting, tests, build verification.
+  #
+  # Wires up `make _ci-*` targets so local `make ci` matches the CI
+  # pipeline byte-for-byte.
+  # -------------------------------------------------------------------
+  ci:
+    name: Build & Test
     runs-on: ubuntu-latest
+    # `dorny/test-reporter` posts a check run with the shellspec results.
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-targets
-      - run: cargo test --workspace --doc
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Install Ubuntu dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck jq
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+          # Built-in caching via Swatinem/rust-cache handles ~/.cargo
+          # registry/git, target/, and (with cache-bin: true) ~/.cargo/bin
+          # so `cargo install cargo-deny` is restored across runs.
+          cache-key: ci
+          cache-bin: "true"
+
+      - name: Cache CI tools
+        id: cache-tools
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.local/bin
+            ~/.local/lib/shellspec
+            ~/.npm-global
+          # Include runner.os + runner.arch so a future macOS or arm64
+          # runner does not silently restore wrong-platform binaries.
+          key: >-
+            ${{ runner.os }}-${{ runner.arch }}-ci-tools-taplo-${{ env.TAPLO_VERSION }}-shfmt-${{ env.SHFMT_VERSION }}-shellspec-${{ env.SHELLSPEC_VERSION }}-mdlint-${{ env.MARKDOWNLINT_CLI2_VERSION }}-checkmake-${{ env.CHECKMAKE_VERSION }}
+
+      - name: Add tool directories to PATH
+        run: |
+          {
+            echo "$HOME/.local/bin"
+            echo "$HOME/.npm-global/bin"
+          } >> "$GITHUB_PATH"
+
+      # cargo-deny is cached automatically by the Rust toolchain action
+      # (Swatinem/rust-cache covers ~/.cargo/bin). cargo install skips
+      # work if the binary is already present at the requested version.
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version ${{ env.CARGO_DENY_VERSION }} --locked
+
+      - name: Install taplo
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.local/bin
+          curl -fsSL -o /tmp/taplo.gz \
+            "https://github.com/tamasfe/taplo/releases/download/${TAPLO_VERSION}/taplo-linux-x86_64.gz"
+          echo "${TAPLO_SHA256_X86_64}  /tmp/taplo.gz" | sha256sum --check
+          gunzip /tmp/taplo.gz
+          chmod +x /tmp/taplo
+          mv /tmp/taplo ~/.local/bin/taplo
+
+      - name: Install shfmt
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.local/bin
+          curl -fsSL -o "$HOME/.local/bin/shfmt" \
+            "https://github.com/mvdan/sh/releases/download/v${SHFMT_VERSION}/shfmt_v${SHFMT_VERSION}_linux_amd64"
+          echo "${SHFMT_SHA256_AMD64}  $HOME/.local/bin/shfmt" | sha256sum --check
+          chmod +x "$HOME/.local/bin/shfmt"
+
+      - name: Install checkmake
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.local/bin
+          curl -fsSL -o "$HOME/.local/bin/checkmake" \
+            "https://github.com/checkmake/checkmake/releases/download/v${CHECKMAKE_VERSION}/checkmake-v${CHECKMAKE_VERSION}.linux.amd64"
+          echo "${CHECKMAKE_SHA256_AMD64}  $HOME/.local/bin/checkmake" | sha256sum --check
+          chmod +x "$HOME/.local/bin/checkmake"
+
+      - name: Install shellspec
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL "https://github.com/shellspec/shellspec/raw/${SHELLSPEC_VERSION}/install.sh" \
+            | sh -s "${SHELLSPEC_VERSION}" --yes
+
+      - name: Install markdownlint-cli2
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        run: |
+          npm config set prefix ~/.npm-global
+          npm install -g "markdownlint-cli2@${MARKDOWNLINT_CLI2_VERSION}"
+
+      - name: Verify tools
+        run: make check-tools
+
+      # -- Formatting checks (must pass before lint/check steps) ----
+      - name: Check formatting
+        run: make _ci-fmt-check
+
+      # -- Independent lint/check steps (sequential for UI visibility) ----
+      - name: Clippy
+        run: make _ci-clippy
+
+      - name: ShellCheck
+        run: make _ci-shellcheck
+
+      - name: Markdown lint
+        run: make _ci-markdown-check
+
+      - name: TOML lint
+        run: make _ci-toml-lint
+
+      - name: Makefile lint
+        run: make _ci-makefile-check
+
+      - name: cargo-deny
+        run: make _ci-deny
+
+      - name: Run Rust tests
+        id: rust-tests
+        continue-on-error: true
+        run: make _ci-test
+
+      - name: Build binaries
+        id: build
+        run: make _ci-build
+
+      - name: Run ShellSpec tests
+        id: shellspec-tests
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: make _ci-shellspec
+
+      - name: ShellSpec test results
+        uses: dorny/test-reporter@3eeb9fc888e82e8be2fb356bbeec2750231672bc # v1
+        if: always() && (steps.shellspec-tests.outcome == 'success' || steps.shellspec-tests.outcome == 'failure')
+        with:
+          name: ShellSpec Tests
+          path: reports/results_junit.xml
+          reporter: java-junit
+          fail-on-error: true
+          max-annotations: 10
+
+      # Safety net: fail the job if any test step failed.
+      - name: Fail on test failures
+        if: always()
+        run: |
+          if [ "${{ steps.rust-tests.outcome }}" = "failure" ] || \
+             [ "${{ steps.shellspec-tests.outcome }}" = "failure" ]; then
+            echo "::error::One or more test steps failed"
+            exit 1
+          fi
+
+  # -------------------------------------------------------------------
+  # Job 3: S3 backend integration tests
+  #
+  # testcontainers spins up a RustFS (S3-compatible) container per test
+  # binary. Docker is preinstalled on ubuntu-latest runners.
+  # -------------------------------------------------------------------
   integration-s3:
-    name: cargo test --features integration-s3 (RustFS)
+    name: Integration (S3 / RustFS)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --features integration-s3 --test s3_store_integration
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          cache-key: integration-s3
+
+      - name: Run S3 integration tests
+        run: cargo test --workspace --features integration-s3 --test s3_store_integration
+
+  # -------------------------------------------------------------------
+  # Job 4: Azure Blob backend integration tests
+  #
+  # testcontainers spins up an Azurite emulator container per test binary.
+  # -------------------------------------------------------------------
   integration-azure:
-    name: cargo test --features integration-azure (Azurite)
+    name: Integration (Azure / Azurite)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --features integration-azure --test azure_store_integration
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-  msrv:
-    name: cargo build (MSRV 1.94)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --all-targets
-
-  deny:
-    name: cargo deny
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1
         with:
-          command: check advisories bans licenses sources
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          cache-key: integration-azure
 
-  markdownlint:
-    name: markdownlint-cli2
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: DavidAnson/markdownlint-cli2-action@v18
-        with:
-          globs: '**/*.md'
+      - name: Run Azure integration tests
+        run: cargo test --workspace --features integration-azure --test azure_store_integration
