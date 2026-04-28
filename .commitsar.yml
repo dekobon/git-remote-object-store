@@ -1,0 +1,5 @@
+version: 1
+verbose: false
+
+commits:
+  upstreamBranch: origin/main
