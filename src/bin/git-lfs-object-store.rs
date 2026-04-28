@@ -49,17 +49,17 @@ async fn run(subcommand: Option<&str>) -> anyhow::Result<()> {
 
     match subcommand {
         Some("install") => {
-            install(&cwd).await.context("install failed")?;
+            install(&cwd).context("install failed")?;
             print_subcommand_ack(&format!("{} installed", lfs::AGENT_NAME));
             Ok(())
         }
         Some("enable-debug") => {
-            enable_debug(&cwd).await.context("enable-debug failed")?;
+            enable_debug(&cwd).context("enable-debug failed")?;
             print_subcommand_ack("debug enabled");
             Ok(())
         }
         Some("disable-debug") => {
-            disable_debug(&cwd).await.context("disable-debug failed")?;
+            disable_debug(&cwd).context("disable-debug failed")?;
             print_subcommand_ack("debug disabled");
             Ok(())
         }
