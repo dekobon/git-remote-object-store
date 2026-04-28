@@ -96,13 +96,24 @@
 //! rotated VIP would hang an in-flight request until the OS-level TCP
 //! retransmit timeout fires (~15 minutes on Linux). [`AzureStore`]
 //! installs a custom [`reqwest::Client`] via [`Transport`] on
-//! [`ClientOptions::transport`] with [`POOL_IDLE_TIMEOUT`] and
-//! [`TCP_KEEPALIVE`] bounded to 30 s, so a rotation costs at most one
-//! short-circuited request rather than minutes of wedged transfer. The
-//! custom transport leaves [`ClientOptions::per_try_policies`] (where
-//! the shared-key signing lives) untouched — the SDK pipeline runs
-//! per-try policies independently of the transport. Tracking
-//! issue: #26.
+//! [`ClientOptions::transport`] with four bounds:
+//!
+//! - [`POOL_IDLE_TIMEOUT`] (30 s) — drops idle pooled connections
+//!   before a typical DNS rotation makes them stale.
+//! - [`TCP_KEEPALIVE`] (30 s) — detects a dead-but-not-closed TCP
+//!   session in seconds rather than the 2-hour Linux default; covers
+//!   *hot* pooled connections that pool-idle alone cannot.
+//! - [`CONNECT_TIMEOUT`] (10 s) — bounds a fresh-connect attempt to
+//!   a dead VIP rather than waiting on the OS connect timeout.
+//! - [`READ_TIMEOUT`] (30 s) — per-read timeout that resets after a
+//!   successful read, so a stuck transfer fails fast without limiting
+//!   total body size.
+//!
+//! Together these cap a DNS-rotation hang at tens of seconds rather
+//! than minutes. The custom transport leaves
+//! [`ClientOptions::per_try_policies`] (where the shared-key signing
+//! lives) untouched — the SDK pipeline runs per-try policies
+//! independently of the transport. Tracking issue: #26.
 //!
 //! ## Stdout discipline
 //!
@@ -152,6 +163,22 @@ pub(crate) const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 2-hour Linux default. See module-level "HTTP transport tuning"
 /// docs and issue #26.
 pub(crate) const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// Bound on a fresh TCP-connect attempt. `reqwest` defaults to no
+/// connect timeout, so an unreachable IP would otherwise wait on the
+/// OS-level connect timeout (~75 s on Linux defaults). 10 s is
+/// comfortable for an in-region or even cross-region handshake while
+/// failing fast on a dead VIP. See module-level "HTTP transport
+/// tuning" docs and issue #26.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-read timeout for the custom [`reqwest`] transport. Resets after
+/// each successful read, so it caps how long a stuck connection can
+/// hold a transfer without limiting total body size. Sized to match
+/// [`POOL_IDLE_TIMEOUT`] / [`TCP_KEEPALIVE`] so a single rotation
+/// budget covers all three knobs. See module-level "HTTP transport
+/// tuning" docs and issue #26.
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Production [`ObjectStore`] backed by `azure_storage_blob`.
 pub struct AzureStore {
@@ -258,15 +285,19 @@ impl AzureStore {
 /// Build the [`reqwest::Client`] used by [`AzureStore`]'s custom
 /// [`Transport`].
 ///
-/// Bounds the connection pool's idle window and enables TCP keepalive
-/// (see [`POOL_IDLE_TIMEOUT`] / [`TCP_KEEPALIVE`] for rationale).
-/// Returns [`ObjectStoreError::Other`] if the TLS / DNS resolver layer
-/// fails to initialise, which the SDK would otherwise surface as a
-/// cryptic per-request error.
+/// Bounds the connection pool's idle window, enables TCP keepalive,
+/// and sets connect / per-read timeouts so a rotated VIP cannot wedge
+/// a long-running session (see [`POOL_IDLE_TIMEOUT`] / [`TCP_KEEPALIVE`]
+/// / [`CONNECT_TIMEOUT`] / [`READ_TIMEOUT`] for rationale). Returns
+/// [`ObjectStoreError::Other`] if the TLS / DNS resolver layer fails
+/// to initialise, which the SDK would otherwise surface as a cryptic
+/// per-request error.
 pub(crate) fn build_http_client() -> Result<Arc<reqwest::Client>, ObjectStoreError> {
     reqwest::Client::builder()
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         .tcp_keepalive(TCP_KEEPALIVE)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
         .build()
         .map(Arc::new)
         .map_err(other_boxed)
@@ -968,9 +999,11 @@ mod tests {
     /// values on the right-hand side together — the test exists to make
     /// such changes deliberate, not to lock the values forever.
     #[test]
-    fn pool_idle_and_keepalive_constants_have_expected_values() {
+    fn transport_timeout_constants_have_expected_values() {
         assert_eq!(POOL_IDLE_TIMEOUT, Duration::from_secs(30));
         assert_eq!(TCP_KEEPALIVE, Duration::from_secs(30));
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(READ_TIMEOUT, Duration::from_secs(30));
     }
 
     #[test]

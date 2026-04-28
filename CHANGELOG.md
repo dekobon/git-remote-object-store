@@ -43,6 +43,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Both `S3Store` and `AzureStore` now apply HTTP-layer
+  read/connect timeouts so a *hot* pooled connection that has gone
+  silent (e.g. mid-LFS push when the server VIP rotates) fails fast
+  instead of waiting for the OS-level TCP retransmit timeout
+  (~15 minutes on Linux). Pool-idle alone bounds only *idle* pooled
+  connections; a connection used within the last 30 s never goes
+  idle. S3 sets `read_timeout(30s)` on the SDK's `TimeoutConfig`
+  (smithy semantics: time-to-first-byte, not body-transfer); `connect_timeout`
+  stays at the SDK default of 3.1 s. Azure sets `connect_timeout(10s)`
+  and `read_timeout(30s)` on the custom `reqwest::Client` (per-read
+  semantics: resets after each successful read). The third
+  remediation checkbox in #26 ("force a fresh connection on
+  connection-level retry") is reframed: the existing one-shot retry
+  in `get_to_file` is a 412 mutation-race retry where the connection
+  is healthy by definition, so forcing a fresh socket there does not
+  help — the timeout-then-SDK-retry path covers the actual stuck-
+  connection case. (#26)
 - The LFS custom-transfer agent now emits `progress` events at each
   network-chunk boundary, mirroring upstream
   `git_remote_s3/lfs.py`'s `ProgressPercentage.__call__` callback.
