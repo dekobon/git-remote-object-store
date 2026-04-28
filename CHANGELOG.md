@@ -20,6 +20,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `git::config_add` / `git::config_unset` now write through
+  `gix-config` and `gix-lock` instead of spawning `git config --add` /
+  `--unset`. The in-process path acquires `.git/config.lock`, parses with
+  `File::from_bytes_no_includes`, mutates via `SectionMut::push` /
+  `remove`, and atomically renames over `<git-dir>/config`. `--unset` on
+  a missing key now returns the typed `GitError::ConfigKeyNotSet` (the
+  callers that previously matched on `Subprocess` are updated).
+  `git::config_add_many` batches multiple key/value writes into a single
+  read / parse / lock / write cycle; `lfs::install::install` uses it to
+  set `lfs.customtransfer.<agent>.path` and `lfs.standalonetransferagent`
+  in one pass. The LFS agent's `install` / `enable_debug` /
+  `disable_debug` subcommands lose their `async` qualifier as a side
+  effect — the only remaining `git` subprocess in production is
+  `git bundle create` / `bundle unbundle`, blocked on `gix` exposing a
+  public bundle reader/writer. (#46)
 - `protocol::run_main` now returns `std::process::ExitCode` instead of
   `anyhow::Result<()>` so the helper binaries
   (`git-remote-{s3,az}-{http,https}`) can render categorical

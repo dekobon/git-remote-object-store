@@ -1,10 +1,11 @@
 //! Native git operations layered on top of [`gix`][gix].
 //!
 //! Mirrors the surface of upstream `git_remote_s3/git.py`. Operations that
-//! `gix` 0.82 exposes go through `gix` natively; bundle creation and
-//! consumption fall back to `git` subprocess because no public bundle
-//! reader/writer exists in `gix` yet (see
-//! `docs/development/spike-gix-bundle-parity.md`).
+//! `gix` 0.82 exposes go through `gix` natively; config reads/writes go
+//! through `gix-config` + `gix-lock` for atomic edits parity with
+//! `git config`. Bundle creation and consumption still fall back to `git`
+//! subprocess because no public bundle reader/writer exists in `gix` yet
+//! (see `docs/development/spike-gix-bundle-parity.md`).
 //!
 //! Subprocess invocation is funnelled through a single private helper
 //! [`run_git`] which hard-codes the stdio configuration required by
@@ -24,6 +25,12 @@ use std::sync::atomic::AtomicBool;
 
 use gix::Repository;
 use gix::bstr::{BStr, ByteSlice};
+use gix::config::file::Metadata as GixConfigMetadata;
+use gix::config::file::init as gix_config_init;
+use gix::config::parse::section::{
+    ValueName, header as gix_section_header, value_name as gix_value_name,
+};
+use gix::lock as gix_lock;
 use gix::progress::Discard;
 use gix::remote::Direction;
 use gix_hash::ObjectId;
@@ -216,6 +223,39 @@ pub enum GitError {
     /// `gix::open()` failed.
     #[error(transparent)]
     Open(Box<gix::open::Error>),
+    /// `gix::discover()` failed when locating the config file.
+    #[error(transparent)]
+    Discover(Box<gix::discover::Error>),
+    /// Dotted config key was empty, contained empty segments, or had no `.`.
+    #[error("invalid config key {0:?}: must be of the form <section>[.<subsection>].<name>")]
+    ConfigKeyParse(String),
+    /// `gix-config` rejected a section header (invalid name characters).
+    #[error("invalid config section name {name:?}: {source}")]
+    ConfigInvalidSectionName {
+        /// The rejected section name.
+        name: String,
+        /// Underlying validator error.
+        #[source]
+        source: gix_section_header::Error,
+    },
+    /// `gix-config` rejected a value name (invalid characters or non-alphabetic start).
+    #[error("invalid config value name {name:?}: {source}")]
+    ConfigInvalidValueName {
+        /// The rejected value name.
+        name: String,
+        /// Underlying validator error.
+        #[source]
+        source: gix_value_name::Error,
+    },
+    /// `--unset` was issued for a key that is not present in the local config.
+    #[error("config key not set: {0}")]
+    ConfigKeyNotSet(String),
+    /// Failed to parse the existing `.git/config` file.
+    #[error(transparent)]
+    ConfigParse(Box<gix_config_init::Error>),
+    /// Failed to acquire `.git/config.lock` for an atomic config write.
+    #[error(transparent)]
+    ConfigLock(Box<gix_lock::acquire::Error>),
 }
 
 impl From<gix::open::Error> for GitError {
@@ -245,6 +285,24 @@ impl From<gix::repository::worktree_archive::Error> for GitError {
 impl From<gix::remote::find::existing::Error> for GitError {
     fn from(e: gix::remote::find::existing::Error) -> Self {
         GitError::FindRemote(Box::new(e))
+    }
+}
+
+impl From<gix::discover::Error> for GitError {
+    fn from(e: gix::discover::Error) -> Self {
+        GitError::Discover(Box::new(e))
+    }
+}
+
+impl From<gix_config_init::Error> for GitError {
+    fn from(e: gix_config_init::Error) -> Self {
+        GitError::ConfigParse(Box::new(e))
+    }
+}
+
+impl From<gix_lock::acquire::Error> for GitError {
+    fn from(e: gix_lock::acquire::Error) -> Self {
+        GitError::ConfigLock(Box::new(e))
     }
 }
 
@@ -493,32 +551,171 @@ pub fn remote_url(repo: &Repository, name: &str) -> Result<String, GitError> {
     })
 }
 
-/// `git config --add <key> <value>` in `cwd`.
+/// Parsed dotted config key: `<section>[.<subsection>].<name>`.
 ///
-/// Used by the LFS agent's `install` / `enable-debug` subcommands
-/// (Phase 10). `--add` rather than plain `set` so that re-running
-/// `install` does not silently clobber an existing entry the user
-/// added by hand.
-pub async fn config_add(cwd: &Path, key: &str, value: &str) -> Result<(), GitError> {
-    let args: [&OsStr; 4] = [
-        OsStr::new("config"),
-        OsStr::new("--add"),
-        OsStr::new(key),
-        OsStr::new(value),
-    ];
-    run_git("config --add", &args, cwd).await?;
+/// Matches `git config`'s native splitting: section is the first
+/// dot-segment, name is the last, and any segments in between are joined
+/// with `.` to form the subsection (so `lfs.customtransfer.git-lfs-object-store.path`
+/// yields section=`lfs`, subsection=`customtransfer.git-lfs-object-store`,
+/// name=`path`).
+struct DottedKey<'a> {
+    section: &'a str,
+    subsection: Option<&'a str>,
+    name: &'a str,
+}
+
+fn parse_dotted_key(key: &str) -> Result<DottedKey<'_>, GitError> {
+    let first_dot = key
+        .find('.')
+        .ok_or_else(|| GitError::ConfigKeyParse(key.to_owned()))?;
+    let last_dot = key
+        .rfind('.')
+        .expect("first_dot found, so rfind cannot be None");
+    let section = &key[..first_dot];
+    let name = &key[last_dot + 1..];
+    if section.is_empty() || name.is_empty() {
+        return Err(GitError::ConfigKeyParse(key.to_owned()));
+    }
+    // Native git accepts an empty subsection (`a..b` → `[a ""]`) and
+    // dot-prefixed subsections (`a..b.c` → `[a ".b"]`); preserve that
+    // permissiveness here. We only reject when section or name is empty.
+    let subsection = (first_dot != last_dot).then(|| &key[first_dot + 1..last_dot]);
+    Ok(DottedKey {
+        section,
+        subsection,
+        name,
+    })
+}
+
+/// Resolve the path to the local `.git/config` for the repository
+/// containing `cwd`. Honours `GIT_DIR` and worktree layouts: for linked
+/// worktrees we write to the **common** dir's config (where
+/// `git config --add` writes by default), not the per-worktree
+/// `config.worktree`.
+fn config_path_for_cwd(cwd: &Path) -> Result<PathBuf, GitError> {
+    let repo = gix::discover(cwd)?;
+    Ok(repo.common_dir().join("config"))
+}
+
+fn read_or_empty(path: &Path) -> Result<Vec<u8>, GitError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(GitError::Io(e)),
+    }
+}
+
+/// Atomically rewrite `path` with `bytes` via a `gix-lock` file. The lock
+/// path is `<path>.lock`; on commit it is `rename(2)`'d over `path`,
+/// matching native `git config`'s behaviour.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), GitError> {
+    use std::io::Write;
+    let mut lock = gix_lock::File::acquire_to_update_resource(
+        path,
+        gix_lock::acquire::Fail::Immediately,
+        None,
+    )?;
+    lock.write_all(bytes).map_err(GitError::Io)?;
+    lock.commit().map_err(|e| GitError::Io(e.error))?;
     Ok(())
 }
 
-/// `git config --unset <key>` in `cwd`.
+/// Add a multi-value entry to the repository's local config (`<section>[.<subsection>].<name> = value`).
 ///
-/// Used by the LFS agent's `disable-debug` subcommand (Phase 10).
-/// Returns [`GitError::Subprocess`] if the key was not set; callers
-/// that want idempotent behaviour should match on that.
-pub async fn config_unset(cwd: &Path, key: &str) -> Result<(), GitError> {
-    let args: [&OsStr; 3] = [OsStr::new("config"), OsStr::new("--unset"), OsStr::new(key)];
-    run_git("config --unset", &args, cwd).await?;
-    Ok(())
+/// In-process equivalent of `git config --add <key> <value>`. Used by the
+/// LFS agent's `install` / `enable-debug` subcommands (Phase 10). `--add`
+/// semantics rather than `set` so that re-running `install` does not
+/// silently clobber an existing entry the user added by hand.
+///
+/// The write goes through `gix-lock` (atomic rename via
+/// `<path>.lock`), preserving parity with `git config`'s on-disk
+/// concurrency contract.
+pub fn config_add(cwd: &Path, key: &str, value: &str) -> Result<(), GitError> {
+    config_add_many(cwd, &[(key, value)])
+}
+
+/// Batched variant of [`config_add`]: applies every `(key, value)` entry
+/// to the local config in a single read / parse / lock / write cycle.
+///
+/// Used by `lfs::install::install`, which previously paid two full
+/// `gix::discover` + `fs::read` + parse + lock + write cycles to set
+/// `lfs.customtransfer.<agent>.path` and `lfs.standalonetransferagent`
+/// back to back. All entries are validated up front, so a malformed
+/// later entry does not partially-write the file.
+pub fn config_add_many(cwd: &Path, entries: &[(&str, &str)]) -> Result<(), GitError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let parsed: Vec<(DottedKey<'_>, ValueName<'_>, &str)> = entries
+        .iter()
+        .map(|(key, value)| {
+            let parts = parse_dotted_key(key)?;
+            let value_name = ValueName::try_from(parts.name).map_err(|source| {
+                GitError::ConfigInvalidValueName {
+                    name: parts.name.to_owned(),
+                    source,
+                }
+            })?;
+            Ok::<_, GitError>((parts, value_name, *value))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let config_path = config_path_for_cwd(cwd)?;
+    let bytes = read_or_empty(&config_path)?;
+    let mut file = gix::config::File::from_bytes_no_includes(
+        &bytes,
+        GixConfigMetadata::api(),
+        gix_config_init::Options::default(),
+    )?;
+    for (parts, value_name, value) in parsed {
+        let subsection = parts.subsection.map(BStr::new);
+        let mut section = file
+            .section_mut_or_create_new(parts.section, subsection)
+            .map_err(|source| GitError::ConfigInvalidSectionName {
+                name: parts.section.to_owned(),
+                source,
+            })?;
+        section.push(value_name, Some(BStr::new(value)));
+    }
+
+    let extra: usize = entries.iter().map(|(k, v)| k.len() + v.len() + 16).sum();
+    let mut serialized = Vec::with_capacity(bytes.len() + extra);
+    file.write_to(&mut serialized).map_err(GitError::Io)?;
+    write_atomic(&config_path, &serialized)
+}
+
+/// Remove the latest value for the given key from the repository's local config.
+///
+/// In-process equivalent of `git config --unset <key>`. Used by the LFS
+/// agent's `disable-debug` subcommand (Phase 10). Returns
+/// [`GitError::ConfigKeyNotSet`] when the section or value is absent;
+/// callers that want idempotent behaviour should match on that.
+///
+/// Divergence from `git config --unset`: native git refuses to unset a
+/// multi-valued key (it requires `--unset-all`). `gix-config` removes
+/// only the latest value. The keys this helper is used with
+/// (`lfs.customtransfer.<agent>.args`) are single-valued in practice,
+/// so the divergence is not observable here.
+pub fn config_unset(cwd: &Path, key: &str) -> Result<(), GitError> {
+    let parts = parse_dotted_key(key)?;
+    let config_path = config_path_for_cwd(cwd)?;
+    let bytes = read_or_empty(&config_path)?;
+    let mut file = gix::config::File::from_bytes_no_includes(
+        &bytes,
+        GixConfigMetadata::api(),
+        gix_config_init::Options::default(),
+    )?;
+    let subsection = parts.subsection.map(BStr::new);
+    let Ok(mut section) = file.section_mut(parts.section, subsection) else {
+        return Err(GitError::ConfigKeyNotSet(key.to_owned()));
+    };
+    if section.remove(parts.name).is_none() {
+        return Err(GitError::ConfigKeyNotSet(key.to_owned()));
+    }
+
+    let mut serialized = Vec::with_capacity(bytes.len());
+    file.write_to(&mut serialized).map_err(GitError::Io)?;
+    write_atomic(&config_path, &serialized)
 }
 
 #[cfg(test)]
@@ -856,6 +1053,321 @@ mod tests {
         let got = remote_url(&repo, "only-push").expect("remote_url");
         assert_eq!(got, push_url);
         drop(dir);
+    }
+
+    // --- parse_dotted_key ---------------------------------------------
+
+    #[test]
+    fn parse_dotted_key_two_segments_has_no_subsection() {
+        let p = parse_dotted_key("lfs.standalonetransferagent").expect("parse");
+        assert_eq!(p.section, "lfs");
+        assert_eq!(p.subsection, None);
+        assert_eq!(p.name, "standalonetransferagent");
+    }
+
+    #[test]
+    fn parse_dotted_key_three_segments_uses_middle_as_subsection() {
+        let p = parse_dotted_key("remote.origin.url").expect("parse");
+        assert_eq!(p.section, "remote");
+        assert_eq!(p.subsection, Some("origin"));
+        assert_eq!(p.name, "url");
+    }
+
+    #[test]
+    fn parse_dotted_key_four_segments_joins_subsection_with_dots() {
+        // The two-level LFS shape: section=lfs,
+        // subsection=customtransfer.git-lfs-object-store, name=path.
+        let p = parse_dotted_key("lfs.customtransfer.git-lfs-object-store.path").expect("parse");
+        assert_eq!(p.section, "lfs");
+        assert_eq!(p.subsection, Some("customtransfer.git-lfs-object-store"));
+        assert_eq!(p.name, "path");
+    }
+
+    #[test]
+    fn parse_dotted_key_rejects_invalid_shapes() {
+        // Covers: empty key, no-dot, leading-dot (empty section),
+        // trailing-dot (empty name), and bare dot. Consecutive dots
+        // are NOT rejected: native git accepts `a..b` (creates
+        // `[a ""]`), so we mirror that.
+        for bad in ["", "nodotsegment", ".name", "section.", "."] {
+            assert!(
+                matches!(parse_dotted_key(bad), Err(GitError::ConfigKeyParse(_))),
+                "expected parse failure for {bad:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_dotted_key_accepts_empty_subsection_for_git_parity() {
+        // `git config a..b foo` creates `[a ""]\n\tb = foo` — we accept
+        // the same shape rather than rejecting it.
+        let p = parse_dotted_key("a..b").expect("parse");
+        assert_eq!(p.section, "a");
+        assert_eq!(p.subsection, Some(""));
+        assert_eq!(p.name, "b");
+    }
+
+    // --- config_add / config_unset (in-process via gix-config) --------
+
+    /// Read the local config back as bytes. Tests parse against the
+    /// committed file, not against a serialized buffer, to verify the
+    /// atomic-rename actually landed.
+    fn read_local_config(repo: &Repository) -> String {
+        let path = repo.common_dir().join("config");
+        std::fs::read_to_string(&path).expect("read config")
+    }
+
+    /// Re-parse `<git_dir>/config` and return all values for `key` as
+    /// owned strings. Uses the same `gix-config` machinery the helpers
+    /// write through, so this asserts behavioural round-trip rather
+    /// than byte equality.
+    fn config_values(repo: &Repository, key: &str) -> Vec<String> {
+        let path = repo.common_dir().join("config");
+        let bytes = std::fs::read(&path).expect("read config");
+        let file = gix::config::File::from_bytes_no_includes(
+            &bytes,
+            GixConfigMetadata::api(),
+            gix_config_init::Options::default(),
+        )
+        .expect("parse");
+        file.raw_values(key)
+            .map(|values| {
+                values
+                    .into_iter()
+                    .map(|v| v.into_owned().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn config_add_creates_section_and_value() {
+        let (repo, _dir) = empty_repo();
+        config_add(
+            repo.workdir().expect("workdir"),
+            "lfs.standalonetransferagent",
+            "git-lfs-object-store",
+        )
+        .expect("config_add");
+        let values = config_values(&repo, "lfs.standalonetransferagent");
+        assert_eq!(values, vec!["git-lfs-object-store".to_owned()]);
+    }
+
+    #[test]
+    fn config_add_handles_two_level_subsection() {
+        let (repo, _dir) = empty_repo();
+        let key = "lfs.customtransfer.git-lfs-object-store.path";
+        config_add(
+            repo.workdir().expect("workdir"),
+            key,
+            "git-lfs-object-store",
+        )
+        .expect("config_add");
+        let values = config_values(&repo, key);
+        assert_eq!(values, vec!["git-lfs-object-store".to_owned()]);
+    }
+
+    #[test]
+    fn config_add_appends_duplicate_values() {
+        // `--add` semantics: pushing the same key twice keeps both
+        // values, matching upstream `git config --add`.
+        let (repo, _dir) = empty_repo();
+        let cwd = repo.workdir().expect("workdir");
+        config_add(cwd, "lfs.standalonetransferagent", "first").expect("first");
+        config_add(cwd, "lfs.standalonetransferagent", "second").expect("second");
+        let values = config_values(&repo, "lfs.standalonetransferagent");
+        assert_eq!(values, vec!["first".to_owned(), "second".to_owned()]);
+    }
+
+    #[test]
+    fn config_add_preserves_existing_comments() {
+        let (repo, _dir) = empty_repo();
+        let path = repo.common_dir().join("config");
+        let existing = std::fs::read_to_string(&path).expect("read config");
+        let amended = format!("{existing}# user marker\n[user]\n\tname = Tester\n");
+        std::fs::write(&path, amended).expect("seed config");
+
+        config_add(
+            repo.workdir().expect("workdir"),
+            "lfs.standalonetransferagent",
+            "git-lfs-object-store",
+        )
+        .expect("config_add");
+
+        let after = read_local_config(&repo);
+        assert!(
+            after.contains("# user marker"),
+            "comment dropped: {after:?}"
+        );
+        assert!(
+            after.contains("name = Tester"),
+            "user.name dropped: {after:?}"
+        );
+        let values = config_values(&repo, "lfs.standalonetransferagent");
+        assert_eq!(values, vec!["git-lfs-object-store".to_owned()]);
+    }
+
+    #[test]
+    fn config_add_rejects_invalid_key() {
+        let (repo, _dir) = empty_repo();
+        assert!(matches!(
+            config_add(repo.workdir().expect("workdir"), "", "v"),
+            Err(GitError::ConfigKeyParse(_))
+        ));
+        assert!(matches!(
+            config_add(repo.workdir().expect("workdir"), "nodot", "v"),
+            Err(GitError::ConfigKeyParse(_))
+        ));
+    }
+
+    #[test]
+    fn config_add_rejects_invalid_value_name() {
+        // Value names must start with an ASCII alphabetic and contain
+        // only alphanumeric/dash. Leading digits trip the validator.
+        let (repo, _dir) = empty_repo();
+        let err = config_add(repo.workdir().expect("workdir"), "lfs.123bad", "v")
+            .expect_err("expected validation error");
+        assert!(
+            matches!(err, GitError::ConfigInvalidValueName { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn config_add_many_writes_all_entries_in_one_pass() {
+        // Both entries land in the file. Order is preserved within a
+        // section but `lfs.standalonetransferagent` lives directly under
+        // `[lfs]` while the path key lives under
+        // `[lfs "customtransfer.git-lfs-object-store"]`, so we just
+        // assert each value is readable rather than asserting a
+        // particular file ordering.
+        let (repo, _dir) = empty_repo();
+        let entries: &[(&str, &str)] = &[
+            (
+                "lfs.customtransfer.git-lfs-object-store.path",
+                "git-lfs-object-store",
+            ),
+            ("lfs.standalonetransferagent", "git-lfs-object-store"),
+        ];
+        config_add_many(repo.workdir().expect("workdir"), entries).expect("config_add_many");
+        for (key, value) in entries {
+            assert_eq!(config_values(&repo, key), vec![(*value).to_owned()]);
+        }
+    }
+
+    #[test]
+    fn config_add_many_validates_all_entries_before_writing() {
+        // A malformed key in any position must abort *before* we touch
+        // the file — otherwise an earlier valid entry would be persisted
+        // alongside the failure, leaving the repo in a half-installed
+        // state.
+        let (repo, _dir) = empty_repo();
+        let cwd = repo.workdir().expect("workdir");
+        let path_before = read_local_config(&repo);
+        let err = config_add_many(
+            cwd,
+            &[
+                ("lfs.standalonetransferagent", "git-lfs-object-store"),
+                ("nodot", "v"),
+            ],
+        )
+        .expect_err("expected parse failure on second entry");
+        assert!(matches!(err, GitError::ConfigKeyParse(_)), "got {err:?}");
+        assert_eq!(read_local_config(&repo), path_before);
+        assert!(
+            config_values(&repo, "lfs.standalonetransferagent").is_empty(),
+            "first entry should not have been written",
+        );
+    }
+
+    #[test]
+    fn config_add_many_empty_input_is_noop() {
+        let (repo, _dir) = empty_repo();
+        let cwd = repo.workdir().expect("workdir");
+        let before = read_local_config(&repo);
+        config_add_many(cwd, &[]).expect("noop");
+        assert_eq!(read_local_config(&repo), before);
+    }
+
+    #[test]
+    fn config_unset_removes_existing_value() {
+        let (repo, _dir) = empty_repo();
+        let cwd = repo.workdir().expect("workdir");
+        config_add(cwd, "lfs.customtransfer.git-lfs-object-store.args", "debug").expect("seed");
+        config_unset(cwd, "lfs.customtransfer.git-lfs-object-store.args").expect("unset");
+        let values = config_values(&repo, "lfs.customtransfer.git-lfs-object-store.args");
+        assert!(values.is_empty(), "value still present: {values:?}");
+    }
+
+    #[test]
+    fn config_unset_missing_key_returns_typed_error() {
+        let (repo, _dir) = empty_repo();
+        let err = config_unset(repo.workdir().expect("workdir"), "lfs.never.set")
+            .expect_err("expected error");
+        assert!(matches!(err, GitError::ConfigKeyNotSet(ref k) if k == "lfs.never.set"));
+    }
+
+    #[test]
+    fn config_unset_missing_section_returns_typed_error() {
+        let (repo, _dir) = empty_repo();
+        // Even when the section itself is absent, we surface
+        // ConfigKeyNotSet (parity with `git config --unset` exiting
+        // non-zero in that case).
+        let err = config_unset(repo.workdir().expect("workdir"), "ghost.value")
+            .expect_err("expected error");
+        assert!(matches!(err, GitError::ConfigKeyNotSet(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn config_unset_missing_key_within_existing_section_returns_typed_error() {
+        // Distinct from the above: here the section IS present (we just
+        // wrote a value to it), so `section_mut` succeeds and the error
+        // must come from `section.remove()` returning None. Without this
+        // test the second `ConfigKeyNotSet` branch in `config_unset`
+        // would be unreachable from the suite.
+        let (repo, _dir) = empty_repo();
+        let cwd = repo.workdir().expect("workdir");
+        config_add(cwd, "lfs.standalonetransferagent", "git-lfs-object-store").expect("seed");
+        let err = config_unset(cwd, "lfs.othervalue").expect_err("expected error");
+        assert!(
+            matches!(err, GitError::ConfigKeyNotSet(ref k) if k == "lfs.othervalue"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn config_add_then_native_git_can_read_value() {
+        // Cross-tool parity: a value written by our gix-config helper
+        // is readable by the native `git config --get` CLI.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (repo, _dir) = empty_repo();
+        let cwd = repo.workdir().expect("workdir");
+        config_add(
+            cwd,
+            "lfs.customtransfer.git-lfs-object-store.path",
+            "git-lfs-object-store",
+        )
+        .expect("config_add");
+
+        let output = std::process::Command::new("git")
+            .args([
+                "config",
+                "--get",
+                "lfs.customtransfer.git-lfs-object-store.path",
+            ])
+            .current_dir(cwd)
+            .output()
+            .expect("git config --get");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+        assert_eq!(stdout.trim(), "git-lfs-object-store");
     }
 
     // --- bundle / unbundle (subprocess) -------------------------------
