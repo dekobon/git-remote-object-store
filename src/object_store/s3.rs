@@ -47,6 +47,16 @@
 //! most one short-circuited request rather than minutes of wedged
 //! transfer. Tracking issue: #26.
 //!
+//! Pool-idle alone does not bound a *hot* pooled connection — one that
+//! was used within the last 30 s but has since become stuck — and the
+//! 412 retry in [`ObjectStore::get_to_file`] is a deliberate-server-
+//! response retry, so forcing a fresh connection there does not help.
+//! Instead, the SDK's [`aws_config::timeout::TimeoutConfig`] is given
+//! a [`READ_TIMEOUT`] (time-to-first-byte bound, not a body-transfer
+//! bound) so a stuck connection fails fast and the SDK's internal
+//! retry layer can pick a fresh one. `connect_timeout` is left at the
+//! SDK default (3.1 s, already aggressive). Tracking issue: #26.
+//!
 //! TCP keepalive (the second knob suggested in #27) is **not** wired
 //! on the S3 path: `aws-smithy-http-client` 1.1.12's public `Builder`
 //! / `ConnectorBuilder` API exposes `pool_idle_timeout` but does not
@@ -66,6 +76,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aws_config::timeout::TimeoutConfig;
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
@@ -134,6 +145,15 @@ const COPY_SOURCE_ENCODE: &AsciiSet = &CONTROLS
 /// fetch / push batches still benefit from connection reuse. See the
 /// module-level "HTTP transport tuning" docs and issue #26.
 pub(crate) const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Time-to-first-byte bound for any single S3 request. Catches a hot
+/// pooled connection that has gone silent (e.g. mid-LFS push when the
+/// server VIP rotates) without limiting body-transfer time, since
+/// smithy's `read_timeout` covers only the response-headers phase.
+/// Sized to match [`POOL_IDLE_TIMEOUT`] — both budgets are "give up
+/// and let the SDK retry pick a fresh connection" budgets. See the
+/// module-level "HTTP transport tuning" docs and issue #26.
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Production [`ObjectStore`] backed by `aws-sdk-s3`.
 #[derive(Debug)]
@@ -233,8 +253,12 @@ impl S3Store {
 /// 1. Load the AWS SDK provider chain with `BehaviorVersion::latest()`.
 /// 2. Install a custom HTTP client with [`POOL_IDLE_TIMEOUT`] so DNS
 ///    rotation does not wedge long-running sessions (#26).
-/// 3. Apply `endpoint_url`, `profile`, `region` from the resolved decisions.
-/// 4. Override `force_path_style` on the resulting `aws_sdk_s3::Config`.
+/// 3. Apply [`READ_TIMEOUT`] so a hot pooled connection that has gone
+///    silent fails fast instead of waiting for the OS-level TCP
+///    retransmit timeout (#26). `connect_timeout` is left at the SDK
+///    default (3.1 s).
+/// 4. Apply `endpoint_url`, `profile`, `region` from the resolved decisions.
+/// 5. Override `force_path_style` on the resulting `aws_sdk_s3::Config`.
 pub(crate) async fn build_s3_config(resolved: &ResolvedS3Config) -> aws_sdk_s3::Config {
     let mut loader = aws_config::defaults(BehaviorVersion::latest())
         .http_client(
@@ -243,6 +267,7 @@ pub(crate) async fn build_s3_config(resolved: &ResolvedS3Config) -> aws_sdk_s3::
                 .pool_idle_timeout(POOL_IDLE_TIMEOUT)
                 .build_https(),
         )
+        .timeout_config(TimeoutConfig::builder().read_timeout(READ_TIMEOUT).build())
         .endpoint_url(resolved.endpoint_url.as_str());
     if let Some(p) = &resolved.profile {
         loader = loader.profile_name(p);
@@ -1372,15 +1397,17 @@ mod tests {
         let _config = build_s3_config(&resolved).await;
     }
 
-    /// Pin the timeout value. A future copy-paste mistake (`from_millis`
-    /// instead of `from_secs`, an accidental zero) silently disables
-    /// the very behaviour the constant exists for; fail fast instead.
-    /// If the constant is deliberately changed, update the expected
-    /// value on the right-hand side together — the test exists to make
-    /// such a change deliberate, not to lock the value forever. See
-    /// the matching Azure-side test for the same rationale.
+    /// Pin the timeout values. A future copy-paste mistake
+    /// (`from_millis` instead of `from_secs`, an accidental zero)
+    /// silently disables the very behaviour the constants exist for;
+    /// fail fast instead. If a constant is deliberately changed,
+    /// update the expected value on the right-hand side together —
+    /// the test exists to make such a change deliberate, not to lock
+    /// the value forever. See the matching Azure-side test for the
+    /// same rationale.
     #[test]
-    fn pool_idle_timeout_constant_has_expected_value() {
+    fn timeout_constants_have_expected_values() {
         assert_eq!(POOL_IDLE_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(READ_TIMEOUT, Duration::from_secs(30));
     }
 }
