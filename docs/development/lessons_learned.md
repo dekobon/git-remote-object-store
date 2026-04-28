@@ -236,3 +236,72 @@ lesson says match exactly; this one says the bytes you match against
 must come from outside the code under test.
 
 ---
+
+## 7. Shellspec `Skip if` cannot parse a leading `!` or shell redirection
+
+`Skip if "<reason>" <condition>` evaluates `<condition>` through
+shellspec's DSL preprocessor, not a plain bash interpreter. A leading
+`!` is folded into the command name (so the negated test never runs as
+intended) and shell redirections (`>/dev/null 2>&1`) get mangled by
+shellspec's argument quoting. The failure mode is silent in the worst
+way: the spec body runs as if the prerequisite were satisfied, then
+falls over inside `BeforeAll` or `setup` with a confusing downstream
+error (a missing CLI, a docker invocation, etc.) rather than the
+intended `SKIPPED`.
+
+**Integration-suite Skip guards initially didn't fire** (spec/integration
+introduced alongside CHANGELOG "Shellspec integration suites" entry).
+`Skip if "aws-cli not on PATH" ! command -v aws >/dev/null 2>&1` ran
+the spec on a host without `aws`, which then failed in
+`rustfs_make_bucket` with `aws: command not found` — a misleading
+error several layers removed from the actual cause. The form
+`Skip if "..." ! command -v aws` (no redirection) didn't run the spec
+but aborted shellspec entirely with `[reporter: 101]`. Wrapping in
+`bash -c "! command -v aws >/dev/null 2>&1"` worked but obscures
+intent and forks a shell per Skip evaluation.
+
+**Lesson**: In shellspec, `Skip if "<reason>" <cond>` requires
+`<cond>` to be a single command (built-in, executable, or function
+call) without a leading `!`, without pipelines, and without
+redirections. Define small predicate functions in `spec/spec_helper.sh`
+that already return the desired exit code — `missing_cmd foo`,
+`have_cmd foo`, `flag_unset INTEGRATION_S3` — and call those from
+Skip if. The `spec_helper.sh` definitions become the one place to
+audit; spec files stay declarative.
+
+---
+
+## 8. The test harness must replicate the production install glue
+
+When the production install instructions include filesystem-level glue
+(symlinks, PATH munging, hooks, file-mode tweaks) that lives outside
+the binary itself, the test harness must perform the same glue before
+exercising the binary end-to-end. Skipping any step because "the
+binary is built" leaves the harness dependent on whatever ad-hoc
+configuration the host happens to have. The failure mode looks like
+"my local works, CI doesn't" or vice versa, and the diagnostic almost
+never points at the missing glue — it points at the symptom one layer
+deeper.
+
+**Integration shellspec suite hit `git: 'remote-s3+http' is not a git
+command`** (spec/integration, spec/spec_helper.sh symlink shim).
+`cargo build` produces binaries with hyphenated names
+(`git-remote-s3-http`, `git-remote-az-https`, …), but git, given a
+URL `s3+http://…`, looks up the literal `git-remote-s3+http` on
+PATH. README's install section already documents the one-time symlink
+loop end users run; the integration suite reproduced the failure
+because the test harness skipped that step. `spec/spec_helper.sh` now
+creates the four `+`-form symlinks in a per-run temp directory and
+prepends it to PATH, mirroring the README workaround inside the
+test session.
+
+**Lesson**: For every step the production install docs spell out
+beyond `cargo install` (or `cargo build`), the test harness's
+bring-up code must perform the equivalent. When you find yourself
+reading `README.md` to debug a test failure, that's the signal —
+fold the missing step into `spec_helper.sh` (or the analogous
+fixture) so the harness is self-contained. Cross-link from the
+fixture comment to the README section so a future reader sees the
+production/test parallel.
+
+---

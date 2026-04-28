@@ -31,7 +31,7 @@ FIND_EXCLUDE   := $(foreach dir,$(EXCLUDE_DIRS),! -path "./$(dir)/*")
 # --warn-undefined-variables warnings, e.g. $(call find-by-ext,md,,).
 find-by-ext = $(if $(FD),$(FD) --extension $(1) $(FD_EXCLUDE) $(2),find . -name "*.$(1)" -type f $(FIND_EXCLUDE) $(3))
 
-.PHONY: help check-tools build build-release test test-all test-integration-s3 test-integration-azure fmt fmt-check markdown-fmt markdown-check markdown-lint shellcheck sh-fmt sh-fmt-check toml-fmt toml-fmt-check toml-lint makefile-check lint check deny shellspec clean install doc doc-open bench all pre-commit ci _pc-fmt _pc-clippy _pc-test _pc-build _pc-shellspec _pc-shellcheck _pc-markdown-lint _pc-toml-lint _pc-makefile-check _pc-deny _ci-fmt-check _ci-clippy _ci-test _ci-build _ci-shellspec _ci-shellcheck _ci-markdown-check _ci-toml-lint _ci-makefile-check _ci-deny _ci-cargo-pipeline
+.PHONY: help check-tools build build-release test test-all test-integration-s3 test-integration-azure fmt fmt-check markdown-fmt markdown-check markdown-lint shellcheck sh-fmt sh-fmt-check toml-fmt toml-fmt-check toml-lint makefile-check lint check deny shellspec shellspec-integration shellspec-integration-s3 shellspec-integration-azure image-pin-check clean install doc doc-open bench all pre-commit ci _pc-fmt _pc-clippy _pc-test _pc-build _pc-shellspec _pc-shellcheck _pc-markdown-lint _pc-toml-lint _pc-makefile-check _pc-deny _ci-fmt-check _ci-clippy _ci-test _ci-build _ci-shellspec _ci-shellcheck _ci-markdown-check _ci-toml-lint _ci-makefile-check _ci-deny _ci-cargo-pipeline
 
 # Default target
 help:
@@ -203,8 +203,45 @@ deny:
 # Shellspec CLI integration tests
 # ---------------------------------------------------------------------------
 shellspec: build
-	@echo "Running shellspec CLI integration tests..."
-	@shellspec --shell bash
+	@echo "Running shellspec CLI unit tests..."
+	@shellspec --shell bash spec/cli_basics_spec.sh
+
+# End-to-end integration suites that drive `git push` / `git fetch` /
+# `git clone` against a real rustfs (S3) or Azurite (Azure Blob)
+# container. Require Docker plus the matching cloud CLI on the host
+# (`aws` for S3, `az` for Azure) and `git-lfs` for the LFS scenarios.
+shellspec-integration-s3: build
+	@echo "Running shellspec S3 integration suite..."
+	@INTEGRATION_S3=1 shellspec --shell bash \
+	  spec/cli_basics_spec.sh spec/integration/s3
+
+shellspec-integration-azure: build
+	@echo "Running shellspec Azure integration suite..."
+	@INTEGRATION_AZ=1 shellspec --shell bash \
+	  spec/cli_basics_spec.sh spec/integration/az
+
+shellspec-integration: shellspec-integration-s3 shellspec-integration-azure
+
+# Image-pin guard: the docker image tags in
+# `spec/support/images.sh` must match the ones in the Rust
+# integration tests so a single backend bug reproduces in both layers.
+# `head -1` keeps the comparison single-line if a future contributor
+# adds a doc comment or duplicate constant matching the same prefix.
+image-pin-check:
+	@echo "Verifying shellspec image pins match Rust integration tests..."
+	@spec_rust_tag=$$(rg --no-line-number --no-filename "^const RUSTFS_TAG: &str = " tests/s3_store_integration.rs \
+	  | head -1 | sed -E 's/.*"([^"]+)".*/\1/') && \
+	  spec_shell_tag=$$(rg --no-line-number --no-filename "^RUSTFS_TAG=" spec/support/images.sh \
+	  | head -1 | sed -E 's/.*"([^"]+)".*/\1/') && \
+	  [ "$$spec_rust_tag" = "$$spec_shell_tag" ] || { \
+	    echo "RUSTFS_TAG drift: rust=$$spec_rust_tag shellspec=$$spec_shell_tag" >&2; exit 1; }
+	@az_rust_tag=$$(rg --no-line-number --no-filename "^const AZURITE_TAG: &str = " tests/azure_store_integration.rs \
+	  | head -1 | sed -E 's/.*"([^"]+)".*/\1/') && \
+	  az_shell_tag=$$(rg --no-line-number --no-filename "^AZURITE_TAG=" spec/support/images.sh \
+	  | head -1 | sed -E 's/.*"([^"]+)".*/\1/') && \
+	  [ "$$az_rust_tag" = "$$az_shell_tag" ] || { \
+	    echo "AZURITE_TAG drift: rust=$$az_rust_tag shellspec=$$az_shell_tag" >&2; exit 1; }
+	@echo "Image pins are in sync."
 
 # ---------------------------------------------------------------------------
 # Maintenance
@@ -287,7 +324,7 @@ _pc-build: _pc-test
 	cargo build --workspace --all-targets
 
 _pc-shellspec: _pc-build
-	shellspec --shell bash
+	shellspec --shell bash spec/cli_basics_spec.sh
 
 _pc-shellcheck: _pc-fmt
 	$(MAKE) shellcheck
@@ -334,7 +371,8 @@ _ci-build:
 
 _ci-shellspec:
 	mkdir -p reports
-	shellspec --shell bash --format progress --output junit --reportdir reports
+	shellspec --shell bash --format progress --output junit --reportdir reports \
+	  spec/cli_basics_spec.sh
 
 _ci-shellcheck:
 	$(MAKE) shellcheck

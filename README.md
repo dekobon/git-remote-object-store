@@ -101,6 +101,19 @@ done
 - [Changelog](CHANGELOG.md).
 - [Lessons learned](docs/development/lessons_learned.md).
 
+## Testing
+
+`make shellspec` runs the fast CLI unit suite. The end-to-end shellspec
+suites drive `git push` / `git fetch` / `git clone` through the helper
+binaries against real backend containers; they require Docker, the
+matching cloud CLI on the host, and `git-lfs` for the LFS scenarios.
+
+```bash
+make shellspec-integration-s3       # requires docker + aws-cli + git-lfs
+make shellspec-integration-azure    # requires docker + azure-cli + git-lfs
+make shellspec-integration          # both
+```
+
 ## Status
 
 `0.1.0`. Phases 1–14 of the [execution plan](execution-plan.md) are

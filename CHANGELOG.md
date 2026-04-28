@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Shellspec integration suites under `spec/integration/{s3,az}/`
+  exercising `git clone` / `git push` / `git fetch` /
+  `git push --force` / `git push --delete` against live rustfs and
+  Azurite Docker containers. Each backend covers core git ops,
+  force-push protection (PROTECTED#), the
+  `git-remote-object-store` management CLI (`protect`, `unprotect`,
+  `delete-branch`, `doctor --delete-stale-locks`), the LFS round-trip
+  via `git-lfs-object-store`, and concurrent / stale-lock contention.
+  Three new Makefile targets (`shellspec-integration-s3`,
+  `shellspec-integration-azure`, `shellspec-integration`) gate the
+  new suites behind Docker + cloud-CLI prerequisites;
+  `image-pin-check` guards against image-tag drift between the
+  shellspec helpers and the Rust integration tests.
 - `protocol::backend::build` now runs an eager probe (single
   `ListObjectsV2` for S3, `ListBlobs` first page for Azure with
   `maxresults=1`) at backend construction. The probe folds well-known
