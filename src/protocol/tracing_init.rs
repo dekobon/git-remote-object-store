@@ -39,9 +39,12 @@ pub type ReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
 /// Initialise the global subscriber and return a handle to its filter.
 ///
-/// Idempotent: callers may invoke this once per process; calling it again
-/// (e.g. from a test that already set up a subscriber) returns
-/// [`Err`]. The helper bins call this exactly once from `run_main`.
+/// # Errors
+///
+/// Returns [`InitError`] if a global subscriber is already set (the
+/// subscriber can only be initialised once per process). The helper
+/// bins call this exactly once from `run_main`; tests that set up their
+/// own subscriber will receive `Err` here.
 pub fn init() -> Result<ReloadHandle, InitError> {
     let initial = build_initial_filter();
     let (filter, handle) = reload::Layer::new(initial);
@@ -62,6 +65,11 @@ pub fn init() -> Result<ReloadHandle, InitError> {
 }
 
 /// Flip the subscriber to `info` level. Used by `option verbosity 2+`.
+///
+/// # Errors
+///
+/// Returns [`InitError`] if the reload handle has been invalidated (the
+/// subscriber was dropped).
 pub fn raise_to_info(handle: &ReloadHandle) -> Result<(), InitError> {
     handle
         .modify(|filter| *filter = info_filter())

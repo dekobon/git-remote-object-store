@@ -296,6 +296,11 @@ fn request_content_length(request: &Request) -> Option<u64> {
 /// no production caller outside this crate; the function is small,
 /// pure, and stable enough that re-using it in tests is preferable
 /// to duplicating the spec-exact canonicalisation logic.
+///
+/// # Errors
+///
+/// Returns `Err(String)` if the HMAC key cannot be decoded from
+/// base64 (the error string describes the decoding failure).
 pub fn compute_authorization(
     account: &str,
     key: &Secret,

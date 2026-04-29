@@ -153,6 +153,14 @@ pub enum ParseError {
 }
 
 /// Parse a remote URL.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] if the input is empty, uses an unsupported
+/// scheme, contains a malformed URL, is missing required components
+/// (host, bucket, container, account), contains invalid component names,
+/// or uses cleartext `http://` against a non-loopback host without the
+/// [`ENV_ALLOW_HTTP`] environment override.
 pub fn parse(input: &str) -> Result<RemoteUrl, ParseError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {

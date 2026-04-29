@@ -124,6 +124,12 @@ fn classify(
 
 /// Construct the right [`ObjectStore`] for `remote` and verify it is
 /// reachable with a single low-cost list call.
+///
+/// # Errors
+///
+/// Returns [`BackendError`] if the backend cannot be constructed (e.g.
+/// invalid credentials or endpoint) or the probe list call fails (e.g.
+/// bucket/container not found or permission denied).
 pub async fn build(remote: &RemoteUrl) -> Result<Arc<dyn ObjectStore>, BackendError> {
     let prefix = remote.prefix().unwrap_or_default();
     match remote {

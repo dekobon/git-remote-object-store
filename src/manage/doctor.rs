@@ -92,6 +92,13 @@ impl<'a> Doctor<'a> {
     /// Errors short-circuit the run — partial fixes are committed
     /// immediately (each `delete` / `copy` / `put` is its own request),
     /// matching upstream's "best-effort" stance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManageError::Store`] if an object-store call fails,
+    /// [`ManageError::Internal`] if a prompter returns an out-of-range
+    /// index, or [`ManageError::Cancelled`] if the user cancels an
+    /// interactive prompt.
     pub async fn run(&self) -> Result<(), ManageError> {
         // Share one LIST between snapshot analysis and stale-lock
         // scanning so a doctor run is a single bucket walk regardless

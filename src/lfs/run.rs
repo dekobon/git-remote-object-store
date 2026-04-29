@@ -135,6 +135,14 @@ impl RemoteResolver for GitRemoteResolver {
 ///
 /// `tmp_dir` is the destination directory for downloads
 /// (`<git-dir>/lfs/tmp` per `execution-plan.md` §5.5).
+///
+/// # Errors
+///
+/// Returns [`RunError::StdinClosed`] if stdin closes before the first event,
+/// [`RunError::MalformedEvent`] for unparseable JSON, or
+/// [`RunError::InitNotFirst`] if the first event is not `init`.
+/// Transport or serialisation errors from upload/download operations surface
+/// as [`RunError::Io`] or [`RunError::Agent`].
 pub async fn run<R, W, Res>(
     reader: R,
     mut writer: W,

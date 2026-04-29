@@ -199,16 +199,20 @@ impl std::fmt::Debug for AzureStore {
 impl AzureStore {
     /// Build an `AzureStore` from a parsed [`RemoteUrl`].
     ///
-    /// Returns `Err(ObjectStoreError::Other)` if `url` is not the Azure variant or
-    /// if credential resolution fails. Like the S3 backend, the
-    /// [`RemoteUrl::Azure::prefix`] field is intentionally **not**
-    /// consumed here; callers compose it into keys themselves.
+    /// Like the S3 backend, the [`RemoteUrl::Azure::prefix`] field is
+    /// intentionally **not** consumed here; callers compose it into keys
+    /// themselves.
     ///
     /// Marked `async` for symmetry with `S3Store::from_remote_url`,
     /// which awaits the AWS provider chain. The Azure path resolves
     /// credentials synchronously today; the signature stays `async` so
     /// future credential providers (e.g. one that fetches an OIDC
     /// token at construction) can plug in without breaking callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObjectStoreError::Other`] if `url` is not the Azure
+    /// variant or if credential resolution fails.
     #[allow(clippy::unused_async)]
     pub async fn from_remote_url(url: &RemoteUrl) -> Result<Self, ObjectStoreError> {
         let RemoteUrl::Azure {

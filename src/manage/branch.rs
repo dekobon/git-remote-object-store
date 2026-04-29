@@ -31,8 +31,15 @@ pub struct ManageBranch<'a> {
 impl<'a> ManageBranch<'a> {
     /// Open a branch handle, verifying it exists by listing
     /// `<prefix>/refs/heads/<branch>/` (or `refs/heads/<branch>/` when
-    /// `prefix` is empty). Returns [`ManageError::BranchNotFound`] when
-    /// no objects are present.
+    /// `prefix` is empty).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManageError::InvalidBranch`] if `branch` fails
+    /// `gix-validate`'s strict ref-name check. Returns
+    /// [`ManageError::BranchNotFound`] when no objects exist under the
+    /// branch prefix. Returns [`ManageError::Store`] for object-store
+    /// failures.
     pub async fn open(
         store: Arc<dyn ObjectStore>,
         prefix: impl Into<String>,
@@ -76,6 +83,11 @@ impl<'a> ManageBranch<'a> {
     /// Delete every object under the branch's prefix after a `yes/no`
     /// confirmation. Aborts (returns `Ok(())`) if the user answers no;
     /// the `Cancelled` variant is reserved for prompt I/O failures.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManageError::Cancelled`] if the confirmation prompt fails.
+    /// Returns [`ManageError::Store`] if a list or delete operation fails.
     pub async fn delete(&self) -> Result<(), ManageError> {
         let objects = self.store.list(&self.branch_prefix()).await?;
         let prompt = format!("Delete branch {} ({} objects)?", self.branch, objects.len());
@@ -93,6 +105,10 @@ impl<'a> ManageBranch<'a> {
 
     /// Mark the branch as protected by writing the `PROTECTED#` sentinel.
     /// Idempotent — overwrites any existing marker.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManageError::Store`] if the put operation fails.
     pub async fn protect(&self) -> Result<(), ManageError> {
         self.store
             .put_bytes(&self.protected_key(), Bytes::new(), PutOpts::default())
@@ -103,6 +119,11 @@ impl<'a> ManageBranch<'a> {
 
     /// Remove the `PROTECTED#` sentinel. A missing marker is treated as
     /// already-unprotected rather than an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManageError::Store`] for object-store failures other than
+    /// `NotFound`.
     pub async fn unprotect(&self) -> Result<(), ManageError> {
         match self.store.delete(&self.protected_key()).await {
             Ok(()) | Err(ObjectStoreError::NotFound(_)) => {

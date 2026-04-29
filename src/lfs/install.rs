@@ -39,6 +39,10 @@ pub enum InstallError {
 ///   LFS to bypass the HTTP transfer queue and call us directly.
 ///
 /// Mirrors `../git-remote-s3/git_remote_s3/lfs.py:install`.
+///
+/// # Errors
+///
+/// Returns [`InstallError::Git`] if writing the config entries fails.
 pub fn install(cwd: &Path) -> Result<(), InstallError> {
     git::config_add_many(cwd, &[(KEY_PATH, AGENT_NAME), (KEY_STANDALONE, AGENT_NAME)])?;
     Ok(())
@@ -47,12 +51,22 @@ pub fn install(cwd: &Path) -> Result<(), InstallError> {
 /// Set `lfs.customtransfer.<agent>.args = debug` so the next time git
 /// invokes the agent it forwards the `debug` argv slot, switching the
 /// agent's logging from stderr to a file in `<git-dir>/lfs/tmp/`.
+///
+/// # Errors
+///
+/// Returns [`InstallError::Git`] if writing the config entry fails.
 pub fn enable_debug(cwd: &Path) -> Result<(), InstallError> {
     git::config_add(cwd, KEY_ARGS, "debug")?;
     Ok(())
 }
 
 /// Inverse of [`enable_debug`]: clear `lfs.customtransfer.<agent>.args`.
+///
+/// # Errors
+///
+/// Returns [`InstallError::Git`] wrapping [`crate::git::GitError::ConfigKeyNotSet`]
+/// if the args key is absent; callers that want idempotent behaviour should
+/// match on that inner variant.
 pub fn disable_debug(cwd: &Path) -> Result<(), InstallError> {
     git::config_unset(cwd, KEY_ARGS)?;
     Ok(())

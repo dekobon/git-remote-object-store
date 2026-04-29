@@ -78,6 +78,11 @@ impl RepoSnapshot {
 /// Performs one `list` call. Callers that already have a listing of
 /// `<prefix>/` should call [`analyze_objects`] instead to avoid a
 /// second LIST round-trip.
+///
+/// # Errors
+///
+/// Returns [`ManageError::Store`] if the list or HEAD-object get calls
+/// fail.
 pub async fn analyze(
     store: &Arc<dyn ObjectStore>,
     prefix: &str,
@@ -90,6 +95,11 @@ pub async fn analyze(
 /// Group an already-fetched `<list_prefix>` listing into a
 /// [`RepoSnapshot`]. Used by [`analyze`] and by `Doctor::run` to share
 /// a single LIST across analysis and stale-lock scanning.
+///
+/// # Errors
+///
+/// Returns [`ManageError::Store`] if fetching the `HEAD` object body
+/// fails.
 pub async fn analyze_objects(
     objects: &[ObjectMeta],
     list_prefix: &str,
