@@ -1,0 +1,5 @@
+[tools]
+checkmake = "latest"
+shellspec = "latest"
+shfmt = "latest"
+taplo = "latest"
