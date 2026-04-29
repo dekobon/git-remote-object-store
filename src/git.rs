@@ -606,7 +606,13 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), GitError> {
 ///
 /// # Errors
 ///
-/// See [`config_add_many`] — this is a thin wrapper around it.
+/// Returns [`GitError::ConfigKeyParse`] for a malformed dotted key,
+/// [`GitError::ConfigInvalidValueName`] if the value name is rejected by
+/// `gix-config`, [`GitError::ConfigInvalidSectionName`] if the section name
+/// is rejected, [`GitError::Discover`] if the repository cannot be located,
+/// [`GitError::ConfigParse`] if the existing config cannot be parsed,
+/// [`GitError::ConfigLock`] if the lock cannot be acquired, or
+/// [`GitError::Io`] for other file I/O failures.
 pub fn config_add(cwd: &Path, key: &str, value: &str) -> Result<(), GitError> {
     config_add_many(cwd, &[(key, value)])
 }
@@ -624,8 +630,11 @@ pub fn config_add(cwd: &Path, key: &str, value: &str) -> Result<(), GitError> {
 ///
 /// Returns [`GitError::ConfigKeyParse`] for a malformed dotted key,
 /// [`GitError::ConfigInvalidValueName`] if a value name is rejected by
-/// `gix-config`, [`GitError::ConfigParse`] if the existing config cannot be
-/// parsed, or [`GitError::ConfigLock`] if the lock cannot be acquired.
+/// `gix-config`, [`GitError::ConfigInvalidSectionName`] if a section name is
+/// rejected, [`GitError::Discover`] if the repository cannot be located,
+/// [`GitError::ConfigParse`] if the existing config cannot be parsed,
+/// [`GitError::ConfigLock`] if the lock cannot be acquired, or
+/// [`GitError::Io`] for other file I/O failures.
 pub fn config_add_many(cwd: &Path, entries: &[(&str, &str)]) -> Result<(), GitError> {
     if entries.is_empty() {
         return Ok(());
@@ -684,8 +693,11 @@ pub fn config_add_many(cwd: &Path, entries: &[(&str, &str)]) -> Result<(), GitEr
 /// # Errors
 ///
 /// Returns [`GitError::ConfigKeyParse`] if `key` is malformed,
-/// [`GitError::ConfigKeyNotSet`] if the section or value is absent, or
-/// [`GitError::ConfigLock`] if the lock cannot be acquired.
+/// [`GitError::Discover`] if the repository cannot be located,
+/// [`GitError::ConfigParse`] if the existing config cannot be parsed,
+/// [`GitError::ConfigKeyNotSet`] if the section or value is absent,
+/// [`GitError::ConfigLock`] if the lock cannot be acquired, or
+/// [`GitError::Io`] for other file I/O failures.
 pub fn config_unset(cwd: &Path, key: &str) -> Result<(), GitError> {
     let parts = parse_dotted_key(key)?;
     let config_path = config_path_for_cwd(cwd)?;

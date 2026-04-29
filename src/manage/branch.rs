@@ -86,8 +86,9 @@ impl<'a> ManageBranch<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`ManageError::Cancelled`] if the confirmation prompt fails.
-    /// Returns [`ManageError::Store`] if a list or delete operation fails.
+    /// Returns [`ManageError::Cancelled`] if the user cancels the prompt,
+    /// [`ManageError::Io`] for prompt I/O failures, or [`ManageError::Store`]
+    /// if a list or delete operation fails.
     pub async fn delete(&self) -> Result<(), ManageError> {
         let objects = self.store.list(&self.branch_prefix()).await?;
         let prompt = format!("Delete branch {} ({} objects)?", self.branch, objects.len());

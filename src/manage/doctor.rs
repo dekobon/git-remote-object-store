@@ -97,8 +97,8 @@ impl<'a> Doctor<'a> {
     ///
     /// Returns [`ManageError::Store`] if an object-store call fails,
     /// [`ManageError::Internal`] if a prompter returns an out-of-range
-    /// index, or [`ManageError::Cancelled`] if the user cancels an
-    /// interactive prompt.
+    /// index, [`ManageError::Cancelled`] if the user cancels an interactive
+    /// prompt, or [`ManageError::Io`] for prompt I/O failures.
     pub async fn run(&self) -> Result<(), ManageError> {
         // Share one LIST between snapshot analysis and stale-lock
         // scanning so a doctor run is a single bucket walk regardless
