@@ -4,6 +4,7 @@
 //! `.claude/rules/protocol-stdout.md`. All diagnostics go to stderr via
 //! `tracing`.
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, anyhow};
@@ -54,14 +55,19 @@ pub async fn run_main() -> ExitCode {
         }
     };
 
-    // Git invokes remote helpers from inside the local repository (cwd is
-    // the worktree, with GIT_DIR set when relevant). `git bundle unbundle`
-    // auto-discovers the git directory from cwd, so the process cwd is the
-    // right thing to hand the parallel fetch path.
-    let repo_dir = match std::env::current_dir() {
+    // Resolve the local repository the helper operates against. Modern
+    // git (>= ~2.50) invokes remote helpers during `git clone` *before*
+    // chdir-ing into the destination, so cwd points at the parent of
+    // the new clone and `gix::open(cwd)` fails. `GIT_DIR` is set by git
+    // in that path, so prefer it; fall back to cwd for the fetch / push
+    // case where git invokes the helper from inside an existing
+    // worktree without `GIT_DIR` set. Hand the worktree (not the `.git`
+    // dir) to the parallel fetch path so subprocess git tooling that
+    // expects a worktree behaves correctly.
+    let repo_dir = match resolve_repo_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("fatal: failed to read current working directory: {e}");
+            eprintln!("fatal: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -97,6 +103,39 @@ where
         .ok_or_else(|| anyhow!("missing remote URL: expected `<remote-name> <url>` on argv"))?;
     raw.parse::<RemoteUrl>()
         .context("failed to parse remote URL")
+}
+
+/// Resolve the local repository directory for the remote-helper REPL.
+///
+/// Returns the **worktree** for non-bare repos, or the git directory
+/// for bare repos. The parallel fetch path uses this as the cwd handed
+/// to `gix::open`, which refuses to treat a non-repository directory
+/// (such as the parent of a `git clone` destination) as a git repo.
+///
+/// Resolution order (matches git's own `setup_git_directory_gently`):
+///
+/// 1. `GIT_DIR` env var (set by `git clone` before invoking the helper,
+///    when cwd is still the parent of the destination).
+/// 2. `gix::discover` from cwd (the fetch / push path: cwd is inside
+///    the worktree, no `GIT_DIR` set).
+fn resolve_repo_dir() -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to read current working directory")?;
+    let candidate = match std::env::var_os("GIT_DIR") {
+        Some(d) => {
+            let p = PathBuf::from(d);
+            if p.is_absolute() { p } else { cwd.join(p) }
+        }
+        None => cwd,
+    };
+    let repo = gix::discover(&candidate).with_context(|| {
+        format!(
+            "failed to discover git repository at {}",
+            candidate.display()
+        )
+    })?;
+    Ok(repo
+        .workdir()
+        .map_or_else(|| repo.git_dir().to_path_buf(), Path::to_path_buf))
 }
 
 #[cfg(unix)]
