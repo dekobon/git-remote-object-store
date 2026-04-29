@@ -64,9 +64,10 @@ pub fn enable_debug(cwd: &Path) -> Result<(), InstallError> {
 ///
 /// # Errors
 ///
-/// Returns [`InstallError::Git`] wrapping [`crate::git::GitError::ConfigKeyNotSet`]
-/// if the args key is absent; callers that want idempotent behaviour should
-/// match on that inner variant.
+/// Returns [`InstallError::Git`] wrapping any [`crate::git::GitError`] from
+/// [`crate::git::config_unset`]. The most common case is
+/// [`crate::git::GitError::ConfigKeyNotSet`] when the args key is absent;
+/// callers that want idempotent behaviour should match on that inner variant.
 pub fn disable_debug(cwd: &Path) -> Result<(), InstallError> {
     git::config_unset(cwd, KEY_ARGS)?;
     Ok(())
