@@ -40,6 +40,12 @@ impl Sha {
     /// Parse a SHA-1 hex string. Accepts lowercase, uppercase, or mixed
     /// case input and stores it canonically; [`Display`][fmt::Display]
     /// always emits lowercase.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShaError::Empty`] if `hex` is empty, or
+    /// [`ShaError::Decode`] if the input is the wrong length or contains
+    /// non-hex characters.
     pub fn from_hex(hex: &str) -> Result<Self, ShaError> {
         if hex.is_empty() {
             return Err(ShaError::Empty);
@@ -83,8 +89,12 @@ pub enum ShaError {
 pub struct RefName(String);
 
 impl RefName {
-    /// Validate `name` and wrap it. Returns [`RefNameError::Invalid`]
-    /// for any string git itself would reject.
+    /// Validate `name` and wrap it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RefNameError::Invalid`] for any name that
+    /// `gix-validate` would reject.
     pub fn new(name: impl Into<String>) -> Result<Self, RefNameError> {
         let name = name.into();
         match gix_validate::reference::name(BStr::new(&name)) {
@@ -392,6 +402,11 @@ pub async fn unbundle_at(
 
 /// Resolve a rev-spec (a ref name, full or short SHA, `HEAD~n`, etc.) to
 /// the canonical 40-hex commit OID it points at.
+///
+/// # Errors
+///
+/// Returns [`GitError::EmptySpec`] if `spec` is empty, or
+/// [`GitError::RevParse`] if the spec cannot be resolved to an object.
 pub fn rev_parse(repo: &Repository, spec: &str) -> Result<Sha, GitError> {
     if spec.is_empty() {
         return Err(GitError::EmptySpec);
@@ -406,6 +421,10 @@ pub fn rev_parse(repo: &Repository, spec: &str) -> Result<Sha, GitError> {
 /// Uses the `merge_base(A, B) == A` identity. A commit is its own
 /// ancestor; unrelated commits return `false`; missing commits propagate
 /// as `GitError`.
+///
+/// # Errors
+///
+/// Returns [`GitError::MergeBase`] if the merge-base computation fails.
 pub fn is_ancestor(repo: &Repository, ancestor: Sha, descendant: Sha) -> Result<bool, GitError> {
     if ancestor == descendant {
         return Ok(true);
@@ -425,6 +444,11 @@ pub fn is_ancestor(repo: &Repository, ancestor: Sha, descendant: Sha) -> Result<
 /// `spec` is any rev-spec gix can resolve — fully-qualified ref, short
 /// branch, tag, or SHA. Uses `gix-archive`'s native zip writer via
 /// [`Repository::worktree_archive`]; no subprocess.
+///
+/// # Errors
+///
+/// Returns [`GitError`] if `spec` cannot be resolved, the object cannot
+/// be peeled to a tree, or writing the zip file fails.
 pub fn archive(repo: &Repository, folder: &Path, spec: &str) -> Result<PathBuf, GitError> {
     let tree = repo
         .rev_parse_single(BStr::new(spec))?
@@ -450,6 +474,12 @@ pub fn archive(repo: &Repository, folder: &Path, spec: &str) -> Result<PathBuf, 
 /// Format `HEAD`'s commit as `"<short-sha> <subject>"`, matching upstream
 /// `git log -1 --pretty=%h %s`. Used as `CodePipeline` metadata in the
 /// `s3+zip` push variant (Phase 8).
+///
+/// # Errors
+///
+/// Returns [`GitError::NoCommits`] if the repository has no commits.
+/// Returns other [`GitError`] variants if the commit object cannot be
+/// decoded or a short id cannot be computed.
 pub fn last_commit_message(repo: &Repository) -> Result<String, GitError> {
     use gix::head::peel;
 
@@ -469,6 +499,13 @@ pub fn last_commit_message(repo: &Repository) -> Result<String, GitError> {
 ///
 /// Tries the fetch URL first and falls back to the push URL, matching
 /// `git remote get-url` semantics.
+///
+/// # Errors
+///
+/// Returns [`GitError::RemoteNotFound`] if the remote does not exist,
+/// [`GitError::RemoteHasNoUrl`] if it has neither a fetch nor a push URL,
+/// [`GitError::NonUtf8RemoteUrl`] if the URL bytes are not valid UTF-8, or
+/// [`GitError::FindRemote`] for other lookup failures.
 pub fn remote_url(repo: &Repository, name: &str) -> Result<String, GitError> {
     let owned_name = || name.to_owned();
     let remote = repo.find_remote(BStr::new(name)).map_err(|e| match e {
@@ -566,6 +603,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), GitError> {
 /// The write goes through `gix-lock` (atomic rename via
 /// `<path>.lock`), preserving parity with `git config`'s on-disk
 /// concurrency contract.
+///
+/// # Errors
+///
+/// See [`config_add_many`] — this is a thin wrapper around it.
 pub fn config_add(cwd: &Path, key: &str, value: &str) -> Result<(), GitError> {
     config_add_many(cwd, &[(key, value)])
 }
@@ -578,6 +619,13 @@ pub fn config_add(cwd: &Path, key: &str, value: &str) -> Result<(), GitError> {
 /// `lfs.customtransfer.<agent>.path` and `lfs.standalonetransferagent`
 /// back to back. All entries are validated up front, so a malformed
 /// later entry does not partially-write the file.
+///
+/// # Errors
+///
+/// Returns [`GitError::ConfigKeyParse`] for a malformed dotted key,
+/// [`GitError::ConfigInvalidValueName`] if a value name is rejected by
+/// `gix-config`, [`GitError::ConfigParse`] if the existing config cannot be
+/// parsed, or [`GitError::ConfigLock`] if the lock cannot be acquired.
 pub fn config_add_many(cwd: &Path, entries: &[(&str, &str)]) -> Result<(), GitError> {
     if entries.is_empty() {
         return Ok(());
@@ -632,6 +680,12 @@ pub fn config_add_many(cwd: &Path, entries: &[(&str, &str)]) -> Result<(), GitEr
 /// only the latest value. The keys this helper is used with
 /// (`lfs.customtransfer.<agent>.args`) are single-valued in practice,
 /// so the divergence is not observable here.
+///
+/// # Errors
+///
+/// Returns [`GitError::ConfigKeyParse`] if `key` is malformed,
+/// [`GitError::ConfigKeyNotSet`] if the section or value is absent, or
+/// [`GitError::ConfigLock`] if the lock cannot be acquired.
 pub fn config_unset(cwd: &Path, key: &str) -> Result<(), GitError> {
     let parts = parse_dotted_key(key)?;
     let config_path = config_path_for_cwd(cwd)?;

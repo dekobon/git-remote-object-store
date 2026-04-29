@@ -122,6 +122,14 @@ fn parse_command(line: &str) -> Option<Command> {
 ///
 /// `repo_dir` is the local repository the helper is operating against;
 /// the parallel fetch path uses it as the cwd for `git bundle unbundle`.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError::Io`] on transport failure,
+/// [`ProtocolError::InvalidCommand`] for an unrecognised command,
+/// [`ProtocolError::List`] / [`ProtocolError::Fetch`] /
+/// [`ProtocolError::Push`] for backend errors in the respective
+/// operations.
 pub async fn run<R, W>(
     remote: RemoteUrl,
     store: Arc<dyn ObjectStore>,

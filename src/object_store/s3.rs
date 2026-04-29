@@ -193,11 +193,15 @@ impl ResolvedS3Config {
 impl S3Store {
     /// Build an `S3Store` from a parsed [`RemoteUrl`].
     ///
-    /// Returns `Err(ObjectStoreError::Other)` if `url` is not the S3 variant or if
-    /// the endpoint URL cannot be normalised for virtual-hosted
-    /// addressing. The [`RemoteUrl::S3::prefix`] field is intentionally
-    /// **not** consumed here; callers compose it into keys themselves
-    /// per the module-level docs.
+    /// The [`RemoteUrl::S3::prefix`] field is intentionally **not**
+    /// consumed here; callers compose it into keys themselves per the
+    /// module-level docs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObjectStoreError::Other`] if `url` is not the S3 variant
+    /// or if the endpoint URL cannot be normalised for virtual-hosted
+    /// addressing.
     pub async fn from_remote_url(url: &RemoteUrl) -> Result<Self, ObjectStoreError> {
         let RemoteUrl::S3 {
             endpoint,

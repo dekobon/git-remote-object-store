@@ -83,11 +83,20 @@ pub enum ManageError {
 pub trait Prompter: Send + Sync {
     /// Ask the user to pick one of `options` by index. `prompt` is the
     /// short headline shown above the choices.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManageError::Cancelled`] if the user aborts (Ctrl+C or
+    /// EOF), or [`ManageError::Io`] for underlying I/O failures.
     fn select(&self, prompt: &str, options: &[String]) -> Result<usize, ManageError>;
 
     /// Ask the user a yes/no question. Returns `Ok(true)` for "yes" and
-    /// `Ok(false)` for "no"; an EOF or signal returns
-    /// [`ManageError::Cancelled`].
+    /// `Ok(false)` for "no".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManageError::Cancelled`] on EOF or signal, or
+    /// [`ManageError::Io`] for underlying I/O failures.
     fn confirm(&self, prompt: &str) -> Result<bool, ManageError>;
 }
 
