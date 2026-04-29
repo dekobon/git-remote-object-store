@@ -33,6 +33,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Restructured as a Cargo workspace: the library crate
+  (`git-remote-object-store`) stays at the repository root; the six
+  binary targets move to a new `cli/` sub-crate
+  (`git-remote-object-store-cli`). Install from source with
+  `cargo install --path cli`; `cargo build --workspace` is unchanged
+  for development builds.
+- Added `Remote` struct as the primary library entry point for external
+  consumers. `Remote::connect(url)` parses a URL and opens a verified
+  backend connection in one call; `Remote::key(suffix)` computes correct
+  prefixed storage keys; `Remote::get_head()`, `Remote::put_head()`, and
+  `Remote::list()` cover the most common on-bucket operations; and
+  `Remote::store()` exposes the underlying `Arc<dyn ObjectStore>` for
+  advanced use.
+- Top-level re-exports added for `ObjectStore`, `ObjectMeta`,
+  `ObjectStoreError`, `RemoteUrl`, `Remote`, `RemoteError`,
+  `BackendError`, and `BackendKind`; consumers no longer need
+  three-level module-path imports.
+- `ProtocolError::is_broken_pipe()` method added; the private
+  `is_broken_pipe(err: &io::Error)` helper is removed.
+- `protocol::run_main` is no longer part of the library API; it lives
+  in the CLI crate. `protocol::capabilities` and `protocol::option` are
+  now `pub(crate)`.
 - `bundle_at` and `unbundle_at` now use a native `gix-pack 0.69`
   implementation (`src/bundle.rs`) instead of shelling out to
   `git bundle create` / `git bundle unbundle`. The `git` binary is no

@@ -1757,7 +1757,6 @@ dependencies = [
  "azure_storage_blob",
  "base64 0.22.1",
  "bytes",
- "clap",
  "dialoguer",
  "futures",
  "gix",
@@ -1781,6 +1780,29 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "git-remote-object-store-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aws-config",
+ "aws-sdk-s3",
+ "azure_core",
+ "bytes",
+ "clap",
+ "git-remote-object-store",
+ "gix",
+ "reqwest",
+ "sha2 0.10.9",
+ "tempfile",
+ "testcontainers",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

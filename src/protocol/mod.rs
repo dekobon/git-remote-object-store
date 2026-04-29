@@ -1,9 +1,7 @@
 //! Git remote-helper protocol REPL and command dispatcher.
 //!
 //! [`run`] is generic over its reader and writer so tests can drive it
-//! through `tokio::io::duplex`; [`run_main`] is the binary-side entry
-//! that wires real stdin/stdout, parses argv, builds the backend, and
-//! installs the tracing subscriber.
+//! through `tokio::io::duplex`.
 //!
 //! Stdout is the wire protocol — see `.claude/rules/protocol-stdout.md`.
 //! Diagnostics use `tracing` (configured to write to stderr by
@@ -12,21 +10,19 @@
 
 use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::process::ExitCode;
 use std::sync::Arc;
 
-use anyhow::{Context, anyhow};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, error};
 
 use crate::object_store::ObjectStore;
-use crate::url::{self, RemoteUrl};
+use crate::url::RemoteUrl;
 
 pub mod backend;
-pub mod capabilities;
+pub(crate) mod capabilities;
 pub mod fetch;
 pub mod list;
-pub mod option;
+pub(crate) mod option;
 pub mod push;
 pub mod tracing_init;
 
@@ -57,6 +53,17 @@ pub enum ProtocolError {
     /// An input line did not match any recognised command.
     #[error("invalid command: {0:?}")]
     InvalidCommand(String),
+}
+
+impl ProtocolError {
+    /// Returns `true` when the error is a broken-pipe or write-zero I/O
+    /// failure — both indicate git closed the helper's stdout, which is a
+    /// clean exit rather than a crash.
+    #[must_use]
+    pub fn is_broken_pipe(&self) -> bool {
+        matches!(self, Self::Io(e)
+            if matches!(e.kind(), ErrorKind::BrokenPipe | ErrorKind::WriteZero))
+    }
 }
 
 /// Single-line command parsed from stdin.
@@ -204,108 +211,6 @@ where
     Ok(())
 }
 
-/// Shared `main` for every `git-remote-{s3,az}-{http,https}` binary.
-///
-/// Git always invokes a remote helper as `git-remote-<scheme> <remote-name>
-/// <url>` — see `git help gitremote-helpers`. We read the URL from
-/// `argv[2]`, matching the upstream Python helper exactly.
-///
-/// Returns [`ExitCode`] rather than `anyhow::Result` so that
-/// credential / missing-bucket / authorization failures from
-/// [`backend::build`] can be rendered as a single-line `fatal:` message
-/// (matching upstream `git-remote-s3` at
-/// `../git-remote-s3/git_remote_s3/remote.py:574-593`) without
-/// `anyhow`'s `Display` chain layering on top.
-pub async fn run_main() -> ExitCode {
-    let remote = match parse_remote_arg(std::env::args()) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("fatal: {e:#}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let reload = match tracing_init::init() {
-        Ok(handle) => Some(handle),
-        Err(e) => {
-            // Tracing failed to install (typically: another global subscriber
-            // already exists, e.g. in some test harnesses). The protocol can
-            // still run — we just lose runtime verbosity flips. Surface the
-            // diagnostic on stderr since `tracing` itself is not available.
-            eprintln!("warning: tracing subscriber install failed: {e}");
-            None
-        }
-    };
-
-    #[cfg(unix)]
-    install_sigpipe_mask();
-
-    let store = match backend::build(&remote).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{}", backend::fatal_message(&e));
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Git invokes remote helpers from inside the local repository (cwd
-    // is the worktree, with `GIT_DIR` set when relevant). `git bundle
-    // unbundle` auto-discovers the git directory from cwd, so the
-    // process cwd is the right thing to hand the parallel fetch path.
-    let repo_dir = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("fatal: failed to read current working directory: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let stdin = BufReader::new(tokio::io::stdin());
-    let stdout = tokio::io::stdout();
-
-    match run(remote, store, stdin, stdout, reload, repo_dir).await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(ProtocolError::Io(e)) if is_broken_pipe(&e) => {
-            debug!("stdout closed (BrokenPipe); exiting cleanly");
-            ExitCode::SUCCESS
-        }
-        Err(other) => {
-            eprintln!("fatal: {other:#}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// Extract and parse the remote URL from a process-argv-style iterator.
-///
-/// Split out from [`run_main`] so the argv contract (slot, error message)
-/// is testable without spawning a process or installing a global tracing
-/// subscriber.
-fn parse_remote_arg<I>(args: I) -> anyhow::Result<RemoteUrl>
-where
-    I: IntoIterator<Item = String>,
-{
-    let raw = args
-        .into_iter()
-        .nth(2)
-        .ok_or_else(|| anyhow!("missing remote URL: expected `<remote-name> <url>` on argv"))?;
-    url::parse(&raw).context("failed to parse remote URL")
-}
-
-fn is_broken_pipe(err: &std::io::Error) -> bool {
-    matches!(err.kind(), ErrorKind::BrokenPipe | ErrorKind::WriteZero)
-}
-
-#[cfg(unix)]
-fn install_sigpipe_mask() {
-    // tokio's signal handler installs `SIG_IGN`-equivalent semantics:
-    // SIGPIPE no longer kills the process; instead, the failing write
-    // returns `EPIPE` → `ErrorKind::BrokenPipe`, which `run_main` catches
-    // above and turns into a clean exit. The returned Signal stream is
-    // dropped immediately — we just need the side effect of the
-    // installation.
-    let _ = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::pipe());
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,46 +261,13 @@ mod tests {
 
     #[test]
     fn is_broken_pipe_matches_kinds() {
-        let pipe = std::io::Error::from(ErrorKind::BrokenPipe);
-        assert!(is_broken_pipe(&pipe));
-        let write_zero = std::io::Error::from(ErrorKind::WriteZero);
-        assert!(is_broken_pipe(&write_zero));
-        let other = std::io::Error::from(ErrorKind::Other);
-        assert!(!is_broken_pipe(&other));
-    }
-
-    /// Build the argv that git actually passes: `argv[0]` is the binary
-    /// path, `argv[1]` is the remote name, `argv[2]` is the URL.
-    fn argv(extras: &[&str]) -> Vec<String> {
-        let mut v = vec!["git-remote-s3-https".to_owned(), "origin".to_owned()];
-        v.extend(extras.iter().map(|s| (*s).to_owned()));
-        v
-    }
-
-    #[test]
-    fn parse_remote_arg_reads_argv_slot_two() {
-        let url = "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo";
-        let remote = parse_remote_arg(argv(&[url])).expect("parse should succeed");
-        assert_eq!(remote.prefix(), Some("repo"));
-    }
-
-    #[test]
-    fn parse_remote_arg_errors_when_url_missing() {
-        let err = parse_remote_arg(argv(&[])).expect_err("argv[2] missing should error");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("missing remote URL"),
-            "error should name the missing slot: {msg}"
-        );
-    }
-
-    #[test]
-    fn parse_remote_arg_errors_on_bad_url() {
-        let err = parse_remote_arg(argv(&["not a url"])).expect_err("invalid URL should error");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("failed to parse remote URL"),
-            "error should preserve context: {msg}"
-        );
+        let pipe = ProtocolError::Io(std::io::Error::from(ErrorKind::BrokenPipe));
+        assert!(pipe.is_broken_pipe());
+        let write_zero = ProtocolError::Io(std::io::Error::from(ErrorKind::WriteZero));
+        assert!(write_zero.is_broken_pipe());
+        let other = ProtocolError::Io(std::io::Error::from(ErrorKind::Other));
+        assert!(!other.is_broken_pipe());
+        let not_io = ProtocolError::InvalidCommand("bad".into());
+        assert!(!not_io.is_broken_pipe());
     }
 }

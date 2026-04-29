@@ -1,0 +1,134 @@
+[package]
+name = "git-remote-object-store-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+publish = false
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+
+[lib]
+name = "git_remote_object_store_cli"
+path = "src/lib.rs"
+
+# Remote-helper shims. Git invokes them by scheme as `git-remote-<scheme>`,
+# so the installed binary names must be `git-remote-s3+https` etc.
+#
+# cargo rejects `+` in `[[bin]] name` ("invalid character '+' in crate name").
+# Falling back to hyphenated cargo bin names; an `xtask` step will rename /
+# hardlink them to the `+` form at install time (tracked for Phase 14 packaging).
+
+[[bin]]
+name = "git-remote-s3-https"
+path = "src/bin/git-remote-s3-https.rs"
+
+[[bin]]
+name = "git-remote-s3-http"
+path = "src/bin/git-remote-s3-http.rs"
+
+[[bin]]
+name = "git-remote-az-https"
+path = "src/bin/git-remote-az-https.rs"
+
+[[bin]]
+name = "git-remote-az-http"
+path = "src/bin/git-remote-az-http.rs"
+
+[[bin]]
+name = "git-remote-object-store"
+path = "src/bin/git-remote-object-store.rs"
+
+[[bin]]
+name = "git-lfs-object-store"
+path = "src/bin/git-lfs-object-store.rs"
+
+[features]
+# Enables the RustFS-backed integration tests in `tests/s3_store_integration.rs`.
+# Requires Docker on the host running `cargo test --features integration-s3`.
+integration-s3 = []
+
+# Enables the Azurite-backed integration tests in
+# `tests/azure_store_integration.rs`. Requires Docker on the host running
+# `cargo test --features integration-azure`.
+integration-azure = []
+
+[dependencies]
+git-remote-object-store = { path = ".." }
+
+# Async runtime — needed for #[tokio::main] macro resolution and for
+# tokio::io (BufReader, stdin, stdout) in the LFS binary.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
+
+# CLI arg parsing — management binary only.
+clap = { version = "4", features = ["derive"] }
+
+# Git repository discovery — git-remote-object-store.rs and
+# git-lfs-object-store.rs call gix::discover() directly.
+gix = "0.82"
+
+# Error handling
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# AWS config — `tests/s3_store_integration.rs` builds `aws_config::defaults`
+# directly for the S3 client setup. Must match the library's feature set.
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+
+# Bytes — imported directly in integration tests for object assertions.
+bytes = "1"
+
+# Time — used in both integration test files for HTTP date header formatting.
+# Must match the library's feature set.
+time = { version = "0.3", features = ["parsing", "formatting"] }
+
+# URL — `tests/azure_store_integration.rs` uses `::url::Url::parse` for
+# endpoint construction in the signed HTTP helper functions.
+url = "2"
+
+# Temporary directories — used by the git CLI integration section of
+# the integration tests to create isolated repo trees.
+tempfile = "3"
+
+# SHA-256 — used in both integration test files for content-hash assertions.
+sha2 = "0.10"
+
+# AWS SDK S3 — `tests/s3_store_integration.rs` imports `ByteStream` directly.
+# Versions and features must match the library's `[dependencies]` entry so
+# cargo unifies to a single copy.
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+  "sigv4a",
+  "http-1x",
+  "default-https-client",
+  "rt-tokio",
+] }
+
+# Azure core — `tests/azure_store_integration.rs` imports `Method` and
+# header types directly for the one-off container-setup HTTP call.
+azure_core = "0.35"
+
+# HTTP client — `tests/azure_store_integration.rs` builds a `reqwest::Client`
+# for the signed container-setup request. Must match the library's feature set.
+reqwest = { version = "0.13", default-features = false, features = [
+  "http2",
+  "rustls",
+] }
+
+# Testcontainers — shared across both integration test files. `blocking`
+# enables `SyncRunner` (starts containers outside any tokio runtime so they
+# survive across `#[tokio::test]`-spawned runtimes). `http_wait_plain` enables
+# the HTTP health-poll wait strategy used by the RustFS fixture.
+testcontainers = { version = "0.27", features = [
+  "blocking",
+  "http_wait_plain",
+] }
