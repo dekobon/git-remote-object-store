@@ -44,8 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend connection in one call; `Remote::key(suffix)` computes correct
   prefixed storage keys; `Remote::get_head()`, `Remote::put_head()`, and
   `Remote::list()` cover the most common on-bucket operations; and
-  `Remote::store()` exposes the underlying `Arc<dyn ObjectStore>` for
-  advanced use.
+  `Remote::store()` exposes the underlying `ObjectStore` (as `&dyn
+  ObjectStore`) for advanced use.
 - Top-level re-exports added for `ObjectStore`, `ObjectMeta`,
   `ObjectStoreError`, `RemoteUrl`, `Remote`, `RemoteError`,
   `BackendError`, and `BackendKind`; consumers no longer need

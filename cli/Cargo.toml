@@ -63,8 +63,9 @@ integration-azure = []
 git-remote-object-store = { path = ".." }
 
 # Async runtime — needed for #[tokio::main] macro resolution and for
-# tokio::io (BufReader, stdin, stdout) in the LFS binary.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
+# tokio::io (BufReader, stdin, stdout) in the LFS binary. `signal` is
+# required by install_sigpipe_mask() in lib.rs (Unix only).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "signal"] }
 
 # CLI arg parsing — management binary only.
 clap = { version = "4", features = ["derive"] }

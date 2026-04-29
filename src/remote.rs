@@ -99,14 +99,7 @@ impl Remote {
 
     /// Compute the storage key for `suffix` within this repository's prefix.
     ///
-    /// Use this to construct keys for direct [`store`](Self::store) operations:
-    ///
-    /// ```
-    /// # use git_remote_object_store::{Remote, RemoteUrl};
-    /// # fn example(remote: &Remote) {
-    /// assert_eq!(remote.key("HEAD"), remote.prefix().to_owned() + if remote.prefix().is_empty() { "" } else { "/" } + "HEAD");
-    /// # }
-    /// ```
+    /// Use this to construct keys for direct [`store`](Self::store) operations.
     ///
     /// For a repository at `s3+https://bucket/my-repo`:
     /// - `remote.key("HEAD")` → `"my-repo/HEAD"`
@@ -152,6 +145,10 @@ impl Remote {
     }
 
     /// Write the repository's `HEAD` ref.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObjectStoreError`] on backend write failure (auth, network, etc.).
     pub async fn put_head(&self, content: Bytes) -> Result<(), ObjectStoreError> {
         self.store
             .put_bytes(&self.key("HEAD"), content, PutOpts::default())
@@ -163,8 +160,44 @@ impl Remote {
     /// Pass `""` to list everything in the repository.
     /// Pass `"refs/heads/main/"` to list all bundles on that branch.
     /// Pass `"refs/"` to list all ref objects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObjectStoreError`] on backend list failure (auth, network, etc.).
     pub async fn list(&self, suffix: &str) -> Result<Vec<ObjectMeta>, ObjectStoreError> {
         self.store.list(&self.key(suffix)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_remote(prefix: &str) -> Remote {
+        Remote {
+            store: Arc::new(crate::object_store::mock::MockStore::new()),
+            prefix: prefix.to_owned(),
+        }
+    }
+
+    #[test]
+    fn key_with_prefix_joins_with_slash() {
+        let remote = make_remote("my-repo");
+        assert_eq!(remote.key("HEAD"), "my-repo/HEAD");
+        assert_eq!(remote.key("refs/heads/main/"), "my-repo/refs/heads/main/");
+    }
+
+    #[test]
+    fn key_without_prefix_returns_suffix_only() {
+        let remote = make_remote("");
+        assert_eq!(remote.key("HEAD"), "HEAD");
+        assert_eq!(remote.key("refs/heads/main/"), "refs/heads/main/");
+    }
+
+    #[test]
+    fn prefix_reflects_construction_value() {
+        assert_eq!(make_remote("my-repo").prefix(), "my-repo");
+        assert_eq!(make_remote("").prefix(), "");
     }
 }
 
