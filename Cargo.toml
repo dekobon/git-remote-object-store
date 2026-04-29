@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "cli"]
+resolver = "2"
+
 [package]
 name = "git-remote-object-store"
 version = "0.1.0"
@@ -25,15 +29,6 @@ missing_errors_doc = "allow"
 # outside the lib crate. Production builds leave the feature off; in-crate
 # unit tests pick up the helpers via `cfg(test)` regardless of the feature.
 test-util = []
-
-# Enables the MinIO-backed integration tests in `tests/s3_store_integration.rs`.
-# Requires Docker on the host running `cargo test --features integration-s3`.
-integration-s3 = []
-
-# Enables the Azurite-backed integration tests in
-# `tests/azure_store_integration.rs`. Requires Docker on the host running
-# `cargo test --features integration-azure`.
-integration-azure = []
 
 [dependencies]
 # Async traits via Boxed futures. `async_trait` keeps `dyn ObjectStore +
@@ -69,9 +64,6 @@ time = { version = "0.3", features = ["parsing", "formatting"] }
 # JSON (LFS)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-# CLI
-clap = { version = "4", features = ["derive"] }
 
 # Interactive prompts for the management CLI (`git-remote-object-store`).
 # Default features pull in fuzzy-select / completion / history machinery
@@ -223,39 +215,6 @@ testcontainers = { version = "0.27", features = [
 # policy. `sha2` is similarly a runtime dep (Phase 11 shared-key
 # signing) so the integration tests can reuse the same crate version
 # for byte-equality assertions on the multipart-download path.
-
-# Remote-helper shims. Git invokes them by scheme as `git-remote-<scheme>`,
-# so the installed binary names must be `git-remote-s3+https` etc.
-#
-# Phase-1 spike result (execution-plan.md §5.6 / §6): cargo rejects `+` in
-# `[[bin]] name` ("invalid character '+' in crate name"). Falling back to
-# hyphenated cargo bin names; an `xtask` step will rename / hardlink them
-# to the `+` form at install time. Tracked separately for Phase 14
-# (packaging).
-
-[[bin]]
-name = "git-remote-s3-https"
-path = "src/bin/git-remote-s3-https.rs"
-
-[[bin]]
-name = "git-remote-s3-http"
-path = "src/bin/git-remote-s3-http.rs"
-
-[[bin]]
-name = "git-remote-az-https"
-path = "src/bin/git-remote-az-https.rs"
-
-[[bin]]
-name = "git-remote-az-http"
-path = "src/bin/git-remote-az-http.rs"
-
-[[bin]]
-name = "git-remote-object-store"
-path = "src/bin/git-remote-object-store.rs"
-
-[[bin]]
-name = "git-lfs-object-store"
-path = "src/bin/git-lfs-object-store.rs"
 
 # Keep line tables in release builds so dsymutil/objcopy can produce
 # meaningful backtraces from a released binary. Release CI splits

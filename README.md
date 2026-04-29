@@ -81,7 +81,7 @@ LFS, submodules, local development against MinIO and Azurite.
 The short version:
 
 ```bash
-cargo install --path .
+cargo install --path cli
 
 # Bridge cargo's hyphenated names to the `+`-form git looks up.
 mkdir -p ~/.local/bin
@@ -90,6 +90,41 @@ for s in s3+https s3+http az+https az+http; do
            "$HOME/.local/bin/git-remote-$s"
 done
 ```
+
+## Using as a library
+
+`git-remote-object-store` is also a Rust library crate. Add it to your
+`Cargo.toml` and use `Remote` as the entry point to read or write objects in
+the on-bucket format:
+
+```rust
+use git_remote_object_store::Remote;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let remote = Remote::connect(
+        "s3+https://my-bucket.s3.us-east-1.amazonaws.com/my-repo"
+    ).await?;
+
+    // Read HEAD
+    let head = remote.get_head().await?;
+    println!("HEAD: {}", String::from_utf8_lossy(&head));
+
+    // List all bundles on a branch
+    let objects = remote.list("refs/heads/main/").await?;
+    for obj in objects {
+        println!("{} ({} bytes)", obj.key, obj.size);
+    }
+
+    // Direct store access for any operation
+    let store = remote.store();
+    let data = store.get_bytes(&remote.key("LOCK#.lock")).await?;
+    Ok(())
+}
+```
+
+The `ObjectStore` trait and the S3 / Azure backends are also publicly
+available for building custom storage integrations.
 
 ## Documentation
 

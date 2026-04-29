@@ -250,7 +250,7 @@ clean:
 	cargo clean
 
 install: build-release
-	cargo install --path . --bins
+	cargo install --path cli
 
 # ---------------------------------------------------------------------------
 # Documentation

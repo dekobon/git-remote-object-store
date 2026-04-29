@@ -31,7 +31,7 @@ that skip cloud accounts entirely.
 ```bash
 git clone https://github.com/dekobon/git-remote-object-store
 cd git-remote-object-store
-cargo install --path .
+cargo install --path cli
 ```
 
 This installs six binaries into `$HOME/.cargo/bin`:
