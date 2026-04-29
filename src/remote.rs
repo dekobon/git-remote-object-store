@@ -54,7 +54,7 @@ use bytes::Bytes;
 
 use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
 use crate::protocol::backend::{self, BackendError};
-use crate::url::RemoteUrl;
+use crate::url::{ParseError, RemoteUrl};
 
 /// A handle to a git-remote-object-store repository in a cloud backend.
 ///
@@ -93,7 +93,7 @@ impl Remote {
     /// Returns [`BackendError`] when the backend is unreachable.
     pub async fn open(url: &RemoteUrl) -> Result<Self, BackendError> {
         let store = backend::build(url).await?;
-        let prefix = url.prefix().unwrap_or("").to_owned();
+        let prefix = url.prefix().unwrap_or_default().to_owned();
         Ok(Self { store, prefix })
     }
 
@@ -132,8 +132,8 @@ impl Remote {
     /// # }
     /// ```
     #[must_use]
-    pub fn store(&self) -> &Arc<dyn ObjectStore> {
-        &self.store
+    pub fn store(&self) -> &dyn ObjectStore {
+        &*self.store
     }
 
     /// The repository prefix (empty string for bucket-root repositories).
@@ -173,7 +173,7 @@ impl Remote {
 pub enum RemoteError {
     /// The URL string was not a recognised scheme or was malformed.
     #[error(transparent)]
-    Url(#[from] crate::url::ParseError),
+    Url(#[from] ParseError),
     /// The backend was unreachable (auth failure, missing bucket/container, etc.).
     #[error(transparent)]
     Backend(#[from] BackendError),
