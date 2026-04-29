@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Extracted local-branch primitives into a new `git::branch` submodule.
+  `git::rev_parse` is removed; callers use `git::branch::resolve`
+  instead. Added `BranchName` newtype that encapsulates the
+  `refs/heads/<name>` invariant and `git::branch::current` reporting
+  the branch HEAD points at (returning `None` for detached, unborn,
+  and non-`refs/heads/` HEADs). (#47)
 - Restructured as a Cargo workspace: the library crate
   (`git-remote-object-store`) stays at the repository root; the six
   binary targets move to a new `cli/` sub-crate

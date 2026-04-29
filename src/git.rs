@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::string::FromUtf8Error;
 use std::sync::atomic::AtomicBool;
 
+pub(crate) mod branch;
+
 use gix::Repository;
 use gix::bstr::{BStr, ByteSlice};
 use gix::config::file::Metadata as GixConfigMetadata;
@@ -252,6 +254,16 @@ pub enum GitError {
     /// Failed to acquire `.git/config.lock` for an atomic config write.
     #[error(transparent)]
     ConfigLock(Box<gix_lock::acquire::Error>),
+    /// Reading the `HEAD` reference failed.
+    #[error(transparent)]
+    HeadLookup(Box<gix::reference::find::existing::Error>),
+    /// `HEAD`'s referent name is not valid UTF-8.
+    #[error("HEAD ref name is not valid UTF-8")]
+    NonUtf8HeadRef {
+        /// Underlying decode error.
+        #[source]
+        source: std::str::Utf8Error,
+    },
 }
 
 impl From<gix::open::Error> for GitError {
@@ -299,6 +311,12 @@ impl From<gix_config_init::Error> for GitError {
 impl From<gix_lock::acquire::Error> for GitError {
     fn from(e: gix_lock::acquire::Error) -> Self {
         GitError::ConfigLock(Box::new(e))
+    }
+}
+
+impl From<gix::reference::find::existing::Error> for GitError {
+    fn from(e: gix::reference::find::existing::Error) -> Self {
+        GitError::HeadLookup(Box::new(e))
     }
 }
 
@@ -398,21 +416,6 @@ pub async fn unbundle_at(
     tokio::task::spawn_blocking(move || crate::bundle::unbundle(&cwd, &folder, sha, &ref_name))
         .await?
         .map_err(|e| GitError::Bundle(Box::new(e)))
-}
-
-/// Resolve a rev-spec (a ref name, full or short SHA, `HEAD~n`, etc.) to
-/// the canonical 40-hex commit OID it points at.
-///
-/// # Errors
-///
-/// Returns [`GitError::EmptySpec`] if `spec` is empty, or
-/// [`GitError::RevParse`] if the spec cannot be resolved to an object.
-pub fn rev_parse(repo: &Repository, spec: &str) -> Result<Sha, GitError> {
-    if spec.is_empty() {
-        return Err(GitError::EmptySpec);
-    }
-    let id = repo.rev_parse_single(BStr::new(spec))?;
-    Ok(Sha::from_object_id(id.detach()))
 }
 
 /// Return `true` iff `ancestor` is an ancestor of `descendant` (or
@@ -878,38 +881,7 @@ mod tests {
         }
     }
 
-    // --- rev_parse / is_ancestor / archive / last_commit_message / remote_url
-
-    #[test]
-    fn rev_parse_resolves_branch_ref() {
-        let (repo, _dir) = empty_repo();
-        let oid = add_commit(&repo, "refs/heads/main", &[], "first");
-        let sha = rev_parse(&repo, "refs/heads/main").expect("rev_parse");
-        assert_eq!(sha.as_object_id(), &oid);
-    }
-
-    #[test]
-    fn rev_parse_resolves_full_sha() {
-        let (repo, _dir) = empty_repo();
-        let oid = add_commit(&repo, "refs/heads/main", &[], "first");
-        let hex = oid.to_string();
-        let sha = rev_parse(&repo, &hex).expect("rev_parse");
-        assert_eq!(sha.as_object_id(), &oid);
-    }
-
-    #[test]
-    fn rev_parse_unknown_returns_error() {
-        let (repo, _dir) = empty_repo();
-        add_commit(&repo, "refs/heads/main", &[], "first");
-        assert!(rev_parse(&repo, "refs/heads/does-not-exist").is_err());
-    }
-
-    #[test]
-    fn rev_parse_empty_returns_empty_spec() {
-        let (repo, _dir) = empty_repo();
-        add_commit(&repo, "refs/heads/main", &[], "first");
-        assert!(matches!(rev_parse(&repo, ""), Err(GitError::EmptySpec)));
-    }
+    // --- is_ancestor / archive / last_commit_message / remote_url
 
     #[test]
     fn is_ancestor_self_is_true() {
@@ -1417,9 +1389,9 @@ mod tests {
         );
         // Verify the OID is also resolvable via gix's spec parser — exercises
         // a different lookup path from contains(). The assert_eq on the
-        // returned sha would be vacuous (rev_parse of a bare hex SHA always
+        // returned sha would be vacuous (resolve of a bare hex SHA always
         // returns that same SHA), so the .expect() is the assertion.
-        rev_parse(&dst_repo, &sha.to_string()).expect("rev_parse must work on bundled OID");
+        branch::resolve(&dst_repo, &sha.to_string()).expect("resolve must work on bundled OID");
 
         // Confirm that unbundle() removes the .keep file created by
         // write_to_directory. A lingering .keep prevents git-repack from

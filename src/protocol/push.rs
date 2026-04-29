@@ -405,7 +405,7 @@ fn local_git_work(
     let repo = gix::open(repo_dir)?;
     let cwd = repo.workdir().unwrap_or_else(|| repo.git_dir()).to_owned();
 
-    let Ok(local_sha) = git::rev_parse(&repo, local_spec) else {
+    let Ok(local_sha) = git::branch::resolve(&repo, local_spec) else {
         return Ok(Err(GitProbeError::LocalRefNotFound));
     };
 
