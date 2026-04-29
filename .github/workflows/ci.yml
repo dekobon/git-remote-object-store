@@ -35,7 +35,7 @@ env:
   RUST_TOOLCHAIN: "1.94.0"
   # Pinned tool versions -- update here to roll forward.
   COMMITSAR_VERSION: "1.0.3"
-  CARGO_DENY_VERSION: "0.18.4"
+  CARGO_DENY_VERSION: "0.18.9"
   SHELLSPEC_VERSION: "0.28.1"
   MARKDOWNLINT_CLI2_VERSION: "0.21.0"
   TAPLO_VERSION: "0.10.0"
