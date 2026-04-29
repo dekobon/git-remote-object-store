@@ -373,7 +373,7 @@ enum GitProbeError {
 struct LocalGit {
     /// Resolved commit OID for the user's `local_spec`.
     local_sha: Sha,
-    /// Working directory for `git bundle create` subprocess calls.
+    /// Working directory passed to `bundle::create`.
     cwd: PathBuf,
     /// On the zip path: archive on disk + metadata for the upload.
     /// `None` on the regular push path. The `TempDir` keeps the file
