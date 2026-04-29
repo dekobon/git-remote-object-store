@@ -9,10 +9,8 @@ use std::process::ExitCode;
 use anyhow::{Context, anyhow};
 use tokio::io::BufReader;
 
-use git_remote_object_store::protocol;
-use git_remote_object_store::protocol::backend;
-use git_remote_object_store::protocol::tracing_init;
-use git_remote_object_store::url;
+use git_remote_object_store::RemoteUrl;
+use git_remote_object_store::protocol::{self, backend, tracing_init};
 
 /// Shared `main` for every `git-remote-{s3,az}-{http,https}` binary.
 ///
@@ -89,7 +87,7 @@ pub async fn run_main() -> ExitCode {
 /// Split out from [`run_main`] so the argv contract (slot, error message)
 /// is testable without spawning a process or installing a global tracing
 /// subscriber.
-fn parse_remote_arg<I>(args: I) -> anyhow::Result<git_remote_object_store::RemoteUrl>
+fn parse_remote_arg<I>(args: I) -> anyhow::Result<RemoteUrl>
 where
     I: IntoIterator<Item = String>,
 {
@@ -97,7 +95,8 @@ where
         .into_iter()
         .nth(2)
         .ok_or_else(|| anyhow!("missing remote URL: expected `<remote-name> <url>` on argv"))?;
-    url::parse(&raw).context("failed to parse remote URL")
+    raw.parse::<RemoteUrl>()
+        .context("failed to parse remote URL")
 }
 
 #[cfg(unix)]
