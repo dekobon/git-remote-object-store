@@ -99,6 +99,7 @@ url = "2"
 # (Phase 14 packaging is the right place to revisit).
 gix = "0.82"
 gix-hash = { version = "0.24", features = ["sha1"] }
+gix-pack = "0.69"
 gix-validate = "0.11"
 gix-archive = "0.31"
 

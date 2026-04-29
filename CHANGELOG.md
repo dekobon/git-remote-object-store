@@ -33,6 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `bundle_at` and `unbundle_at` now use a native `gix-pack 0.69`
+  implementation (`src/bundle.rs`) instead of shelling out to
+  `git bundle create` / `git bundle unbundle`. The `git` binary is no
+  longer required at runtime for bundle operations. The implementation
+  walks the commit graph with `rev_walk`, counts objects with
+  `count::objects` (using `ObjectExpansion::TreeContents` to include
+  trees and blobs), serialises with the `entry::iter_from_counts` →
+  `bytes::FromEntriesIter` pipeline, and writes the header + pack
+  atomically via `NamedTempFile::persist`. Unbundle parses the v2 header,
+  checks prerequisites, and calls `Bundle::write_to_directory`.
 - `git::config_add` / `git::config_unset` now write through
   `gix-config` and `gix-lock` instead of spawning `git config --add` /
   `--unset`. The in-process path acquires `.git/config.lock`, parses with
@@ -45,9 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   set `lfs.customtransfer.<agent>.path` and `lfs.standalonetransferagent`
   in one pass. The LFS agent's `install` / `enable_debug` /
   `disable_debug` subcommands lose their `async` qualifier as a side
-  effect — the only remaining `git` subprocess in production is
-  `git bundle create` / `bundle unbundle`, blocked on `gix` exposing a
-  public bundle reader/writer. (#46)
+  effect. (#46)
 - `protocol::run_main` now returns `std::process::ExitCode` instead of
   `anyhow::Result<()>` so the helper binaries
   (`git-remote-{s3,az}-{http,https}`) can render categorical
@@ -68,6 +76,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   call sites pass `GetOpts::default()` and `progress: None`; the LFS
   agent populates the sink. This is a public-API break for callers of
   `ObjectStore::get_to_file`. (#44)
+
+### Removed
+
+- Internal `run_git` helper — was the sole subprocess-spawning point in
+  production; removed once `bundle_at` / `unbundle_at` moved to the native
+  `gix-pack` path.
+- `GitError::GitBinaryMissing` — was only reachable through `run_git`;
+  removed along with it.
+- `GitError::Subprocess` — likewise only reachable through `run_git`.
 
 ### Fixed
 

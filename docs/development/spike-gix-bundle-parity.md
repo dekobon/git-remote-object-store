@@ -2,7 +2,8 @@
 
 **Phase:** 3 (`gix` (gitoxide) wrapper)
 **Date:** 2026-04-25
-**Status:** resolved — keep subprocess fallback for `bundle`/`unbundle` only.
+**Status:** resolved — native implementation in `src/bundle.rs` via
+`gix-pack 0.69`.
 
 ## Question
 
@@ -21,34 +22,30 @@ subprocess can be dropped from the Rust port?
    would land bundle support. None found; the closest hit is the
    long-open #104 about `pack-receive`, which is unrelated.
 
-## Result
+## Initial result (2026-04-25)
 
-`gix` 0.82 has **no public API for creating or consuming git bundle
-files**. The bundle wire format is documented in
-[git's `bundle-format.txt`][fmt] and could in principle be implemented
-on top of the existing `gix-pack` writer/reader, but no such layer
-exists today.
+`gix` 0.82 had **no public API for creating or consuming git bundle
+files**. Decision at the time: keep a subprocess fallback for
+`bundle()` and `unbundle()` only.
 
-Decision: keep a subprocess fallback for `bundle()` and `unbundle()`
-only. All other helpers (`rev_parse`, `is_ancestor`, `archive`,
-`is_valid_ref_name`, `last_commit_message`, `remote_url`) go through
-`gix` natively.
+## Resolution (2026-04-28)
 
-The fallback is implemented through a single private helper,
-`run_git()`, that hard-codes `Stdio::null` for stdin and `Stdio::piped`
-for both stdout and stderr — protecting the helper-protocol stdout
-discipline mandated by `.claude/rules/protocol-stdout.md`. `run_git()`
-is the only place in the crate that spawns `git`.
+`gix-pack 0.69` (already a transitive dependency through `gix 0.82`)
+exposes the two primitives needed to implement the bundle v2 format
+natively:
 
-## Re-evaluation triggers
+- **`gix_pack::Bundle::write_to_directory`** — receives a raw PACK byte
+  stream and writes an indexed `.pack`/`.idx` pair into a directory.
+  Used by the unbundle path: parse the git bundle text header, seek to
+  the PACK data, and pass the remaining bytes into this function.
+- **`gix_pack::data::output` pipeline** — three-stage:
+  `count::objects` → `entry::iter_from_counts` →
+  `bytes::FromEntriesIter`. Using `ObjectExpansion::TreeContents`,
+  passing only commit IDs causes automatic per-commit expansion to trees
+  and blobs. Used by the bundle-create path.
 
-- `gix` ships a public bundle reader/writer (likely as a new
-  `gix-bundle` sub-crate, or under `gix::bundle::*`). Watch the
-  gitoxide CHANGELOG and the `bundle` label on the issue tracker.
-- A standalone `gix-bundle` crate appears with a stable API.
-
-When either triggers, replace the `bundle`/`unbundle` body to call the
-new API and drop the `run_git` helper if no other site uses it.
+The implementation lives in `src/bundle.rs`. The `run_git` subprocess
+helper was removed along with `GitError::GitBinaryMissing` and
+`GitError::Subprocess`. See `CHANGELOG.md` for the full entry.
 
 [gix]: https://docs.rs/gix/0.82.0/gix/
-[fmt]: https://git-scm.com/docs/bundle-format

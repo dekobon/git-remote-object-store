@@ -3,23 +3,15 @@
 //! Mirrors the surface of upstream `git_remote_s3/git.py`. Operations that
 //! `gix` 0.82 exposes go through `gix` natively; config reads/writes go
 //! through `gix-config` + `gix-lock` for atomic edits parity with
-//! `git config`. Bundle creation and consumption still fall back to `git`
-//! subprocess because no public bundle reader/writer exists in `gix` yet
-//! (see `docs/development/spike-gix-bundle-parity.md`).
-//!
-//! Subprocess invocation is funnelled through a single private helper
-//! [`run_git`] which hard-codes the stdio configuration required by
-//! `.claude/rules/protocol-stdout.md` — stdin null, stdout and stderr
-//! captured, never inherited. `run_git` is the only place in the crate
-//! that spawns `git`.
+//! `git config`. Bundle creation and consumption use the native
+//! `gix-pack`-based implementation in [`crate::bundle`]; no `git`
+//! subprocess is spawned at runtime.
 //!
 //! [gix]: https://docs.rs/gix
 
-use std::ffi::OsStr;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::string::FromUtf8Error;
 use std::sync::atomic::AtomicBool;
 
@@ -35,7 +27,6 @@ use gix::progress::Discard;
 use gix::remote::Direction;
 use gix_hash::ObjectId;
 use thiserror::Error;
-use tokio::process::Command;
 
 /// SHA-1 commit OID, displayed as 40 lowercase hex characters.
 ///
@@ -176,17 +167,12 @@ pub enum GitError {
         #[source]
         source: FromUtf8Error,
     },
-    /// `git` binary is not on `PATH`.
-    #[error("git binary not found on PATH")]
-    GitBinaryMissing,
-    /// `git` subprocess exited with a non-zero status.
-    #[error("git {operation} failed: {stderr}")]
-    Subprocess {
-        /// Short tag identifying the subprocess command (e.g. `bundle create`).
-        operation: &'static str,
-        /// Captured stderr from the subprocess.
-        stderr: String,
-    },
+    /// Native bundle operation failed.
+    #[error("bundle: {0}")]
+    Bundle(Box<crate::bundle::BundleError>),
+    /// A `spawn_blocking` task panicked.
+    #[error("blocking task panicked")]
+    Panic(#[from] tokio::task::JoinError),
     /// Local I/O error.
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -306,56 +292,8 @@ impl From<gix_lock::acquire::Error> for GitError {
     }
 }
 
-/// The single git-spawning entry point.
-///
-/// Hard-codes `Stdio::null` for stdin and `Stdio::piped` for both stdout
-/// and stderr, satisfying `.claude/rules/protocol-stdout.md`. `operation`
-/// is a short human-readable tag attached to the resulting error if the
-/// subprocess exits non-zero. `cwd` is set explicitly; the parent's cwd
-/// is never inherited.
-async fn run_git(
-    operation: &'static str,
-    args: &[&OsStr],
-    cwd: &Path,
-) -> Result<Vec<u8>, GitError> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| match e.kind() {
-            // `cwd` not existing also surfaces as `NotFound`; only treat
-            // a missing-binary kind as such if the cwd is sane. The
-            // probe is best-effort — a TOCTOU window is harmless here
-            // since both branches still fail the call.
-            io::ErrorKind::NotFound if cwd.is_dir() => GitError::GitBinaryMissing,
-            _ => GitError::Io(e),
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        return Err(GitError::Subprocess { operation, stderr });
-    }
-
-    if !output.stderr.is_empty() {
-        tracing::debug!(
-            target: "git_remote_object_store::git",
-            operation,
-            "{}",
-            String::from_utf8_lossy(&output.stderr).trim_end()
-        );
-    }
-
-    Ok(output.stdout)
-}
-
-/// Pick a working directory for `git` subprocess invocations targeting
-/// `repo`. Prefers the work tree (so relative path arguments resolve as
-/// the user expects) and falls back to the git directory for bare
-/// repositories.
+/// Pick a working directory for git operations targeting `repo`. Prefers
+/// the work tree and falls back to the git directory for bare repositories.
 fn repo_cwd(repo: &Repository) -> &Path {
     repo.workdir().unwrap_or_else(|| repo.git_dir())
 }
@@ -363,22 +301,20 @@ fn repo_cwd(repo: &Repository) -> &Path {
 /// Write a git bundle for `spec` to `<folder>/<sha>.bundle` and return
 /// the absolute path.
 ///
-/// `spec` is a rev-spec passed verbatim to `git bundle create` — a
-/// fully-qualified ref (`refs/heads/main`), a short branch (`main`),
-/// `HEAD`, or even a SHA. Callers should run [`is_valid_ref_name`] on
-/// untrusted input first; git itself enforces the same invariants and
-/// will fail the subprocess otherwise.
-///
-/// Falls back to `git bundle create` because `gix` 0.82 has no public
-/// bundle writer (see `docs/development/spike-gix-bundle-parity.md`).
-/// `folder` is canonicalized so the returned bundle path resolves
-/// identically regardless of the caller's cwd at observation time.
+/// `spec` is a rev-spec — a fully-qualified ref (`refs/heads/main`), a
+/// short branch (`main`), `HEAD`, or a SHA. All objects reachable from
+/// the resolved commit are included.
 ///
 /// The returned future is **not** `Send`: `gix::Repository` is `!Sync`,
 /// so the captured `&Repository` parameter cannot cross thread
 /// boundaries. Callers must `.await` it directly rather than passing
-/// it to `tokio::spawn`. This is fine for the protocol REPL, which
-/// drives bundle/unbundle serially.
+/// it to `tokio::spawn`.
+///
+/// # Errors
+///
+/// Returns [`GitError::Bundle`] if the spec cannot be resolved, the
+/// commit graph cannot be walked, or the bundle file cannot be written.
+/// Returns [`GitError::Panic`] if the blocking task panics.
 pub async fn bundle(
     repo: &Repository,
     folder: &Path,
@@ -386,8 +322,7 @@ pub async fn bundle(
     spec: &str,
 ) -> Result<PathBuf, GitError> {
     // `&Repository` is !Send (Repository is Send but !Sync), so we must
-    // not hold a `&Path` borrowed from `repo` across the .await. Detach
-    // to an owned PathBuf before suspension.
+    // not hold a `&Path` borrowed from `repo` across the .await.
     let cwd = repo_cwd(repo).to_owned();
     bundle_at(&cwd, folder, sha, spec).await
 }
@@ -396,32 +331,34 @@ pub async fn bundle(
 /// `&Repository` across `.await` (the protocol push handler shares
 /// state across tokio tasks; `gix::Repository` is `!Sync`, so its
 /// future would not be `Send`).
+///
+/// # Errors
+///
+/// Returns [`GitError::Bundle`] if the spec cannot be resolved, the
+/// commit graph cannot be walked, or the bundle file cannot be written.
+/// Returns [`GitError::Panic`] if the blocking task panics.
 pub async fn bundle_at(
     cwd: &Path,
     folder: &Path,
     sha: Sha,
     spec: &str,
 ) -> Result<PathBuf, GitError> {
-    let folder = folder.canonicalize()?;
-    let bundle_path = folder.join(format!("{sha}.bundle"));
-    let ref_arg = OsStr::new(spec);
-    let args: [&OsStr; 4] = [
-        OsStr::new("bundle"),
-        OsStr::new("create"),
-        bundle_path.as_os_str(),
-        ref_arg,
-    ];
-    run_git("bundle create", &args, cwd).await?;
-    Ok(bundle_path)
+    let (cwd, folder, spec) = (cwd.to_owned(), folder.to_owned(), spec.to_owned());
+    tokio::task::spawn_blocking(move || crate::bundle::create(&cwd, &folder, sha, &spec))
+        .await?
+        .map_err(|e| GitError::Bundle(Box::new(e)))
 }
 
-/// Unbundle `<folder>/<sha>.bundle` into `repo`, creating `ref_name`.
+/// Unbundle `<folder>/<sha>.bundle` into `repo`.
 ///
-/// Falls back to `git bundle unbundle` for the same reason as
-/// [`bundle`]. The trailing `ref_name` argument to `git bundle unbundle`
-/// is what causes the ref to be created in the local repo — it is not
-/// optional. `folder` is canonicalized so resolution is independent of
-/// the caller's cwd.
+/// Objects are installed into the ODB; no ref is created. Ref creation
+/// is the remote-helper protocol's responsibility.
+///
+/// # Errors
+///
+/// Returns [`GitError::Bundle`] if the bundle file is malformed,
+/// prerequisite objects are missing, or the pack cannot be installed.
+/// Returns [`GitError::Panic`] if the blocking task panics.
 pub async fn unbundle(
     repo: &Repository,
     folder: &Path,
@@ -435,23 +372,22 @@ pub async fn unbundle(
 /// `&Repository` across `.await` (notably the parallel fetch handler:
 /// `gix::Repository` is `!Sync`, so it cannot be shared across
 /// concurrent tasks).
+///
+/// # Errors
+///
+/// Returns [`GitError::Bundle`] if the bundle file is malformed,
+/// prerequisite objects are missing, or the pack cannot be installed.
+/// Returns [`GitError::Panic`] if the blocking task panics.
 pub async fn unbundle_at(
     cwd: &Path,
     folder: &Path,
     sha: Sha,
     ref_name: &RefName,
 ) -> Result<(), GitError> {
-    let folder = folder.canonicalize()?;
-    let bundle_path = folder.join(format!("{sha}.bundle"));
-    let ref_arg = OsStr::new(ref_name.as_str());
-    let args: [&OsStr; 4] = [
-        OsStr::new("bundle"),
-        OsStr::new("unbundle"),
-        bundle_path.as_os_str(),
-        ref_arg,
-    ];
-    run_git("bundle unbundle", &args, cwd).await?;
-    Ok(())
+    let (cwd, folder, ref_name) = (cwd.to_owned(), folder.to_owned(), ref_name.clone());
+    tokio::task::spawn_blocking(move || crate::bundle::unbundle(&cwd, &folder, sha, &ref_name))
+        .await?
+        .map_err(|e| GitError::Bundle(Box::new(e)))
 }
 
 /// Resolve a rev-spec (a ref name, full or short SHA, `HEAD~n`, etc.) to
@@ -724,6 +660,7 @@ mod tests {
 
     use gix::actor::SignatureRef;
     use gix::bstr::BStr;
+    use gix_pack::Find as _;
     use std::sync::OnceLock;
     use tempfile::TempDir;
 
@@ -1370,15 +1307,10 @@ mod tests {
         assert_eq!(stdout.trim(), "git-lfs-object-store");
     }
 
-    // --- bundle / unbundle (subprocess) -------------------------------
+    // --- bundle / unbundle (native gix-pack) --------------------------
 
     #[tokio::test]
-    async fn bundle_unbundle_round_trips_through_subprocess() {
-        if !git_available() {
-            eprintln!("skipping: git not on PATH");
-            return;
-        }
-
+    async fn bundle_unbundle_round_trips_natively() {
         let (src_repo, src_dir) = empty_repo();
         let oid = add_commit(&src_repo, "refs/heads/main", &[], "first");
         let sha = Sha::from_object_id(oid);
@@ -1390,16 +1322,295 @@ mod tests {
             .expect("bundle");
         assert!(bundle_path.exists(), "bundle not written");
 
+        // Verify bundle v2 header format.
+        let first_line = {
+            use std::io::BufRead as _;
+            let f = std::fs::File::open(&bundle_path).expect("open bundle");
+            let mut buf = String::new();
+            std::io::BufReader::new(f)
+                .read_line(&mut buf)
+                .expect("read");
+            buf.trim_end().to_owned()
+        };
+        assert_eq!(first_line, "# v2 git bundle", "bundle magic mismatch");
+
         let (dst_repo, _dst_dir) = empty_repo();
         unbundle(&dst_repo, bundles.path(), sha, &ref_name)
             .await
             .expect("unbundle");
-        // `git bundle unbundle` copies pack objects into the destination
-        // odb but does not update refs — that's the remote-helper
-        // protocol's job. Round-trip is proven by the commit object
-        // becoming resolvable in dst_repo.
-        let dst_sha = rev_parse(&dst_repo, &sha.to_string()).expect("rev_parse dst");
-        assert_eq!(dst_sha, sha);
+        // `unbundle` copies pack objects into the destination ODB but does
+        // not update refs — that's the remote-helper protocol's job.
+        // Confirm via direct ODB lookup and via rev_parse.
+        assert!(
+            dst_repo
+                .objects
+                .clone()
+                .into_inner()
+                .contains(sha.as_object_id()),
+            "commit object not in dst ODB after unbundle"
+        );
+        // Verify the OID is also resolvable via gix's spec parser — exercises
+        // a different lookup path from contains(). The assert_eq on the
+        // returned sha would be vacuous (rev_parse of a bare hex SHA always
+        // returns that same SHA), so the .expect() is the assertion.
+        rev_parse(&dst_repo, &sha.to_string()).expect("rev_parse must work on bundled OID");
+
+        // Confirm that unbundle() removes the .keep file created by
+        // write_to_directory. A lingering .keep prevents git-repack from
+        // consolidating packs; this check would catch any regression that
+        // stops the removal.
+        let pack_dir = dst_repo.git_dir().join("objects/pack");
+        let keep_files: Vec<_> = std::fs::read_dir(&pack_dir)
+            .expect("read pack dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "keep"))
+            .collect();
+        assert!(
+            keep_files.is_empty(),
+            ".keep files not removed after unbundle: {keep_files:?}"
+        );
+        drop(src_dir);
+    }
+
+    #[tokio::test]
+    async fn bundle_includes_full_commit_history() {
+        let (src_repo, src_dir) = empty_repo();
+        let oid1 = add_commit(&src_repo, "refs/heads/main", &[], "first");
+        let oid2 = add_commit(&src_repo, "refs/heads/main", &[oid1], "second");
+        let sha = Sha::from_object_id(oid2);
+        let ref_name = RefName::new("refs/heads/main").expect("RefName");
+
+        let bundles = TempDir::new().expect("tempdir");
+        bundle(&src_repo, bundles.path(), sha, ref_name.as_str())
+            .await
+            .expect("bundle");
+
+        let (dst_repo, _dst_dir) = empty_repo();
+        unbundle(&dst_repo, bundles.path(), sha, &ref_name)
+            .await
+            .expect("unbundle");
+
+        // Both commits must be present in dst_repo ODB.
+        let dst_odb = dst_repo.objects.clone().into_inner();
+        assert!(
+            dst_odb.contains(&oid1),
+            "ancestor commit not in dst ODB after unbundle"
+        );
+        assert!(
+            dst_odb.contains(&oid2),
+            "tip commit not in dst ODB after unbundle"
+        );
+
+        // Verify that trees and blobs (not just commits) are in the bundle.
+        // add_commit always writes the same blob; write_blob is idempotent
+        // (content-addressed), so this returns the same ID that add_commit
+        // stored in src_repo without writing a second copy.
+        let blob_id = src_repo.write_blob(b"hello\n").expect("blob id").detach();
+        assert!(
+            dst_odb.contains(&blob_id),
+            "blob object not in dst ODB — ObjectExpansion::TreeContents may not be working"
+        );
+        drop(src_dir);
+    }
+
+    // --- idempotency --------------------------------------------------
+
+    /// Calling `unbundle()` twice for the same SHA must succeed both times.
+    ///
+    /// On the second call `gix_pack::Bundle::write_to_directory` detects the
+    /// pack already exists and returns `Outcome { keep_path: None, .. }` — the
+    /// branch of our `.keep` removal logic that skips the `fs::remove_file`
+    /// entirely. This test pins that path and guards against regressions that
+    /// would return an error on a duplicate install.
+    #[tokio::test]
+    async fn unbundle_is_idempotent_on_duplicate_install() {
+        let (src_repo, src_dir) = empty_repo();
+        let oid = add_commit(&src_repo, "refs/heads/main", &[], "first");
+        let sha = Sha::from_object_id(oid);
+        let ref_name = RefName::new("refs/heads/main").expect("RefName");
+
+        let bundles = TempDir::new().expect("tempdir");
+        bundle(&src_repo, bundles.path(), sha, ref_name.as_str())
+            .await
+            .expect("bundle");
+
+        let (dst_repo, _dst_dir) = empty_repo();
+
+        unbundle(&dst_repo, bundles.path(), sha, &ref_name)
+            .await
+            .expect("first unbundle");
+
+        // Second unbundle of the same SHA: pack already on disk, so
+        // write_to_directory returns keep_path = None. Must still return Ok(()).
+        unbundle(&dst_repo, bundles.path(), sha, &ref_name)
+            .await
+            .expect("second unbundle (duplicate install)");
+
+        let pack_dir = dst_repo.git_dir().join("objects/pack");
+        let keep_files: Vec<_> = std::fs::read_dir(&pack_dir)
+            .expect("read pack dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "keep"))
+            .collect();
+        assert!(
+            keep_files.is_empty(),
+            ".keep files after duplicate unbundle: {keep_files:?}"
+        );
+
+        assert!(
+            dst_repo.objects.clone().into_inner().contains(&oid),
+            "commit not in dst ODB after duplicate unbundle"
+        );
+        drop(src_dir);
+    }
+
+    // --- concurrency --------------------------------------------------
+
+    /// Two concurrent `unbundle_at` calls for the same SHA must both succeed,
+    /// leave no `.keep` files, and end with the object in the destination ODB.
+    ///
+    /// This exercises the `NotFound` handling in the `.keep` removal: the
+    /// faster task removes the file; the slower task gets `NotFound` and must
+    /// silently succeed rather than returning an error. The production fetch
+    /// path (`fetch_batch`) runs bundle downloads in parallel and can reach
+    /// this scenario when the same SHA appears in multiple concurrent fetch
+    /// commands before `FetchedRefs` has recorded the first completion.
+    #[tokio::test]
+    async fn concurrent_unbundle_same_sha_is_idempotent() {
+        let (src_repo, src_dir) = empty_repo();
+        let oid = add_commit(&src_repo, "refs/heads/main", &[], "first");
+        let sha = Sha::from_object_id(oid);
+        let ref_name = RefName::new("refs/heads/main").expect("RefName");
+
+        let bundles = TempDir::new().expect("tempdir");
+        bundle(&src_repo, bundles.path(), sha, ref_name.as_str())
+            .await
+            .expect("bundle");
+
+        let (dst_repo, _dst_dir) = empty_repo();
+        let dst_cwd = repo_cwd(&dst_repo).to_owned();
+        let bundles_path = bundles.path().to_owned();
+
+        let (r1, r2) = tokio::join!(
+            unbundle_at(&dst_cwd, &bundles_path, sha, &ref_name),
+            unbundle_at(&dst_cwd, &bundles_path, sha, &ref_name),
+        );
+        assert!(r1.is_ok(), "first concurrent unbundle failed: {r1:?}");
+        assert!(r2.is_ok(), "second concurrent unbundle failed: {r2:?}");
+
+        // No .keep files should survive regardless of task ordering.
+        let pack_dir = dst_repo.git_dir().join("objects/pack");
+        let keep_files: Vec<_> = std::fs::read_dir(&pack_dir)
+            .expect("read pack dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "keep"))
+            .collect();
+        assert!(
+            keep_files.is_empty(),
+            ".keep files lingered after concurrent unbundle: {keep_files:?}"
+        );
+
+        assert!(
+            dst_repo.objects.clone().into_inner().contains(&oid),
+            "commit not in dst ODB after concurrent unbundle"
+        );
+        drop(src_dir);
+    }
+
+    // --- cross-tool bundle compatibility --------------------------------
+
+    /// Create a bundle with `git bundle create`, then verify our native
+    /// unbundle can parse and install the objects.
+    #[tokio::test]
+    async fn git_bundle_create_readable_by_native_unbundle() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (src_repo, src_dir) = empty_repo();
+        let oid = add_commit(&src_repo, "refs/heads/main", &[], "first");
+        let sha = Sha::from_object_id(oid);
+        let ref_name = RefName::new("refs/heads/main").expect("RefName");
+
+        let bundles = TempDir::new().expect("tempdir");
+        let bundle_path = bundles.path().join(format!("{sha}.bundle"));
+
+        let output = std::process::Command::new("git")
+            .args(["bundle", "create"])
+            .arg(&bundle_path)
+            .arg("refs/heads/main")
+            .current_dir(src_dir.path())
+            .output()
+            .expect("git bundle create");
+        assert!(
+            output.status.success(),
+            "git bundle create failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let (dst_repo, _dst_dir) = empty_repo();
+        unbundle(&dst_repo, bundles.path(), sha, &ref_name)
+            .await
+            .expect("native unbundle of git-created bundle");
+
+        assert!(
+            dst_repo.objects.clone().into_inner().contains(&oid),
+            "commit not in dst ODB after native unbundle of git-created bundle"
+        );
+        drop(src_dir);
+    }
+
+    /// Create a bundle with our native implementation, then verify that
+    /// `git bundle verify` accepts the format and `git bundle unbundle`
+    /// can install the objects into a git repository.
+    #[tokio::test]
+    async fn native_bundle_create_accepted_by_git() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (src_repo, src_dir) = empty_repo();
+        let oid = add_commit(&src_repo, "refs/heads/main", &[], "first");
+        let sha = Sha::from_object_id(oid);
+        let ref_name = RefName::new("refs/heads/main").expect("RefName");
+
+        let bundles = TempDir::new().expect("tempdir");
+        let bundle_path = bundle(&src_repo, bundles.path(), sha, ref_name.as_str())
+            .await
+            .expect("native bundle");
+        drop(src_repo);
+
+        // `git bundle verify` validates the header format and pack checksum.
+        let output = std::process::Command::new("git")
+            .args(["bundle", "verify"])
+            .arg(&bundle_path)
+            .current_dir(src_dir.path())
+            .output()
+            .expect("git bundle verify");
+        assert!(
+            output.status.success(),
+            "git bundle verify rejected our bundle:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // `git bundle unbundle` installs the pack objects into a repository.
+        let (dst_repo, dst_dir) = empty_repo();
+        let output = std::process::Command::new("git")
+            .args(["bundle", "unbundle"])
+            .arg(&bundle_path)
+            .current_dir(dst_dir.path())
+            .output()
+            .expect("git bundle unbundle");
+        assert!(
+            output.status.success(),
+            "git bundle unbundle failed on native bundle:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(
+            dst_repo.objects.clone().into_inner().contains(&oid),
+            "commit not in dst ODB after git bundle unbundle of native bundle"
+        );
         drop(src_dir);
     }
 }
