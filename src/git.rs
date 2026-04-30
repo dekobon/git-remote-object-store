@@ -9,7 +9,7 @@
 //!
 //! [gix]: https://docs.rs/gix
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::io;
 use std::io::Write as _;
@@ -447,11 +447,10 @@ pub fn is_ancestor(repo: &Repository, ancestor: Sha, descendant: Sha) -> Result<
 
 /// Compute the shallow-fetch boundary commits for `tip` at `max_depth`.
 ///
-/// Performs a breadth-first walk from `tip`, marking every commit at
-/// depth `≤ max_depth` as included. The returned vector contains the
-/// distinct OIDs of every parent of the included set that is **not
-/// itself** included — these are the SHAs that must be written to
-/// `.git/shallow` to mark the truncation boundary.
+/// Performs a breadth-first walk from `tip`. The returned vector contains
+/// the **frontier** OIDs — commits reached at exactly `max_depth`. Git
+/// writes these to `.git/shallow` so they appear parentless, giving
+/// exactly `max_depth` visible commits from `tip`.
 ///
 /// BFS is mandatory here: `gix::Repository::rev_walk` returns commits in
 /// topological-sort order, which does not coincide with depth order at
@@ -477,21 +476,21 @@ pub(crate) fn shallow_boundaries(
     let max_depth = max_depth.get();
     let tip_oid = *tip.as_object_id();
 
-    // BFS from `tip`, recording the depth at which each commit was first
-    // reached. BFS guarantees first-visit depth is the minimum depth from
-    // the tip, which is what git uses to determine the frontier.
-    let mut seen: HashMap<ObjectId, u32> = HashMap::new();
+    // BFS from `tip`. `seen` deduplicates; `frontier` accumulates the
+    // commits at exactly max_depth — the boundary written to .git/shallow.
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut frontier: Vec<ObjectId> = Vec::new();
     let mut queue: VecDeque<(ObjectId, u32)> = VecDeque::new();
     queue.push_back((tip_oid, 1));
 
     while let Some((oid, depth)) = queue.pop_front() {
-        if seen.contains_key(&oid) {
+        if !seen.insert(oid) {
             continue;
         }
-        seen.insert(oid, depth);
-        // Do not recurse past max_depth; parents of frontier commits are
-        // excluded from the local repo and need not be visited.
         if depth == max_depth {
+            // Frontier commit: appears parentless in the shallow clone.
+            // Do not recurse further — its parents are excluded.
+            frontier.push(oid);
             continue;
         }
         let commit = repo
@@ -500,20 +499,13 @@ pub(crate) fn shallow_boundaries(
         let commit = commit.into_commit();
         for parent in commit.parent_ids() {
             let parent_oid = parent.detach();
-            if !seen.contains_key(&parent_oid) {
+            if !seen.contains(&parent_oid) {
                 queue.push_back((parent_oid, depth + 1));
             }
         }
     }
 
-    // The boundary is the frontier: commits at exactly max_depth. Git writes
-    // these OIDs to `.git/shallow` so they appear parentless, giving exactly
-    // max_depth visible commits from the tip.
-    Ok(seen
-        .into_iter()
-        .filter(|(_, d)| *d == max_depth)
-        .map(|(oid, _)| oid)
-        .collect())
+    Ok(frontier)
 }
 
 /// Write `boundaries` to `<git_dir>/shallow`, merging with any existing
@@ -539,14 +531,12 @@ pub(crate) fn write_shallow_file(git_dir: &Path, boundaries: &[ObjectId]) -> Res
     // unrecognised content) so an external tool's annotations don't
     // break us.
     let mut merged: HashSet<ObjectId> = HashSet::new();
-    if let Some(bytes) = read_file_if_present(&path)? {
-        for line in bytes.split(|&b| b == b'\n') {
-            let line = line.trim_ascii();
-            if !line.is_empty()
-                && let Ok(oid) = ObjectId::from_hex(line)
-            {
-                merged.insert(oid);
-            }
+    for line in read_or_empty(&path)?.split(|&b| b == b'\n') {
+        let line = line.trim_ascii();
+        if !line.is_empty()
+            && let Ok(oid) = ObjectId::from_hex(line)
+        {
+            merged.insert(oid);
         }
     }
     for oid in boundaries {
@@ -565,19 +555,13 @@ pub(crate) fn write_shallow_file(git_dir: &Path, boundaries: &[ObjectId]) -> Res
     let mut sorted: Vec<ObjectId> = merged.into_iter().collect();
     sorted.sort_unstable();
 
-    let mut buf = Vec::with_capacity(sorted.len() * 41);
+    // 40 hex digits + '\n' per entry.
+    const SHA1_HEX_LINE_LEN: usize = 41;
+    let mut buf = Vec::with_capacity(sorted.len() * SHA1_HEX_LINE_LEN);
     for oid in &sorted {
         writeln!(buf, "{}", oid.to_hex()).map_err(GitError::Io)?;
     }
     write_atomic(&path, &buf)
-}
-
-fn read_file_if_present(path: &Path) -> Result<Option<Vec<u8>>, GitError> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(GitError::Io(e)),
-    }
 }
 
 /// Write a zip archive of the tree at `spec` to `<folder>/repo.zip` and
