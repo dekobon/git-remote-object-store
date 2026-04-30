@@ -358,24 +358,22 @@ fn finish_s3(
         .host_str()
         .ok_or(ParseError::MissingHost)?
         .to_owned();
-    // Pre-compute the AWS bucket prefix for any case where addressing
-    // might be virtual-hosted — skipped only when path-style is forced.
-    // This avoids the double rfind scan that occurred when auto-detection
-    // (detect_s3_addressing) and bucket extraction both called
-    // s3_virtual_hosted_bucket independently.
-    let aws_bucket = match addressing_override {
-        Some(AddressingOverride::Path) => None,
-        _ => s3_virtual_hosted_bucket(&host),
-    };
-    let addressing = match addressing_override {
-        Some(AddressingOverride::Path) => S3Addressing::PathStyle,
-        Some(AddressingOverride::Virtual) => S3Addressing::VirtualHosted,
+    // Compute addressing and the AWS bucket prefix together. Path-style
+    // skips the rfind scan entirely; virtual-hosted (auto or explicit)
+    // runs it once and reuses the result for both detection and extraction.
+    let (addressing, aws_bucket) = match addressing_override {
+        Some(AddressingOverride::Path) => (S3Addressing::PathStyle, None),
+        Some(AddressingOverride::Virtual) => {
+            (S3Addressing::VirtualHosted, s3_virtual_hosted_bucket(&host))
+        }
         None => {
-            if aws_bucket.is_some() {
+            let b = s3_virtual_hosted_bucket(&host);
+            let a = if b.is_some() {
                 S3Addressing::VirtualHosted
             } else {
                 S3Addressing::PathStyle
-            }
+            };
+            (a, b)
         }
     };
 
@@ -438,11 +436,14 @@ const AWS_S3_INFIXES: &[&str] = &[".s3.", ".s3-"];
 /// The returned string is the entire substring before the chosen
 /// infix, so dotted bucket names like `bucketname.com` survive intact.
 fn s3_virtual_hosted_bucket(host: &str) -> Option<String> {
+    // Both infixes are 4 bytes, so the maximum byte-position index
+    // uniquely identifies the rightmost match regardless of which infix
+    // produced it — no need to carry the infix value through the chain.
     AWS_S3_INFIXES
         .iter()
-        .filter_map(|infix| host.rfind(infix).map(|idx| (idx, *infix)))
-        .max_by_key(|(idx, _)| *idx)
-        .map(|(idx, _)| host[..idx].to_owned())
+        .filter_map(|infix| host.rfind(infix))
+        .max()
+        .map(|idx| host[..idx].to_owned())
         .filter(|bucket| !bucket.is_empty())
 }
 

@@ -42,8 +42,7 @@ pub(crate) async fn handle_option<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let parsed = parse_option(args);
-    let (response, effect): (&[u8], OptionEffect) = match parsed {
+    let (response, effect): (&[u8], OptionEffect) = match parse_option(args) {
         Some(OptionRequest::Verbosity(n)) if n >= 2 => {
             if let Some(handle) = reload {
                 // Reload error is best-effort: if the subscriber's filter
