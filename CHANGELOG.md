@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Shallow-fetch support in the helper protocol: `option depth <N>` is
+  now recognised and handled end-to-end. Depth is threaded through REPL
+  state (reset after each batch so it applies per-operation only) and
+  into `fetch_batch`, which runs a BFS from each fetched ref's tip to
+  collect the correct boundary commits and writes them atomically to
+  `.git/shallow` (read–merge–write so existing entries are preserved).
+  BFS is used rather than topological-walk `.take(N)` because topo order
+  does not match depth order at merge commits — all parents of the
+  included set that lie outside it are boundaries. Phase 1 only: bundles
+  are still downloaded in full; depth-limited bundle storage is a
+  separate future feature. (#50)
 - Shellspec integration suites under `spec/integration/{s3,az}/`
   exercising `git clone` / `git push` / `git fetch` /
   `git push --force` / `git push --delete` against live rustfs and
@@ -123,6 +134,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Dotted S3 bucket names (e.g. `bucketname.com`) in virtual-hosted URLs
+  are now parsed correctly. `detect_s3_addressing` scans for the
+  rightmost `.s3.` or `.s3-` AWS service infix anywhere in the host
+  (instead of only checking the second label), and the virtual-hosted
+  bucket extractor returns the full prefix preceding that infix (instead
+  of just the leftmost label). Hosts of the shape
+  `bucketname.com.s3.<region>.amazonaws.com` and the legacy
+  `bucketname.com.s3-<region>.amazonaws.com` form now resolve to the
+  correct bucket; the previous behaviour silently routed to the wrong
+  bucket or produced a misleading `InvalidBucket` error. (#48)
 - Both `S3Store` and `AzureStore` now apply HTTP-layer
   read/connect timeouts so a *hot* pooled connection that has gone
   silent (e.g. mid-LFS push when the server VIP rotates) fails fast
