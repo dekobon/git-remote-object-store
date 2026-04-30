@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `S3Store::get_to_file` no longer ends in `unreachable!()`. The
+  retry-on-412 (head→GET race) loop is rewritten as an explicit
+  `match … { Err(PreconditionFailed) => retry once, other => other }`
+  over a new private `head_then_download` helper, mirroring the
+  Azure backend's shape. Every control-flow path now returns a
+  value, so the panic primitive is gone. `clippy::unreachable` is
+  denied at the workspace level to prevent regressions. (#49)
 - Extracted local-branch primitives into a new `git::branch` submodule.
   `git::rev_parse` is removed; callers use `git::branch::resolve`
   instead. Added `BranchName` newtype that encapsulates the

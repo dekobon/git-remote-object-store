@@ -21,6 +21,11 @@ missing_docs = "warn"
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
+# `unreachable!()` expands to `panic!()`, which `.claude/rules/rust.md`
+# bans in non-test code. Encoding the rule as a lint catches future
+# regressions at compile time. Test code that legitimately needs
+# `unreachable!()` (none today) must opt out with `#[allow(...)]`.
+unreachable = "deny"
 
 [features]
 # Expose test-only helpers (notably `object_store::mock::MockStore`) to

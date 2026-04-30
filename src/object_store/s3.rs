@@ -566,51 +566,19 @@ impl ObjectStore for S3Store {
             )
         })?;
 
-        // Attempt the head→download cycle up to twice: if the object is
-        // mutated between `head` and the body GET, the `If-Match` guard
-        // returns 412 and we retry with the new ETag/size. On the second
-        // iteration the `attempt == 0` guard is false, so a repeated 412
-        // falls through to `Err(e) => return Err(e)` — every path returns.
-        for attempt in 0..2 {
-            let meta = self.head(key).await?;
-            if meta.size == 0 {
-                let temp = NamedTempFile::new_in(parent).map_err(other_boxed)?;
-                persist_temp(temp, dest)?;
-                return Ok(());
+        // Mirror Azure: try once, retry once on 412 (the head→GET race).
+        // After the second attempt any error — including a repeated 412 —
+        // propagates. Encoding retry as an explicit second call keeps every
+        // control-flow path returning a value, so no `unreachable!` is
+        // required.
+        let progress = opts.progress.as_ref();
+        match self.head_then_download(key, dest, parent, progress).await {
+            Err(ObjectStoreError::PreconditionFailed(_)) => {
+                tracing::warn!(key, "object changed between head and GET; retrying");
+                self.head_then_download(key, dest, parent, progress).await
             }
-
-            let temp = NamedTempFile::new_in(parent).map_err(other_boxed)?;
-            let result = if meta.size <= MULTIPART_THRESHOLD {
-                self.download_single(
-                    key,
-                    temp.path(),
-                    meta.etag.as_deref(),
-                    opts.progress.as_ref(),
-                )
-                .await
-            } else {
-                self.download_multipart(
-                    key,
-                    temp.path(),
-                    meta.size,
-                    meta.etag.as_deref(),
-                    opts.progress.as_ref(),
-                )
-                .await
-            };
-
-            match result {
-                Ok(()) => {
-                    persist_temp(temp, dest)?;
-                    return Ok(());
-                }
-                Err(ObjectStoreError::PreconditionFailed(_)) if attempt == 0 => {
-                    tracing::warn!(key, "object changed between head and GET; retrying");
-                }
-                Err(e) => return Err(e),
-            }
+            other => other,
         }
-        unreachable!("both loop iterations return from within the match")
     }
 
     async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
@@ -746,6 +714,38 @@ impl ObjectStore for S3Store {
 }
 
 impl S3Store {
+    /// One head→tempfile→download→persist round trip.
+    ///
+    /// Factored out so [`get_to_file`](ObjectStore::get_to_file) can invoke
+    /// it twice: once normally, once more on a 412 retry. Mirrors
+    /// [`AzureStore::head_then_download`](super::azure) so both backends
+    /// share the same retry shape.
+    async fn head_then_download(
+        &self,
+        key: &str,
+        dest: &Path,
+        parent: &Path,
+        progress: Option<&ProgressSink>,
+    ) -> Result<(), ObjectStoreError> {
+        let meta = self.head(key).await?;
+        let temp = NamedTempFile::new_in(parent).map_err(other_boxed)?;
+        if meta.size == 0 {
+            // Skip the GET entirely for zero-byte objects (lock files).
+            // Range fetches against an empty object would also waste a
+            // round trip on the multipart path.
+            return persist_temp(temp, dest);
+        }
+
+        if meta.size <= MULTIPART_THRESHOLD {
+            self.download_single(key, temp.path(), meta.etag.as_deref(), progress)
+                .await?;
+        } else {
+            self.download_multipart(key, temp.path(), meta.size, meta.etag.as_deref(), progress)
+                .await?;
+        }
+        persist_temp(temp, dest)
+    }
+
     /// Common upload helper: sends the given [`ByteStream`] to S3 with
     /// optional `Content-Disposition` and user metadata from [`PutOpts`].
     /// Shared by `put_bytes` (in-memory) and `put_path` (streamed from
