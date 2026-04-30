@@ -659,8 +659,9 @@ impl AzureStore {
         let meta = self.head(key).await?;
         let temp = NamedTempFile::new_in(parent).map_err(other_boxed)?;
         if meta.size == 0 {
-            // Skip the GET entirely for zero-byte blobs (lock files).
-            // Range fetches against an empty blob return 416.
+            // Skip the GET entirely for zero-byte blobs (lock files):
+            // `download_streaming` would issue a plain GET for an empty
+            // body — correct but a wasted round trip.
             return persist_temp(temp, dest);
         }
         self.download_streaming(key, temp.path(), meta.etag.as_deref(), progress)
