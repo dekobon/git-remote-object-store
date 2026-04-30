@@ -116,6 +116,24 @@ push_branch() {
 	capture_git "$dir" push "$remote" "$refspec" "$@"
 }
 
+# shallow_clone_remote <depth> <url> <dir>
+# `git clone --depth <depth>` wrapper. Sets LAST_GIT_OUTPUT / LAST_GIT_STATUS.
+shallow_clone_remote() {
+	local depth="$1"
+	local url="$2"
+	local dir="$3"
+	if [[ -z "$depth" || -z "$url" || -z "$dir" ]]; then
+		echo "shallow_clone_remote: requires <depth> <url> <dir>" >&2
+		return 1
+	fi
+	LAST_GIT_OUTPUT=$(git clone --depth "$depth" "$url" "$dir" 2>&1)
+	LAST_GIT_STATUS=$?
+	if ((LAST_GIT_STATUS != 0)); then
+		echo "$LAST_GIT_OUTPUT" >&2
+	fi
+	return "$LAST_GIT_STATUS"
+}
+
 # clone_remote <url> <dir>
 # `git clone` wrapper. Returns the exit code; LAST_GIT_OUTPUT has the
 # combined output.
@@ -176,6 +194,38 @@ assert_git_sha_equals() {
 	actual=$(git -C "$dir" rev-parse "$rev" 2>/dev/null)
 	if [[ "$actual" != "$expected" ]]; then
 		echo "assert_git_sha_equals: $rev in $dir is $actual, expected $expected" >&2
+		return 1
+	fi
+}
+
+# commit_count <dir>
+# Print the number of commits reachable from HEAD (respects .git/shallow).
+commit_count() {
+	local dir="$1"
+	git -C "$dir" log --oneline | wc -l | tr -d ' '
+}
+
+# assert_shallow_file_exists <dir>
+# Fail unless <dir>/.git/shallow is present (non-empty — an all-grafted
+# shallow clone always has at least one boundary entry).
+assert_shallow_file_exists() {
+	local dir="$1"
+	if [[ ! -s "${dir}/.git/shallow" ]]; then
+		echo "assert_shallow_file_exists: ${dir}/.git/shallow missing or empty" >&2
+		return 1
+	fi
+}
+
+# assert_commit_count <dir> <expected>
+# Fail unless git log reports exactly <expected> commits from HEAD.
+assert_commit_count() {
+	local dir="$1"
+	local expected="$2"
+	local actual
+	actual=$(commit_count "$dir")
+	if [[ "$actual" != "$expected" ]]; then
+		echo "assert_commit_count: $dir has $actual commit(s), expected $expected" >&2
+		git -C "$dir" log --oneline >&2 || true
 		return 1
 	fi
 }
