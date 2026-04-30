@@ -718,8 +718,8 @@ impl S3Store {
     ///
     /// Factored out so [`get_to_file`](ObjectStore::get_to_file) can invoke
     /// it twice: once normally, once more on a 412 retry. Mirrors
-    /// [`AzureStore::head_then_download`](super::azure) so both backends
-    /// share the same retry shape.
+    /// `AzureStore::head_then_download` so both backends share the same
+    /// retry shape.
     async fn head_then_download(
         &self,
         key: &str,
@@ -730,9 +730,11 @@ impl S3Store {
         let meta = self.head(key).await?;
         let temp = NamedTempFile::new_in(parent).map_err(other_boxed)?;
         if meta.size == 0 {
-            // Skip the GET entirely for zero-byte objects (lock files).
-            // Range fetches against an empty object would also waste a
-            // round trip on the multipart path.
+            // Skip the GET entirely for zero-byte objects (lock files):
+            // `download_single` would issue a plain GET for an empty body
+            // and `download_multipart` would set_len(0) with no ranges —
+            // both correct but a wasted round trip and a wasted file
+            // open, respectively.
             return persist_temp(temp, dest);
         }
 
