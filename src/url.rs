@@ -366,7 +366,15 @@ fn finish_s3(
 
     let (bucket, prefix_segments) = match addressing {
         S3Addressing::VirtualHosted => {
-            let bucket = leftmost_label(&host).ok_or(ParseError::MissingBucket)?;
+            // Use the AWS-infix scan so dotted bucket names (e.g.
+            // `bucketname.com.s3.us-west-2.amazonaws.com`) are extracted in
+            // full. Falls back to the leftmost label when the host has no
+            // `.s3.` / `.s3-` infix — that is the case for non-AWS
+            // virtual-hosted endpoints reached via `?addressing=virtual`,
+            // which by convention put the bucket as the leftmost label.
+            let bucket = s3_virtual_hosted_bucket(&host)
+                .or_else(|| leftmost_label(&host))
+                .ok_or(ParseError::MissingBucket)?;
             (bucket, segments.as_slice())
         }
         S3Addressing::PathStyle => {
@@ -399,16 +407,47 @@ fn finish_s3(
 }
 
 fn detect_s3_addressing(host: &str) -> S3Addressing {
-    // §3.4: virtual-hosted iff the second hostname label is `s3`.
+    // §3.4: virtual-hosted iff the host contains a `.s3.` or `.s3-` AWS
+    // infix anywhere. Scanning for the infix (rather than only the second
+    // label) keeps dotted bucket names whole — e.g. `bucketname.com` in
+    // `bucketname.com.s3.us-west-2.amazonaws.com` — and still recognises
+    // the legacy hyphenated `<bucket>.s3-<region>.amazonaws.com` form.
     // Otherwise default to path-style; the `?addressing=` override is
     // available for S3-compatible endpoints that follow a different
     // virtual-hosted convention. Hosts are already lowercased by the
     // `url` crate (RFC 3986), so direct comparison is sufficient.
-    if host.split('.').nth(1) == Some("s3") {
+    if s3_virtual_hosted_bucket(host).is_some() {
         S3Addressing::VirtualHosted
     } else {
         S3Addressing::PathStyle
     }
+}
+
+/// AWS virtual-hosted infixes anchored at the start of the
+/// `s3[.-]<region>.amazonaws.com` suffix. The scan picks the rightmost
+/// occurrence (see `s3_virtual_hosted_bucket`) so a bucket prefix
+/// containing dots — or even a literal `.s3.` segment — survives
+/// intact and only the AWS service marker before the region is
+/// consumed.
+const AWS_S3_INFIXES: &[&str] = &[".s3.", ".s3-"];
+
+/// Extract the bucket prefix that precedes the AWS `.s3.` or `.s3-`
+/// service infix in `host`. Returns `None` for hosts that don't carry
+/// the AWS virtual-hosted shape — callers fall back to `leftmost_label`
+/// for non-AWS endpoints reached via `?addressing=virtual`.
+///
+/// Uses `rfind` (rightmost occurrence) so a bucket name that itself
+/// contains `.s3.` or `.s3-` segments (no AWS rule forbids it) is
+/// extracted in full instead of being truncated at the first match.
+/// The returned string is the entire substring before the chosen
+/// infix, so dotted bucket names like `bucketname.com` survive intact.
+fn s3_virtual_hosted_bucket(host: &str) -> Option<String> {
+    AWS_S3_INFIXES
+        .iter()
+        .filter_map(|infix| host.rfind(infix).map(|idx| (idx, *infix)))
+        .max_by_key(|(idx, _)| *idx)
+        .map(|(idx, _)| host[..idx].to_owned())
+        .filter(|bucket| !bucket.is_empty())
 }
 
 fn leftmost_label(host: &str) -> Option<String> {
@@ -688,6 +727,61 @@ mod tests {
         assert_eq!(
             detect_s3_addressing("acc.r2.cloudflarestorage.com"),
             S3Addressing::PathStyle
+        );
+    }
+
+    #[test]
+    fn s3_addressing_heuristic_dotted_bucket() {
+        // Bucket names with embedded dots stretch the host across more
+        // than two labels — auto-detection must still recognise the
+        // virtual-hosted shape.
+        assert_eq!(
+            detect_s3_addressing("bucketname.com.s3.us-west-2.amazonaws.com"),
+            S3Addressing::VirtualHosted
+        );
+        assert_eq!(
+            detect_s3_addressing("my.dotted.s3.us-west-2.amazonaws.com"),
+            S3Addressing::VirtualHosted
+        );
+        // Legacy `s3-<region>` hyphenated form.
+        assert_eq!(
+            detect_s3_addressing("bucketname.com.s3-us-west-2.amazonaws.com"),
+            S3Addressing::VirtualHosted
+        );
+    }
+
+    #[test]
+    fn s3_virtual_hosted_bucket_extracts_full_prefix() {
+        assert_eq!(
+            s3_virtual_hosted_bucket("my-bucket.s3.us-west-2.amazonaws.com"),
+            Some("my-bucket".to_owned())
+        );
+        assert_eq!(
+            s3_virtual_hosted_bucket("bucketname.com.s3.us-west-2.amazonaws.com"),
+            Some("bucketname.com".to_owned())
+        );
+        assert_eq!(
+            s3_virtual_hosted_bucket("my.dotted.s3.us-west-2.amazonaws.com"),
+            Some("my.dotted".to_owned())
+        );
+        assert_eq!(
+            s3_virtual_hosted_bucket("bucketname.com.s3-us-west-2.amazonaws.com"),
+            Some("bucketname.com".to_owned())
+        );
+        // Path-style host has no `.s3.` infix preceded by anything —
+        // returns None so the caller falls through.
+        assert_eq!(s3_virtual_hosted_bucket("s3.us-west-2.amazonaws.com"), None);
+        // Non-AWS host: no infix.
+        assert_eq!(
+            s3_virtual_hosted_bucket("acc.r2.cloudflarestorage.com"),
+            None
+        );
+        // Pathological: bucket name itself contains `.s3.`. The
+        // rightmost infix is the AWS service marker, so the full
+        // bucket prefix is recovered.
+        assert_eq!(
+            s3_virtual_hosted_bucket("my.s3.bucket.s3.us-west-2.amazonaws.com"),
+            Some("my.s3.bucket".to_owned())
         );
     }
 
