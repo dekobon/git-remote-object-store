@@ -540,12 +540,11 @@ pub(crate) fn write_shallow_file(git_dir: &Path, boundaries: &[ObjectId]) -> Res
     // break us.
     let mut merged: HashSet<ObjectId> = HashSet::new();
     if let Some(bytes) = read_file_if_present(&path)? {
-        for line in bytes.split(|b| *b == b'\n') {
+        for line in bytes.split(|&b| b == b'\n') {
             let line = line.trim_ascii();
-            if line.is_empty() {
-                continue;
-            }
-            if let Ok(oid) = ObjectId::from_hex(line) {
+            if !line.is_empty()
+                && let Ok(oid) = ObjectId::from_hex(line)
+            {
                 merged.insert(oid);
             }
         }
