@@ -500,12 +500,21 @@ async fn depth_resets_between_batches() {
         .to_owned();
     let bundle_main = bundle_ref(seed.path(), &tip_sha, "refs/heads/main");
 
-    // Independent root commit on a side branch (no shared history with
-    // main, so its bundle's only commit is a fresh root). Batch 2 will
-    // pull this without depth.
+    // Side branch with 2 commits so depth=1 from the tip produces a
+    // non-empty boundary (the root commit). If depth leaked from batch 1,
+    // `shallow_boundaries(repo, side_tip, 1)` would return [side_root],
+    // which would be merged into .git/shallow alongside parent_sha —
+    // detectable via the final content assertion. An orphan (single-commit)
+    // side branch would be invisible to the leak because it has no parents.
     git(&["checkout", "--orphan", "side"], seed.path());
     git(&["rm", "-rf", "."], seed.path());
     std::fs::write(seed.path().join("b.txt"), b"b\n").unwrap();
+    git(&["add", "b.txt"], seed.path());
+    git(
+        &["commit", "--quiet", "-m", "side0", "--no-gpg-sign"],
+        seed.path(),
+    );
+    std::fs::write(seed.path().join("b.txt"), b"b2\n").unwrap();
     git(&["add", "b.txt"], seed.path());
     git(
         &["commit", "--quiet", "-m", "side1", "--no-gpg-sign"],
