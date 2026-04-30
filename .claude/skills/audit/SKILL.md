@@ -335,13 +335,17 @@ will apply, so the vocabulary must match end-to-end. Mapping rules:
 
 ### Project-Specific (git-remote-object-store)
 
-28. Does any change diverge from the upstream `git-remote-s3` Python implementation
-    in a way **not** documented in `execution-plan.md` §0/§3/§6? Per `AGENTS.md`,
-    upstream is the source of truth for behavior, on-the-wire object layout,
-    locking semantics, LFS transfer protocol, and management-CLI command shapes.
-29. Does any code break the on-bucket object-layout invariant (`<prefix>/<ref>/<sha>.bundle`,
-    `HEAD`, `PROTECTED#`, lock files, `lfs/<oid>`)? This is the single
-    backwards-compatibility contract the project preserves.
+28. Does any change touch a wire-format surface — helper-protocol stdout
+    bytes, on-bucket key shapes, LFS JSON events, or error-string wording
+    matched by external tools (git, git-lfs)? If yes, has the change
+    been verified against the upstream Python reference at
+    `../git-remote-s3`? Upstream is a useful reference for these
+    surfaces, not authoritative; behavioral differences that matter to
+    a user are filed as bugs.
+29. Does any code break the on-bucket object-layout invariant
+    (`<prefix>/<ref>/<sha>.bundle`, `HEAD`, `PROTECTED#`, lock files,
+    `lfs/<oid>`)? This is the contract that keeps existing buckets
+    written by `awslabs/git-remote-s3` readable.
 30. Are there `unwrap()`, `expect()`, `assert!()`, or `panic!()` calls in
     non-test code? `expect()`/`assert!()` are acceptable in tests; production
     code must propagate with `?`. (Per `.claude/rules/rust.md`.)
@@ -369,7 +373,7 @@ For each finding:
 Before filing the first issue, ensure every label the audit may use exists in
 the repo. `gh issue create` rejects unknown labels. Of the four categories,
 `bug`, `documentation`, and `enhancement` already exist; `security` and
-`upstream-blocked` need to be created on first use:
+`bucket-compat` need to be created on first use:
 
 ```bash
 ensure_label() {
@@ -379,8 +383,8 @@ ensure_label() {
   fi
 }
 
-ensure_label security        "ee0701" "Security-relevant finding"
-ensure_label upstream-blocked "fbca04" "Cannot be fixed locally; needs upstream coordination"
+ensure_label security      "ee0701" "Security-relevant finding"
+ensure_label bucket-compat "fbca04" "Touches the on-bucket layout shared with awslabs/git-remote-s3"
 ```
 
 ### 5b: Create the issue
@@ -422,45 +426,45 @@ EOF
 gh issue create --title "crate: short description" --label "bug" --body-file /tmp/issue-body.md
 ```
 
-### Upstream-blocked findings
+### Bucket-compatibility findings
 
-Some findings cannot be fixed in this repository because they require changes
-to behavior owned by an upstream project. For `git-remote-object-store`, the
-relevant upstream is `awslabs/git-remote-s3` (checked out as a sibling at
-`../git-remote-s3`). The on-bucket object layout, locking semantics, and LFS
-transfer protocol must remain compatible with upstream so existing buckets
-remain readable.
+Some findings touch the on-bucket object layout
+(`<prefix>/<ref>/<sha>.bundle`, `HEAD`, `PROTECTED#`, lock files,
+`lfs/<oid>`). That layout is the contract that keeps existing buckets
+written by `awslabs/git-remote-s3` readable, and changing it would
+break shipped users. Mark these findings clearly so reviewers can
+weigh the bucket-compatibility cost.
 
 When a finding falls into this category:
 
 1. **Still file the issue** — the problem is real and should be tracked.
-2. Add the `upstream-blocked` label alongside the normal category label
+2. Add the `bucket-compat` label alongside the normal category label
    (`bug`, `security`, etc.).
-3. In the issue body, add an `## Upstream Ownership` section that names the
-   upstream project and explains why a local fix is not possible.
-4. Do NOT add a fix plan in Step 6 that assumes a local fix; instead, the
-   fix-plan comment should describe the upstream coordination required
-   (file an issue against `awslabs/git-remote-s3`, document the divergence
-   in `execution-plan.md`, etc.).
+3. In the issue body, add a `## Bucket Compatibility` section that
+   names the on-bucket shape that would change and the user impact.
+4. The fix plan should call out whether the change is acceptable
+   (e.g. it only affects new keys), or whether a migration / opt-in
+   flag / deprecation is required.
 
 Example:
 
 ```bash
 gh issue create \
-  --title "object-store: bundle path naming diverges from upstream" \
+  --title "object-store: bundle path naming change" \
   --label "bug" \
-  --label "upstream-blocked" \
+  --label "bucket-compat" \
   --body-file /tmp/issue-body.md
 ```
 
-Signals that an upstream block applies include:
+Signals that this category applies include:
 
-- Finding would change the on-bucket object layout (`<prefix>/<ref>/<sha>.bundle`,
-  `HEAD`, `PROTECTED#`, lock files, `lfs/<oid>`).
-- Finding would change the LFS custom-transfer JSON event shape.
-- Finding would change locking semantics across cooperating clients.
-- Fix would cause behavioral divergence from `awslabs/git-remote-s3` not
-  already documented in `execution-plan.md` §0/§3/§6.
+- Finding would change the on-bucket object layout
+  (`<prefix>/<ref>/<sha>.bundle`, `HEAD`, `PROTECTED#`, lock files,
+  `lfs/<oid>`).
+- Finding would change the LFS custom-transfer JSON event shape that
+  external git-lfs clients depend on.
+- Finding would change locking semantics across cooperating clients
+  (mixed S3 / Azure / upstream-Python deployments).
 
 ---
 

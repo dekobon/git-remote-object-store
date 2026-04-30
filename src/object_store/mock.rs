@@ -1,5 +1,4 @@
-//! In-memory [`ObjectStore`] used by every higher-layer test in
-//! Phases 5–9.
+//! In-memory [`ObjectStore`] used by every higher-layer test.
 //!
 //! Keeps push, fetch, locking, doctor, and LFS logic exercisable without a
 //! MinIO/Azurite container. Production builds do not see this module — it
@@ -10,12 +9,12 @@
 //! The backing store is a `BTreeMap<String, MockObject>` so [`list`]'s
 //! iteration is deterministic (lexicographic). Prefix matching mirrors S3
 //! `Prefix=` byte-prefix semantics — `list("a")` returns `a`, `a/1`, and
-//! `aaa` — see the §1.1 wire-format invariants in `execution-plan.md`.
+//! `aaa`.
 //!
 //! Fault injection is FIFO: tests call [`MockStore::arm`] to queue a
 //! [`Fault`]; the next matching operation consumes it and returns the
-//! corresponding [`ObjectStoreError`]. This drives Phase 8's stale-lock recovery and
-//! similar error-path tests deterministically.
+//! corresponding [`ObjectStoreError`]. This drives stale-lock recovery
+//! and similar error-path tests deterministically.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;

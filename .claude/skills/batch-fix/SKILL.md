@@ -170,10 +170,11 @@ indicators AND **zero** disqualifiers.
 - Requires new public API or architectural changes
 - Spans multiple modules explicitly ("change X in object_store and update
   protocol")
-- Touches the on-the-wire object layout, locking semantics, or LFS transfer
-  protocol (these require upstream-Python parity verification)
+- Touches a wire-format surface (on-bucket object layout, helper-protocol
+  stdout bytes, LFS JSON events, error wording matched by external tools)
+  — these benefit from a verification pass against the upstream Python
+  reference at `../git-remote-s3`
 - Needs external input or design decision ("should we...?", "RFC")
-- References an unimplemented phase from `execution-plan.md`
 - Has `cross_module: true` from Step 2a
 
 ### 2c: Cross-issue dependency detection
@@ -472,8 +473,8 @@ Proceed to the next wave.
 
 ## Step 5: Consolidate shared files
 
-After all waves are processed, collect CHANGELOG and execution-plan entries
-from all successful agents and apply them in a single commit on the
+After all waves are processed, collect CHANGELOG entries from all
+successful agents and apply them in a single commit on the
 integration branch. This avoids merge conflicts on shared files.
 
 ### 5a: Update CHANGELOG.md
@@ -484,52 +485,23 @@ subsection (`### Fixed`, `### Added`, `### Changed`) per
 `.claude/rules/changelog.md`. Each entry should reference the issue number
 (e.g., `- Fix incorrect URL host validation (#42)`).
 
-### 5b: Record divergences (if applicable)
-
-If any agent reported a `DIVERGENCE:` entry other than "none" (a deliberate
-divergence from upstream `git-remote-s3` behavior, or a change to a resolved
-decision), append it to a single, append-only section at the bottom of
-`execution-plan.md` titled `## Resolved Divergences (post-plan)`. Create the
-heading if it does not yet exist. Each entry must include the issue number,
-the affected upstream behavior, and the rationale. Format:
-
-```markdown
-## Resolved Divergences (post-plan)
-
-### #<ISSUE_NUMBER> — <short title> (<YYYY-MM-DD>)
-
-- **Upstream behavior**: <what `../git-remote-s3` does>
-- **New behavior**: <what this crate now does>
-- **Rationale**: <why the divergence is justified>
-- **Affected sections**: <e.g., relates to §3 URL grammar, §6 resolved
-  decisions — but the canonical record lives in this section>
-```
-
-Do NOT edit §0/§3/§6 inline from this skill — those sections are the
-authoritative pre-implementation plan and are easy to corrupt with
-parallel divergence notes. The append-only section is the canonical record;
-a maintainer can later promote stable entries into §0/§3/§6 by hand.
-
-Per `AGENTS.md`, undocumented divergences from upstream are not allowed --
-if an agent flagged a divergence, it MUST be recorded here.
-
-### 5c: Run markdown lint on touched docs
+### 5b: Run markdown lint on touched docs
 
 ```bash
-markdownlint-cli2 CHANGELOG.md execution-plan.md
+markdownlint-cli2 CHANGELOG.md
 ```
 
 Fix any lint issues before committing.
 
-### 5d: Commit shared file updates
+### 5c: Commit shared file updates
 
 ```bash
-git add CHANGELOG.md execution-plan.md
+git add CHANGELOG.md
 git commit -m "$(cat <<'EOF'
-docs: consolidate changelog and divergences from batch fix
+docs: consolidate changelog from batch fix
 
-Update CHANGELOG.md (and execution-plan.md if applicable) with entries
-from all successfully merged issue fixes in this batch.
+Update CHANGELOG.md with entries from all successfully merged issue
+fixes in this batch.
 EOF
 )"
 ```
@@ -551,7 +523,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-(Run the markdown lint from Step 5c too, if any Markdown files were touched
+(Run the markdown lint from Step 5b too, if any Markdown files were touched
 by an agent.)
 
 ### 6b: Handle pre-commit failure
@@ -725,21 +697,21 @@ Grep/Glob tools, `rg`, or `fd`.
 Follow the `/fix-issue` workflow:
 
 1. Re-read the project conventions that govern this fix:
-   - `AGENTS.md` — upstream-as-source-of-truth and greenfield rules.
-   - `execution-plan.md` — §0 goals/non-goals, §3 URL grammar, §6 resolved
-     decisions.
+   - `AGENTS.md` — relationship to upstream and greenfield rules.
    - `.claude/rules/rust.md`, `.claude/rules/naming.md`,
      `.claude/rules/testing.md`, `.claude/rules/git-commits.md`,
      `.claude/rules/worktree-safety.md`, `.claude/rules/protocol-stdout.md`.
 2. Read `docs/development/lessons_learned.md` -- check whether any lesson
    applies to this issue's domain.
-3. Investigate the codebase to understand the root cause. For any behavior
-   that touches the on-the-wire object layout, locking semantics, LFS
-   transfer protocol, or management-CLI shape, **read the upstream Python at
-   `../git-remote-s3` first** — that is the authoritative behavior. Only
-   diverge where `execution-plan.md` already documents the divergence;
-   otherwise stop and report FAILED with reason "undocumented divergence
-   required -- needs user decision".
+3. Investigate the codebase to understand the root cause. For any
+   behavior that touches a wire-format surface — on-bucket object
+   layout, helper-protocol stdout bytes, LFS JSON events, or error
+   wording matched by external tools — read the upstream Python at
+   `../git-remote-s3` as a reference; it is the closest existing
+   reference implementation, but is not authoritative. If the change
+   would break bucket compatibility for buckets written by upstream,
+   report FAILED with reason "bucket-compatibility risk -- needs
+   user decision".
 4. Use Serena LSP tools (`find_symbol`, `get_symbols_overview`,
    `find_referencing_symbols`) for code navigation. Fall back to Read/Grep
    if Serena is unavailable. Before changing any public API, run
@@ -777,8 +749,9 @@ Follow the `/fix-issue` workflow:
    implementation reveals issues the plan missed, revise via sequential
    thinking before proceeding.
 8. Self-review the implementation:
-   - Correctness: root cause addressed, not just symptom? Match upstream
-     Python behavior where required?
+   - Correctness: root cause addressed, not just symptom? For
+     wire-format-sensitive code, has the change been verified against
+     the upstream Python reference at `../git-remote-s3`?
    - Performance: appropriate algorithms and data structures? Hot paths
      (push/fetch on large histories, multipart transfers) considered?
    - Simplicity: simplest fix that solves the problem? No speculative
@@ -813,10 +786,10 @@ Follow the `/fix-issue` workflow:
       `.claude/rules/documentation.md` ("all tests passing", not "42 tests
       passing").
     - Run `markdownlint-cli2` against any Markdown files touched.
-12. Do NOT update `CHANGELOG.md` or `execution-plan.md` -- the
-    orchestrator consolidates these shared files after merging to avoid
-    merge conflicts between parallel agents. Include the changelog entry
-    text and any divergence notes in your Phase 7 result instead.
+12. Do NOT update `CHANGELOG.md` -- the orchestrator consolidates this
+    shared file after merging to avoid merge conflicts between parallel
+    agents. Include the changelog entry text in your Phase 7 result
+    instead.
 
 ### Phase 2: Simplify
 
@@ -1032,7 +1005,6 @@ COMMIT: <short-hash>
 FILES: <number of files changed>
 SUMMARY: <one-line description of the fix>
 CHANGELOG: <changelog entry text, e.g. "Fixed incorrect URL host validation in url::parse">
-DIVERGENCE: <divergence note if applicable, or "none" — only set if execution-plan.md needs an update>
 LESSON: <hard-won, globally reusable lesson if any, or "none" — the orchestrator collects these and proposes them to the user after all waves complete>
 ```
 
@@ -1077,5 +1049,8 @@ Do NOT run `git clean -fd` -- the worktree runtime manages untracked files.
   issues are always serialized across waves
 - Each worktree agent is fully self-contained -- it does not call /fix-issue,
   /simplify-rust, or /review as skills. The logic is embedded in the prompt.
-- Undocumented divergence from upstream `git-remote-s3` is forbidden per
-  `AGENTS.md` -- agents that need to diverge must report FAILED instead.
+- Changes that would break bucket compatibility (the on-bucket layout
+  this crate shares with `awslabs/git-remote-s3` so existing buckets
+  remain readable) require explicit user sign-off -- agents must
+  report FAILED with a `bucket-compatibility risk` reason instead of
+  proceeding.

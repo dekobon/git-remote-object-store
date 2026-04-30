@@ -145,49 +145,44 @@ new protocol tests before merge.
 
 ---
 
-## 5. Upstream is a wire-format contract; classify every divergence
+## 5. Read the upstream Python reference when porting wire-format-sensitive code
 
-This project is a Rust port of `awslabs/git-remote-s3`, with the Python
-implementation checked out at `../git-remote-s3` and designated as
-source-of-truth for behaviour, on-bucket object layout, locking
-semantics, LFS transfer protocol, and management-CLI command shapes
-(`AGENTS.md`). Greenfield URL grammar and CLI surface are deliberate
-divergences enumerated in `execution-plan.md` §0 / §3 / §6; the
-on-bucket layout (`<prefix>/<ref>/<sha>.bundle`, `HEAD`, `PROTECTED#`,
-lock files, `lfs/<oid>`) is a preserved invariant so existing buckets
-remain readable. Any other divergence — wire bytes the helper writes
-to stdout, key shapes on the bucket, error message phrasing that LFS
-or git matches against — is a contract break against either upstream
-or shipping users, even when the Rust code compiles and tests pass.
+The on-bucket object layout (`<prefix>/<ref>/<sha>.bundle`, `HEAD`,
+`PROTECTED#`, lock files, `lfs/<oid>`) is the only contract this
+project shares with `awslabs/git-remote-s3` (Python, checked out at
+`../git-remote-s3`). Behaviour, locking semantics, error wording, and
+the management-CLI shape are this project's own decisions. But for
+anything that touches a wire-format surface — the bytes the helper
+writes to stdout, the keys it writes on the bucket, the JSON events
+the LFS agent emits, the error strings that git or git-lfs matches
+against — the Python reference is the closest existing
+implementation, and reading it before writing the Rust saves
+debugging time.
 
 **Trailing `?` dropped from the under-lock duplicate-bundle error**
 (#34, 84b1811). The under-lock branch emitted
 `error <ref> "multiple bundles ..."` without the trailing `?` that
-every other `error <ref>` line in the helper carries. Upstream
-Python's wire format included it; the Rust port silently dropped it
-on one of two structurally-identical branches. The fix landed as a
-deliberate divergence (we keep `?` everywhere; upstream omits it on
-this single path), now documented in CHANGELOG.
+every other `error <ref>` line in the helper carries. The Rust port
+silently dropped it on one of two structurally-identical branches.
+The fix kept `?` consistent across all branches.
 
 **Stale-ref cleanup behaviour and bundle-listing semantics**
-(repeated CHANGELOG citations of `git_remote_s3/remote.py:286-296`,
+(CHANGELOG citations of `git_remote_s3/remote.py:286-296`,
 `git_remote_s3/remote.py:574-593`, `git_remote_s3/lfs.py`'s
 `ProgressPercentage`, etc.). Multiple porting tasks were resolved by
 re-reading the Python at the cited line range and matching its
 behaviour byte-for-byte; in each case, an "obvious" Rust shape
 diverged from upstream until the diff was checked.
 
-**Lesson**: For every behaviour port, read the upstream Python
-before writing the Rust, and classify each observed difference as
-INTENTIONAL (covered by `execution-plan.md`), IMPROVEMENT (a
-deliberate fix that should be added to the divergence list), or BUG
-(unintentional drift that must be reverted). Cite the upstream file
-and line range in the commit message or CHANGELOG entry so the next
-porter can verify. If a divergence isn't already listed in
-`execution-plan.md`, stop and confirm before merging — silent
-divergence is the failure mode this project is most exposed to.
-Related to lesson #4 (exact wire bytes in tests): that lesson says
-*how* to assert; this one says *what* to assert against.
+**Lesson**: For wire-format-sensitive behaviour, read
+`../git-remote-s3` first and cite the upstream file and line range
+in the commit message or CHANGELOG entry so the next reader can
+verify. If the Rust behaviour ends up differing from upstream and
+the difference matters to a user — broken bucket compatibility,
+surprising CLI output, broken LFS interop — file a GitHub issue.
+Differences that don't matter to a user aren't tracked. Related to
+lesson #4 (exact wire bytes in tests): that lesson says *how* to
+assert; this one says *what* to assert against.
 
 ---
 
@@ -217,11 +212,11 @@ matching the format every other `error <ref>` site uses.
 **Bundle-key filter regex was tightened against upstream behaviour,
 not against the Rust output**. The protocol-smoke tests for
 `list` / `list for-push` filter on `^refs/.+/.+/[a-f0-9]{40}\.bundle$`
-to reject sibling-prefix collisions (CHANGELOG Phase 6). The
-expected behaviour is derived from upstream's filter logic, not
-from running the Rust code with one input and copying the output —
-which is why the test catches sibling-prefix bugs the Rust shape
-alone would not have surfaced.
+to reject sibling-prefix collisions. The expected behaviour is
+derived from upstream's filter logic, not from running the Rust
+code with one input and copying the output — which is why the test
+catches sibling-prefix bugs the Rust shape alone would not have
+surfaced.
 
 **Lesson**: For any test asserting wire-format output, document in
 the test or its module-level comment where the expected value comes

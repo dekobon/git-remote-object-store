@@ -1,6 +1,7 @@
-//! Phase 8 integration test: drive [`protocol::run`] through push
-//! batches against a [`MockStore`] and a real local git repo, and
-//! verify the on-bucket layout matches `execution-plan.md` §1.1.
+//! Push integration test: drive [`protocol::run`] through push batches
+//! against a [`MockStore`] and a real local git repo, and verify the
+//! on-bucket layout contract (`<prefix>/<ref>/<sha>.bundle`, `HEAD`,
+//! `PROTECTED#`, lock files) is honored byte-for-byte.
 
 #![cfg(feature = "test-util")]
 

@@ -609,10 +609,10 @@ async fn access_denied_via_wrong_creds() {
 // dispatch in `protocol::backend::build`, and the LFS custom-transfer
 // agent.
 //
-// Cargo bin names cannot contain `+` (execution-plan.md §5.6), so each
-// helper is built as `git-remote-s3-http` and we symlink the binary to
-// `git-remote-s3+http` in a tempdir prepended to PATH for the duration
-// of these tests. The symlink-based PATH shim is unix-only by design.
+// Cargo bin names cannot contain `+`, so each helper is built as
+// `git-remote-s3-http` and we symlink the binary to `git-remote-s3+http`
+// in a tempdir prepended to PATH for the duration of these tests. The
+// symlink-based PATH shim is unix-only by design.
 //
 // Mirrors the structure used by `tests/azure_store_integration.rs`.
 // ---------------------------------------------------------------------------

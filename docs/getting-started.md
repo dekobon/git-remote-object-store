@@ -282,8 +282,9 @@ Query-string flags:
 | `addressing=path\|virtual` | Both     | Force the addressing style (auto-detected by default)   |
 | `zip=1`                    | Both     | Mirror each push as `repo.zip` (AWS CodePipeline input) |
 
-The full grammar and validation rules live in
-[`execution-plan.md` §3](../execution-plan.md).
+The complete grammar lives in the URL parser (`src/url.rs`); the
+table above and the scheme outline earlier in this section cover
+everything an end-user typically needs.
 
 ## 6. Submodules
 

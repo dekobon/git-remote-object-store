@@ -31,8 +31,7 @@ use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
 pub(crate) const DEFAULT_LOCK_TTL_SECONDS: u64 = 60;
 
 /// Environment override for the lock TTL, in seconds. Name is preserved
-/// from upstream for cross-implementation parity (see `execution-plan.md`
-/// §1.1).
+/// from upstream for cross-implementation parity.
 pub(crate) const ENV_LOCK_TTL_SECONDS: &str = "GIT_REMOTE_S3_LOCK_TTL_SECONDS";
 
 /// Errors surfaced by the push path. These abort the helper — per-ref
@@ -244,7 +243,7 @@ pub(crate) fn lock_ttl_from_env() -> Duration {
 /// inherent to non-conditional deletes — another client could acquire
 /// the lock between our delete and retry. We accept that race; the
 /// retry `put_if_absent` will return `Ok(false)` and the user will
-/// retry. Documented in `execution-plan.md` §5.2.
+/// retry.
 pub(crate) async fn acquire_lock(
     store: &dyn ObjectStore,
     lock_key: &str,
@@ -1089,8 +1088,8 @@ mod tests {
     /// suffix is the project-wide Rust convention for `error <ref> "..."`
     /// messages — git treats `"..."?` as recoverable and `"..."` as
     /// fatal. Upstream Python omits the `?` on the under-lock branch
-    /// (../git-remote-s3/git_remote_s3/remote.py:245); this is a
-    /// deliberate normalization documented in `execution-plan.md`.
+    /// (`../git-remote-s3/git_remote_s3/remote.py:245`); this is a
+    /// deliberate normalization in this crate.
     #[test]
     fn duplicate_bundle_errors_use_consistent_wire_format() {
         let pre_lock_line = PushOutcome::Error {

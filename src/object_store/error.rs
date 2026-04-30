@@ -6,12 +6,12 @@
 //! pattern-match without caring whether the underlying SDK returned an
 //! `aws_sdk_s3::error::SdkError` or an `azure_core::error::Error`.
 //!
-//! The variant set follows `execution-plan.md` §2.3 and the conditional-write
-//! note in §5.1: S3 returns 412 (`PreconditionFailed`) *and* 409
-//! (`ConditionalRequestConflict`) for the same `If-None-Match: "*"`
-//! contention path; both must be available so backends can preserve the
-//! distinction in diagnostics, while the `put_if_absent` trait method
-//! collapses both into the `Ok(false)` "lock not acquired" return.
+//! On the conditional-write path, S3 returns 412 (`PreconditionFailed`)
+//! *and* 409 (`ConditionalRequestConflict`) for the same
+//! `If-None-Match: "*"` contention path; both variants are kept here so
+//! backends can preserve the distinction in diagnostics, while the
+//! `put_if_absent` trait method collapses both into the `Ok(false)`
+//! "lock not acquired" return.
 
 use std::error::Error as StdError;
 
@@ -41,9 +41,9 @@ pub enum ObjectStoreError {
     AccessDenied(String),
 
     /// Conditional request returned 412 — the precondition (typically
-    /// `If-None-Match: "*"`) was not satisfied. See `execution-plan.md`
-    /// §5.1; backends `put_if_absent` collapses this into `Ok(false)`, so
-    /// callers should rarely observe it directly.
+    /// `If-None-Match: "*"`) was not satisfied. `put_if_absent`
+    /// collapses this into `Ok(false)`, so callers should rarely
+    /// observe it directly.
     #[error("precondition failed: {0}")]
     PreconditionFailed(String),
 

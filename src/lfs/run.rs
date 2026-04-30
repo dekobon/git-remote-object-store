@@ -134,7 +134,7 @@ impl RemoteResolver for GitRemoteResolver {
 /// Drive the LFS REPL until stdin closes or `terminate` arrives.
 ///
 /// `tmp_dir` is the destination directory for downloads
-/// (`<git-dir>/lfs/tmp` per `execution-plan.md` §5.5).
+/// (`<git-dir>/lfs/tmp`).
 ///
 /// # Errors
 ///

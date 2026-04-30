@@ -1,9 +1,9 @@
 //! Validated Git LFS object id (lowercase 64-char SHA-256 hex).
 //!
 //! LFS pointer files reference payloads by `<oid>` and the on-bucket
-//! layout is `<prefix>/lfs/<oid>` (`execution-plan.md` §1.1). The OID
-//! flows in over an untrusted JSON line on stdin, so we validate it
-//! once at the agent boundary and pass [`LfsOid`] downward.
+//! layout is `<prefix>/lfs/<oid>`. The OID flows in over an untrusted
+//! JSON line on stdin, so we validate it once at the agent boundary
+//! and pass [`LfsOid`] downward.
 
 use std::fmt;
 use std::str::FromStr;

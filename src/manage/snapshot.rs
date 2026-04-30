@@ -33,9 +33,8 @@ pub struct BundleEntry {
 #[derive(Debug, Clone, Default)]
 pub struct RefSnapshot {
     /// `true` iff at least one `<ref>/PROTECTED#…` marker is present.
-    /// Per `execution-plan.md` §1.1 the marker is matched by **prefix**,
-    /// so any key under `<ref>/` whose final segment starts with
-    /// `PROTECTED#` counts.
+    /// The marker is matched by **prefix**, so any key under `<ref>/`
+    /// whose final segment starts with `PROTECTED#` counts.
     pub is_protected: bool,
     /// Bundle objects under this ref, in listing order. The doctor's
     /// "multiple bundles" check fires when this is longer than one.

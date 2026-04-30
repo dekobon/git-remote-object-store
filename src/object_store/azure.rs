@@ -1,13 +1,12 @@
 //! Azure Blob Storage backend for the [`ObjectStore`][super::ObjectStore]
-//! trait (Phase 11 of `execution-plan.md`).
+//! trait.
 //!
 //! `AzureStore` wraps `azure_storage_blob`. Like the S3 backend, this
 //! module owns the URL → SDK config translation, the error-code
 //! classifier ([`classify`]), and the credential resolution plumbing.
 //! Unlike S3, the SDK already does parallel range downloads inside
 //! `BlobClient::download()`, so there is no hand-rolled multipart
-//! orchestrator (asymmetric with S3 by design — see
-//! `execution-plan.md` §5.3 / §6).
+//! orchestrator (asymmetric with S3 by design).
 //!
 //! ## Authentication
 //!
@@ -41,7 +40,7 @@
 //! `BlockBlobClientUploadOptions::with_if_not_exists` convenience).
 //! Azure returns 409 (`BlobAlreadyExists`) or 412
 //! (`ConditionNotMet`) for the contention case; both collapse to
-//! `Ok(false)` per `execution-plan.md` §5.1.
+//! `Ok(false)`.
 //!
 //! ## Atomic `get_to_file`
 //!
@@ -390,7 +389,7 @@ fn classify_status(status: u16, key: &str) -> Option<ObjectStoreError> {
 /// empty) and downstream `head_then_download` takes a fast path on
 /// `size == 0` that writes an empty destination file. Treating "header
 /// absent" as 0 would silently produce empty bundles instead of
-/// surfacing the malformed response. See `execution-plan.md` §5.1.
+/// surfacing the malformed response.
 fn properties_to_meta(
     key: &str,
     content_length: Option<u64>,

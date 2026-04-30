@@ -9,7 +9,7 @@
 //! Storage shared-key v2 scheme. Tracking issue:
 //! `Azure/azure-sdk-for-rust#2975`.
 //!
-//! Resolution order, per `execution-plan.md` §11:
+//! Resolution order:
 //!
 //! 1. URL flag `?credential=<NAME>` →
 //!    - `AZSTORE_<NAME>_KEY` (base64 account key) → [`SharedKeySigningPolicy`]

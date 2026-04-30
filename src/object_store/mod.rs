@@ -1,16 +1,15 @@
 //! Backend-neutral object-store trait shared by the S3 and Azure Blob
 //! implementations.
 //!
-//! See `execution-plan.md` §2.1 for the trait sketch and §2.3 / §5.1 for
-//! the error mapping rationale. Phase 4 lands the trait, value types, and
-//! an in-memory mock; Phase 5 fills in `s3.rs` and Phase 11 fills in
-//! `azure.rs`.
+//! The trait, value types, and in-memory mock live here; the concrete
+//! S3 and Azure backends are in the sibling modules.
 //!
-//! Trait dispatch is intended for `Arc<dyn ObjectStore>` so the protocol
-//! REPL (Phase 6) can drive either backend without monomorphisation. Async
-//! methods are routed through [`async_trait`] so `dyn ObjectStore + Send +
-//! Sync` composes cleanly — native `async fn`-in-trait would require
-//! per-method `Send` bounds that don't survive `dyn`.
+//! Trait dispatch is intended for `Arc<dyn ObjectStore>` so the
+//! protocol REPL can drive either backend without monomorphisation.
+//! Async methods are routed through [`async_trait`] so
+//! `dyn ObjectStore + Send + Sync` composes cleanly — native
+//! `async fn`-in-trait would require per-method `Send` bounds that
+//! don't survive `dyn`.
 
 pub mod azure;
 pub mod error;
@@ -82,8 +81,8 @@ pub(crate) fn persist_temp(temp: NamedTempFile, dest: &Path) -> Result<(), Objec
 /// Metadata returned by `list` and `head`.
 ///
 /// `key` is the full backend key (the prefix passed to `list` is included);
-/// `last_modified` is the server-side wall clock, used by Phase 8's
-/// stale-lock recovery (`execution-plan.md` §1.1 / §5.2).
+/// `last_modified` is the server-side wall clock, used by stale-lock
+/// recovery in the push path.
 #[derive(Debug, Clone)]
 pub struct ObjectMeta {
     /// Full key of the stored object.
@@ -153,9 +152,8 @@ pub struct GetOpts {
 ///   override for large-file streaming.
 /// - **`put_if_absent`** — returns `Ok(true)` on creation, `Ok(false)` if
 ///   the key already existed. Backends collapse both 412
-///   (`PreconditionFailed`) and 409 (`Conflict`) into `Ok(false)` per
-///   `execution-plan.md` §5.1; transport-level failures still surface as
-///   `Err`.
+///   (`PreconditionFailed`) and 409 (`Conflict`) into `Ok(false)`;
+///   transport-level failures still surface as `Err`.
 /// - **`copy(src, dst)`** — overwrites `dst`; returns `Err(NotFound)` when
 ///   `src` is absent.
 /// - **`delete`** — returns `Err(NotFound)` on missing key. `release_lock`

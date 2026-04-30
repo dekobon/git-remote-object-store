@@ -283,11 +283,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the REPL exits early with a 'not yet implemented' error" note
   from both Azure helper shim binaries; the wrappers now describe
   the current shape symmetrically with the S3 shims. (#31)
-- `execution-plan.md` §1.1 ls-remote description now matches the
-  actual `cmd_list` wire output: one line per bundle (not per ref),
-  sorted by `LastModified` descending, with the `@<head> HEAD` line
-  prepended only when not `list for-push` and the head ref appears
-  in the listed bundles. (#36)
+- ls-remote / `cmd_list` wire output documentation now matches the
+  actual behaviour: one line per bundle (not per ref), sorted by
+  `LastModified` descending, with the `@<head> HEAD` line prepended
+  only when not `list for-push` and the head ref appears in the
+  listed bundles. (#36)
 - `README.md` "Status" section now describes the gitoxide /
   subprocess split honestly: gitoxide is used for rev-parse,
   is-ancestor, ref-name validation, remote-URL inspection, archive,
@@ -297,13 +297,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] - 2026-04-26
 
-Initial release. Phases 1–14 of the [execution plan](execution-plan.md)
-are complete: URL parser, gitoxide-backed git operations, the
-`ObjectStore` trait with S3 and Azure Blob backends, the helper
-protocol REPL, parallel `fetch`, locked `push`, the management CLI
-(`doctor` / `delete-branch` / `protect` / `unprotect`), the LFS
-custom-transfer agent, the helper-binary shims for both schemes, and
-the documentation / packaging / release pipeline.
+Initial release. The full feature surface is in place: URL parser,
+gitoxide-backed git operations, the `ObjectStore` trait with S3 and
+Azure Blob backends, the helper protocol REPL, parallel `fetch`,
+locked `push`, the management CLI (`doctor` / `delete-branch` /
+`protect` / `unprotect`), the LFS custom-transfer agent, the
+helper-binary shims for both schemes, and the documentation /
+packaging / release pipeline.
 
 ### Added
 
@@ -463,9 +463,8 @@ the documentation / packaging / release pipeline.
   `info`. The filter sits behind `reload::Layer` so the protocol can flip
   verbosity at runtime.
 - `clippy.toml` now bans `println!`/`print!`/`dbg!` via `disallowed-macros`
-  per execution-plan.md §5.8 / `.claude/rules/protocol-stdout.md`. The
-  management CLI and LFS agent will opt out at the file level when they
-  start writing to stdout in Phases 9/10.
+  per `.claude/rules/protocol-stdout.md`. The management CLI and LFS
+  agent opt out at the file level when they need to write to stdout.
 - Tokio's `io-std` feature is now enabled so the helper binaries can read
   stdin and write stdout asynchronously.
 - Smoke test `tests/protocol_smoke.rs` (gated on `feature = "test-util"`)
@@ -526,23 +525,23 @@ the documentation / packaging / release pipeline.
   zip writer; `bundle`/`unbundle` retain a subprocess fallback because
   `gix` 0.82 has no public bundle API. Spike result captured in
   `docs/development/spike-gix-bundle-parity.md`.
-- Phase 2 URL parser (`src/url.rs`): `parse(&str) -> Result<RemoteUrl, ParseError>`
-  for the `s3+https`, `s3+http`, `az+https`, `az+http` grammar in
-  `execution-plan.md` §3.1. Includes addressing-style auto-detection
-  (§3.4) with `?addressing=path|virtual` override, query-flag extraction
-  (`zip`, `profile`, `credential`, `region`), and cleartext-HTTP gating
-  (§3.5) — non-loopback `*+http://` is rejected unless
+- URL parser (`src/url.rs`): `parse(&str) -> Result<RemoteUrl, ParseError>`
+  for the `s3+https`, `s3+http`, `az+https`, `az+http` grammar.
+  Includes addressing-style auto-detection with
+  `?addressing=path|virtual` override, query-flag extraction (`zip`,
+  `profile`, `credential`, `region`), and cleartext-HTTP gating —
+  non-loopback `*+http://` is rejected unless
   `GIT_REMOTE_OBJECT_STORE_ALLOW_HTTP=1` is set.
 - Integration tests in `tests/url_parsing.rs` covering every concrete
-  example in §3.1 plus negative cases for invalid bucket / account /
-  container charsets, missing segments, unknown flags, illegal flag
-  values, and cleartext-HTTP rejection. `proptest` round-trip
-  (parse → display → parse) for the legal grammar.
-- Phase 1 scaffolding: Cargo manifest with the dependency set called out
-  in `execution-plan.md` (tokio, thiserror/anyhow, tracing, time, serde,
-  clap v4, url, gix and selected sub-crates, bytes, tempfile).
-- Empty module skeleton matching §2 of the execution plan
-  (`url`, `git`, `protocol/*`, `object_store/*`, `lfs`, `manage/*`).
+  URL example in the grammar plus negative cases for invalid bucket /
+  account / container charsets, missing segments, unknown flags,
+  illegal flag values, and cleartext-HTTP rejection. `proptest`
+  round-trip (parse → display → parse) for the legal grammar.
+- Cargo manifest with the dependency set used throughout (tokio,
+  thiserror/anyhow, tracing, time, serde, clap v4, url, gix and
+  selected sub-crates, bytes, tempfile).
+- Module skeleton (`url`, `git`, `protocol/*`, `object_store/*`,
+  `lfs`, `manage/*`).
 - Placeholder `[[bin]]` shims for the remote-helper schemes plus the
   management and LFS binaries.
 - GitHub Actions CI workflow running `cargo fmt --check`,
@@ -569,13 +568,12 @@ the documentation / packaging / release pipeline.
 - Fixed §3.1 Azure example to use `myaccount` rather than `my-account`;
   the previous form contradicted the §3.5 account charset rule
   `[a-z0-9]{3,24}` (no hyphens).
-- Phase-1 spike result: `cargo` rejects `+` in `[[bin]] name` (it derives
-  a crate name from the bin name and `+` is not a legal crate-name
+- Spike result: `cargo` rejects `+` in `[[bin]] name` (it derives a
+  crate name from the bin name and `+` is not a legal crate-name
   character). The cargo bins therefore use hyphenated names
   (`git-remote-s3-https`, `git-remote-s3-http`, `git-remote-az-https`,
   `git-remote-az-http`) and a later `xtask` step will rename / hardlink
-  them to the `+` form expected by `git` at install time
-  (see `execution-plan.md` §5.6 / §6).
+  them to the `+` form expected by `git` at install time.
 
 ### Fixed
 

@@ -90,7 +90,7 @@ likely to contain lesson-worthy material.
 ### 3d: Documentation changes (skip when hint provided)
 
 ```bash
-git log --since="$BOUNDARY" --name-only --format="" -- docs/ execution-plan.md AGENTS.md CLAUDE.md
+git log --since="$BOUNDARY" --name-only --format="" -- docs/ AGENTS.md CLAUDE.md
 ```
 
 Look for new or substantially updated documentation that may reflect
@@ -142,7 +142,7 @@ case-by-case reasoning:
 | Signal | Alternative Home |
 |--------|-----------------|
 | One-off debugging trick | Code comment at the relevant site |
-| Architectural decision | `execution-plan.md` or a `//!` module doc |
+| Architectural decision | A `//!` module doc, AGENTS.md, or `.claude/rules/*.md` |
 | Testing pattern | Test file comment, or `.claude/rules/testing.md` |
 | Project convention | `.claude/rules/*.md` or `AGENTS.md` |
 | Already covered by existing lesson | Merge into existing lesson #N |

@@ -32,9 +32,9 @@ use thiserror::Error;
 
 /// SHA-1 commit OID, displayed as 40 lowercase hex characters.
 ///
-/// Wraps [`gix_hash::ObjectId`] to make the wire-format invariant
-/// (lowercase-hex bundle filenames, see `execution-plan.md` §1.1) a
-/// type-system property.
+/// Wraps [`gix_hash::ObjectId`] to make the wire-format invariant —
+/// lowercase-hex bundle filenames on the bucket — a type-system
+/// property.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Sha(ObjectId);
 
@@ -476,7 +476,7 @@ pub fn archive(repo: &Repository, folder: &Path, spec: &str) -> Result<PathBuf, 
 
 /// Format `HEAD`'s commit as `"<short-sha> <subject>"`, matching upstream
 /// `git log -1 --pretty=%h %s`. Used as `CodePipeline` metadata in the
-/// `s3+zip` push variant (Phase 8).
+/// `s3+zip` push variant.
 ///
 /// # Errors
 ///
@@ -599,9 +599,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), GitError> {
 /// Add a multi-value entry to the repository's local config (`<section>[.<subsection>].<name> = value`).
 ///
 /// In-process equivalent of `git config --add <key> <value>`. Used by the
-/// LFS agent's `install` / `enable-debug` subcommands (Phase 10). `--add`
-/// semantics rather than `set` so that re-running `install` does not
-/// silently clobber an existing entry the user added by hand.
+/// LFS agent's `install` / `enable-debug` subcommands. `--add` semantics
+/// rather than `set` so that re-running `install` does not silently
+/// clobber an existing entry the user added by hand.
 ///
 /// The write goes through `gix-lock` (atomic rename via
 /// `<path>.lock`), preserving parity with `git config`'s on-disk
@@ -683,7 +683,7 @@ pub fn config_add_many(cwd: &Path, entries: &[(&str, &str)]) -> Result<(), GitEr
 /// Remove the latest value for the given key from the repository's local config.
 ///
 /// In-process equivalent of `git config --unset <key>`. Used by the LFS
-/// agent's `disable-debug` subcommand (Phase 10). Returns
+/// agent's `disable-debug` subcommand. Returns
 /// [`GitError::ConfigKeyNotSet`] when the section or value is absent;
 /// callers that want idempotent behaviour should match on that.
 ///

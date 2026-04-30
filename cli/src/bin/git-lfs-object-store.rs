@@ -1,5 +1,5 @@
 //! `git-lfs-object-store` — LFS custom-transfer agent for the S3 /
-//! Azure backends (Phase 10).
+//! Azure backends.
 //!
 //! Three subcommands (`install`, `enable-debug`, `disable-debug`)
 //! mutate the local repo's `git config`; passing `debug` (or no

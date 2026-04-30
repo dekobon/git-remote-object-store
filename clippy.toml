@@ -2,8 +2,8 @@
 # Using ".." appends to the default list rather than replacing it.
 doc-valid-idents = ["S3", "Azure", "DoS", "RustFS", ".."]
 
-# Stdout discipline (`.claude/rules/protocol-stdout.md`, execution-plan.md
-# §5.8). The remote-helper binaries and the LFS custom-transfer agent speak
+# Stdout discipline (see `.claude/rules/protocol-stdout.md`).
+# The remote-helper binaries and the LFS custom-transfer agent speak
 # their wire protocol on stdout, so a stray `println!`/`print!`/`dbg!` in a
 # library module silently corrupts the protocol. The management CLI and the
 # LFS agent legitimately write to stdout — both files carry an explicit

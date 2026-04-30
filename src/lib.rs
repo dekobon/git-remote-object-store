@@ -29,10 +29,11 @@
 //!
 //! # Architecture
 //!
-//! The high-level design is documented in `execution-plan.md` at the
-//! repository root. This crate is a Rust port of
-//! [`awslabs/git-remote-s3`][upstream] with an additional Azure Blob Storage
-//! backend.
+//! This crate was originally seeded as a Rust port of
+//! [`awslabs/git-remote-s3`][upstream] and now stands on its own,
+//! adding an Azure Blob Storage backend alongside S3. The on-bucket
+//! object layout is preserved so existing buckets written by the
+//! upstream Python tool remain readable.
 //!
 //! [upstream]: https://github.com/awslabs/git-remote-s3
 
