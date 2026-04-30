@@ -237,14 +237,10 @@ pub(crate) async fn fetch_batch(
         let collected = boundaries.drain();
         if !collected.is_empty() {
             let git_dir = git_dir_for(repo_dir.as_path());
-            let join =
-                tokio::task::spawn_blocking(move || git::write_shallow_file(&git_dir, &collected))
-                    .await;
-            match join {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err(e.into()),
-                Err(je) => return Err(je.into()),
-            }
+            tokio::task::spawn_blocking(move || git::write_shallow_file(&git_dir, &collected))
+                .await
+                .map_err(FetchError::from)?
+                .map_err(FetchError::from)?;
         }
     }
 
@@ -313,16 +309,14 @@ async fn fetch_one(ctx: FetchOneCtx<'_>) -> Result<(), FetchError> {
     // omit boundaries from the eventual `.git/shallow` write.
     if let Some(depth) = depth {
         let repo_dir = repo_dir.to_path_buf();
-        let join = tokio::task::spawn_blocking(move || {
+        let ids = tokio::task::spawn_blocking(move || {
             let repo = gix::open(&repo_dir).map_err(GitError::from)?;
             git::shallow_boundaries(&repo, sha, depth)
         })
-        .await;
-        match join {
-            Ok(Ok(ids)) => boundaries.extend(ids),
-            Ok(Err(e)) => return Err(e.into()),
-            Err(je) => return Err(je.into()),
-        }
+        .await
+        .map_err(FetchError::from)?
+        .map_err(FetchError::from)?;
+        boundaries.extend(ids);
     }
     Ok(())
 }
