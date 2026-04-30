@@ -198,6 +198,106 @@ fn azure_azurite_path_style() {
 }
 
 #[test]
+fn s3_virtual_hosted_dotted_bucket_auto_detect() {
+    // Pre-2018 AWS allowed `.` in bucket names. Auto-detection must
+    // recognise the virtual-hosted shape and capture the full prefix —
+    // not just the leftmost label — as the bucket.
+    let url = parse("s3+https://bucketname.com.s3.us-west-2.amazonaws.com/repo").unwrap();
+    let RemoteUrl::S3 {
+        bucket,
+        prefix,
+        addressing,
+        ..
+    } = url
+    else {
+        panic!("expected S3");
+    };
+    assert_eq!(bucket, "bucketname.com");
+    assert_eq!(prefix.as_deref(), Some("repo"));
+    assert_eq!(addressing, S3Addressing::VirtualHosted);
+}
+
+#[test]
+fn s3_virtual_hosted_dotted_bucket_explicit_flag() {
+    // Same URL with `?addressing=virtual` set: the explicit flag must
+    // not regress to the leftmost-label parse that silently dropped
+    // bucket segments before the fix.
+    let url = parse("s3+https://bucketname.com.s3.us-west-2.amazonaws.com/repo?addressing=virtual")
+        .unwrap();
+    let RemoteUrl::S3 {
+        bucket,
+        prefix,
+        addressing,
+        ..
+    } = url
+    else {
+        panic!("expected S3");
+    };
+    assert_eq!(bucket, "bucketname.com");
+    assert_eq!(prefix.as_deref(), Some("repo"));
+    assert_eq!(addressing, S3Addressing::VirtualHosted);
+}
+
+#[test]
+fn s3_legacy_hyphenated_with_dotted_bucket() {
+    // Legacy `s3-<region>` hyphenated form combined with a dotted
+    // bucket name.
+    let url = parse("s3+https://bucketname.com.s3-us-west-2.amazonaws.com/repo").unwrap();
+    let RemoteUrl::S3 {
+        bucket,
+        prefix,
+        addressing,
+        ..
+    } = url
+    else {
+        panic!("expected S3");
+    };
+    assert_eq!(bucket, "bucketname.com");
+    assert_eq!(prefix.as_deref(), Some("repo"));
+    assert_eq!(addressing, S3Addressing::VirtualHosted);
+}
+
+#[test]
+fn s3_virtual_hosted_short_dotted_bucket_no_longer_invalid() {
+    // Before the fix, `my.dotted.s3.<region>.amazonaws.com` parsed as
+    // the bucket "my" (length 2, fails `is_valid_bucket`). The full
+    // prefix is now recovered.
+    let url = parse("s3+https://my.dotted.s3.us-west-2.amazonaws.com/repo").unwrap();
+    let RemoteUrl::S3 {
+        bucket,
+        prefix,
+        addressing,
+        ..
+    } = url
+    else {
+        panic!("expected S3");
+    };
+    assert_eq!(bucket, "my.dotted");
+    assert_eq!(prefix.as_deref(), Some("repo"));
+    assert_eq!(addressing, S3Addressing::VirtualHosted);
+}
+
+#[test]
+fn s3_path_style_dotted_bucket_still_works() {
+    // Path-style URL pointing at a dotted bucket: bucket comes from
+    // the path, not the host, and the existing extraction is
+    // unaffected by the virtual-hosted change.
+    let url = parse("s3+https://s3.us-west-2.amazonaws.com/my.dotted.bucket/repo").unwrap();
+    let RemoteUrl::S3 {
+        bucket,
+        prefix,
+        addressing,
+        ..
+    } = url
+    else {
+        panic!("expected S3");
+    };
+    assert_eq!(bucket, "my.dotted.bucket");
+    assert_eq!(prefix.as_deref(), Some("repo"));
+    assert_eq!(addressing, S3Addressing::PathStyle);
+}
+
+#[test]
 fn s3_zip_flag() {
     let url = parse("s3+https://my-bucket.s3.us-west-2.amazonaws.com/my-repo?zip=1").unwrap();
     assert!(url.flags().zip);
@@ -571,6 +671,38 @@ fn arb_bucket() -> impl Strategy<Value = String> {
         })
 }
 
+/// True iff `s` looks like a dotted-quad IPv4 address — four
+/// numeric-only segments separated by `.`. AWS rejects bucket names
+/// with this shape; the proptest generator filters them out so every
+/// generated value is a valid bucket.
+fn looks_like_ipv4(s: &str) -> bool {
+    let mut parts = s.split('.');
+    let segs = [parts.next(), parts.next(), parts.next(), parts.next()];
+    parts.next().is_none()
+        && segs
+            .iter()
+            .all(|p| matches!(p, Some(seg) if !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit())))
+}
+
+/// Dotted-bucket strategy: two or more dot-separated segments, each
+/// alphanumeric only (so the bucket cannot start/end with a dash or
+/// produce consecutive periods). The full string must satisfy
+/// `is_valid_bucket`'s 3..=63 length, charset, IPv4-shape, and
+/// reserved-prefix/suffix rules.
+fn arb_dotted_bucket() -> impl Strategy<Value = String> {
+    proptest::collection::vec(
+        proptest::string::string_regex("[a-z0-9]{1,8}").expect("dotted-bucket segment regex"),
+        2..=4,
+    )
+    .prop_map(|parts| parts.join("."))
+    .prop_filter("valid AWS bucket name", |s| {
+        (3..=63).contains(&s.len())
+            && !FORBIDDEN_BUCKET_PREFIXES.iter().any(|p| s.starts_with(p))
+            && !FORBIDDEN_BUCKET_SUFFIXES.iter().any(|p| s.ends_with(p))
+            && !looks_like_ipv4(s)
+    })
+}
+
 fn arb_account() -> impl Strategy<Value = String> {
     proptest::string::string_regex("[a-z0-9]{3,24}").expect("valid account regex")
 }
@@ -625,6 +757,25 @@ proptest! {
         let prefix_part = prefix.as_deref().map_or(String::new(), |p| format!("/{p}"));
         let input = format!("s3+https://s3.us-west-2.amazonaws.com/{bucket}{prefix_part}");
         let parsed = parse(&input).expect("valid input");
+        let reparsed = parse(&parsed.to_string()).expect("display output should re-parse");
+        prop_assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn s3_virtual_hosted_dotted_bucket_round_trip(
+        bucket in arb_dotted_bucket(),
+        prefix in arb_prefix(),
+    ) {
+        let prefix_part = prefix.as_deref().map_or(String::new(), |p| format!("/{p}"));
+        let input = format!(
+            "s3+https://{bucket}.s3.us-west-2.amazonaws.com{prefix_part}"
+        );
+        let parsed = parse(&input).expect("valid input");
+        let RemoteUrl::S3 { bucket: parsed_bucket, addressing, .. } = &parsed else {
+            panic!("expected S3");
+        };
+        prop_assert_eq!(parsed_bucket, &bucket);
+        prop_assert_eq!(*addressing, S3Addressing::VirtualHosted);
         let reparsed = parse(&parsed.to_string()).expect("display output should re-parse");
         prop_assert_eq!(parsed, reparsed);
     }
