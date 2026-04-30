@@ -508,6 +508,9 @@ pub(crate) fn shallow_boundaries(
     Ok(frontier)
 }
 
+/// 40 hex digits + '\n' per `.git/shallow` entry.
+const SHA1_HEX_LINE_LEN: usize = 41;
+
 /// Write `boundaries` to `<git_dir>/shallow`, merging with any existing
 /// entries. The file is one SHA-1 hex per line, sorted for stable output.
 ///
@@ -555,8 +558,6 @@ pub(crate) fn write_shallow_file(git_dir: &Path, boundaries: &[ObjectId]) -> Res
     let mut sorted: Vec<ObjectId> = merged.into_iter().collect();
     sorted.sort_unstable();
 
-    // 40 hex digits + '\n' per entry.
-    const SHA1_HEX_LINE_LEN: usize = 41;
     let mut buf = Vec::with_capacity(sorted.len() * SHA1_HEX_LINE_LEN);
     for oid in &sorted {
         writeln!(buf, "{}", oid.to_hex()).map_err(GitError::Io)?;
