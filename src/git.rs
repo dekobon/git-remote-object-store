@@ -9,7 +9,7 @@
 //!
 //! [gix]: https://docs.rs/gix
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io;
 use std::io::Write as _;
@@ -254,7 +254,8 @@ pub enum GitError {
     /// Failed to parse the existing `.git/config` file.
     #[error(transparent)]
     ConfigParse(Box<gix_config_init::Error>),
-    /// Failed to acquire `.git/config.lock` for an atomic config write.
+    /// Failed to acquire a lock file for an atomic file write (e.g.
+    /// `.git/config.lock`, `.git/shallow.lock`).
     #[error(transparent)]
     ConfigLock(Box<gix_lock::acquire::Error>),
     /// Reading the `HEAD` reference failed.
@@ -476,20 +477,21 @@ pub(crate) fn shallow_boundaries(
     let max_depth = max_depth.get();
     let tip_oid = *tip.as_object_id();
 
-    // BFS from `tip`. `seen` is the included set; `parents_seen` collects
-    // every parent OID referenced by any included commit. After BFS, the
-    // boundaries are exactly `parents_seen - seen`.
-    //
-    // Collecting parents during BFS (rather than a separate second pass)
-    // means each commit is opened via `find_object` exactly once instead
-    // of twice: once when dequeued for expansion, and not again.
-    let mut seen: HashSet<ObjectId> = HashSet::new();
-    let mut parents_seen: HashSet<ObjectId> = HashSet::new();
+    // BFS from `tip`, recording the depth at which each commit was first
+    // reached. BFS guarantees first-visit depth is the minimum depth from
+    // the tip, which is what git uses to determine the frontier.
+    let mut seen: HashMap<ObjectId, u32> = HashMap::new();
     let mut queue: VecDeque<(ObjectId, u32)> = VecDeque::new();
     queue.push_back((tip_oid, 1));
 
     while let Some((oid, depth)) = queue.pop_front() {
-        if !seen.insert(oid) {
+        if seen.contains_key(&oid) {
+            continue;
+        }
+        seen.insert(oid, depth);
+        // Do not recurse past max_depth; parents of frontier commits are
+        // excluded from the local repo and need not be visited.
+        if depth == max_depth {
             continue;
         }
         let commit = repo
@@ -498,19 +500,19 @@ pub(crate) fn shallow_boundaries(
         let commit = commit.into_commit();
         for parent in commit.parent_ids() {
             let parent_oid = parent.detach();
-            parents_seen.insert(parent_oid);
-            if depth < max_depth && !seen.contains(&parent_oid) {
+            if !seen.contains_key(&parent_oid) {
                 queue.push_back((parent_oid, depth + 1));
             }
         }
     }
 
-    // Boundaries = parents referenced by included commits that are not
-    // themselves included. Multiple included commits can share an excluded
-    // parent; `parents_seen` is already a HashSet so dedup is free.
-    Ok(parents_seen
+    // The boundary is the frontier: commits at exactly max_depth. Git writes
+    // these OIDs to `.git/shallow` so they appear parentless, giving exactly
+    // max_depth visible commits from the tip.
+    Ok(seen
         .into_iter()
-        .filter(|p| !seen.contains(p))
+        .filter(|(_, d)| *d == max_depth)
+        .map(|(oid, _)| oid)
         .collect())
 }
 
@@ -528,9 +530,7 @@ pub(crate) fn shallow_boundaries(
 /// # Errors
 ///
 /// Returns [`GitError::Io`] if the file cannot be read or written, or
-/// [`GitError::ConfigLock`] if the lock file cannot be acquired (the
-/// `gix-lock`-based atomic-rename is shared with config writes; the
-/// variant name reflects its first user, not its only one).
+/// [`GitError::ConfigLock`] if the lock file cannot be acquired.
 pub(crate) fn write_shallow_file(git_dir: &Path, boundaries: &[ObjectId]) -> Result<(), GitError> {
     let path = git_dir.join("shallow");
 
@@ -1487,16 +1487,17 @@ mod tests {
     // --- shallow_boundaries / write_shallow_file ----------------------
 
     #[test]
-    fn shallow_boundaries_depth_one_returns_tip_parent() {
-        // Linear history a → b. With depth=1 the included set is {b}
-        // and its only parent (a) is the boundary.
+    fn shallow_boundaries_depth_one_returns_tip() {
+        // Linear history a → b. With depth=1 the frontier is {b} (the tip
+        // itself). Git writes b to .git/shallow so b appears parentless,
+        // giving exactly 1 visible commit.
         let (repo, _dir) = empty_repo();
         let a = add_commit(&repo, "refs/heads/main", &[], "a");
         let b = add_commit(&repo, "refs/heads/main", &[a], "b");
         let tip = Sha::from_object_id(b);
         let bounds =
             shallow_boundaries(&repo, tip, NonZeroU32::new(1).unwrap()).expect("boundaries");
-        assert_eq!(bounds, vec![a]);
+        assert_eq!(bounds, vec![b]);
     }
 
     #[test]
@@ -1512,18 +1513,17 @@ mod tests {
     }
 
     #[test]
-    fn shallow_boundaries_at_merge_returns_all_excluded_parents() {
-        // Build the merge graph from the issue:
+    fn shallow_boundaries_at_merge_returns_frontier_at_depth() {
+        // Merge graph:
         //     M (tip, depth 1)
         //    / \
-        //   A   B   (both depth 2)
+        //   A   B   (both depth 2 — the frontier)
         //    \ /
-        //     C (depth 3 — the only boundary at depth=2)
+        //     C (depth 3 — excluded, not a boundary marker)
         //
-        // BFS at depth=2 must include {M, A, B}. C is the parent of
-        // both A and B and lives outside the included set, so it is
-        // the single boundary. A topological-walk `.take(N)` would
-        // mis-handle this.
+        // BFS at depth=2 includes {M, A, B}. The frontier is {A, B};
+        // both appear parentless in the shallow clone, giving 3 visible
+        // commits. C is never visited and is not written to .git/shallow.
         let (repo, _dir) = empty_repo();
         let c = add_commit(&repo, "refs/heads/main", &[], "C");
         let a = add_commit(&repo, "refs/heads/main", &[c], "A");
@@ -1532,13 +1532,18 @@ mod tests {
         let tip = Sha::from_object_id(m);
         let bounds =
             shallow_boundaries(&repo, tip, NonZeroU32::new(2).unwrap()).expect("boundaries");
-        assert_eq!(bounds, vec![c]);
+        let mut sorted = bounds.clone();
+        sorted.sort_unstable();
+        let mut expected = vec![a, b];
+        expected.sort_unstable();
+        assert_eq!(sorted, expected);
     }
 
     #[test]
-    fn shallow_boundaries_at_merge_with_depth_one_emits_both_parents() {
-        // depth=1 includes only the merge tip; both parents become
-        // boundaries.
+    fn shallow_boundaries_at_merge_with_depth_one_returns_tip() {
+        // depth=1: the frontier is the merge tip itself. M appears
+        // parentless, giving exactly 1 visible commit regardless of
+        // how many parents it has.
         let (repo, _dir) = empty_repo();
         let a = add_commit(&repo, "refs/heads/main", &[], "A");
         let b = add_commit(&repo, "refs/heads/side", &[], "B");
@@ -1546,11 +1551,7 @@ mod tests {
         let tip = Sha::from_object_id(m);
         let bounds =
             shallow_boundaries(&repo, tip, NonZeroU32::new(1).unwrap()).expect("boundaries");
-        let mut sorted = bounds.clone();
-        sorted.sort_unstable();
-        let mut expected = vec![a, b];
-        expected.sort_unstable();
-        assert_eq!(sorted, expected);
+        assert_eq!(bounds, vec![m]);
     }
 
     #[test]
@@ -1611,8 +1612,6 @@ mod tests {
         let path = repo.git_dir().join("shallow");
         std::fs::write(&path, format!("{a}\n")).expect("seed");
         write_shallow_file(repo.git_dir(), &[]).expect("noop");
-        // The function returns early with `Ok(())` when there's no
-        // change to make; the existing file is left untouched.
         let contents = std::fs::read_to_string(&path).expect("read");
         assert_eq!(contents, format!("{a}\n"));
     }

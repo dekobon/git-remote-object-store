@@ -375,7 +375,7 @@ async fn fetch_with_depth_writes_shallow_file_with_boundary() {
         return;
     }
     // Build a 3-commit linear history so depth=1 produces exactly one
-    // boundary (the parent of HEAD).
+    // boundary (the tip itself — it appears parentless in the shallow clone).
     let seed = tempfile::tempdir().expect("tempdir");
     git(&["init", "--quiet", "--initial-branch=main"], seed.path());
     git(&["config", "user.email", "test@example.com"], seed.path());
@@ -390,9 +390,6 @@ async fn fetch_with_depth_writes_shallow_file_with_boundary() {
         );
     }
     let tip_sha = git_capture(&["rev-parse", "HEAD"], seed.path())
-        .trim()
-        .to_owned();
-    let parent_sha = git_capture(&["rev-parse", "HEAD~1"], seed.path())
         .trim()
         .to_owned();
     let bundle = bundle_ref(seed.path(), &tip_sha, "refs/heads/main");
@@ -419,8 +416,8 @@ async fn fetch_with_depth_writes_shallow_file_with_boundary() {
     let shallow = std::fs::read_to_string(&shallow_path).expect("shallow file should exist");
     assert_eq!(
         shallow.trim(),
-        parent_sha,
-        "shallow boundary should be HEAD~1; got {shallow:?}"
+        tip_sha,
+        "shallow boundary should be HEAD (tip appears parentless); got {shallow:?}"
     );
 }
 
@@ -495,17 +492,15 @@ async fn depth_resets_between_batches() {
     let tip_sha = git_capture(&["rev-parse", "HEAD"], seed.path())
         .trim()
         .to_owned();
-    let parent_sha = git_capture(&["rev-parse", "HEAD~1"], seed.path())
-        .trim()
-        .to_owned();
     let bundle_main = bundle_ref(seed.path(), &tip_sha, "refs/heads/main");
 
     // Side branch with 2 commits so depth=1 from the tip produces a
-    // non-empty boundary (the root commit). If depth leaked from batch 1,
-    // `shallow_boundaries(repo, side_tip, 1)` would return [side_root],
-    // which would be merged into .git/shallow alongside parent_sha —
+    // non-empty boundary (side_sha itself). If depth leaked from batch 1,
+    // `shallow_boundaries(repo, side_tip, 1)` would return [side_sha],
+    // which would be merged into .git/shallow alongside tip_sha —
     // detectable via the final content assertion. An orphan (single-commit)
-    // side branch would be invisible to the leak because it has no parents.
+    // side branch would be invisible to the leak because it has no parents
+    // and would produce an empty boundary either way.
     git(&["checkout", "--orphan", "side"], seed.path());
     git(&["rm", "-rf", "."], seed.path());
     std::fs::write(seed.path().join("b.txt"), b"b\n").unwrap();
@@ -567,9 +562,9 @@ async fn depth_resets_between_batches() {
     assert_eq!(&buf, b"ok\n\n");
 
     // Batch 2: plain fetch of side. If depth leaked across batches,
-    // .git/shallow would contain side_sha (depth=1 from a root commit
-    // produces no boundary, but the dedup write would still touch the
-    // file). The reset semantic means batch 2 contributes nothing.
+    // .git/shallow would also contain side_sha (depth=1 from side_sha
+    // returns [side_sha] as boundary). The reset semantic means batch 2
+    // contributes nothing to .git/shallow.
     client_writer
         .write_all(format!("fetch {side_sha} refs/heads/side\n\n").as_bytes())
         .await
@@ -583,12 +578,72 @@ async fn depth_resets_between_batches() {
 
     let shallow_path = dst.path().join(".git").join("shallow");
     let shallow = std::fs::read_to_string(&shallow_path).expect("shallow file should exist");
-    // The boundary set must be exactly `parent_sha` from batch 1.
-    // batch 2 contributing entries (or wiping batch 1's) would either
-    // add side_sha to the file or remove parent_sha.
+    // The boundary set must be exactly `tip_sha` from batch 1.
+    // Batch 2 contributing entries (or wiping batch 1's) would either
+    // add side_sha to the file or remove tip_sha.
     assert_eq!(
         shallow.trim(),
-        parent_sha,
+        tip_sha,
         "shallow file polluted by depth-less batch 2: {shallow:?}",
+    );
+}
+
+#[tokio::test]
+async fn shallow_fetch_limits_visible_commit_count() {
+    // End-to-end check: after a depth-N fetch, `git log` in the destination
+    // repo must show exactly N commits. This verifies that the shallow
+    // boundary written to .git/shallow correctly truncates history — not
+    // just that the file was created with some content.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+
+    const TOTAL_COMMITS: u32 = 5;
+    const DEPTH: u32 = 3;
+
+    let seed = tempfile::tempdir().expect("tempdir");
+    git(&["init", "--quiet", "--initial-branch=main"], seed.path());
+    git(&["config", "user.email", "test@example.com"], seed.path());
+    git(&["config", "user.name", "Test"], seed.path());
+    git(&["config", "commit.gpgsign", "false"], seed.path());
+    for i in 0..TOTAL_COMMITS {
+        std::fs::write(seed.path().join("f.txt"), format!("{i}\n")).unwrap();
+        git(&["add", "f.txt"], seed.path());
+        git(
+            &["commit", "--quiet", "-m", &format!("c{i}"), "--no-gpg-sign"],
+            seed.path(),
+        );
+    }
+    let tip_sha = git_capture(&["rev-parse", "HEAD"], seed.path())
+        .trim()
+        .to_owned();
+    let bundle = bundle_ref(seed.path(), &tip_sha, "refs/heads/main");
+
+    let store = MockStore::new();
+    store.insert(format!("repo/refs/heads/main/{tip_sha}.bundle"), bundle);
+
+    let dst = make_dst_repo();
+    let script = format!("option depth {DEPTH}\nfetch {tip_sha} refs/heads/main\n\n");
+    let (_out, result) = drive_in(
+        s3_url(Some("repo")),
+        Arc::new(store),
+        &script,
+        dst.path().to_path_buf(),
+    )
+    .await;
+    result.expect("shallow fetch should succeed");
+
+    // The helper writes objects to the ODB but does not update refs — git
+    // does that after the helper exits. Simulate it so `git log` works.
+    git(&["update-ref", "refs/heads/main", &tip_sha], dst.path());
+
+    // `git log --oneline` emits one line per visible commit; the count
+    // must equal the requested depth.
+    let log = git_capture(&["log", "--oneline", "refs/heads/main"], dst.path());
+    let visible = log.lines().count();
+    assert_eq!(
+        visible, DEPTH as usize,
+        "expected {DEPTH} visible commits after depth={DEPTH} fetch, got {visible}: {log:?}"
     );
 }
