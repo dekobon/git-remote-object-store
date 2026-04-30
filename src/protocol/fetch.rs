@@ -20,9 +20,11 @@
 //! `.claude/rules/protocol-stdout.md`.
 
 use std::collections::HashSet;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use gix_hash::ObjectId;
 use tokio::sync::Semaphore;
 use tokio::task::{JoinError, JoinSet};
 use tracing::debug;
@@ -116,26 +118,73 @@ impl FetchedRefs {
     }
 }
 
+/// Per-batch accumulator of shallow boundary OIDs.
+///
+/// Mirrors [`FetchedRefs`]: each parallel `fetch_one` task pushes the
+/// boundary commits it computed, and `fetch_batch` performs a single
+/// merged write to `.git/shallow` after all tasks finish. Cloning is
+/// cheap (`Arc` bump).
+#[derive(Clone, Default)]
+struct ShallowBoundaries {
+    inner: Arc<Mutex<HashSet<ObjectId>>>,
+}
+
+impl ShallowBoundaries {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn extend(&self, ids: impl IntoIterator<Item = ObjectId>) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.extend(ids);
+    }
+
+    fn drain(&self) -> Vec<ObjectId> {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.drain().collect()
+    }
+}
+
 /// Drive a batch of `fetch` commands to completion.
 ///
 /// Runs at most [`MAX_FETCH_CONCURRENCY`] downloads in parallel and
 /// returns the first error after every spawned task has finished — that
 /// way no zombie task is left running when the helper exits.
+///
+/// `depth`, when set, requests a shallow fetch: each ref's installed
+/// objects are walked breadth-first from the tip and the boundary
+/// commits at depth `N` are merged into `.git/shallow` once all tasks
+/// have finished. The walk runs even when a SHA's bundle was skipped
+/// (already in `fetched_refs` from an earlier batch in the same REPL
+/// session), since the boundary depends on `depth`, not on whether the
+/// download happened.
 pub(crate) async fn fetch_batch(
     store: Arc<dyn ObjectStore>,
     prefix: Option<String>,
     repo_dir: Arc<PathBuf>,
     cmds: Vec<String>,
     fetched_refs: FetchedRefs,
+    depth: Option<NonZeroU32>,
 ) -> Result<(), FetchError> {
     if cmds.is_empty() {
         return Ok(());
     }
-    debug!(count = cmds.len(), "fetching bundles in parallel");
+    debug!(
+        count = cmds.len(),
+        depth = ?depth,
+        "fetching bundles in parallel"
+    );
 
     let semaphore = Arc::new(Semaphore::new(MAX_FETCH_CONCURRENCY));
     let mut tasks: JoinSet<Result<(), FetchError>> = JoinSet::new();
     let prefix = prefix.map(Arc::new);
+    let boundaries = ShallowBoundaries::new();
 
     for cmd in cmds {
         let store = Arc::clone(&store);
@@ -143,20 +192,23 @@ pub(crate) async fn fetch_batch(
         let prefix = prefix.clone();
         let repo_dir = Arc::clone(&repo_dir);
         let fetched_refs = fetched_refs.clone();
+        let boundaries = boundaries.clone();
         tasks.spawn(async move {
             let _permit = semaphore
                 .acquire_owned()
                 .await
                 .expect("fetch semaphore is owned by this batch and never closed");
             let (sha, ref_name) = parse_fetch_args(&cmd)?;
-            fetch_one(
-                store.as_ref(),
-                prefix.as_deref().map(String::as_str),
-                repo_dir.as_path(),
+            fetch_one(FetchOneCtx {
+                store: store.as_ref(),
+                prefix: prefix.as_deref().map(String::as_str),
+                repo_dir: repo_dir.as_path(),
                 sha,
-                &ref_name,
-                &fetched_refs,
-            )
+                ref_name: &ref_name,
+                fetched_refs: &fetched_refs,
+                depth,
+                boundaries: &boundaries,
+            })
             .await
         });
     }
@@ -175,33 +227,103 @@ pub(crate) async fn fetch_batch(
             first_err = Some(err);
         }
     }
+
+    // Apply shallow boundaries only when the batch succeeded. If any
+    // task errored, the bundle for that ref may be missing from the
+    // ODB, so its BFS results would be incomplete — better to leave
+    // `.git/shallow` untouched and let git report the underlying error
+    // than to write a half-built boundary set.
+    if first_err.is_none() && depth.is_some() {
+        let collected = boundaries.drain();
+        if !collected.is_empty() {
+            let git_dir = git_dir_for(repo_dir.as_path());
+            let join =
+                tokio::task::spawn_blocking(move || git::write_shallow_file(&git_dir, &collected))
+                    .await;
+            match join {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e.into()),
+                Err(je) => return Err(je.into()),
+            }
+        }
+    }
+
     first_err.map_or(Ok(()), Err)
 }
 
-async fn fetch_one(
-    store: &dyn ObjectStore,
-    prefix: Option<&str>,
-    repo_dir: &Path,
+/// Resolve the on-disk git directory for `repo_dir`. Falls back to
+/// treating `repo_dir` as the git directory itself for bare layouts —
+/// the worktree case is handled by appending `.git`.
+fn git_dir_for(repo_dir: &Path) -> PathBuf {
+    let candidate = repo_dir.join(".git");
+    if candidate.is_dir() {
+        candidate
+    } else {
+        repo_dir.to_path_buf()
+    }
+}
+
+/// Per-task fetch context: bundles every parameter that varies across
+/// `fetch_one` calls into a single struct, keeping the function under
+/// the clippy `too_many_arguments` threshold while still owning every
+/// borrow it needs.
+struct FetchOneCtx<'a> {
+    store: &'a dyn ObjectStore,
+    prefix: Option<&'a str>,
+    repo_dir: &'a Path,
     sha: Sha,
-    ref_name: &RefName,
-    fetched_refs: &FetchedRefs,
-) -> Result<(), FetchError> {
+    ref_name: &'a RefName,
+    fetched_refs: &'a FetchedRefs,
+    depth: Option<NonZeroU32>,
+    boundaries: &'a ShallowBoundaries,
+}
+
+async fn fetch_one(ctx: FetchOneCtx<'_>) -> Result<(), FetchError> {
+    let FetchOneCtx {
+        store,
+        prefix,
+        repo_dir,
+        sha,
+        ref_name,
+        fetched_refs,
+        depth,
+        boundaries,
+    } = ctx;
+
     if fetched_refs.contains(&sha) {
         debug!(%sha, ref_name = %ref_name, "skipping fetch: already fetched in this session");
-        return Ok(());
+    } else {
+        let key = bundle_key(prefix, ref_name, sha);
+        let temp_dir = tempfile::Builder::new()
+            .prefix("git_remote_object_store_fetch_")
+            .tempdir()?;
+        let bundle_path = temp_dir.path().join(format!("{sha}.bundle"));
+        debug!(%sha, ref_name = %ref_name, key = %key, "downloading bundle");
+        store
+            .get_to_file(&key, &bundle_path, GetOpts::default())
+            .await?;
+        git::unbundle_at(repo_dir, temp_dir.path(), sha, ref_name).await?;
+        fetched_refs.insert(sha);
     }
 
-    let key = bundle_key(prefix, ref_name, sha);
-    let temp_dir = tempfile::Builder::new()
-        .prefix("git_remote_object_store_fetch_")
-        .tempdir()?;
-    let bundle_path = temp_dir.path().join(format!("{sha}.bundle"));
-    debug!(%sha, ref_name = %ref_name, key = %key, "downloading bundle");
-    store
-        .get_to_file(&key, &bundle_path, GetOpts::default())
-        .await?;
-    git::unbundle_at(repo_dir, temp_dir.path(), sha, ref_name).await?;
-    fetched_refs.insert(sha);
+    // Shallow boundary collection runs even when the bundle was
+    // already installed in this session: the per-batch `depth` option
+    // is independent of the dedup that skips the download. The walk
+    // is cheap (objects are local) and skipping it would silently
+    // omit boundaries from the eventual `.git/shallow` write.
+    if let Some(depth) = depth {
+        let repo_dir = repo_dir.to_path_buf();
+        let join = tokio::task::spawn_blocking(move || {
+            let repo = gix::open(&repo_dir).map_err(GitError::from)?;
+            git::shallow_boundaries(&repo, sha, depth)
+        })
+        .await;
+        match join {
+            Ok(Ok(ids)) => boundaries.extend(ids),
+            Ok(Err(e)) => return Err(e.into()),
+            Err(je) => return Err(je.into()),
+        }
+    }
     Ok(())
 }
 
@@ -337,6 +459,7 @@ mod tests {
             Arc::new(repo_dir.path().to_path_buf()),
             Vec::new(),
             FetchedRefs::new(),
+            None,
         )
         .await;
         assert!(matches!(result, Ok(())));

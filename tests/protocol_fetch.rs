@@ -367,3 +367,219 @@ async fn fetched_refs_dedupes_across_batches() {
     result
         .expect("second batch must short-circuit via fetched_refs even though the bundle is gone");
 }
+
+#[tokio::test]
+async fn fetch_with_depth_writes_shallow_file_with_boundary() {
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    // Build a 3-commit linear history so depth=1 produces exactly one
+    // boundary (the parent of HEAD).
+    let seed = tempfile::tempdir().expect("tempdir");
+    git(&["init", "--quiet", "--initial-branch=main"], seed.path());
+    git(&["config", "user.email", "test@example.com"], seed.path());
+    git(&["config", "user.name", "Test"], seed.path());
+    git(&["config", "commit.gpgsign", "false"], seed.path());
+    for i in 0..3u32 {
+        std::fs::write(seed.path().join("hello.txt"), format!("hi {i}\n")).unwrap();
+        git(&["add", "hello.txt"], seed.path());
+        git(
+            &["commit", "--quiet", "-m", &format!("c{i}"), "--no-gpg-sign"],
+            seed.path(),
+        );
+    }
+    let tip_sha = git_capture(&["rev-parse", "HEAD"], seed.path())
+        .trim()
+        .to_owned();
+    let parent_sha = git_capture(&["rev-parse", "HEAD~1"], seed.path())
+        .trim()
+        .to_owned();
+    let bundle = bundle_ref(seed.path(), &tip_sha, "refs/heads/main");
+
+    let store = MockStore::new();
+    store.insert(format!("repo/refs/heads/main/{tip_sha}.bundle"), bundle);
+
+    let dst = make_dst_repo();
+    // option depth 1 -> ok; fetch tip -> shallow; blank -> flush.
+    let script = format!("option depth 1\nfetch {tip_sha} refs/heads/main\n\n");
+    let (out, result) = drive_in(
+        s3_url(Some("repo")),
+        Arc::new(store),
+        &script,
+        dst.path().to_path_buf(),
+    )
+    .await;
+    result.expect("fetch with depth should succeed");
+    // Helper output: `ok\n` for the option ack, then `\n` batch
+    // terminator. No other bytes.
+    assert_eq!(&out, b"ok\n\n", "expected option ack + terminator");
+
+    let shallow_path = dst.path().join(".git").join("shallow");
+    let shallow = std::fs::read_to_string(&shallow_path).expect("shallow file should exist");
+    assert_eq!(
+        shallow.trim(),
+        parent_sha,
+        "shallow boundary should be HEAD~1; got {shallow:?}"
+    );
+}
+
+#[tokio::test]
+async fn fetch_without_depth_does_not_write_shallow_file() {
+    // Regression guard: a plain `git clone` with no `--depth` must not
+    // create `.git/shallow`. This pins the per-batch reset of the depth
+    // option in the REPL state.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, sha) = make_seed_repo();
+    let bundle = bundle_ref(seed.path(), &sha, "refs/heads/main");
+
+    let store = MockStore::new();
+    store.insert(format!("repo/refs/heads/main/{sha}.bundle"), bundle);
+
+    let dst = make_dst_repo();
+    let script = format!("fetch {sha} refs/heads/main\n\n");
+    let (_out, result) = drive_in(
+        s3_url(Some("repo")),
+        Arc::new(store),
+        &script,
+        dst.path().to_path_buf(),
+    )
+    .await;
+    result.expect("fetch should succeed");
+
+    let shallow_path = dst.path().join(".git").join("shallow");
+    assert!(
+        !shallow_path.exists(),
+        ".git/shallow unexpectedly created without `option depth`"
+    );
+}
+
+#[tokio::test]
+async fn depth_resets_between_batches() {
+    // After a shallow batch completes, a subsequent batch in the same
+    // REPL session must default to non-shallow semantics: depth is
+    // per-operation, not session-sticky. We verify this by running
+    // batch 1 with depth=1 (writes shallow), then batch 2 without
+    // depth on a different ref (must NOT add to .git/shallow beyond
+    // batch 1's contribution).
+    use git_remote_object_store::protocol::run;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+
+    // Seed: linear two-commit history for batch 1; an unrelated
+    // single-commit branch for batch 2.
+    let seed = tempfile::tempdir().expect("tempdir");
+    git(&["init", "--quiet", "--initial-branch=main"], seed.path());
+    git(&["config", "user.email", "test@example.com"], seed.path());
+    git(&["config", "user.name", "Test"], seed.path());
+    git(&["config", "commit.gpgsign", "false"], seed.path());
+    std::fs::write(seed.path().join("a.txt"), b"a\n").unwrap();
+    git(&["add", "a.txt"], seed.path());
+    git(
+        &["commit", "--quiet", "-m", "c0", "--no-gpg-sign"],
+        seed.path(),
+    );
+    std::fs::write(seed.path().join("a.txt"), b"a2\n").unwrap();
+    git(&["add", "a.txt"], seed.path());
+    git(
+        &["commit", "--quiet", "-m", "c1", "--no-gpg-sign"],
+        seed.path(),
+    );
+    let tip_sha = git_capture(&["rev-parse", "HEAD"], seed.path())
+        .trim()
+        .to_owned();
+    let parent_sha = git_capture(&["rev-parse", "HEAD~1"], seed.path())
+        .trim()
+        .to_owned();
+    let bundle_main = bundle_ref(seed.path(), &tip_sha, "refs/heads/main");
+
+    // Independent root commit on a side branch (no shared history with
+    // main, so its bundle's only commit is a fresh root). Batch 2 will
+    // pull this without depth.
+    git(&["checkout", "--orphan", "side"], seed.path());
+    git(&["rm", "-rf", "."], seed.path());
+    std::fs::write(seed.path().join("b.txt"), b"b\n").unwrap();
+    git(&["add", "b.txt"], seed.path());
+    git(
+        &["commit", "--quiet", "-m", "side1", "--no-gpg-sign"],
+        seed.path(),
+    );
+    let side_sha = git_capture(&["rev-parse", "HEAD"], seed.path())
+        .trim()
+        .to_owned();
+    let bundle_side = bundle_ref(seed.path(), &side_sha, "refs/heads/side");
+
+    let store = Arc::new(MockStore::new());
+    store.insert(
+        format!("repo/refs/heads/main/{tip_sha}.bundle"),
+        bundle_main,
+    );
+    store.insert(
+        format!("repo/refs/heads/side/{side_sha}.bundle"),
+        bundle_side,
+    );
+
+    let dst = make_dst_repo();
+    let dst_path = dst.path().to_path_buf();
+    let remote = s3_url(Some("repo"));
+
+    let (client_side, helper_side) = tokio::io::duplex(64 * 1024);
+    let (helper_in, helper_out) = tokio::io::split(helper_side);
+    let (mut client_reader, mut client_writer) = tokio::io::split(client_side);
+
+    let store_for_run: Arc<dyn ObjectStore> = Arc::clone(&store) as _;
+    let run_task = tokio::spawn(async move {
+        run(
+            remote,
+            store_for_run,
+            BufReader::new(helper_in),
+            helper_out,
+            None,
+            dst_path,
+        )
+        .await
+    });
+
+    // Batch 1: shallow fetch of main.
+    client_writer
+        .write_all(format!("option depth 1\nfetch {tip_sha} refs/heads/main\n\n").as_bytes())
+        .await
+        .unwrap();
+    // option ack: `ok\n`; batch terminator: `\n` -> 4 bytes.
+    let mut buf = [0u8; 4];
+    client_reader.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"ok\n\n");
+
+    // Batch 2: plain fetch of side. If depth leaked across batches,
+    // .git/shallow would contain side_sha (depth=1 from a root commit
+    // produces no boundary, but the dedup write would still touch the
+    // file). The reset semantic means batch 2 contributes nothing.
+    client_writer
+        .write_all(format!("fetch {side_sha} refs/heads/side\n\n").as_bytes())
+        .await
+        .unwrap();
+    let mut term = [0u8; 1];
+    client_reader.read_exact(&mut term).await.unwrap();
+    assert_eq!(&term, b"\n");
+
+    client_writer.shutdown().await.unwrap();
+    let _ = run_task.await.unwrap();
+
+    let shallow_path = dst.path().join(".git").join("shallow");
+    let shallow = std::fs::read_to_string(&shallow_path).expect("shallow file should exist");
+    // The boundary set must be exactly `parent_sha` from batch 1.
+    // batch 2 contributing entries (or wiping batch 1's) would either
+    // add side_sha to the file or remove parent_sha.
+    assert_eq!(
+        shallow.trim(),
+        parent_sha,
+        "shallow file polluted by depth-less batch 2: {shallow:?}",
+    );
+}
