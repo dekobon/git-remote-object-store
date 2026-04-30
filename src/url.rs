@@ -1,10 +1,11 @@
 //! Parser for the `s3+https` / `s3+http` / `az+https` / `az+http` URL
-//! grammar described in §3 of `execution-plan.md`.
+//! grammar.
 //!
 //! The parser strips the backend prefix (`s3+` or `az+`), parses the
 //! remainder as an RFC 3986 URL via the [`url`] crate, then layers
-//! cleartext-HTTP gating (§3.5), backend-specific name validation,
-//! addressing-style detection (§3.4), and query-flag extraction on top.
+//! cleartext-HTTP gating, backend-specific name validation,
+//! addressing-style detection, and query-flag extraction on top. The
+//! user-facing grammar reference is `docs/getting-started.md`.
 
 use std::env;
 use std::fmt;
@@ -14,7 +15,7 @@ use thiserror::Error;
 use url::Url;
 
 /// Environment override that allows cleartext `*+http://` URLs against
-/// non-loopback hosts. Per §3.5 this is accepted only when set to `1`.
+/// non-loopback hosts. Accepted only when set to `1`.
 pub const ENV_ALLOW_HTTP: &str = "GIT_REMOTE_OBJECT_STORE_ALLOW_HTTP";
 
 /// A parsed remote URL.

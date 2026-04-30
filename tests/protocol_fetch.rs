@@ -1,4 +1,4 @@
-//! Phase 7 integration test: drive [`protocol::run`] through a fetch
+//! Fetch integration test: drive [`protocol::run`] through a fetch
 //! batch against a [`MockStore`] seeded with real git bundles, and
 //! verify the bundles end up applied in a destination repository.
 //!
@@ -61,12 +61,12 @@ fn make_dst_repo() -> TempDir {
 
 #[tokio::test]
 async fn idle_blank_line_with_fetch_wiring_emits_terminator() {
-    // Smoke coverage: confirm the new `repo_dir` parameter and FetchedRefs
-    // session state added in Phase 7 do not perturb the idle blank-line
-    // path. No fetch commands are sent — `mode` stays `None`, so the
-    // fetch batch flush in mod.rs is bypassed entirely. The internal
-    // empty-cmds short-circuit in `fetch_batch` is covered separately by
-    // the unit test in `src/protocol/fetch.rs`.
+    // Smoke coverage: confirm the `repo_dir` parameter and FetchedRefs
+    // session state do not perturb the idle blank-line path. No fetch
+    // commands are sent — `mode` stays `None`, so the fetch batch flush
+    // in mod.rs is bypassed entirely. The internal empty-cmds
+    // short-circuit in `fetch_batch` is covered separately by the unit
+    // test in `src/protocol/fetch.rs`.
     let dst = make_dst_repo();
     let (out, result) = drive_in(
         s3_url(Some("repo")),

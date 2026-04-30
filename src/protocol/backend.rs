@@ -1,7 +1,7 @@
 //! Backend factory: turns a parsed [`RemoteUrl`] into an
 //! [`Arc<dyn ObjectStore>`] for the protocol REPL to drive.
 //!
-//! Both S3 (Phase 5) and Azure Blob (Phase 11) are wired here.
+//! Both S3 and Azure Blob are wired here.
 //!
 //! # Eager probe and categorical error mapping
 //!

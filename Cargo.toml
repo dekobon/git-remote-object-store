@@ -59,7 +59,7 @@ anyhow = "1"
 # Logging
 tracing = "0.1"
 # `reload` is required for runtime verbosity flips driven by the helper
-# protocol's `option verbosity <n>` line (Phase 6 / execution-plan.md §2.4).
+# protocol's `option verbosity <n>` line.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Time
@@ -76,7 +76,7 @@ serde_json = "1"
 dialoguer = { version = "0.11", default-features = false }
 
 # UUID v4 for the doctor's quarantine ref suffix
-# (`<ref>_<uuid8>` per execution-plan.md §1.1 / Phase 9).
+# (`<ref>_<uuid8>`).
 uuid = { version = "1", features = ["v4"] }
 
 # URL parsing
@@ -91,8 +91,7 @@ url = "2"
 # `features = ["sha1"]` below ensures `Kind` is inhabited; disabling
 # `gix`'s defaults causes the rest of the gix tree to be compiled without
 # `sha1` and reintroduces the non-exhaustive-match build error in
-# gix-hash. Keep the defaults until we have a reason to slim the tree
-# (Phase 14 packaging is the right place to revisit).
+# gix-hash. Keep the defaults until we have a reason to slim the tree.
 gix = "0.82"
 gix-hash = { version = "0.24", features = ["sha1"] }
 gix-pack = "0.69"
@@ -103,9 +102,9 @@ gix-archive = "0.31"
 bytes = "1"
 tempfile = "3"
 
-# AWS SDK for the S3 backend (Phase 5). `aws-config` carries the
+# AWS SDK for the S3 backend. `aws-config` carries the
 # `behavior-version-latest` feature so the SDK picks up its own latest
-# defaults automatically; revisit pinning at Phase 14 if reproducibility
+# defaults automatically; revisit pinning later if reproducibility
 # becomes a concern.
 #
 # `aws-sdk-s3` defaults include the legacy `rustls` feature, which
@@ -153,7 +152,7 @@ futures = "0.3"
 # before being passed in.
 percent-encoding = "2"
 
-# Azure SDK for the Blob backend (Phase 11). The SDK is in beta (0.12)
+# Azure SDK for the Blob backend. The SDK is in beta (0.12)
 # and does NOT support shared-key authentication out of the box — only
 # `Arc<dyn TokenCredential>` (Entra ID). We implement a custom shared-key
 # signing `Policy` ourselves so users can authenticate with account keys
@@ -216,8 +215,8 @@ testcontainers = { version = "0.27", features = [
 # by the Azure backend's transport tuning (#26 / #28) and reused here by
 # `tests/azure_store_integration.rs` (gated on `integration-azure`) for
 # the one-off Create-Container setup request signed via our shared-key
-# policy. `sha2` is similarly a runtime dep (Phase 11 shared-key
-# signing) so the integration tests can reuse the same crate version
+# policy. `sha2` is similarly a runtime dep (the shared-key signing
+# policy) so the integration tests can reuse the same crate version
 # for byte-equality assertions on the multipart-download path.
 
 # Keep line tables in release builds so dsymutil/objcopy can produce

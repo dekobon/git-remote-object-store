@@ -1,12 +1,11 @@
-//! Phase 6 smoke test: drive [`protocol::run`] in-process via
+//! Smoke test: drive [`protocol::run`] in-process via
 //! `tokio::io::duplex`, with a [`MockStore`] standing in for the cloud
-//! backend. Every claim from the upstream Python `cmd_list`/`cmd_capabilities`
-//! port has a matching assertion here.
+//! backend. Every claim from the `cmd_list` / `cmd_capabilities`
+//! handlers has a matching assertion here.
 //!
-//! Binary-spawn integration tests (real `git-remote-s3-https` against
-//! RustFS) are deferred until Phase 7's fetch handler exists — there is
-//! nothing for git to do today besides `ls-remote`, which the in-process
-//! tests below cover deterministically.
+//! Real binary-spawn integration tests (with `git-remote-s3-https`
+//! against RustFS) live alongside the fetch and push integration
+//! suites; this file's role is the deterministic in-process check.
 
 #![cfg(feature = "test-util")]
 

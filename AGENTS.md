@@ -4,17 +4,17 @@ Universal project instructions for AI coding assistants.
 
 ## Project Overview
 
-`git-remote-object-store` is a Rust rewrite of [`awslabs/git-remote-s3`](https://github.com/awslabs/git-remote-s3) that supports both AWS S3 and Azure Blob Storage as git remote backends.
+`git-remote-object-store` is a Rust crate that exposes AWS S3 and Azure Blob Storage as git remote backends. It ships the helper-protocol binaries (`git-remote-s3+https`, `git-remote-az+https`, etc.), an LFS custom-transfer agent, and a management CLI (`doctor`, `delete-branch`, `protect`, `unprotect`).
 
-### Upstream is the source of truth
+### Relationship to `awslabs/git-remote-s3`
 
-The upstream Python implementation is checked out as a sibling directory at `../git-remote-s3`. Treat that codebase as the **source of truth** for behavior, on-the-wire object layout, locking semantics, LFS transfer protocol, and management-CLI command shapes. When porting a feature, read the upstream Python before writing Rust.
+This project was originally seeded as a Rust port of [`awslabs/git-remote-s3`](https://github.com/awslabs/git-remote-s3) (Python) and now stands on its own. The on-bucket object layout — `<prefix>/<ref>/<sha>.bundle`, `HEAD`, `PROTECTED#`, lock files, `lfs/<oid>` — is preserved so that buckets written by the upstream Python tool remain readable here. That layout is the only shared contract.
 
-The only exceptions are deliberate divergences that are explicitly documented in `execution-plan.md` (notably §0 "Goals and non-goals", §3 "URL scheme design", and §6 "Resolved decisions"). Examples of intentional divergence: the new HTTPS-native URL grammar, no `profile@` userinfo, no `*+zip://` scheme, gitoxide instead of subprocess `git`, hand-rolled S3 multipart download. If you find yourself diverging from upstream behavior in any way that is not already covered by `execution-plan.md`, stop and ask before continuing.
+Behavior, locking semantics, error wording, the URL grammar, and the management-CLI shape are all this project's own decisions. The upstream Python implementation, checked out as a sibling at `../git-remote-s3`, remains a useful reference when porting or debugging wire-format-sensitive code (helper-protocol stdout bytes, on-bucket key shapes, LFS JSON events) — but it is not authoritative. Behavioral differences that matter to a user (broken bucket compatibility, surprising CLI output, broken LFS interop) are filed as GitHub issues like any other bug; differences that don't matter aren't tracked.
 
 ### Greenfield project — no backwards compatibility
 
-This is a clean-slate rewrite. There are **no backwards-compatibility concerns** with `git-remote-s3` at the URL, CLI-flag, or config-file level. Users will re-create their remotes against the new grammar; that cost is paid once. Do not introduce shims, aliases, deprecated-form parsers, or `--legacy-*` flags to accommodate upstream's surface. The single preserved invariant is the on-bucket object layout (`<prefix>/<ref>/<sha>.bundle`, `HEAD`, `PROTECTED#`, lock files, `lfs/<oid>`) so existing buckets remain readable — nothing else.
+There are **no backwards-compatibility concerns** with `git-remote-s3` at the URL, CLI-flag, or config-file level. Users will re-create their remotes against the new grammar; that cost is paid once. Do not introduce shims, aliases, deprecated-form parsers, or `--legacy-*` flags to accommodate upstream's surface.
 
 Coding conventions for the project live in `.claude/rules/`:
 

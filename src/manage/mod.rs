@@ -1,10 +1,11 @@
 //! Management CLI: `doctor`, `delete-branch`, `protect`, `unprotect`.
 //!
-//! These commands operate against the on-bucket object layout described in
-//! `execution-plan.md` §1.1. They mirror the upstream Python
-//! `git_remote_s3.manage` module
-//! (`../git-remote-s3/git_remote_s3/manage.py`); behavioral parity is the
-//! source of truth.
+//! These commands operate against the same on-bucket object layout as
+//! the helper protocol (bundles under `<prefix>/<ref>/`, `PROTECTED#`
+//! markers, lock files). The shapes of the user-facing commands were
+//! seeded from the upstream Python `git_remote_s3.manage` module
+//! (`../git-remote-s3/git_remote_s3/manage.py`), which remains a
+//! useful reference but is not authoritative.
 //!
 //! The library entry points (`Doctor`, `ManageBranch`, `analyze`) take an
 //! [`ObjectStore`][crate::object_store::ObjectStore] and a

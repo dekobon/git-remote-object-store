@@ -1,14 +1,14 @@
 //! Stderr-only `tracing` subscriber for the helper-protocol binaries.
 //!
 //! The remote-helper binaries speak the git transport protocol on stdout —
-//! see `.claude/rules/protocol-stdout.md` and `execution-plan.md` §5.8 — so
-//! every log line MUST go to stderr. The subscriber returned here is wired
-//! with [`std::io::stderr`] as its writer; the `EnvFilter` is wrapped in a
-//! [`reload::Layer`] so the protocol REPL can flip the level at runtime in
-//! response to `option verbosity <n>`.
+//! see `.claude/rules/protocol-stdout.md` — so every log line MUST go to
+//! stderr. The subscriber returned here is wired with [`std::io::stderr`]
+//! as its writer; the `EnvFilter` is wrapped in a [`reload::Layer`] so
+//! the protocol REPL can flip the level at runtime in response to
+//! `option verbosity <n>`.
 //!
-//! Startup level is `error` per `execution-plan.md` §2.4, with two env-var
-//! overrides honoured for parity with the upstream Python helper:
+//! Startup level is `error`, with two env-var overrides honoured for
+//! parity with the upstream Python helper:
 //!
 //! - `GIT_REMOTE_OBJECT_STORE_VERBOSE` — canonical name for this crate.
 //! - `GIT_REMOTE_S3_VERBOSE` — accepted as an alias so users migrating from

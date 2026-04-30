@@ -1,9 +1,8 @@
 //! Integration tests for `git_remote_object_store::url::parse`.
 //!
-//! Covers every concrete example from `execution-plan.md` §3.1 plus
-//! negative cases for the validation rules in §3.5, the addressing
-//! override from §3.4, and a `proptest` round-trip on the legal
-//! grammar.
+//! Covers every concrete URL example in the grammar plus negative
+//! cases for the validation rules, the `?addressing=` override, and a
+//! `proptest` round-trip on the legal grammar.
 
 use std::env;
 use std::sync::Mutex;

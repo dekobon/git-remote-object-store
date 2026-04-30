@@ -22,8 +22,8 @@ path = "src/lib.rs"
 # so the installed binary names must be `git-remote-s3+https` etc.
 #
 # cargo rejects `+` in `[[bin]] name` ("invalid character '+' in crate name").
-# Falling back to hyphenated cargo bin names; an `xtask` step will rename /
-# hardlink them to the `+` form at install time (tracked for Phase 14 packaging).
+# Falling back to hyphenated cargo bin names; an `xtask` step renames /
+# hardlinks them to the `+` form at install time.
 
 [[bin]]
 name = "git-remote-s3-https"

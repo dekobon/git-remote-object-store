@@ -382,8 +382,7 @@ async fn put_if_absent_first_succeeds_second_returns_false() {
 
 #[tokio::test]
 async fn put_if_absent_concurrent_contention() {
-    // 16-racer canary: this is the parity test called out by the
-    // Phase 11 issue. Azurite implements `If-None-Match: *` on Put
+    // 16-racer canary: Azurite implements `If-None-Match: *` on Put
     // Blob, so exactly one of N concurrent put_if_absent calls must
     // succeed. Anything else is a regression in either the SDK, our
     // mapping, or Azurite itself.
@@ -765,7 +764,7 @@ async fn put_path_zero_byte_file_round_trips() {
 }
 
 // ---------------------------------------------------------------------------
-// End-to-end binary tests (Phase 12)
+// End-to-end binary tests
 //
 // Drive `git push` / `git clone` against the actual `git-remote-az+http`
 // helper binary, with Azurite as the backend. These complement the
@@ -773,14 +772,14 @@ async fn put_path_zero_byte_file_round_trips() {
 // dispatch in `protocol::backend::build`, and the LFS custom-transfer
 // agent.
 //
-// Cargo bin names cannot contain `+` (execution-plan.md §5.6), so each
-// helper is built as `git-remote-az-http` and we symlink the binary to
-// `git-remote-az+http` in a tempdir prepended to PATH for the duration
-// of these tests. The symlink-based PATH shim is unix-only by design.
+// Cargo bin names cannot contain `+`, so each helper is built as
+// `git-remote-az-http` and we symlink the binary to `git-remote-az+http`
+// in a tempdir prepended to PATH for the duration of these tests. The
+// symlink-based PATH shim is unix-only by design.
 // ---------------------------------------------------------------------------
 
 #[cfg(not(unix))]
-compile_error!("Phase 12 E2E tests are unix-only (symlink-based PATH shim)");
+compile_error!("E2E tests are unix-only (symlink-based PATH shim)");
 
 use std::os::unix::fs::symlink;
 use std::path::Path;
@@ -952,7 +951,7 @@ async fn helper_binary_round_trips_init_push_clone_fetch() {
 
     // Source repo: one commit on main.
     let seed = init_seed_repo();
-    std::fs::write(seed.path().join("hello.txt"), b"hello phase 12\n").expect("write seed file");
+    std::fs::write(seed.path().join("hello.txt"), b"hello world\n").expect("write seed file");
     run_git(&["add", "hello.txt"], seed.path());
     commit(seed.path(), "seed");
 
@@ -985,12 +984,11 @@ async fn helper_binary_round_trips_init_push_clone_fetch() {
     );
 
     let cloned_body = std::fs::read(dest.join("hello.txt")).expect("cloned file readable");
-    assert_eq!(cloned_body, b"hello phase 12\n");
+    assert_eq!(cloned_body, b"hello world\n");
 
     // Second commit + fetch round-trip: confirms incremental fetch
     // works as well as the first-clone path.
-    std::fs::write(seed.path().join("hello.txt"), b"hello phase 12 v2\n")
-        .expect("rewrite seed file");
+    std::fs::write(seed.path().join("hello.txt"), b"hello world v2\n").expect("rewrite seed file");
     run_git(&["add", "hello.txt"], seed.path());
     commit(seed.path(), "v2");
     run_git(&["push", "origin", "main"], seed.path());
@@ -999,7 +997,7 @@ async fn helper_binary_round_trips_init_push_clone_fetch() {
     run_git(&["reset", "--hard", "origin/main"], &dest);
 
     let updated = std::fs::read(dest.join("hello.txt")).expect("updated file");
-    assert_eq!(updated, b"hello phase 12 v2\n");
+    assert_eq!(updated, b"hello world v2\n");
 }
 
 #[tokio::test]

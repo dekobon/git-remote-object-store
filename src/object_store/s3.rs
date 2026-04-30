@@ -4,7 +4,7 @@
 //! pooling, and timeout policy; this module owns the URL → SDK config
 //! translation, the error-code classifier ([`classify`]), and the
 //! hand-rolled multipart download orchestrator that the SDK does not
-//! provide. See `execution-plan.md` §5, §5.1, and §5.3.
+//! provide.
 //!
 //! ## Key composition
 //!
@@ -12,7 +12,7 @@
 //! keys are byte-prefix per the contract on
 //! [`ObjectStore::list`][super::ObjectStore::list]
 //! (`mod.rs:65-67`); the URL `prefix` is a repository concern and is
-//! composed by Phase 6+ callers that build keys like
+//! composed by callers that build keys like
 //! `<prefix>/refs/.../<sha>.bundle`.
 //!
 //! ## Conditional writes
@@ -20,15 +20,14 @@
 //! [`put_if_absent`][super::ObjectStore::put_if_absent] uses
 //! `If-None-Match: "*"`. S3 returns either 412 (`PreconditionFailed`)
 //! when the key already exists or 409 (`ConditionalRequestConflict`)
-//! when two PUTs race. Both collapse to `Ok(false)` per
-//! `execution-plan.md` §5.1; only 412 is in upstream Python's path.
+//! when two PUTs race. Both collapse to `Ok(false)`; only 412 is in
+//! upstream Python's path.
 //!
 //! ## Atomic `get_to_file`
 //!
 //! Both the small-object and multipart download paths write to a sibling
 //! [`tempfile::NamedTempFile`] and rename on success so a partial
-//! failure cannot leave a corrupt destination for the Phase 7 unbundle
-//! step.
+//! failure cannot leave a corrupt destination for the unbundle step.
 //!
 //! Every GET carries `If-Match: <etag>` derived from the preceding
 //! `HeadObject` call. If the object is overwritten between `head` and
@@ -465,8 +464,8 @@ pub(crate) fn object_to_meta(
 /// files are intentionally empty) and downstream `get_to_file` takes
 /// a fast path on `size == 0` that writes an empty destination file.
 /// Treating "header absent" as 0 would silently produce empty bundles
-/// instead of surfacing the malformed response. See `execution-plan.md`
-/// §5.1 — every backend HEAD must yield `Content-Length`.
+/// instead of surfacing the malformed response. Every backend HEAD
+/// must yield `Content-Length`.
 pub(crate) fn head_output_to_meta(
     key: &str,
     content_length: Option<i64>,

@@ -12,16 +12,17 @@ description: Complete workflow for fixing GitHub issues including investigation,
    over text-based search/edit for code; fall back to `rg`/`fd` and the built-in
    Grep/Glob tools only when LSP is unavailable. Never use legacy `grep`/`find`.
 3. Re-read the project conventions that govern this fix:
-   - `AGENTS.md` — upstream-as-source-of-truth and greenfield rules.
-   - `execution-plan.md` — §0 goals/non-goals, §3 URL grammar, §6 resolved decisions.
+   - `AGENTS.md` — relationship to upstream and greenfield rules.
    - `.claude/rules/rust.md`, `.claude/rules/naming.md`, `.claude/rules/testing.md`,
      `.claude/rules/git-commits.md`, `.claude/rules/worktree-safety.md`.
    Note any rule that is directly relevant so it can be cited in the fix.
-4. Investigate the codebase to understand the root cause. For any behavior that
-   touches the on-the-wire object layout, locking semantics, LFS transfer, or
-   management-CLI shape, **read the upstream Python at `../git-remote-s3` first**
-   — that is the authoritative behavior. Only diverge where `execution-plan.md`
-   already documents the divergence; otherwise stop and ask the user.
+4. Investigate the codebase to understand the root cause. For any
+   behavior that touches a wire-format surface — the on-bucket object
+   layout, helper-protocol stdout bytes, LFS JSON events, or error
+   strings that git/git-lfs match against — read the upstream Python
+   at `../git-remote-s3` as a reference implementation; it is not
+   authoritative, but it is the closest existing reference and saves
+   debugging time.
 5. Check for the same bug pattern elsewhere in the codebase. If the root cause
    is a repeated pattern, fix all instances — do not leave known-broken siblings
    for a follow-up.
@@ -70,7 +71,8 @@ description: Complete workflow for fixing GitHub issues including investigation,
      (`.claude/rules/testing.md`).
 9. **Review the changes** for:
    - **Correctness**: Does the fix actually address the root cause, not just the
-     symptom? Does it match upstream Python behavior where required?
+     symptom? For wire-format-sensitive code, has the change been
+     verified against the upstream Python reference at `../git-remote-s3`?
    - **Performance**: Are algorithms and data structures appropriate? Avoid
      O(n²) when O(n) is feasible. Consider hot paths (push/fetch on large
      histories, multipart transfers) and large inputs.
@@ -102,8 +104,6 @@ description: Complete workflow for fixing GitHub issues including investigation,
     applicable:
     - `CHANGELOG.md` — add an entry under the appropriate section (Added,
       Changed, Fixed) per `.claude/rules/changelog.md`.
-    - `execution-plan.md` — if the fix changes a resolved decision, the URL
-      grammar, the goals/non-goals, or any documented divergence from upstream.
     - `README.md` — if user-facing behavior, install steps, or supported
       backends changed.
     - Crate-level or module-level doc comments (`//!`) — if module intent or

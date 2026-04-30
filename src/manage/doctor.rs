@@ -242,8 +242,8 @@ impl<'a> Doctor<'a> {
             // `Uuid::Simple`'s `Display` impl does NOT honor the
             // precision specifier (`{:.8}`), so encode into a stack
             // buffer and slice to 8 chars — mirroring upstream's
-            // `str(uuid.uuid4())[:8]` (`<ref>_<uuid8>` per
-            // `execution-plan.md` §1.1 / Phase 9).
+            // `str(uuid.uuid4())[:8]` to produce the `<ref>_<uuid8>`
+            // quarantine ref name.
             let mut buf = [0u8; uuid::fmt::Simple::LENGTH];
             let suffix = &Uuid::new_v4().simple().encode_lower(&mut buf)[..8];
             let new_ref = format!("{ref_path}_{suffix}");
@@ -401,8 +401,8 @@ mod tests {
         // Loser was moved off the main ref.
         assert!(!mock.contains("myrepo/refs/heads/main/bbbbbbbb.bundle"));
         // The new quarantine ref has a key with the moved bundle, and
-        // the suffix is exactly 8 lowercase hex characters as documented
-        // in `execution-plan.md` §1.1 / Phase 9 (`<ref>_<uuid8>`).
+        // the suffix is exactly 8 lowercase hex characters
+        // (`<ref>_<uuid8>`).
         let moved = mock
             .keys()
             .into_iter()
