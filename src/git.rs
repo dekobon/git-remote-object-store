@@ -476,21 +476,20 @@ pub(crate) fn shallow_boundaries(
     let max_depth = max_depth.get();
     let tip_oid = *tip.as_object_id();
 
-    // BFS from `tip`. `seen` is the included set; `queue` carries
-    // (commit, depth) pairs where `depth=1` for `tip` itself, matching
-    // the spec ("--depth 1" means just the tip commit).
+    // BFS from `tip`. `seen` is the included set; `parents_seen` collects
+    // every parent OID referenced by any included commit. After BFS, the
+    // boundaries are exactly `parents_seen - seen`.
+    //
+    // Collecting parents during BFS (rather than a separate second pass)
+    // means each commit is opened via `find_object` exactly once instead
+    // of twice: once when dequeued for expansion, and not again.
     let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut parents_seen: HashSet<ObjectId> = HashSet::new();
     let mut queue: VecDeque<(ObjectId, u32)> = VecDeque::new();
     queue.push_back((tip_oid, 1));
 
     while let Some((oid, depth)) = queue.pop_front() {
         if !seen.insert(oid) {
-            continue;
-        }
-        if depth >= max_depth {
-            // `oid` is at the cut-off; its parents (if any) become
-            // boundaries. Boundary collection runs in a second pass to
-            // keep the BFS itself simple.
             continue;
         }
         let commit = repo
@@ -499,30 +498,20 @@ pub(crate) fn shallow_boundaries(
         let commit = commit.into_commit();
         for parent in commit.parent_ids() {
             let parent_oid = parent.detach();
-            if !seen.contains(&parent_oid) {
+            parents_seen.insert(parent_oid);
+            if depth < max_depth && !seen.contains(&parent_oid) {
                 queue.push_back((parent_oid, depth + 1));
             }
         }
     }
 
-    // Collect every parent of an included commit that lies *outside*
-    // the included set. Use a HashSet for dedup, then materialise as a
-    // Vec — multiple included commits can share an excluded parent and
-    // must produce a single boundary line.
-    let mut boundaries: HashSet<ObjectId> = HashSet::new();
-    for oid in &seen {
-        let commit = repo
-            .find_object(*oid)?
-            .peel_to_kind(gix::object::Kind::Commit)?;
-        let commit = commit.into_commit();
-        for parent in commit.parent_ids() {
-            let parent_oid = parent.detach();
-            if !seen.contains(&parent_oid) {
-                boundaries.insert(parent_oid);
-            }
-        }
-    }
-    Ok(boundaries.into_iter().collect())
+    // Boundaries = parents referenced by included commits that are not
+    // themselves included. Multiple included commits can share an excluded
+    // parent; `parents_seen` is already a HashSet so dedup is free.
+    Ok(parents_seen
+        .into_iter()
+        .filter(|p| !seen.contains(p))
+        .collect())
 }
 
 /// Write `boundaries` to `<git_dir>/shallow`, merging with any existing
@@ -561,7 +550,6 @@ pub(crate) fn write_shallow_file(git_dir: &Path, boundaries: &[ObjectId]) -> Res
             }
         }
     }
-    let had_existing = !merged.is_empty();
     for oid in boundaries {
         merged.insert(*oid);
     }
@@ -572,20 +560,11 @@ pub(crate) fn write_shallow_file(git_dir: &Path, boundaries: &[ObjectId]) -> Res
         // semantics to git).
         return Ok(());
     }
-    if !had_existing && boundaries.is_empty() {
-        // Defensive: this branch is only reachable if merged was
-        // populated solely by parsing nonsense lines from a pre-existing
-        // file. That would have set had_existing=true, contradicting
-        // the guard. Keep the early return so a future refactor that
-        // relaxes the parser cannot accidentally start creating
-        // empty-input writes.
-        return Ok(());
-    }
 
-    // Stable on-disk order: sort by hex representation so test fixtures
-    // and human inspection don't depend on HashSet iteration order.
+    // Stable on-disk order. ObjectId: Ord sorts by raw SHA bytes, which
+    // is the same order as the hex strings the file contains.
     let mut sorted: Vec<ObjectId> = merged.into_iter().collect();
-    sorted.sort_unstable_by_key(|a| a.to_hex().to_string());
+    sorted.sort_unstable();
 
     let mut buf = Vec::with_capacity(sorted.len() * 41);
     for oid in &sorted {
