@@ -9,6 +9,7 @@
 //! per-command handlers below.
 
 use std::io::ErrorKind;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ pub mod push;
 pub mod tracing_init;
 
 use self::fetch::{FetchedRefs, fetch_batch};
-use self::option::handle_option;
+use self::option::{OptionEffect, handle_option};
 use self::push::push_batch;
 use self::tracing_init::ReloadHandle;
 
@@ -148,6 +149,11 @@ where
     let mut mode: Option<Mode> = None;
     let mut fetch_cmds: Vec<String> = Vec::new();
     let mut push_cmds: Vec<String> = Vec::new();
+    // Per-operation `option depth <N>` is set immediately before a
+    // fetch batch and reset to `None` once that batch drains. Depth is
+    // not session-sticky — git re-issues `option depth` for each
+    // shallow operation.
+    let mut depth: Option<NonZeroU32> = None;
     let zip = remote.flags().zip;
 
     while let Some(line) = lines.next_line().await? {
@@ -164,7 +170,10 @@ where
                 list::handle_list(store.as_ref(), remote.prefix(), for_push, &mut writer).await?;
             }
             Command::Option(args) => {
-                handle_option(&args, reload.as_ref(), &mut writer).await?;
+                let effect = handle_option(&args, reload.as_ref(), &mut writer).await?;
+                if let OptionEffect::SetDepth(d) = effect {
+                    depth = Some(d);
+                }
             }
             Command::Fetch(args) => {
                 if mode != Some(Mode::Fetch) {
@@ -185,12 +194,18 @@ where
             Command::Empty => {
                 if mode == Some(Mode::Fetch) && !fetch_cmds.is_empty() {
                     let drained = std::mem::take(&mut fetch_cmds);
+                    // Take depth so it applies to *this* batch only; a
+                    // subsequent fetch without a fresh `option depth`
+                    // line must clone fully, matching upstream git's
+                    // per-operation depth contract.
+                    let batch_depth = depth.take();
                     fetch_batch(
                         Arc::clone(&store),
                         remote.prefix().map(str::to_owned),
                         Arc::clone(&repo_dir),
                         drained,
                         fetched_refs.clone(),
+                        batch_depth,
                     )
                     .await?;
                     mode = None;

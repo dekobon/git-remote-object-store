@@ -9,8 +9,11 @@
 //!
 //! [gix]: https://docs.rs/gix
 
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::io;
+use std::io::Write as _;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::string::FromUtf8Error;
 use std::sync::atomic::AtomicBool;
@@ -438,6 +441,164 @@ pub fn is_ancestor(repo: &Repository, ancestor: Sha, descendant: Sha) -> Result<
         Ok(base) => Ok(base.detach() == ancestor_oid),
         Err(gix::repository::merge_base::Error::NotFound { .. }) => Ok(false),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Compute the shallow-fetch boundary commits for `tip` at `max_depth`.
+///
+/// Performs a breadth-first walk from `tip`, marking every commit at
+/// depth `≤ max_depth` as included. The returned vector contains the
+/// distinct OIDs of every parent of the included set that is **not
+/// itself** included — these are the SHAs that must be written to
+/// `.git/shallow` to mark the truncation boundary.
+///
+/// BFS is mandatory here: `gix::Repository::rev_walk` returns commits in
+/// topological-sort order, which does not coincide with depth order at
+/// merge points. Naively `.take(N)` on the walk would include the wrong
+/// commits and emit incorrect boundaries.
+///
+/// If the walk exhausts the graph before reaching `max_depth` (i.e. the
+/// repository's history is shorter than the requested depth) the
+/// returned vector is empty — the repo is fully cloned and no shallow
+/// marker should be written.
+///
+/// # Errors
+///
+/// Returns [`GitError::FindObject`] if `tip` or any of its ancestors
+/// cannot be located in the local object database (the bundle was not
+/// installed correctly), or [`GitError::PeelToKind`] if an object that
+/// is supposed to be a commit cannot be decoded as one.
+pub(crate) fn shallow_boundaries(
+    repo: &Repository,
+    tip: Sha,
+    max_depth: NonZeroU32,
+) -> Result<Vec<ObjectId>, GitError> {
+    let max_depth = max_depth.get();
+    let tip_oid = *tip.as_object_id();
+
+    // BFS from `tip`. `seen` is the included set; `queue` carries
+    // (commit, depth) pairs where `depth=1` for `tip` itself, matching
+    // the spec ("--depth 1" means just the tip commit).
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut queue: VecDeque<(ObjectId, u32)> = VecDeque::new();
+    queue.push_back((tip_oid, 1));
+
+    while let Some((oid, depth)) = queue.pop_front() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        if depth >= max_depth {
+            // `oid` is at the cut-off; its parents (if any) become
+            // boundaries. Boundary collection runs in a second pass to
+            // keep the BFS itself simple.
+            continue;
+        }
+        let commit = repo
+            .find_object(oid)?
+            .peel_to_kind(gix::object::Kind::Commit)?;
+        let commit = commit.into_commit();
+        for parent in commit.parent_ids() {
+            let parent_oid = parent.detach();
+            if !seen.contains(&parent_oid) {
+                queue.push_back((parent_oid, depth + 1));
+            }
+        }
+    }
+
+    // Collect every parent of an included commit that lies *outside*
+    // the included set. Use a HashSet for dedup, then materialise as a
+    // Vec — multiple included commits can share an excluded parent and
+    // must produce a single boundary line.
+    let mut boundaries: HashSet<ObjectId> = HashSet::new();
+    for oid in &seen {
+        let commit = repo
+            .find_object(*oid)?
+            .peel_to_kind(gix::object::Kind::Commit)?;
+        let commit = commit.into_commit();
+        for parent in commit.parent_ids() {
+            let parent_oid = parent.detach();
+            if !seen.contains(&parent_oid) {
+                boundaries.insert(parent_oid);
+            }
+        }
+    }
+    Ok(boundaries.into_iter().collect())
+}
+
+/// Write `boundaries` to `<git_dir>/shallow`, merging with any existing
+/// entries. The file is one SHA-1 hex per line, sorted for stable output.
+///
+/// Read-then-merge-then-atomically-rewrite preserves any boundaries
+/// previously written by another process or by an earlier shallow
+/// fetch in the same repository (e.g. `git fetch --depth 2` from a
+/// depth-1 clone deepens rather than overwrites).
+///
+/// Empty `boundaries` and an absent `.git/shallow` is a no-op: a fully
+/// cloned repository must not have a `.git/shallow` file.
+///
+/// # Errors
+///
+/// Returns [`GitError::Io`] if the file cannot be read or written, or
+/// [`GitError::ConfigLock`] if the lock file cannot be acquired (the
+/// `gix-lock`-based atomic-rename is shared with config writes; the
+/// variant name reflects its first user, not its only one).
+pub(crate) fn write_shallow_file(git_dir: &Path, boundaries: &[ObjectId]) -> Result<(), GitError> {
+    let path = git_dir.join("shallow");
+
+    // Merge with whatever the file already holds. Format is one
+    // 40-hex line per boundary; parse leniently (skip blank lines and
+    // unrecognised content) so an external tool's annotations don't
+    // break us.
+    let mut merged: HashSet<ObjectId> = HashSet::new();
+    if let Some(bytes) = read_file_if_present(&path)? {
+        for line in bytes.split(|b| *b == b'\n') {
+            let line = line.trim_ascii();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(oid) = ObjectId::from_hex(line) {
+                merged.insert(oid);
+            }
+        }
+    }
+    let had_existing = !merged.is_empty();
+    for oid in boundaries {
+        merged.insert(*oid);
+    }
+
+    if merged.is_empty() {
+        // No new boundaries and nothing to preserve; do not create an
+        // empty `.git/shallow` (its presence alone signals shallow
+        // semantics to git).
+        return Ok(());
+    }
+    if !had_existing && boundaries.is_empty() {
+        // Defensive: this branch is only reachable if merged was
+        // populated solely by parsing nonsense lines from a pre-existing
+        // file. That would have set had_existing=true, contradicting
+        // the guard. Keep the early return so a future refactor that
+        // relaxes the parser cannot accidentally start creating
+        // empty-input writes.
+        return Ok(());
+    }
+
+    // Stable on-disk order: sort by hex representation so test fixtures
+    // and human inspection don't depend on HashSet iteration order.
+    let mut sorted: Vec<ObjectId> = merged.into_iter().collect();
+    sorted.sort_unstable_by_key(|a| a.to_hex().to_string());
+
+    let mut buf = Vec::with_capacity(sorted.len() * 41);
+    for oid in &sorted {
+        writeln!(buf, "{}", oid.to_hex()).map_err(GitError::Io)?;
+    }
+    write_atomic(&path, &buf)
+}
+
+fn read_file_if_present(path: &Path) -> Result<Option<Vec<u8>>, GitError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(GitError::Io(e)),
     }
 }
 
@@ -1343,6 +1504,139 @@ mod tests {
         );
         let stdout = String::from_utf8(output.stdout).expect("utf8");
         assert_eq!(stdout.trim(), "git-lfs-object-store");
+    }
+
+    // --- shallow_boundaries / write_shallow_file ----------------------
+
+    #[test]
+    fn shallow_boundaries_depth_one_returns_tip_parent() {
+        // Linear history a → b. With depth=1 the included set is {b}
+        // and its only parent (a) is the boundary.
+        let (repo, _dir) = empty_repo();
+        let a = add_commit(&repo, "refs/heads/main", &[], "a");
+        let b = add_commit(&repo, "refs/heads/main", &[a], "b");
+        let tip = Sha::from_object_id(b);
+        let bounds =
+            shallow_boundaries(&repo, tip, NonZeroU32::new(1).unwrap()).expect("boundaries");
+        assert_eq!(bounds, vec![a]);
+    }
+
+    #[test]
+    fn shallow_boundaries_returns_empty_when_history_shorter_than_depth() {
+        // Single-commit history; depth=5 exhausts the graph and writes
+        // no boundary (full clone).
+        let (repo, _dir) = empty_repo();
+        let a = add_commit(&repo, "refs/heads/main", &[], "a");
+        let tip = Sha::from_object_id(a);
+        let bounds =
+            shallow_boundaries(&repo, tip, NonZeroU32::new(5).unwrap()).expect("boundaries");
+        assert!(bounds.is_empty(), "expected empty, got {bounds:?}");
+    }
+
+    #[test]
+    fn shallow_boundaries_at_merge_returns_all_excluded_parents() {
+        // Build the merge graph from the issue:
+        //     M (tip, depth 1)
+        //    / \
+        //   A   B   (both depth 2)
+        //    \ /
+        //     C (depth 3 — the only boundary at depth=2)
+        //
+        // BFS at depth=2 must include {M, A, B}. C is the parent of
+        // both A and B and lives outside the included set, so it is
+        // the single boundary. A topological-walk `.take(N)` would
+        // mis-handle this.
+        let (repo, _dir) = empty_repo();
+        let c = add_commit(&repo, "refs/heads/main", &[], "C");
+        let a = add_commit(&repo, "refs/heads/main", &[c], "A");
+        let b = add_commit(&repo, "refs/heads/side", &[c], "B");
+        let m = add_commit(&repo, "refs/heads/main", &[a, b], "M");
+        let tip = Sha::from_object_id(m);
+        let bounds =
+            shallow_boundaries(&repo, tip, NonZeroU32::new(2).unwrap()).expect("boundaries");
+        assert_eq!(bounds, vec![c]);
+    }
+
+    #[test]
+    fn shallow_boundaries_at_merge_with_depth_one_emits_both_parents() {
+        // depth=1 includes only the merge tip; both parents become
+        // boundaries.
+        let (repo, _dir) = empty_repo();
+        let a = add_commit(&repo, "refs/heads/main", &[], "A");
+        let b = add_commit(&repo, "refs/heads/side", &[], "B");
+        let m = add_commit(&repo, "refs/heads/main", &[a, b], "M");
+        let tip = Sha::from_object_id(m);
+        let bounds =
+            shallow_boundaries(&repo, tip, NonZeroU32::new(1).unwrap()).expect("boundaries");
+        let mut sorted = bounds.clone();
+        sorted.sort_unstable();
+        let mut expected = vec![a, b];
+        expected.sort_unstable();
+        assert_eq!(sorted, expected);
+    }
+
+    #[test]
+    fn write_shallow_file_writes_boundaries_when_absent() {
+        let (repo, _dir) = empty_repo();
+        let a = add_commit(&repo, "refs/heads/main", &[], "a");
+        write_shallow_file(repo.git_dir(), &[a]).expect("write");
+        let path = repo.git_dir().join("shallow");
+        let contents = std::fs::read_to_string(&path).expect("read shallow");
+        assert_eq!(contents, format!("{a}\n"));
+    }
+
+    #[test]
+    fn write_shallow_file_merges_with_existing_file() {
+        let (repo, _dir) = empty_repo();
+        let a = add_commit(&repo, "refs/heads/main", &[], "a");
+        let b = add_commit(&repo, "refs/heads/main", &[a], "b");
+        let path = repo.git_dir().join("shallow");
+        std::fs::write(&path, format!("{a}\n")).expect("seed");
+        write_shallow_file(repo.git_dir(), &[b]).expect("merge");
+        let contents = std::fs::read_to_string(&path).expect("read");
+        // Both entries present, sorted lexicographically.
+        let mut expected = [format!("{a}"), format!("{b}")];
+        expected.sort();
+        assert_eq!(contents.trim(), expected.join("\n"));
+    }
+
+    #[test]
+    fn write_shallow_file_dedupes_entries() {
+        let (repo, _dir) = empty_repo();
+        let a = add_commit(&repo, "refs/heads/main", &[], "a");
+        let path = repo.git_dir().join("shallow");
+        std::fs::write(&path, format!("{a}\n")).expect("seed");
+        write_shallow_file(repo.git_dir(), &[a]).expect("merge");
+        let contents = std::fs::read_to_string(&path).expect("read");
+        // One line, not two.
+        assert_eq!(contents, format!("{a}\n"));
+    }
+
+    #[test]
+    fn write_shallow_file_no_boundaries_no_existing_does_not_create_file() {
+        // Empty boundaries + no existing file = no `.git/shallow`. A
+        // fully cloned repo must not have this file.
+        let (repo, _dir) = empty_repo();
+        let path = repo.git_dir().join("shallow");
+        write_shallow_file(repo.git_dir(), &[]).expect("noop");
+        assert!(!path.exists(), "shallow file unexpectedly created");
+    }
+
+    #[test]
+    fn write_shallow_file_empty_boundaries_preserves_existing() {
+        // If `.git/shallow` already has entries, an empty new
+        // boundary set must not delete them — the merge with prior
+        // shallow state is what makes deepening (`fetch --depth N+M`)
+        // work without losing previous markers.
+        let (repo, _dir) = empty_repo();
+        let a = add_commit(&repo, "refs/heads/main", &[], "a");
+        let path = repo.git_dir().join("shallow");
+        std::fs::write(&path, format!("{a}\n")).expect("seed");
+        write_shallow_file(repo.git_dir(), &[]).expect("noop");
+        // The function returns early with `Ok(())` when there's no
+        // change to make; the existing file is left untouched.
+        let contents = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(contents, format!("{a}\n"));
     }
 
     // --- bundle / unbundle (native gix-pack) --------------------------
