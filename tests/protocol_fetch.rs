@@ -455,6 +455,42 @@ async fn fetch_without_depth_does_not_write_shallow_file() {
 }
 
 #[tokio::test]
+async fn fetch_with_depth_exceeding_history_does_not_write_shallow_file() {
+    // When the requested depth is larger than the total number of commits
+    // in the history, shallow_boundaries returns [] — the entire history
+    // fits in the shallow clone without a boundary. fetch_batch must NOT
+    // create .git/shallow in this case (an empty collected set short-circuits
+    // write_shallow_file).
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, sha) = make_seed_repo(); // 1-commit history
+    let bundle = bundle_ref(seed.path(), &sha, "refs/heads/main");
+
+    let store = MockStore::new();
+    store.insert(format!("repo/refs/heads/main/{sha}.bundle"), bundle);
+
+    let dst = make_dst_repo();
+    // depth=10 >> 1-commit history → no boundary → no shallow file
+    let script = format!("option depth 10\nfetch {sha} refs/heads/main\n\n");
+    let (_out, result) = drive_in(
+        s3_url(Some("repo")),
+        Arc::new(store),
+        &script,
+        dst.path().to_path_buf(),
+    )
+    .await;
+    result.expect("fetch with depth exceeding history should succeed");
+
+    let shallow_path = dst.path().join(".git").join("shallow");
+    assert!(
+        !shallow_path.exists(),
+        ".git/shallow must not be created when depth exceeds total history length"
+    );
+}
+
+#[tokio::test]
 async fn depth_resets_between_batches() {
     // After a shallow batch completes, a subsequent batch in the same
     // REPL session must default to non-shallow semantics: depth is
@@ -594,13 +630,13 @@ async fn shallow_fetch_limits_visible_commit_count() {
     // repo must show exactly N commits. This verifies that the shallow
     // boundary written to .git/shallow correctly truncates history — not
     // just that the file was created with some content.
+    const TOTAL_COMMITS: u32 = 5;
+    const DEPTH: u32 = 3;
+
     if !git_available() {
         eprintln!("skipping: git not on PATH");
         return;
     }
-
-    const TOTAL_COMMITS: u32 = 5;
-    const DEPTH: u32 = 3;
 
     let seed = tempfile::tempdir().expect("tempdir");
     git(&["init", "--quiet", "--initial-branch=main"], seed.path());
