@@ -440,11 +440,14 @@ mod tests {
     #[tokio::test]
     async fn validate_format_uses_prefix_for_key_lookup() {
         let store = MockStore::new();
-        // Key at prefix/FORMAT, not at bare FORMAT.
+        // Valid key at the prefixed path.
         store.insert("my-repo/FORMAT", Bytes::from_static(b"bundle"));
-        // Without prefix: FORMAT absent → passes.
-        validate_format(&store, "", None).await.unwrap();
-        // With prefix: FORMAT found → passes.
+        // Conflicting/invalid content at the root path — if the prefix is
+        // ignored, the "with prefix" call below would read this and fail.
+        store.insert("FORMAT", Bytes::from_static(b"unknown-format"));
+        // Without prefix: reads root FORMAT = "unknown-format" → UnknownStoredEngine.
+        assert!(validate_format(&store, "", None).await.is_err());
+        // With prefix "my-repo": reads "my-repo/FORMAT" = "bundle" → Ok.
         validate_format(&store, "my-repo", None).await.unwrap();
     }
 
