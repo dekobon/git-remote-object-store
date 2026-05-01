@@ -79,6 +79,49 @@ pub enum AzureAddressing {
     PathStyle,
 }
 
+/// Identifies the on-bucket storage format / serialisation engine.
+///
+/// `engine` is a bucket-level property: once written to the `FORMAT` key on
+/// the first push, it is validated on every subsequent connect. The
+/// `?engine=` URL parameter is advisory — it is only meaningful when
+/// initialising a new repository. After the first push the stored value is
+/// authoritative and the URL parameter is checked for conflicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageEngine {
+    /// Git bundle v2 — a text header followed by a PACK file.
+    ///
+    /// This is the original format, compatible with the upstream Python
+    /// `awslabs/git-remote-s3` implementation. Key layout:
+    /// `<prefix>/refs/heads/<branch>/<sha>.bundle`.
+    Bundle,
+}
+
+impl StorageEngine {
+    /// Parse an engine from its canonical string name. Returns `None` for
+    /// unrecognised names.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "bundle" => Some(Self::Bundle),
+            _ => None,
+        }
+    }
+
+    /// The canonical name for this engine, as stored in the `FORMAT` key and
+    /// accepted in the `?engine=` URL parameter.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bundle => "bundle",
+        }
+    }
+}
+
+impl fmt::Display for StorageEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Query-string flags described in §3.2 / §3.3.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemoteFlags {
@@ -90,6 +133,12 @@ pub struct RemoteFlags {
     pub credential: Option<String>,
     /// `?region=...` — overrides the SDK-derived region (rare).
     pub region: Option<String>,
+    /// `?engine=...` — declares the storage engine for a new repository.
+    ///
+    /// On the first push to an empty bucket this value is written to the
+    /// `FORMAT` key. On subsequent connects the stored `FORMAT` value is
+    /// authoritative; a conflicting `?engine=` aborts with an error.
+    pub engine: Option<StorageEngine>,
 }
 
 /// Errors produced by [`parse`].
@@ -151,6 +200,9 @@ pub enum ParseError {
     /// A query parameter is not part of the documented flag set.
     #[error("unknown query flag `{0}`")]
     UnknownFlag(String),
+    /// `?engine=` value is not a recognised engine name.
+    #[error("unknown engine `{0}`; expected `bundle`")]
+    UnknownEngine(String),
 }
 
 /// Parse a remote URL.
@@ -303,6 +355,12 @@ fn extract_flags(u: &Url) -> Result<(RemoteFlags, Option<AddressingOverride>), P
                     "virtual" => AddressingOverride::Virtual,
                     other => return Err(ParseError::UnknownAddressing(other.to_owned())),
                 });
+            }
+            "engine" => {
+                flags.engine = Some(
+                    StorageEngine::from_name(value.as_ref())
+                        .ok_or_else(|| ParseError::UnknownEngine(value.into_owned()))?,
+                );
             }
             other => return Err(ParseError::UnknownFlag(other.to_owned())),
         }
@@ -775,5 +833,65 @@ mod tests {
             detect_azure_addressing("127.0.0.1"),
             AzureAddressing::PathStyle
         );
+    }
+
+    // --- StorageEngine and ?engine= flag ---------------------------------
+
+    #[test]
+    fn engine_flag_absent_leaves_none() {
+        let url = parse("s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo").unwrap();
+        assert_eq!(url.flags().engine, None);
+    }
+
+    #[test]
+    fn engine_flag_bundle_parses() {
+        let url =
+            parse("s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=bundle").unwrap();
+        assert_eq!(url.flags().engine, Some(StorageEngine::Bundle));
+    }
+
+    #[test]
+    fn engine_flag_rejects_unknown_value() {
+        let err =
+            parse("s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=pack").unwrap_err();
+        assert!(
+            matches!(err, ParseError::UnknownEngine(ref s) if s == "pack"),
+            "expected UnknownEngine(pack), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn engine_flag_rejects_empty_value() {
+        let err =
+            parse("s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=").unwrap_err();
+        assert!(
+            matches!(err, ParseError::UnknownEngine(ref s) if s.is_empty()),
+            "expected UnknownEngine(\"\"), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn engine_as_str_roundtrips() {
+        assert_eq!(StorageEngine::Bundle.as_str(), "bundle");
+        assert_eq!(StorageEngine::Bundle.to_string(), "bundle");
+    }
+
+    #[test]
+    fn engine_from_name_parses_known_and_rejects_unknown() {
+        assert_eq!(
+            StorageEngine::from_name("bundle"),
+            Some(StorageEngine::Bundle)
+        );
+        assert_eq!(StorageEngine::from_name("pack"), None);
+        assert_eq!(StorageEngine::from_name(""), None);
+        assert_eq!(StorageEngine::from_name("Bundle"), None); // case-sensitive
+    }
+
+    #[test]
+    fn engine_flag_on_azure_url() {
+        let url =
+            parse("az+https://myaccount.blob.core.windows.net/my-container/repo?engine=bundle")
+                .unwrap();
+        assert_eq!(url.flags().engine, Some(StorageEngine::Bundle));
     }
 }

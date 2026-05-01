@@ -58,4 +58,4 @@ pub use protocol::backend::{BackendError, BackendKind};
 #[doc(no_inline)]
 pub use remote::{Remote, RemoteError};
 #[doc(no_inline)]
-pub use url::RemoteUrl;
+pub use url::{RemoteUrl, StorageEngine};

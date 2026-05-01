@@ -17,7 +17,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, error};
 
 use crate::object_store::ObjectStore;
-use crate::url::RemoteUrl;
+use crate::url::{RemoteUrl, StorageEngine};
 
 pub mod backend;
 pub(crate) mod capabilities;
@@ -155,6 +155,7 @@ where
     // shallow operation.
     let mut depth: Option<NonZeroU32> = None;
     let zip = remote.flags().zip;
+    let engine = remote.flags().engine.unwrap_or(StorageEngine::Bundle);
 
     while let Some(line) = lines.next_line().await? {
         debug!(cmd = %line, "received protocol command");
@@ -216,6 +217,7 @@ where
                         remote.prefix().map(str::to_owned),
                         Arc::clone(&repo_dir),
                         zip,
+                        engine,
                         drained,
                     )
                     .await?;
