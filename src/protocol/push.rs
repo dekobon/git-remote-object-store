@@ -1239,16 +1239,19 @@ mod tests {
     #[tokio::test]
     async fn perform_push_under_lock_format_key_is_idempotent() {
         // If FORMAT already exists (second push), put_if_absent is a no-op.
+        // Pre-insert with a trailing newline so the original bytes differ from
+        // what the push would write — a plain `put` would overwrite to
+        // b"bundle", while put_if_absent must preserve b"bundle\n".
         let store = MockStore::new();
-        store.insert("repo/FORMAT", Bytes::from_static(b"bundle"));
+        store.insert("repo/FORMAT", Bytes::from_static(b"bundle\n"));
         let outcome =
             push_under_lock_with_bundle(&store, Some("repo"), StorageEngine::Bundle).await;
         assert!(
             matches!(outcome, PushOutcome::Ok { .. }),
             "expected Ok outcome"
         );
-        // Key still has original content — put_if_absent did not overwrite.
+        // Original content preserved — put_if_absent did not overwrite.
         let content = store.get_bytes("repo/FORMAT").await.unwrap();
-        assert_eq!(content.as_ref(), b"bundle");
+        assert_eq!(content.as_ref(), b"bundle\n");
     }
 }
