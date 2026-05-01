@@ -80,6 +80,8 @@ pub enum BackendError {
     },
 
     /// The `FORMAT` key records an engine name this binary does not support.
+    // Update the supported-engine list in this message when StorageEngine
+    // gains new variants.
     #[error(
         "bucket uses unknown storage engine `{stored}`; \
          this client only supports `bundle`"
@@ -184,6 +186,9 @@ async fn validate_format(
             stored: stored_name.to_owned(),
         })?;
 
+    // With a single-variant StorageEngine enum this branch is unreachable:
+    // `stored_engine` and `url_engine` are always both `Bundle`. Add a test
+    // for this path when a second engine variant ships.
     if let Some(url_engine) = url_engine
         && url_engine != stored_engine
     {
@@ -390,6 +395,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fatal_message_engine_mismatch() {
+        // With a single-variant enum both fields are Bundle; the test still
+        // pins the format string against accidental wording changes.
+        let err = BackendError::EngineMismatch {
+            url_engine: StorageEngine::Bundle,
+            stored_engine: StorageEngine::Bundle,
+        };
+        assert_eq!(
+            fatal_message(&err),
+            "fatal: URL specifies engine `bundle` but this bucket uses `bundle`; \
+             remove the `?engine=` parameter from the remote URL",
+        );
+    }
+
     // --- validate_format --------------------------------------------------
 
     #[tokio::test]
@@ -459,6 +479,20 @@ mod tests {
         assert_eq!(
             fatal_message(&err),
             "fatal: bucket uses unknown storage engine `pack`; this client only supports `bundle`",
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_format_returns_invalid_credentials_on_transport_error() {
+        use crate::object_store::mock::Fault;
+        let store = MockStore::new();
+        store.arm(Fault::NetworkOnGetBytes {
+            key: "FORMAT".into(),
+        });
+        let err = validate_format(&store, "", None).await.unwrap_err();
+        assert!(
+            matches!(err, BackendError::InvalidCredentials { .. }),
+            "expected InvalidCredentials, got {err:?}",
         );
     }
 }
