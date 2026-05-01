@@ -216,6 +216,28 @@ assert_shallow_file_exists() {
 	fi
 }
 
+# build_linear_history <src> <url> <n>
+# Initialise a repo at <src>, push <n> sequential commits to <url>, and
+# echo the tip SHA. Suitable for both S3 and Azure backends (the URL
+# grammar is the only backend-specific detail).
+build_linear_history() {
+	local src="$1"
+	local url="$2"
+	local n="$3"
+	local i sha
+	if [[ -z "$src" || -z "$url" || -z "$n" ]]; then
+		echo "build_linear_history: requires <src> <url> <n>" >&2
+		return 1
+	fi
+	mk_local_repo "$src"
+	add_remote "$src" origin "$url"
+	for ((i = 1; i <= n; i++)); do
+		sha=$(commit_in_repo "$src" "file${i}.txt" "content ${i}" "commit ${i}")
+	done
+	push_branch "$src" origin refs/heads/main:refs/heads/main
+	echo "$sha"
+}
+
 # assert_commit_count <dir> <expected>
 # Fail unless git log reports exactly <expected> commits from HEAD.
 assert_commit_count() {

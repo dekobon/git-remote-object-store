@@ -247,16 +247,37 @@ pub(crate) async fn fetch_batch(
     first_err.map_or(Ok(()), Err)
 }
 
-/// Resolve the on-disk git directory for `repo_dir`. Falls back to
-/// treating `repo_dir` as the git directory itself for bare layouts —
-/// the worktree case is handled by appending `.git`.
+/// Resolve the on-disk git directory for `repo_dir`.
+///
+/// Three layouts are handled in priority order:
+/// 1. `.git/` is a directory → normal clone.
+/// 2. `.git` is a file → linked worktree or `--separate-git-dir`; the
+///    file contains `gitdir: <path>` pointing to the real git dir.
+/// 3. No `.git` entry → bare repository; `repo_dir` is the git dir.
 fn git_dir_for(repo_dir: &Path) -> PathBuf {
     let candidate = repo_dir.join(".git");
     if candidate.is_dir() {
-        candidate
-    } else {
-        repo_dir.to_path_buf()
+        return candidate;
     }
+    // Linked-worktree / --separate-git-dir: `.git` is a text file whose
+    // sole content is `gitdir: <path>`. Follow the pointer so that
+    // write_shallow_file lands in the real git directory.
+    if candidate.is_file()
+        && let Ok(content) = std::fs::read_to_string(&candidate)
+        && let Some(rest) = content.trim().strip_prefix("gitdir:")
+    {
+        let pointed = std::path::Path::new(rest.trim());
+        let resolved = if pointed.is_absolute() {
+            pointed.to_path_buf()
+        } else {
+            repo_dir.join(pointed)
+        };
+        if resolved.is_dir() {
+            return resolved;
+        }
+    }
+    // Bare repository: the working tree root is the git directory.
+    repo_dir.to_path_buf()
 }
 
 /// Per-task fetch context: bundles every parameter that varies across

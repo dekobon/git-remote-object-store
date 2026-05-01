@@ -436,9 +436,9 @@ const AWS_S3_INFIXES: &[&str] = &[".s3.", ".s3-"];
 /// The returned string is the entire substring before the chosen
 /// infix, so dotted bucket names like `bucketname.com` survive intact.
 fn s3_virtual_hosted_bucket(host: &str) -> Option<String> {
-    // Both infixes are 4 bytes, so the maximum byte-position index
-    // uniquely identifies the rightmost match regardless of which infix
-    // produced it — no need to carry the infix value through the chain.
+    // Both infixes are 4 bytes, so the one whose rfind position is
+    // numerically largest is the rightmost match in the string — no need
+    // to track which infix won after taking the max.
     AWS_S3_INFIXES
         .iter()
         .filter_map(|infix| host.rfind(infix))

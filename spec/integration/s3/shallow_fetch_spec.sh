@@ -15,22 +15,6 @@ Describe "S3 helper: shallow fetch"
 	BeforeAll 'rustfs_start'
 	AfterAll 'rustfs_stop'
 
-	# build_linear_history <src> <url> <n>
-	# Push <n> commits to <url> from <src>. Echoes the tip SHA.
-	build_linear_history() {
-		local src="$1"
-		local url="$2"
-		local n="$3"
-		local i sha
-		mk_local_repo "$src"
-		add_remote "$src" origin "$url"
-		for ((i = 1; i <= n; i++)); do
-			sha=$(commit_in_repo "$src" "file${i}.txt" "content ${i}" "commit ${i}")
-		done
-		push_branch "$src" origin refs/heads/main:refs/heads/main
-		echo "$sha"
-	}
-
 	Describe "git clone --depth 1 on a 5-commit history"
 		# Split setup/It so the clone is the observable action. If setup
 		# silently failed to push, both depth and full clone would produce
