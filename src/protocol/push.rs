@@ -1183,7 +1183,7 @@ mod tests {
     async fn push_under_lock_with_bundle(
         store: &MockStore,
         prefix: Option<&str>,
-        engine: crate::url::StorageEngine,
+        engine: StorageEngine,
     ) -> PushOutcome {
         let r = rn("refs/heads/main");
         let temp = tempfile::NamedTempFile::new().unwrap();
@@ -1205,8 +1205,6 @@ mod tests {
 
     #[tokio::test]
     async fn perform_push_under_lock_writes_format_key_on_first_push() {
-        use crate::object_store::ObjectStore as _;
-        use crate::url::StorageEngine;
         let store = MockStore::new();
         let outcome =
             push_under_lock_with_bundle(&store, Some("repo"), StorageEngine::Bundle).await;
@@ -1224,8 +1222,6 @@ mod tests {
 
     #[tokio::test]
     async fn perform_push_under_lock_writes_format_key_without_prefix() {
-        use crate::object_store::ObjectStore as _;
-        use crate::url::StorageEngine;
         let store = MockStore::new();
         let outcome = push_under_lock_with_bundle(&store, None, StorageEngine::Bundle).await;
         assert!(
@@ -1243,8 +1239,6 @@ mod tests {
     #[tokio::test]
     async fn perform_push_under_lock_format_key_is_idempotent() {
         // If FORMAT already exists (second push), put_if_absent is a no-op.
-        use crate::object_store::ObjectStore as _;
-        use crate::url::StorageEngine;
         let store = MockStore::new();
         store.insert("repo/FORMAT", Bytes::from_static(b"bundle"));
         let outcome =
