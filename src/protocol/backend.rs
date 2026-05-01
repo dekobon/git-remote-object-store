@@ -238,6 +238,8 @@ pub async fn build(remote: &RemoteUrl) -> Result<Arc<dyn ObjectStore>, BackendEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object_store::mock::MockStore;
+    use bytes::Bytes;
 
     fn boxed(message: &str) -> crate::object_store::BoxError {
         Box::new(std::io::Error::other(message.to_string()))
@@ -392,7 +394,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_format_passes_when_key_absent() {
-        use crate::object_store::mock::MockStore;
         let store = MockStore::new();
         // No FORMAT key in the store — should succeed (new bucket).
         validate_format(&store, "", None).await.unwrap();
@@ -401,9 +402,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_format_passes_when_stored_engine_matches_url() {
-        use crate::object_store::mock::MockStore;
-        use crate::url::StorageEngine;
-        use bytes::Bytes;
         let store = MockStore::new();
         store.insert("FORMAT", Bytes::from_static(b"bundle"));
         validate_format(&store, "", Some(StorageEngine::Bundle))
@@ -413,8 +411,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_format_passes_when_no_url_engine_declared() {
-        use crate::object_store::mock::MockStore;
-        use bytes::Bytes;
         let store = MockStore::new();
         store.insert("FORMAT", Bytes::from_static(b"bundle"));
         // No URL engine — stored value is authoritative; no conflict.
@@ -423,9 +419,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_format_passes_when_key_has_trailing_newline() {
-        use crate::object_store::mock::MockStore;
-        use crate::url::StorageEngine;
-        use bytes::Bytes;
         let store = MockStore::new();
         store.insert("FORMAT", Bytes::from_static(b"bundle\n"));
         validate_format(&store, "", Some(StorageEngine::Bundle))
@@ -435,8 +428,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_format_rejects_unknown_stored_engine() {
-        use crate::object_store::mock::MockStore;
-        use bytes::Bytes;
         let store = MockStore::new();
         store.insert("FORMAT", Bytes::from_static(b"pack"));
         let err = validate_format(&store, "", None).await.unwrap_err();
@@ -448,8 +439,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_format_uses_prefix_for_key_lookup() {
-        use crate::object_store::mock::MockStore;
-        use bytes::Bytes;
         let store = MockStore::new();
         // Key at prefix/FORMAT, not at bare FORMAT.
         store.insert("my-repo/FORMAT", Bytes::from_static(b"bundle"));
