@@ -655,7 +655,7 @@ async fn perform_push_under_lock(
     // `backend::build`.
     let format_key = keys::join(prefix.unwrap_or(""), "FORMAT");
     store
-        .put_if_absent(&format_key, Bytes::from(engine.as_str()))
+        .put_if_absent(&format_key, Bytes::from_static(engine.as_str().as_bytes()))
         .await?;
 
     if let Some(prev) = current_key
