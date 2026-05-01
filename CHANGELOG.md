@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Storage-engine selector: `?engine=<name>` URL query parameter and
+  `<prefix>/FORMAT` bucket-level lock key. The only supported engine is
+  `bundle` (the existing git bundle v2 format, also the default when
+  `?engine=` is omitted). On the first push the engine is written to
+  `FORMAT`; subsequent connects read and validate it. A `?engine=` value
+  that conflicts with the stored `FORMAT` aborts with a clear error:
+  `"URL specifies engine X but this bucket uses Y; remove the ?engine=
+  parameter from the remote URL"`. Existing buckets without a `FORMAT`
+  key continue to work — the key is written on the next push. (#51)
 - Shallow-fetch support in the helper protocol: `option depth <N>` is
   now recognised and handled end-to-end. Depth is threaded through REPL
   state (reset after each batch so it applies per-operation only) and

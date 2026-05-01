@@ -18,10 +18,11 @@
 
 use std::sync::Arc;
 
+use crate::keys;
 use crate::object_store::azure::AzureStore;
 use crate::object_store::s3::S3Store;
 use crate::object_store::{ObjectStore, ObjectStoreError};
-use crate::url::RemoteUrl;
+use crate::url::{RemoteUrl, StorageEngine};
 
 /// Which backend a [`BackendError`] refers to. Drives the wording in
 /// [`fatal_message`] (S3 says "bucket"; Azure says "container").
@@ -77,6 +78,29 @@ pub enum BackendError {
         #[source]
         source: ObjectStoreError,
     },
+
+    /// The `FORMAT` key records an engine name this binary does not support.
+    #[error(
+        "bucket uses unknown storage engine `{stored}`; \
+         this client only supports `bundle`"
+    )]
+    UnknownStoredEngine {
+        /// The engine name as written in the `FORMAT` key.
+        stored: String,
+    },
+
+    /// The `?engine=` URL parameter conflicts with the engine stored in the
+    /// `FORMAT` key.
+    #[error(
+        "URL specifies engine `{url_engine}` but this bucket uses `{stored_engine}`; \
+         remove the `?engine=` parameter from the remote URL"
+    )]
+    EngineMismatch {
+        /// Engine requested via the `?engine=` URL parameter.
+        url_engine: StorageEngine,
+        /// Engine stored in the `FORMAT` key.
+        stored_engine: StorageEngine,
+    },
 }
 
 const fn container_word(kind: BackendKind) -> &'static str {
@@ -122,17 +146,70 @@ fn classify(
     }
 }
 
+/// Read the `FORMAT` key at `<prefix>/FORMAT` and validate it against the
+/// engine declared in the URL. Returns `Ok(())` when:
+///
+/// - The key does not exist (new bucket — engine will be written on first push).
+/// - The stored engine matches the URL engine (or no engine was declared).
+///
+/// # Errors
+///
+/// - [`BackendError::UnknownStoredEngine`] when the `FORMAT` content is not a
+///   recognised engine name.
+/// - [`BackendError::EngineMismatch`] when the URL engine conflicts with the
+///   stored engine.
+/// - [`BackendError::InvalidCredentials`] for transport / auth failures reading
+///   the key.
+async fn validate_format(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    url_engine: Option<StorageEngine>,
+) -> Result<(), BackendError> {
+    let format_key = keys::join(prefix, "FORMAT");
+    let bytes = match store.get_bytes(&format_key).await {
+        Ok(b) => b,
+        // No FORMAT key — this is a new or legacy bucket. The engine will
+        // be written on the first push.
+        Err(ObjectStoreError::NotFound(_)) => return Ok(()),
+        Err(e) => return Err(BackendError::InvalidCredentials { source: e }),
+    };
+
+    // Trim ASCII whitespace so a trailing newline in the stored value does
+    // not cause a spurious parse failure.
+    let stored_name = String::from_utf8_lossy(&bytes);
+    let stored_name = stored_name.trim();
+
+    let stored_engine =
+        StorageEngine::from_name(stored_name).ok_or_else(|| BackendError::UnknownStoredEngine {
+            stored: stored_name.to_owned(),
+        })?;
+
+    if let Some(url_engine) = url_engine
+        && url_engine != stored_engine
+    {
+        return Err(BackendError::EngineMismatch {
+            url_engine,
+            stored_engine,
+        });
+    }
+
+    Ok(())
+}
+
 /// Construct the right [`ObjectStore`] for `remote` and verify it is
-/// reachable with a single low-cost list call.
+/// reachable with a single low-cost list call. After the probe, reads the
+/// `FORMAT` key to validate the storage engine declared in `?engine=`.
 ///
 /// # Errors
 ///
 /// Returns [`BackendError`] if the backend cannot be constructed (e.g.
-/// invalid credentials or endpoint) or the probe list call fails (e.g.
-/// bucket/container not found or permission denied).
+/// invalid credentials or endpoint), the probe list call fails (e.g.
+/// bucket/container not found or permission denied), or the `FORMAT` key
+/// conflicts with `?engine=`.
 pub async fn build(remote: &RemoteUrl) -> Result<Arc<dyn ObjectStore>, BackendError> {
     let prefix = remote.prefix().unwrap_or_default();
-    match remote {
+    let url_engine = remote.flags().engine;
+    let store: Arc<dyn ObjectStore> = match remote {
         RemoteUrl::S3 { bucket, .. } => {
             let store = S3Store::from_remote_url(remote)
                 .await
@@ -141,7 +218,7 @@ pub async fn build(remote: &RemoteUrl) -> Result<Arc<dyn ObjectStore>, BackendEr
                 .probe(prefix)
                 .await
                 .map_err(|e| classify(BackendKind::S3, bucket, "ListObjectsV2", e))?;
-            Ok(Arc::new(store))
+            Arc::new(store)
         }
         RemoteUrl::Azure { container, .. } => {
             let store = AzureStore::from_remote_url(remote)
@@ -151,9 +228,11 @@ pub async fn build(remote: &RemoteUrl) -> Result<Arc<dyn ObjectStore>, BackendEr
                 .probe(prefix)
                 .await
                 .map_err(|e| classify(BackendKind::Azure, container, "ListBlobs", e))?;
-            Ok(Arc::new(store))
+            Arc::new(store)
         }
-    }
+    };
+    validate_format(store.as_ref(), prefix, url_engine).await?;
+    Ok(store)
 }
 
 #[cfg(test)]
@@ -306,6 +385,88 @@ mod tests {
         assert_eq!(
             fatal_message(&err),
             "fatal: invalid credentials credential acquisition failed"
+        );
+    }
+
+    // --- validate_format --------------------------------------------------
+
+    #[tokio::test]
+    async fn validate_format_passes_when_key_absent() {
+        use crate::object_store::mock::MockStore;
+        let store = MockStore::new();
+        // No FORMAT key in the store — should succeed (new bucket).
+        validate_format(&store, "", None).await.unwrap();
+        validate_format(&store, "my-repo", None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_format_passes_when_stored_engine_matches_url() {
+        use crate::object_store::mock::MockStore;
+        use crate::url::StorageEngine;
+        use bytes::Bytes;
+        let store = MockStore::new();
+        store.insert("FORMAT", Bytes::from_static(b"bundle"));
+        validate_format(&store, "", Some(StorageEngine::Bundle))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_format_passes_when_no_url_engine_declared() {
+        use crate::object_store::mock::MockStore;
+        use bytes::Bytes;
+        let store = MockStore::new();
+        store.insert("FORMAT", Bytes::from_static(b"bundle"));
+        // No URL engine — stored value is authoritative; no conflict.
+        validate_format(&store, "", None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_format_passes_when_key_has_trailing_newline() {
+        use crate::object_store::mock::MockStore;
+        use crate::url::StorageEngine;
+        use bytes::Bytes;
+        let store = MockStore::new();
+        store.insert("FORMAT", Bytes::from_static(b"bundle\n"));
+        validate_format(&store, "", Some(StorageEngine::Bundle))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_format_rejects_unknown_stored_engine() {
+        use crate::object_store::mock::MockStore;
+        use bytes::Bytes;
+        let store = MockStore::new();
+        store.insert("FORMAT", Bytes::from_static(b"pack"));
+        let err = validate_format(&store, "", None).await.unwrap_err();
+        assert!(
+            matches!(err, BackendError::UnknownStoredEngine { ref stored } if stored == "pack"),
+            "expected UnknownStoredEngine(pack), got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_format_uses_prefix_for_key_lookup() {
+        use crate::object_store::mock::MockStore;
+        use bytes::Bytes;
+        let store = MockStore::new();
+        // Key at prefix/FORMAT, not at bare FORMAT.
+        store.insert("my-repo/FORMAT", Bytes::from_static(b"bundle"));
+        // Without prefix: FORMAT absent → passes.
+        validate_format(&store, "", None).await.unwrap();
+        // With prefix: FORMAT found → passes.
+        validate_format(&store, "my-repo", None).await.unwrap();
+    }
+
+    #[test]
+    fn unknown_stored_engine_error_message() {
+        let err = BackendError::UnknownStoredEngine {
+            stored: "pack".into(),
+        };
+        assert_eq!(
+            fatal_message(&err),
+            "fatal: bucket uses unknown storage engine `pack`; this client only supports `bundle`",
         );
     }
 }

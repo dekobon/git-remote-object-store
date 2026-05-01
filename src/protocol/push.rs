@@ -24,11 +24,25 @@ use tracing::{debug, warn};
 use crate::git::{self, GitError, RefName, RefNameError, Sha, ShaError, is_valid_ref_name};
 use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
+use crate::url::StorageEngine;
 
 /// Default per-ref lock TTL, in seconds. Matches upstream
 /// (`DEFAULT_LOCK_TTL_SECONDS = 60`,
 /// `../git-remote-s3/git_remote_s3/remote.py:45`).
 pub(crate) const DEFAULT_LOCK_TTL_SECONDS: u64 = 60;
+
+/// Push configuration that is constant across an entire batch.
+///
+/// Bundles the `zip`, `engine`, and `ttl` parameters so that [`push_one`]
+/// and [`perform_push_under_lock`] stay within the argument-count budget.
+struct PushConfig {
+    /// Whether to upload `repo.zip` alongside each bundle.
+    zip: bool,
+    /// Storage engine to lock into the `FORMAT` key on the first push.
+    engine: StorageEngine,
+    /// Per-ref lock TTL.
+    ttl: Duration,
+}
 
 /// Environment override for the lock TTL, in seconds. Name is preserved
 /// from upstream for cross-implementation parity.
@@ -302,6 +316,7 @@ pub(crate) async fn push_batch(
     prefix: Option<String>,
     repo_dir: Arc<PathBuf>,
     zip: bool,
+    engine: StorageEngine,
     cmds: Vec<String>,
 ) -> Result<Vec<PushOutcome>, PushError> {
     if cmds.is_empty() {
@@ -309,7 +324,11 @@ pub(crate) async fn push_batch(
     }
     debug!(count = cmds.len(), "processing push batch");
 
-    let ttl = lock_ttl_from_env();
+    let config = PushConfig {
+        zip,
+        engine,
+        ttl: lock_ttl_from_env(),
+    };
     let mut outcomes = Vec::with_capacity(cmds.len());
 
     for cmd in cmds {
@@ -323,8 +342,7 @@ pub(crate) async fn push_batch(
             store.as_ref(),
             prefix.as_deref(),
             repo_dir.as_path(),
-            zip,
-            ttl,
+            &config,
             OffsetDateTime::now_utc(),
             spec,
         )
@@ -443,12 +461,12 @@ fn local_git_work(
 /// Execute one push: lock, validate, upload, release. Mirrors the
 /// upstream `cmd_push` body verbatim except where typed errors replace
 /// stringy ones.
+#[allow(clippy::too_many_lines)]
 async fn push_one(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
     repo_dir: &Path,
-    zip: bool,
-    ttl: Duration,
+    config: &PushConfig,
     now: OffsetDateTime,
     spec: PushSpec,
 ) -> Result<PushOutcome, PushError> {
@@ -460,7 +478,7 @@ async fn push_one(
     let remote_ref_str = remote_ref.as_str().to_owned();
 
     if local_spec.is_empty() {
-        return delete_remote_ref(store, prefix, &remote_ref, zip).await;
+        return delete_remote_ref(store, prefix, &remote_ref, config.zip).await;
     }
 
     let force_push = if force {
@@ -498,7 +516,13 @@ async fn push_one(
     // Sync gix work (rev-parse / ancestor / archive) runs in a
     // dedicated scope so the !Sync `Repository` is dropped before any
     // .await — keeps `push_batch`'s future `Send`.
-    let probe = local_git_work(repo_dir, &local_spec, pre_existing_sha, force_push, zip)?;
+    let probe = local_git_work(
+        repo_dir,
+        &local_spec,
+        pre_existing_sha,
+        force_push,
+        config.zip,
+    )?;
     let local = match probe {
         Ok(local) => local,
         Err(GitProbeError::LocalRefNotFound) => {
@@ -522,13 +546,13 @@ async fn push_one(
         git::bundle_at(&local.cwd, temp_dir.path(), local.local_sha, &local_spec).await?;
 
     let lock = lock_key(prefix, &remote_ref);
-    let acquired = acquire_lock(store, &lock, ttl, now).await?;
+    let acquired = acquire_lock(store, &lock, config.ttl, now).await?;
     if !acquired {
         return Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
             message: format!(
                 r#""failed to acquire ref lock at {lock}. Another client may be pushing. If this persists beyond {}s, run git-remote-object-store doctor to inspect and optionally clear stale locks."?"#,
-                ttl.whole_seconds(),
+                config.ttl.whole_seconds(),
             ),
         });
     }
@@ -544,6 +568,7 @@ async fn push_one(
         pre_existing,
         &bundle_path,
         local.zip_artifacts,
+        config.engine,
     )
     .await;
     let release_result = release_lock(store, &lock).await;
@@ -576,9 +601,10 @@ async fn push_one(
     }
 }
 
-/// Re-list under the lock, upload the bundle, init HEAD, delete the
-/// previous bundle, optionally upload `repo.zip`. Split out so the lock
-/// release in the caller is unconditional.
+/// Re-list under the lock, upload the bundle, init HEAD, write the `FORMAT`
+/// key, delete the previous bundle, optionally upload `repo.zip`. Split out
+/// so the lock release in the caller is unconditional.
+#[allow(clippy::too_many_arguments)]
 async fn perform_push_under_lock(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
@@ -587,6 +613,7 @@ async fn perform_push_under_lock(
     pre_existing: Option<String>,
     bundle_path: &std::path::Path,
     zip_artifacts: Option<ZipArtifacts>,
+    engine: StorageEngine,
 ) -> Result<PushOutcome, PushError> {
     let current = bundles_for_ref(store, prefix, remote_ref).await?;
     if current.len() > 1 {
@@ -619,6 +646,16 @@ async fn perform_push_under_lock(
             &head,
             Bytes::copy_from_slice(remote_ref.as_str().as_bytes()),
         )
+        .await?;
+
+    // Lock in the storage engine on the first push. `put_if_absent` makes
+    // concurrent first-push races safe — both write the same `bundle` value,
+    // so the one that loses is a no-op. The boolean result is intentionally
+    // ignored: an existing FORMAT key was already validated at connect time by
+    // `backend::build`.
+    let format_key = keys::join(prefix.unwrap_or(""), "FORMAT");
+    store
+        .put_if_absent(&format_key, Bytes::from(engine.as_str()))
         .await?;
 
     if let Some(prev) = current_key
@@ -1137,5 +1174,87 @@ mod tests {
             ttl,
             Duration::seconds(i64::try_from(DEFAULT_LOCK_TTL_SECONDS).unwrap()),
         );
+    }
+
+    // --- FORMAT key write via perform_push_under_lock --------------------
+
+    /// Helper: run `perform_push_under_lock` against a temporary bundle file
+    /// so we can assert on the resulting store state.
+    async fn push_under_lock_with_bundle(
+        store: &MockStore,
+        prefix: Option<&str>,
+        engine: crate::url::StorageEngine,
+    ) -> PushOutcome {
+        let r = rn("refs/heads/main");
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), b"fake bundle").unwrap();
+
+        perform_push_under_lock(
+            store,
+            prefix,
+            &r,
+            Sha::from_hex(SHA).unwrap(),
+            None, // no pre-existing bundle
+            temp.path(),
+            None, // no zip artifacts
+            engine,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn perform_push_under_lock_writes_format_key_on_first_push() {
+        use crate::object_store::ObjectStore as _;
+        use crate::url::StorageEngine;
+        let store = MockStore::new();
+        let outcome =
+            push_under_lock_with_bundle(&store, Some("repo"), StorageEngine::Bundle).await;
+        assert!(
+            matches!(outcome, PushOutcome::Ok { .. }),
+            "expected Ok outcome"
+        );
+        assert!(
+            store.contains("repo/FORMAT"),
+            "FORMAT key must be written on the first push",
+        );
+        let content = store.get_bytes("repo/FORMAT").await.unwrap();
+        assert_eq!(content.as_ref(), b"bundle");
+    }
+
+    #[tokio::test]
+    async fn perform_push_under_lock_writes_format_key_without_prefix() {
+        use crate::object_store::ObjectStore as _;
+        use crate::url::StorageEngine;
+        let store = MockStore::new();
+        let outcome = push_under_lock_with_bundle(&store, None, StorageEngine::Bundle).await;
+        assert!(
+            matches!(outcome, PushOutcome::Ok { .. }),
+            "expected Ok outcome"
+        );
+        assert!(
+            store.contains("FORMAT"),
+            "FORMAT key must be written at root when no prefix",
+        );
+        let content = store.get_bytes("FORMAT").await.unwrap();
+        assert_eq!(content.as_ref(), b"bundle");
+    }
+
+    #[tokio::test]
+    async fn perform_push_under_lock_format_key_is_idempotent() {
+        // If FORMAT already exists (second push), put_if_absent is a no-op.
+        use crate::object_store::ObjectStore as _;
+        use crate::url::StorageEngine;
+        let store = MockStore::new();
+        store.insert("repo/FORMAT", Bytes::from_static(b"bundle"));
+        let outcome =
+            push_under_lock_with_bundle(&store, Some("repo"), StorageEngine::Bundle).await;
+        assert!(
+            matches!(outcome, PushOutcome::Ok { .. }),
+            "expected Ok outcome"
+        );
+        // Key still has original content — put_if_absent did not overwrite.
+        let content = store.get_bytes("repo/FORMAT").await.unwrap();
+        assert_eq!(content.as_ref(), b"bundle");
     }
 }
