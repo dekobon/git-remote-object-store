@@ -165,11 +165,6 @@ fn ref_listing_prefix(prefix: Option<&str>, remote_ref: &RefName) -> String {
     keys::join(prefix.unwrap_or(""), &format!("{remote_ref}/"))
 }
 
-/// Build the bundle key for `<prefix>/<ref>/<sha>.bundle`.
-fn bundle_key(prefix: Option<&str>, remote_ref: &RefName, sha: Sha) -> String {
-    format!("{}{sha}.bundle", ref_listing_prefix(prefix, remote_ref))
-}
-
 /// Build the lock key: `<prefix>/<ref>/LOCK#.lock`.
 fn lock_key(prefix: Option<&str>, remote_ref: &RefName) -> String {
     format!("{}LOCK#.lock", ref_listing_prefix(prefix, remote_ref))
@@ -406,6 +401,35 @@ struct ZipArtifacts {
     _tempdir: tempfile::TempDir,
 }
 
+/// All state computed before the per-ref lock is acquired.
+///
+/// Passed to [`perform_push_under_lock`] so the argument count stays within
+/// the clippy budget and the two phases of [`push_one`] have a clean
+/// boundary: pre-lock work (protect check, bundle listing, local git,
+/// bundle creation) vs. under-lock work (re-list, upload, HEAD/FORMAT
+/// init, old-bundle deletion).
+struct PushReadyState {
+    remote_ref: RefName,
+    local_sha: Sha,
+    /// Key of the pre-existing bundle (if any). Checked inside the lock
+    /// to detect concurrent pushes (stale-remote guard).
+    pre_existing: Option<String>,
+    bundle_path: PathBuf,
+    zip_artifacts: Option<ZipArtifacts>,
+    engine: StorageEngine,
+    /// Keeps the temp directory (and `bundle_path`) alive until the bundle
+    /// is uploaded inside `perform_push_under_lock`.
+    _temp_dir: tempfile::TempDir,
+}
+
+/// Outcome of [`prepare_push`]: either all pre-lock work completed and the
+/// caller should proceed to locking, or the outcome is already decided
+/// (delete-refspec, multiple-bundle error, ancestry failure, …).
+enum PrepareOutcome {
+    Ready(PushReadyState),
+    Done(PushOutcome),
+}
+
 /// Open the repo, resolve `local_sha`, optionally check ancestry, and
 /// (for the zip variant) build the archive synchronously. The
 /// `Repository` handle is dropped before this returns so the caller's
@@ -458,18 +482,19 @@ fn local_git_work(
     }))
 }
 
-/// Execute one push: lock, validate, upload, release. Mirrors the
-/// upstream `cmd_push` body verbatim except where typed errors replace
-/// stringy ones.
-#[allow(clippy::too_many_lines)]
-async fn push_one(
+/// Perform all pre-lock work for a push: resolve the local ref, check
+/// ancestry, list the remote bundles, and create the local bundle file.
+/// Returns [`PrepareOutcome::Done`] for cases that are already resolved
+/// (delete-refspec, protection check, multiple-bundle error, ancestry
+/// failure) or [`PrepareOutcome::Ready`] when the caller should proceed
+/// to acquire the per-ref lock and call [`perform_push_under_lock`].
+async fn prepare_push(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
     repo_dir: &Path,
     config: &PushConfig,
-    now: OffsetDateTime,
     spec: PushSpec,
-) -> Result<PushOutcome, PushError> {
+) -> Result<PrepareOutcome, PushError> {
     let PushSpec {
         force,
         local_spec,
@@ -478,7 +503,8 @@ async fn push_one(
     let remote_ref_str = remote_ref.as_str().to_owned();
 
     if local_spec.is_empty() {
-        return delete_remote_ref(store, prefix, &remote_ref, config.zip).await;
+        let outcome = delete_remote_ref(store, prefix, &remote_ref, config.zip).await?;
+        return Ok(PrepareOutcome::Done(outcome));
     }
 
     let force_push = if force {
@@ -490,11 +516,11 @@ async fn push_one(
 
     let pre_bundles = bundles_for_ref(store, prefix, &remote_ref).await?;
     if pre_bundles.len() > 1 {
-        return Ok(PushOutcome::Error {
+        return Ok(PrepareOutcome::Done(PushOutcome::Error {
             remote_ref: remote_ref_str,
             message: r#""multiple bundles exists on server. Run git-remote-object-store doctor to fix."?"#
                 .to_owned(),
-        });
+        }));
     }
     let pre_existing = pre_bundles.into_iter().next().map(|m| m.key);
 
@@ -502,12 +528,12 @@ async fn push_one(
         Some(key) => match parse_remote_sha_from_key(key) {
             Some(s) => Some(s),
             None => {
-                return Ok(PushOutcome::Error {
+                return Ok(PrepareOutcome::Done(PushOutcome::Error {
                     remote_ref: remote_ref_str,
                     message: format!(
                         r#""unable to parse remote bundle key {key:?}; run git-remote-object-store doctor to fix."?"#,
                     ),
-                });
+                }));
             }
         },
         None => None,
@@ -516,26 +542,20 @@ async fn push_one(
     // Sync gix work (rev-parse / ancestor / archive) runs in a
     // dedicated scope so the !Sync `Repository` is dropped before any
     // .await — keeps `push_batch`'s future `Send`.
-    let probe = local_git_work(
-        repo_dir,
-        &local_spec,
-        pre_existing_sha,
-        force_push,
-        config.zip,
-    )?;
+    let probe = local_git_work(repo_dir, &local_spec, pre_existing_sha, force_push, config.zip)?;
     let local = match probe {
         Ok(local) => local,
         Err(GitProbeError::LocalRefNotFound) => {
-            return Ok(PushOutcome::Error {
+            return Ok(PrepareOutcome::Done(PushOutcome::Error {
                 remote_ref: remote_ref_str,
                 message: format!(r#""{local_spec} not found"?"#),
-            });
+            }));
         }
         Err(GitProbeError::NotAncestor) => {
-            return Ok(PushOutcome::Error {
+            return Ok(PrepareOutcome::Done(PushOutcome::Error {
                 remote_ref: remote_ref_str,
                 message: format!(r#""remote ref is not ancestor of {local_spec}."?"#),
-            });
+            }));
         }
     };
 
@@ -545,7 +565,34 @@ async fn push_one(
     let bundle_path =
         git::bundle_at(&local.cwd, temp_dir.path(), local.local_sha, &local_spec).await?;
 
-    let lock = lock_key(prefix, &remote_ref);
+    Ok(PrepareOutcome::Ready(PushReadyState {
+        remote_ref,
+        local_sha: local.local_sha,
+        pre_existing,
+        bundle_path,
+        zip_artifacts: local.zip_artifacts,
+        engine: config.engine,
+        _temp_dir: temp_dir,
+    }))
+}
+
+/// Execute one push: prepare, lock, upload, release. Mirrors the
+/// upstream `cmd_push` body except where typed errors replace stringy ones.
+async fn push_one(
+    store: &dyn ObjectStore,
+    prefix: Option<&str>,
+    repo_dir: &Path,
+    config: &PushConfig,
+    now: OffsetDateTime,
+    spec: PushSpec,
+) -> Result<PushOutcome, PushError> {
+    let state = match prepare_push(store, prefix, repo_dir, config, spec).await? {
+        PrepareOutcome::Done(o) => return Ok(o),
+        PrepareOutcome::Ready(s) => s,
+    };
+
+    let remote_ref_str = state.remote_ref.as_str().to_owned();
+    let lock = lock_key(prefix, &state.remote_ref);
     let acquired = acquire_lock(store, &lock, config.ttl, now).await?;
     if !acquired {
         return Ok(PushOutcome::Error {
@@ -560,17 +607,7 @@ async fn push_one(
     // Run the lock-protected work, then release the lock unconditionally
     // before propagating the result. Mirrors upstream's `try/finally` so a
     // mid-push error never leaves the lock dangling for the full TTL.
-    let result = perform_push_under_lock(
-        store,
-        prefix,
-        &remote_ref,
-        local.local_sha,
-        pre_existing,
-        &bundle_path,
-        local.zip_artifacts,
-        config.engine,
-    )
-    .await;
+    let result = perform_push_under_lock(store, prefix, state).await;
     let release_result = release_lock(store, &lock).await;
 
     // Upstream `cmd_push` (`../git-remote-s3/git_remote_s3/remote.py:297-303`)
@@ -604,18 +641,22 @@ async fn push_one(
 /// Re-list under the lock, upload the bundle, init HEAD, write the `FORMAT`
 /// key, delete the previous bundle, optionally upload `repo.zip`. Split out
 /// so the lock release in the caller is unconditional.
-#[allow(clippy::too_many_arguments)]
 async fn perform_push_under_lock(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
-    remote_ref: &RefName,
-    local_sha: Sha,
-    pre_existing: Option<String>,
-    bundle_path: &std::path::Path,
-    zip_artifacts: Option<ZipArtifacts>,
-    engine: StorageEngine,
+    state: PushReadyState,
 ) -> Result<PushOutcome, PushError> {
-    let current = bundles_for_ref(store, prefix, remote_ref).await?;
+    let PushReadyState {
+        remote_ref,
+        local_sha,
+        pre_existing,
+        bundle_path,
+        zip_artifacts,
+        engine,
+        _temp_dir,
+    } = state;
+
+    let current = bundles_for_ref(store, prefix, &remote_ref).await?;
     if current.len() > 1 {
         return Ok(PushOutcome::Error {
             remote_ref: remote_ref.as_str().to_owned(),
@@ -632,9 +673,9 @@ async fn perform_push_under_lock(
         });
     }
 
-    let bundle_dest = bundle_key(prefix, remote_ref, local_sha);
+    let bundle_dest = keys::bundle_key(prefix, &remote_ref, local_sha);
     store
-        .put_path(&bundle_dest, bundle_path, PutOpts::default())
+        .put_path(&bundle_dest, &bundle_path, PutOpts::default())
         .await?;
 
     // HEAD bootstrap: write only if absent. Single round-trip via
@@ -676,7 +717,7 @@ async fn perform_push_under_lock(
             )],
             progress: None,
         };
-        let zip_dest = archive_key(prefix, remote_ref);
+        let zip_dest = archive_key(prefix, &remote_ref);
         store
             .put_path(&zip_dest, &artifacts.archive_path, opts)
             .await?;
@@ -826,7 +867,7 @@ mod tests {
         let r = rn("refs/heads/main");
         let sha = Sha::from_hex(SHA).unwrap();
         assert_eq!(
-            bundle_key(Some("repo"), &r, sha),
+            keys::bundle_key(Some("repo"), &r, sha),
             format!("repo/refs/heads/main/{SHA}.bundle"),
         );
         assert_eq!(
@@ -845,7 +886,7 @@ mod tests {
         let r = rn("refs/heads/main");
         let sha = Sha::from_hex(SHA).unwrap();
         assert_eq!(
-            bundle_key(None, &r, sha),
+            keys::bundle_key(None, &r, sha),
             format!("refs/heads/main/{SHA}.bundle"),
         );
         assert_eq!(lock_key(None, &r), "refs/heads/main/LOCK#.lock");
@@ -1186,21 +1227,24 @@ mod tests {
         engine: StorageEngine,
     ) -> PushOutcome {
         let r = rn("refs/heads/main");
-        let temp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(temp.path(), b"fake bundle").unwrap();
+        let temp_dir = tempfile::Builder::new()
+            .prefix("test_push_")
+            .tempdir()
+            .unwrap();
+        let bundle_path = temp_dir.path().join("bundle");
+        std::fs::write(&bundle_path, b"fake bundle").unwrap();
 
-        perform_push_under_lock(
-            store,
-            prefix,
-            &r,
-            Sha::from_hex(SHA).unwrap(),
-            None, // no pre-existing bundle
-            temp.path(),
-            None, // no zip artifacts
+        let state = PushReadyState {
+            remote_ref: r,
+            local_sha: Sha::from_hex(SHA).unwrap(),
+            pre_existing: None,
+            bundle_path,
+            zip_artifacts: None,
             engine,
-        )
-        .await
-        .unwrap()
+            _temp_dir: temp_dir,
+        };
+
+        perform_push_under_lock(store, prefix, state).await.unwrap()
     }
 
     #[tokio::test]

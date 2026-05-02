@@ -310,7 +310,7 @@ async fn fetch_one(ctx: FetchOneCtx<'_>) -> Result<(), FetchError> {
     if fetched_refs.contains(&sha) {
         debug!(%sha, ref_name = %ref_name, "skipping fetch: already fetched in this session");
     } else {
-        let key = bundle_key(prefix, ref_name, sha);
+        let key = keys::bundle_key(prefix, ref_name, sha);
         let temp_dir = tempfile::Builder::new()
             .prefix("git_remote_object_store_fetch_")
             .tempdir()?;
@@ -342,13 +342,6 @@ async fn fetch_one(ctx: FetchOneCtx<'_>) -> Result<(), FetchError> {
     Ok(())
 }
 
-/// Format the bundle key for `<prefix>/<ref>/<sha>.bundle`, dropping the
-/// leading `/` when the URL has no prefix (matches the on-bucket layout
-/// used by `list`).
-fn bundle_key(prefix: Option<&str>, ref_name: &RefName, sha: Sha) -> String {
-    keys::join(prefix.unwrap_or(""), &format!("{ref_name}/{sha}.bundle"))
-}
-
 /// Parse the payload of a `fetch <sha> <ref>` line (the bytes after the
 /// `fetch ` prefix have already been stripped by the REPL).
 fn parse_fetch_args(args: &str) -> Result<(Sha, RefName), FetchError> {
@@ -373,7 +366,7 @@ mod tests {
         let sha = Sha::from_hex(SHA).unwrap();
         let ref_name = RefName::new("refs/heads/main").unwrap();
         assert_eq!(
-            bundle_key(Some("repo"), &ref_name, sha),
+            keys::bundle_key(Some("repo"), &ref_name, sha),
             format!("repo/refs/heads/main/{SHA}.bundle"),
         );
     }
@@ -383,13 +376,13 @@ mod tests {
         let sha = Sha::from_hex(SHA).unwrap();
         let ref_name = RefName::new("refs/heads/main").unwrap();
         assert_eq!(
-            bundle_key(None, &ref_name, sha),
+            keys::bundle_key(None, &ref_name, sha),
             format!("refs/heads/main/{SHA}.bundle"),
         );
         // Empty-string prefix is treated identically to None — guards
         // against an accidental `/refs/...` bundle key.
         assert_eq!(
-            bundle_key(Some(""), &ref_name, sha),
+            keys::bundle_key(Some(""), &ref_name, sha),
             format!("refs/heads/main/{SHA}.bundle"),
         );
     }

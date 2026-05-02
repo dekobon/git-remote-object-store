@@ -1,11 +1,17 @@
 //! Helpers for constructing object-store keys.
 //!
+//! All key-building functions live here so that the "empty prefix means
+//! no leading slash" rule and the bundle-key format have exactly one
+//! implementation. See Lessons Learned §3.
+//!
 //! Both the helper protocol (push/fetch/list) and the management CLI
 //! (doctor/branch/snapshot) build keys of the form `<prefix>/<suffix>`
 //! and have to special-case the empty-prefix (root-of-bucket) case so
 //! the resulting key has no leading slash. Centralising the rule here
 //! keeps the four module call sites in lockstep and prevents the
 //! recurring "leading slash on root-prefix repos" bug (#29, #32).
+
+use std::fmt;
 
 /// Join `prefix` and `suffix` with a single `/`, omitting both the
 /// separator and the prefix entirely when `prefix` is empty.
@@ -17,6 +23,16 @@
 /// Callers who carry the prefix as `Option<&str>` should pass
 /// `prefix.unwrap_or("")`. `Some("")` and `None` collapse to the same
 /// "no prefix" key shape.
+/// Build the bundle key `<prefix>/<ref_name>/<sha>.bundle`, applying the
+/// same empty-prefix rule as [`join`].
+pub(crate) fn bundle_key(
+    prefix: Option<&str>,
+    ref_name: impl fmt::Display,
+    sha: impl fmt::Display,
+) -> String {
+    join(prefix.unwrap_or(""), &format!("{ref_name}/{sha}.bundle"))
+}
+
 pub(crate) fn join(prefix: &str, suffix: &str) -> String {
     if prefix.is_empty() {
         suffix.to_owned()

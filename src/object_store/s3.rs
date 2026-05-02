@@ -79,6 +79,7 @@ use aws_config::timeout::TimeoutConfig;
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::MetadataDirective;
 use aws_smithy_http_client::tls::{Provider as TlsProvider, rustls_provider::CryptoMode};
 use aws_smithy_types_convert::date_time::DateTimeExt;
 use bytes::Bytes;
@@ -680,6 +681,10 @@ impl ObjectStore for S3Store {
 
     async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
         let copy_source = encode_copy_source(&self.bucket, src);
+        // `MetadataDirective::Replace` makes S3 consistent with the Azure
+        // backend (which drops metadata on copy via download-then-reupload):
+        // neither backend preserves user metadata, matching the trait
+        // contract in `ObjectStore::copy`.
         // Pass `src` as the key context so a 404 surfaces as
         // `NotFound(src)` — that's what the trait promises.
         self.client
@@ -687,6 +692,7 @@ impl ObjectStore for S3Store {
             .bucket(&self.bucket)
             .key(dst)
             .copy_source(copy_source)
+            .metadata_directive(MetadataDirective::Replace)
             .send()
             .await
             .map_err(|e| classify(e, src))?;
