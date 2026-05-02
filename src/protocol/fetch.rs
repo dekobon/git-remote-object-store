@@ -181,8 +181,8 @@ pub(crate) async fn fetch_batch(
 
     let semaphore = Arc::new(Semaphore::new(MAX_FETCH_CONCURRENCY));
     let mut tasks: JoinSet<Result<(), FetchError>> = JoinSet::new();
-    // Convert prefix to Arc<String> once; each spawned task gets a cheap clone.
-    let prefix = ctx.prefix.clone().map(Arc::new);
+    // Clone the Arc<str> once; each spawned task gets a cheap reference-count bump.
+    let prefix = ctx.prefix.clone();
     let boundaries = ShallowBoundaries::new();
 
     for cmd in cmds {
@@ -200,7 +200,7 @@ pub(crate) async fn fetch_batch(
             let (sha, ref_name) = parse_fetch_args(&cmd)?;
             fetch_one(FetchOneCtx {
                 store: store.as_ref(),
-                prefix: prefix.as_deref().map(String::as_str),
+                prefix: prefix.as_deref(),
                 repo_dir: repo_dir.as_path(),
                 sha,
                 ref_name: &ref_name,

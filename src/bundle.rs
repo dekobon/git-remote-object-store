@@ -50,7 +50,7 @@ impl BundleHeader {
         let mut line = String::new();
 
         file.read_line(&mut line)?;
-        let magic = line.trim_end_matches('\n').trim_end_matches('\r');
+        let magic = line.trim_end_matches(['\n', '\r']);
         if magic == BUNDLE_V3_MAGIC {
             return Err(BundleError::UnsupportedVersion(3));
         }
@@ -99,16 +99,14 @@ enum HeaderEntry {
 ///
 /// The trailing `\n` / `\r\n` is stripped before classification.
 fn parse_header_entry(line: &str) -> Result<HeaderEntry, BundleError> {
-    let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+    let trimmed = line.trim_end_matches(['\n', '\r']);
     if trimmed.is_empty() {
         return Ok(HeaderEntry::End);
     }
     if let Some(rest) = trimmed.strip_prefix('-') {
         // Prerequisite line: -<sha40> [optional comment]
         let sha_hex = rest.split_once(' ').map_or(rest, |(s, _)| s);
-        let oid = ObjectId::from_hex(sha_hex.as_bytes()).map_err(|_| {
-            BundleError::InvalidHeader(format!("bad prerequisite SHA: {sha_hex:?}"))
-        })?;
+        let oid = parse_oid(sha_hex, "prerequisite")?;
         return Ok(HeaderEntry::Prerequisite(oid));
     }
     // Ref line: <sha40> <refname>
@@ -121,9 +119,14 @@ fn parse_header_entry(line: &str) -> Result<HeaderEntry, BundleError> {
         .next()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| BundleError::InvalidHeader(format!("missing ref name: {trimmed:?}")))?;
-    let oid = ObjectId::from_hex(sha_hex.as_bytes())
-        .map_err(|_| BundleError::InvalidHeader(format!("bad ref SHA: {sha_hex:?}")))?;
+    let oid = parse_oid(sha_hex, "ref")?;
     Ok(HeaderEntry::Ref(oid, ref_name.as_bytes().to_vec()))
+}
+
+/// Parse a 40-hex object ID, returning a [`BundleError::InvalidHeader`] on failure.
+fn parse_oid(sha_hex: &str, context: &str) -> Result<ObjectId, BundleError> {
+    ObjectId::from_hex(sha_hex.as_bytes())
+        .map_err(|_| BundleError::InvalidHeader(format!("bad {context} SHA: {sha_hex:?}")))
 }
 
 /// Verify that the next four bytes in `file` are the `PACK` magic.
