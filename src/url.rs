@@ -109,7 +109,7 @@ impl StorageEngine {
     /// The canonical name for this engine, as stored in the `FORMAT` key and
     /// accepted in the `?engine=` URL parameter.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Bundle => "bundle",
         }
@@ -137,10 +137,10 @@ pub enum BackendKind {
 
 impl BackendKind {
     /// The URL scheme prefix for this backend (`"s3+"` or `"az+"`).
-    pub(crate) fn scheme_prefix(self) -> &'static str {
+    pub(crate) const fn scheme_prefix(self) -> &'static str {
         match self {
-            BackendKind::S3 => "s3+",
-            BackendKind::Azure => "az+",
+            Self::S3 => "s3+",
+            Self::Azure => "az+",
         }
     }
 }
@@ -275,8 +275,8 @@ impl FromStr for RemoteUrl {
 impl fmt::Display for RemoteUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RemoteUrl::S3 { endpoint, .. } => write!(f, "s3+{endpoint}"),
-            RemoteUrl::Azure { endpoint, .. } => write!(f, "az+{endpoint}"),
+            Self::S3 { endpoint, .. } => write!(f, "s3+{endpoint}"),
+            Self::Azure { endpoint, .. } => write!(f, "az+{endpoint}"),
         }
     }
 }
@@ -284,9 +284,9 @@ impl fmt::Display for RemoteUrl {
 impl RemoteUrl {
     /// Returns the canonical endpoint URL (without the backend prefix).
     #[must_use]
-    pub fn endpoint(&self) -> &Url {
+    pub const fn endpoint(&self) -> &Url {
         match self {
-            RemoteUrl::S3 { endpoint, .. } | RemoteUrl::Azure { endpoint, .. } => endpoint,
+            Self::S3 { endpoint, .. } | Self::Azure { endpoint, .. } => endpoint,
         }
     }
 
@@ -294,15 +294,15 @@ impl RemoteUrl {
     #[must_use]
     pub fn prefix(&self) -> Option<&str> {
         match self {
-            RemoteUrl::S3 { prefix, .. } | RemoteUrl::Azure { prefix, .. } => prefix.as_deref(),
+            Self::S3 { prefix, .. } | Self::Azure { prefix, .. } => prefix.as_deref(),
         }
     }
 
     /// Returns the parsed query flags.
     #[must_use]
-    pub fn flags(&self) -> &RemoteFlags {
+    pub const fn flags(&self) -> &RemoteFlags {
         match self {
-            RemoteUrl::S3 { flags, .. } | RemoteUrl::Azure { flags, .. } => flags,
+            Self::S3 { flags, .. } | Self::Azure { flags, .. } => flags,
         }
     }
 }
@@ -654,7 +654,7 @@ fn is_valid_container(s: &str) -> bool {
         && !s.contains("--")
 }
 
-fn is_ascii_alphanum_lower(b: u8) -> bool {
+const fn is_ascii_alphanum_lower(b: u8) -> bool {
     b.is_ascii_lowercase() || b.is_ascii_digit()
 }
 

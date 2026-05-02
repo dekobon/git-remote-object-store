@@ -111,8 +111,8 @@ impl PushOutcome {
     #[must_use]
     pub(crate) fn to_protocol_line(&self) -> String {
         match self {
-            PushOutcome::Ok { remote_ref } => format!("ok {remote_ref}\n"),
-            PushOutcome::Error {
+            Self::Ok { remote_ref } => format!("ok {remote_ref}\n"),
+            Self::Error {
                 remote_ref,
                 message,
             } => format!("error {remote_ref} {message}\n"),
@@ -542,7 +542,13 @@ async fn prepare_push(
     // Sync gix work (rev-parse / ancestor / archive) runs in a
     // dedicated scope so the !Sync `Repository` is dropped before any
     // .await — keeps `push_batch`'s future `Send`.
-    let probe = local_git_work(repo_dir, &local_spec, pre_existing_sha, force_push, config.zip)?;
+    let probe = local_git_work(
+        repo_dir,
+        &local_spec,
+        pre_existing_sha,
+        force_push,
+        config.zip,
+    )?;
     let local = match probe {
         Ok(local) => local,
         Err(GitProbeError::LocalRefNotFound) => {
