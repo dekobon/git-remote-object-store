@@ -340,4 +340,50 @@ mod tests {
         let not_io = ProtocolError::InvalidCommand("bad".into());
         assert!(!not_io.is_broken_pipe());
     }
+
+    // --- BatchState ---------------------------------------------------
+
+    #[test]
+    fn batch_state_empty_take_returns_none() {
+        let mut batch = BatchState::new();
+        assert!(batch.take_pending().is_none());
+    }
+
+    #[test]
+    fn batch_state_accumulate_and_take_round_trip() {
+        let mut batch = BatchState::new();
+        batch.accumulate(Mode::Fetch, "a".to_owned());
+        batch.accumulate(Mode::Fetch, "b".to_owned());
+        let (mode, cmds) = batch.take_pending().expect("non-empty fetch batch");
+        assert_eq!(mode, Mode::Fetch);
+        assert_eq!(cmds, ["a", "b"]);
+        // Mode is reset after drain; a second take returns None.
+        assert!(batch.take_pending().is_none());
+    }
+
+    #[test]
+    fn batch_state_mode_switch_clears_prior_cmds() {
+        let mut batch = BatchState::new();
+        // Accumulate fetch commands, then switch to push mid-batch.
+        batch.accumulate(Mode::Fetch, "fetch-cmd".to_owned());
+        batch.accumulate(Mode::Push, "push-cmd".to_owned());
+        // Only the push command survives the mode switch.
+        let (mode, cmds) = batch.take_pending().expect("non-empty push batch");
+        assert_eq!(mode, Mode::Push);
+        assert_eq!(cmds, ["push-cmd"]);
+        assert!(batch.take_pending().is_none());
+    }
+
+    #[test]
+    fn batch_state_accumulate_with_no_cmds_after_mode_set_takes_none() {
+        // Verify that take_pending does not return Some for a mode with
+        // an empty accumulator (mode is set but no cmds were pushed).
+        // This can happen if the mode was set by accumulate and then all
+        // cmds were consumed, leaving mode non-None but cmds empty.
+        let mut batch = BatchState::new();
+        batch.accumulate(Mode::Fetch, "only-cmd".to_owned());
+        batch.take_pending(); // drain and reset mode
+        // After take, mode == None; a spurious second take must return None.
+        assert!(batch.take_pending().is_none());
+    }
 }

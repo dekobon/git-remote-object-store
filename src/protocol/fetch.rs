@@ -452,20 +452,32 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_batch_empty_cmds_short_circuits() {
-        use crate::object_store::mock::MockStore;
+        use crate::object_store::mock::{Fault, MockStore};
         use crate::protocol::BatchCtx;
         // Empty-cmds early return — no store call, no spawn. Covers the
         // internal short-circuit that the integration test cannot reach
         // (the REPL never calls `fetch_batch` with an empty Vec because
         // `BatchState::take_pending` guards on non-empty cmds).
-        let store: Arc<dyn ObjectStore> = Arc::new(MockStore::new());
+        //
+        // The armed fault acts as a tripwire: if any store method is
+        // invoked, it fires and the test fails with an error instead of
+        // passing silently.
+        let mock = Arc::new(MockStore::new());
+        mock.arm(Fault::NetworkOnGetBytes {
+            key: "sentinel".to_owned(),
+        });
         let repo_dir = tempfile::tempdir().expect("tempdir");
         let ctx = BatchCtx {
-            store,
+            store: Arc::clone(&mock) as Arc<dyn ObjectStore>,
             prefix: Some("repo".into()),
             repo_dir: Arc::new(repo_dir.path().to_path_buf()),
         };
         let result = fetch_batch(&ctx, Vec::new(), FetchedRefs::new(), None).await;
         assert!(matches!(result, Ok(())));
+        assert_eq!(
+            mock.pending_faults(),
+            1,
+            "no store call should occur for empty cmds"
+        );
     }
 }
