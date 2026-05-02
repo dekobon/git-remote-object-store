@@ -165,9 +165,7 @@ impl ShallowBoundaries {
 /// session), since the boundary depends on `depth`, not on whether the
 /// download happened.
 pub(crate) async fn fetch_batch(
-    store: Arc<dyn ObjectStore>,
-    prefix: Option<String>,
-    repo_dir: Arc<PathBuf>,
+    ctx: &super::BatchCtx,
     cmds: Vec<String>,
     fetched_refs: FetchedRefs,
     depth: Option<NonZeroU32>,
@@ -183,14 +181,15 @@ pub(crate) async fn fetch_batch(
 
     let semaphore = Arc::new(Semaphore::new(MAX_FETCH_CONCURRENCY));
     let mut tasks: JoinSet<Result<(), FetchError>> = JoinSet::new();
-    let prefix = prefix.map(Arc::new);
+    // Convert prefix to Arc<String> once; each spawned task gets a cheap clone.
+    let prefix = ctx.prefix.clone().map(Arc::new);
     let boundaries = ShallowBoundaries::new();
 
     for cmd in cmds {
-        let store = Arc::clone(&store);
+        let store = Arc::clone(&ctx.store);
         let semaphore = Arc::clone(&semaphore);
         let prefix = prefix.clone();
-        let repo_dir = Arc::clone(&repo_dir);
+        let repo_dir = Arc::clone(&ctx.repo_dir);
         let fetched_refs = fetched_refs.clone();
         let boundaries = boundaries.clone();
         tasks.spawn(async move {
@@ -236,7 +235,7 @@ pub(crate) async fn fetch_batch(
     if first_err.is_none() && depth.is_some() {
         let collected = boundaries.drain();
         if !collected.is_empty() {
-            let git_dir = git_dir_for(repo_dir.as_path());
+            let git_dir = git_dir_for(ctx.repo_dir.as_path());
             tokio::task::spawn_blocking(move || git::write_shallow_file(&git_dir, &collected))
                 .await
                 .map_err(FetchError::from)?
@@ -454,22 +453,19 @@ mod tests {
     #[tokio::test]
     async fn fetch_batch_empty_cmds_short_circuits() {
         use crate::object_store::mock::MockStore;
-        // Empty-cmds early return at `fetch_batch:125` — no store call,
-        // no spawn. Covers the internal short-circuit that the
-        // integration test cannot reach (the REPL never calls
-        // `fetch_batch` with an empty Vec because the Empty arm guards
-        // on `!fetch_cmds.is_empty()`).
+        use crate::protocol::BatchCtx;
+        // Empty-cmds early return — no store call, no spawn. Covers the
+        // internal short-circuit that the integration test cannot reach
+        // (the REPL never calls `fetch_batch` with an empty Vec because
+        // `BatchState::take_pending` guards on non-empty cmds).
         let store: Arc<dyn ObjectStore> = Arc::new(MockStore::new());
         let repo_dir = tempfile::tempdir().expect("tempdir");
-        let result = fetch_batch(
+        let ctx = BatchCtx {
             store,
-            Some("repo".into()),
-            Arc::new(repo_dir.path().to_path_buf()),
-            Vec::new(),
-            FetchedRefs::new(),
-            None,
-        )
-        .await;
+            prefix: Some("repo".into()),
+            repo_dir: Arc::new(repo_dir.path().to_path_buf()),
+        };
+        let result = fetch_batch(&ctx, Vec::new(), FetchedRefs::new(), None).await;
         assert!(matches!(result, Ok(())));
     }
 }

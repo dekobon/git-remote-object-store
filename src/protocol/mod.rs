@@ -90,6 +90,73 @@ enum Mode {
     Push,
 }
 
+/// Session-fixed infrastructure shared by [`fetch_batch`] and [`push_batch`].
+///
+/// Created once per [`run`] call and passed by shared reference to both
+/// batch handlers so the call sites don't repeat the `(store, prefix,
+/// repo_dir)` triple.
+pub(crate) struct BatchCtx {
+    pub(crate) store: Arc<dyn ObjectStore>,
+    /// Optional repository prefix within the bucket / container.
+    pub(crate) prefix: Option<String>,
+    pub(crate) repo_dir: Arc<PathBuf>,
+}
+
+/// Accumulates `fetch` / `push` commands until a blank line flushes the batch.
+///
+/// The REPL protocol delivers commands as a batch separated by a blank
+/// line.  Mode switches between fetch and push (rare but spec-allowed)
+/// reset both accumulators so stale commands from the prior mode are
+/// discarded.
+struct BatchState {
+    mode: Option<Mode>,
+    fetch_cmds: Vec<String>,
+    push_cmds: Vec<String>,
+}
+
+impl BatchState {
+    fn new() -> Self {
+        Self {
+            mode: None,
+            fetch_cmds: Vec::new(),
+            push_cmds: Vec::new(),
+        }
+    }
+
+    /// Record one command for `incoming` mode, resetting the other
+    /// accumulator if the mode has changed.
+    fn accumulate(&mut self, incoming: Mode, cmd: String) {
+        if self.mode != Some(incoming) {
+            self.fetch_cmds.clear();
+            self.push_cmds.clear();
+            self.mode = Some(incoming);
+        }
+        match incoming {
+            Mode::Fetch => self.fetch_cmds.push(cmd),
+            Mode::Push => self.push_cmds.push(cmd),
+        }
+    }
+
+    /// Drain the pending batch, returning `(mode, cmds)` when non-empty.
+    ///
+    /// Returns `None` if there is no current mode or the accumulator is
+    /// empty, leaving state unchanged so the REPL can still emit the
+    /// mandatory blank-line acknowledgement.
+    fn take_pending(&mut self) -> Option<(Mode, Vec<String>)> {
+        match self.mode {
+            Some(Mode::Fetch) if !self.fetch_cmds.is_empty() => {
+                self.mode = None;
+                Some((Mode::Fetch, std::mem::take(&mut self.fetch_cmds)))
+            }
+            Some(Mode::Push) if !self.push_cmds.is_empty() => {
+                self.mode = None;
+                Some((Mode::Push, std::mem::take(&mut self.push_cmds)))
+            }
+            _ => None,
+        }
+    }
+}
+
 fn parse_command(line: &str) -> Option<Command> {
     let trimmed = line.trim_end_matches(['\r', '\n']);
     if trimmed.is_empty() {
@@ -144,11 +211,8 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut lines = reader.lines();
-    let repo_dir = Arc::new(repo_dir);
     let fetched_refs = FetchedRefs::new();
-    let mut mode: Option<Mode> = None;
-    let mut fetch_cmds: Vec<String> = Vec::new();
-    let mut push_cmds: Vec<String> = Vec::new();
+    let mut batch = BatchState::new();
     // Per-operation `option depth <N>` is set immediately before a
     // fetch batch and reset to `None` once that batch drains. Depth is
     // not session-sticky — git re-issues `option depth` for each
@@ -156,6 +220,11 @@ where
     let mut depth: Option<NonZeroU32> = None;
     let zip = remote.flags().zip;
     let engine = remote.flags().engine.unwrap_or(StorageEngine::Bundle);
+    let ctx = BatchCtx {
+        store,
+        prefix: remote.prefix().map(str::to_owned),
+        repo_dir: Arc::new(repo_dir),
+    };
 
     while let Some(line) = lines.next_line().await? {
         debug!(cmd = %line, "received protocol command");
@@ -168,7 +237,13 @@ where
                 capabilities::handle_capabilities(&mut writer).await?;
             }
             Command::List { for_push } => {
-                list::handle_list(store.as_ref(), remote.prefix(), for_push, &mut writer).await?;
+                list::handle_list(
+                    ctx.store.as_ref(),
+                    ctx.prefix.as_deref(),
+                    for_push,
+                    &mut writer,
+                )
+                .await?;
             }
             Command::Option(args) => {
                 let effect = handle_option(&args, reload.as_ref(), &mut writer).await?;
@@ -176,57 +251,27 @@ where
                     depth = Some(d);
                 }
             }
-            Command::Fetch(args) => {
-                if mode != Some(Mode::Fetch) {
-                    fetch_cmds.clear();
-                    push_cmds.clear();
-                    mode = Some(Mode::Fetch);
-                }
-                fetch_cmds.push(args);
-            }
-            Command::Push(args) => {
-                if mode != Some(Mode::Push) {
-                    push_cmds.clear();
-                    fetch_cmds.clear();
-                    mode = Some(Mode::Push);
-                }
-                push_cmds.push(args);
-            }
+            Command::Fetch(args) => batch.accumulate(Mode::Fetch, args),
+            Command::Push(args) => batch.accumulate(Mode::Push, args),
             Command::Empty => {
-                if mode == Some(Mode::Fetch) && !fetch_cmds.is_empty() {
-                    let drained = std::mem::take(&mut fetch_cmds);
-                    // Take depth so it applies to *this* batch only; a
-                    // subsequent fetch without a fresh `option depth`
-                    // line must clone fully, matching upstream git's
-                    // per-operation depth contract.
-                    let batch_depth = depth.take();
-                    fetch_batch(
-                        Arc::clone(&store),
-                        remote.prefix().map(str::to_owned),
-                        Arc::clone(&repo_dir),
-                        drained,
-                        fetched_refs.clone(),
-                        batch_depth,
-                    )
-                    .await?;
-                    mode = None;
-                } else if mode == Some(Mode::Push) && !push_cmds.is_empty() {
-                    let drained = std::mem::take(&mut push_cmds);
-                    let outcomes = push_batch(
-                        Arc::clone(&store),
-                        remote.prefix().map(str::to_owned),
-                        Arc::clone(&repo_dir),
-                        zip,
-                        engine,
-                        drained,
-                    )
-                    .await?;
-                    for outcome in &outcomes {
-                        writer
-                            .write_all(outcome.to_protocol_line().as_bytes())
-                            .await?;
+                if let Some((mode, cmds)) = batch.take_pending() {
+                    match mode {
+                        Mode::Fetch => {
+                            // Take depth so it applies to *this* batch only; a
+                            // subsequent fetch without a fresh `option depth`
+                            // line must clone fully, matching upstream git's
+                            // per-operation depth contract.
+                            fetch_batch(&ctx, cmds, fetched_refs.clone(), depth.take()).await?;
+                        }
+                        Mode::Push => {
+                            let outcomes = push_batch(&ctx, zip, engine, cmds).await?;
+                            for outcome in &outcomes {
+                                writer
+                                    .write_all(outcome.to_protocol_line().as_bytes())
+                                    .await?;
+                            }
+                        }
                     }
-                    mode = None;
                 }
                 writer.write_all(b"\n").await?;
                 writer.flush().await?;

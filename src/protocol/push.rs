@@ -15,7 +15,6 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use bytes::Bytes;
 use time::{Duration, OffsetDateTime};
@@ -307,9 +306,7 @@ async fn delete_idempotent(store: &dyn ObjectStore, key: &str) -> Result<(), Obj
 /// [`PushError`]; per-ref failures are encoded as
 /// [`PushOutcome::Error`] and the batch continues.
 pub(crate) async fn push_batch(
-    store: Arc<dyn ObjectStore>,
-    prefix: Option<String>,
-    repo_dir: Arc<PathBuf>,
+    ctx: &super::BatchCtx,
     zip: bool,
     engine: StorageEngine,
     cmds: Vec<String>,
@@ -334,9 +331,9 @@ pub(crate) async fn push_batch(
         // can still render an `error <ref> ...` line if the call fails.
         let remote_ref_str = spec.remote_ref.as_str().to_owned();
         let outcome = match push_one(
-            store.as_ref(),
-            prefix.as_deref(),
-            repo_dir.as_path(),
+            ctx.store.as_ref(),
+            ctx.prefix.as_deref(),
+            ctx.repo_dir.as_path(),
             &config,
             OffsetDateTime::now_utc(),
             spec,
