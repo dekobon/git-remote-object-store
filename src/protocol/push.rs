@@ -814,6 +814,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_push_args_accepts_force_delete_form() {
+        let spec = parse_push_args("+:refs/heads/main").expect("parse");
+        assert!(spec.force);
+        assert!(spec.local_spec.is_empty());
+        assert_eq!(spec.remote_ref.as_str(), "refs/heads/main");
+    }
+
+    #[test]
     fn parse_push_args_accepts_short_local() {
         let spec = parse_push_args("HEAD:refs/heads/main").expect("parse");
         assert_eq!(spec.local_spec, "HEAD");
