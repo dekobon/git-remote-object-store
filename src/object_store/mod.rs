@@ -274,12 +274,7 @@ impl<T: ObjectStore + ?Sized> ObjectStore for Arc<T> {
         (**self).put_bytes(key, body, opts).await
     }
 
-    async fn put_path(
-        &self,
-        key: &str,
-        src: &Path,
-        opts: PutOpts,
-    ) -> Result<(), ObjectStoreError> {
+    async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), ObjectStoreError> {
         (**self).put_path(key, src, opts).await
     }
 
