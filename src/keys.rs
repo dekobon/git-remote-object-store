@@ -40,15 +40,12 @@ pub(crate) fn bundle_key(
     ref_name: impl fmt::Display,
     sha: impl fmt::Display,
 ) -> String {
-    match prefix.unwrap_or("") {
-        "" => format!("{ref_name}/{sha}.bundle"),
-        p => format!("{p}/{ref_name}/{sha}.bundle"),
-    }
+    join(prefix.unwrap_or(""), &format!("{ref_name}/{sha}.bundle"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::join;
+    use super::{bundle_key, join};
 
     #[test]
     fn joins_prefix_and_suffix_with_slash() {
@@ -74,5 +71,32 @@ mod tests {
     fn empty_prefix_and_suffix_yields_empty_string() {
         // Listing the bucket root with no prefix at all.
         assert_eq!(join("", ""), "");
+    }
+
+    #[test]
+    fn bundle_key_with_prefix() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            bundle_key(Some("acme"), "refs/heads/main", sha),
+            format!("acme/refs/heads/main/{sha}.bundle"),
+        );
+    }
+
+    #[test]
+    fn bundle_key_without_prefix() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            bundle_key(None, "refs/heads/main", sha),
+            format!("refs/heads/main/{sha}.bundle"),
+        );
+    }
+
+    #[test]
+    fn bundle_key_empty_prefix_matches_none() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            bundle_key(Some(""), "refs/heads/main", sha),
+            bundle_key(None, "refs/heads/main", sha),
+        );
     }
 }

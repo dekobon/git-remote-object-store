@@ -349,7 +349,9 @@ impl<'a> Doctor<'a> {
 /// `fix_head`'s branch picker. Returns the full path if it has no
 /// slashes (e.g. a single-component ref).
 fn short_branch_name(full: &str) -> &str {
-    full.rsplit('/').next().unwrap_or(full)
+    full.rsplit('/')
+        .next()
+        .expect("rsplit always yields at least one element")
 }
 
 #[cfg(test)]

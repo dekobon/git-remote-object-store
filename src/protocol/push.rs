@@ -515,8 +515,9 @@ async fn prepare_push(
     if pre_bundles.len() > 1 {
         return Ok(PrepareOutcome::Done(PushOutcome::Error {
             remote_ref: remote_ref_str,
-            message: r#""multiple bundles exists on server. Run git-remote-object-store doctor to fix."?"#
-                .to_owned(),
+            message:
+                r#""multiple bundles exist on server. Run git-remote-object-store doctor to fix."?"#
+                    .to_owned(),
         }));
     }
     let pre_existing = pre_bundles.into_iter().next().map(|m| m.key);
@@ -664,13 +665,15 @@ async fn perform_push_under_lock(
     if current.len() > 1 {
         return Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
-            message: r#""multiple bundles exists for the same ref on server. Run git-remote-object-store doctor to fix."?"#.to_owned(),
+            message: r#""multiple bundles exist for the same ref on server. Run git-remote-object-store doctor to fix."?"#.to_owned(),
         });
     }
     let current_key = current.into_iter().next().map(|m| m.key);
-    if let (Some(prev), Some(now_key)) = (pre_existing.as_deref(), current_key.as_deref())
-        && prev != now_key
-    {
+    // Compare the pre-lock snapshot to the under-lock reality. All four
+    // cases (None/None, Some/Some-same, Some/Some-diff, None/Some, Some/None)
+    // must be checked: a concurrent push that created or replaced the bundle
+    // while we prepared ours would be silently overwritten without this guard.
+    if pre_existing.as_deref() != current_key.as_deref() {
         return Ok(PushOutcome::Error {
             remote_ref: remote_ref_str.clone(),
             message: r#""stale remote. Please fetch and retry."?"#.to_owned(),
@@ -732,6 +735,11 @@ async fn perform_push_under_lock(
     })
 }
 
+/// Expected key count for a non-zip ref: one bundle object.
+const DELETE_EXPECTED_NO_ZIP: usize = 1;
+/// Expected key count for a zip ref: one bundle + one archive object.
+const DELETE_EXPECTED_WITH_ZIP: usize = 2;
+
 /// Handle a delete refspec (`:<remote_ref>`). Mirrors upstream
 /// `remove_remote_ref`: list `<prefix>/<ref>/`, expect 1 (or 2 with zip)
 /// keys, delete them all, emit `ok` or the appropriate error.
@@ -755,7 +763,11 @@ async fn delete_remote_ref(
 ) -> Result<PushOutcome, PushError> {
     let listing = ref_listing_prefix(prefix, remote_ref);
     let entries = store.list(&listing).await?;
-    let expected = if zip { 2 } else { 1 };
+    let expected = if zip {
+        DELETE_EXPECTED_WITH_ZIP
+    } else {
+        DELETE_EXPECTED_NO_ZIP
+    };
     let remote_ref_str = remote_ref.as_str().to_owned();
     if entries.len() == expected {
         for entry in &entries {
@@ -767,12 +779,14 @@ async fn delete_remote_ref(
     } else if entries.is_empty() {
         Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
-            message: "not found".to_owned(),
+            message: r#""not found"?"#.to_owned(),
         })
     } else {
         Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
-            message: r#""multiple bundles exists on server. Run git-remote-object-store doctor to fix."?"#.to_owned(),
+            message:
+                r#""multiple bundles exist on server. Run git-remote-object-store doctor to fix."?"#
+                    .to_owned(),
         })
     }
 }
@@ -1184,23 +1198,25 @@ mod tests {
     fn duplicate_bundle_errors_use_consistent_wire_format() {
         let pre_lock_line = PushOutcome::Error {
             remote_ref: "refs/heads/main".into(),
-            message: r#""multiple bundles exists on server. Run git-remote-object-store doctor to fix."?"#.to_owned(),
+            message:
+                r#""multiple bundles exist on server. Run git-remote-object-store doctor to fix."?"#
+                    .to_owned(),
         }
         .to_protocol_line();
         let under_lock_line = PushOutcome::Error {
             remote_ref: "refs/heads/main".into(),
-            message: r#""multiple bundles exists for the same ref on server. Run git-remote-object-store doctor to fix."?"#.to_owned(),
+            message: r#""multiple bundles exist for the same ref on server. Run git-remote-object-store doctor to fix."?"#.to_owned(),
         }
         .to_protocol_line();
 
         assert_eq!(
             pre_lock_line,
-            "error refs/heads/main \"multiple bundles exists on server. \
+            "error refs/heads/main \"multiple bundles exist on server. \
              Run git-remote-object-store doctor to fix.\"?\n",
         );
         assert_eq!(
             under_lock_line,
-            "error refs/heads/main \"multiple bundles exists for the same ref on server. \
+            "error refs/heads/main \"multiple bundles exist for the same ref on server. \
              Run git-remote-object-store doctor to fix.\"?\n",
         );
         assert!(pre_lock_line.ends_with("\"?\n"));

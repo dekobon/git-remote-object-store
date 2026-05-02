@@ -459,12 +459,14 @@ mod tests {
         // (the REPL never calls `fetch_batch` with an empty Vec because
         // `BatchState::take_pending` guards on non-empty cmds).
         //
-        // The armed fault acts as a tripwire: if any store method is
-        // invoked, it fires and the test fails with an error instead of
-        // passing silently.
+        // The armed fault acts as a tripwire: if `fetch_batch` makes any
+        // listing call, it fires and the test fails with an error. The fetch
+        // path uses `store.list()` (not `get_bytes()`) for bundle discovery,
+        // so `AccessDeniedOnList` is the right variant to catch an accidental
+        // store call here.
         let mock = Arc::new(MockStore::new());
-        mock.arm(Fault::NetworkOnGetBytes {
-            key: "sentinel".to_owned(),
+        mock.arm(Fault::AccessDeniedOnList {
+            prefix: "repo".to_owned(),
         });
         let repo_dir = tempfile::tempdir().expect("tempdir");
         let ctx = BatchCtx {
