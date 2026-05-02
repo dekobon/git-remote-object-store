@@ -81,10 +81,7 @@ impl RepoSnapshot {
 ///
 /// Returns [`ManageError::Store`] if the list or HEAD-object get calls
 /// fail.
-pub async fn analyze(
-    store: &dyn ObjectStore,
-    prefix: &str,
-) -> Result<RepoSnapshot, ManageError> {
+pub async fn analyze(store: &dyn ObjectStore, prefix: &str) -> Result<RepoSnapshot, ManageError> {
     let list_prefix = keys::join(prefix, "");
     let objects = store.list(&list_prefix).await?;
     analyze_objects(&objects, &list_prefix, store).await
