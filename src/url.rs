@@ -424,41 +424,9 @@ fn finish_s3(
         .host_str()
         .ok_or(ParseError::MissingHost)?
         .to_owned();
-    // Compute addressing and the AWS bucket prefix together. Path-style
-    // skips the rfind scan entirely; virtual-hosted (auto or explicit)
-    // runs it once and reuses the result for both detection and extraction.
-    let (addressing, aws_bucket) = match addressing_override {
-        Some(AddressingOverride::Path) => (S3Addressing::PathStyle, None),
-        Some(AddressingOverride::Virtual) => {
-            (S3Addressing::VirtualHosted, s3_virtual_hosted_bucket(&host))
-        }
-        None => {
-            let b = s3_virtual_hosted_bucket(&host);
-            let a = if b.is_some() {
-                S3Addressing::VirtualHosted
-            } else {
-                S3Addressing::PathStyle
-            };
-            (a, b)
-        }
-    };
 
-    let (bucket, prefix_segments) = match addressing {
-        S3Addressing::VirtualHosted => {
-            // aws_bucket covers both auto-detected and explicit
-            // `?addressing=virtual` for AWS hosts. Falls back to the
-            // leftmost label for non-AWS virtual-hosted endpoints, which
-            // by convention put the bucket as the leftmost label.
-            let bucket = aws_bucket
-                .or_else(|| leftmost_label(&host))
-                .ok_or(ParseError::MissingBucket)?;
-            (bucket, segments.as_slice())
-        }
-        S3Addressing::PathStyle => {
-            let (head, tail) = segments.split_first().ok_or(ParseError::MissingBucket)?;
-            (head.clone(), tail)
-        }
-    };
+    let (addressing, bucket, prefix_segments) =
+        resolve_s3_components(&host, &segments, addressing_override)?;
 
     if !is_valid_bucket(&bucket) {
         return Err(ParseError::InvalidBucket(bucket));
@@ -481,6 +449,54 @@ fn finish_s3(
         addressing,
         flags,
     })
+}
+
+/// Determine S3 addressing style and extract the bucket name and prefix
+/// segments from the URL's host and path.
+///
+/// Path-style skips the `rfind` scan entirely; virtual-hosted (auto or
+/// explicit) runs it once and reuses the result for both detection and
+/// extraction.
+fn resolve_s3_components<'a>(
+    host: &str,
+    segments: &'a [String],
+    addressing_override: Option<AddressingOverride>,
+) -> Result<(S3Addressing, String, &'a [String]), ParseError> {
+    // Compute addressing and the AWS bucket prefix together.
+    let (addressing, aws_bucket) = match addressing_override {
+        Some(AddressingOverride::Path) => (S3Addressing::PathStyle, None),
+        Some(AddressingOverride::Virtual) => {
+            (S3Addressing::VirtualHosted, s3_virtual_hosted_bucket(host))
+        }
+        None => {
+            let b = s3_virtual_hosted_bucket(host);
+            let style = if b.is_some() {
+                S3Addressing::VirtualHosted
+            } else {
+                S3Addressing::PathStyle
+            };
+            (style, b)
+        }
+    };
+
+    let (bucket, prefix_segments) = match addressing {
+        S3Addressing::VirtualHosted => {
+            // `aws_bucket` covers both auto-detected and explicit
+            // `?addressing=virtual` for AWS hosts. Falls back to the
+            // leftmost label for non-AWS virtual-hosted endpoints, which
+            // by convention put the bucket as the leftmost label.
+            let bucket = aws_bucket
+                .or_else(|| leftmost_label(host))
+                .ok_or(ParseError::MissingBucket)?;
+            (bucket, segments)
+        }
+        S3Addressing::PathStyle => {
+            let (head, tail) = segments.split_first().ok_or(ParseError::MissingBucket)?;
+            (head.clone(), tail)
+        }
+    };
+
+    Ok((addressing, bucket, prefix_segments))
 }
 
 /// AWS virtual-hosted infixes anchored at the start of the
@@ -534,26 +550,15 @@ fn finish_azure(
         .host_str()
         .ok_or(ParseError::MissingHost)?
         .to_owned();
+
     let addressing = match addressing_override {
         Some(AddressingOverride::Path) => AzureAddressing::PathStyle,
         Some(AddressingOverride::Virtual) => AzureAddressing::VirtualHosted,
         None => detect_azure_addressing(&host),
     };
 
-    let (account, container, prefix_segments) = match addressing {
-        AzureAddressing::VirtualHosted => {
-            let account = leftmost_label(&host).ok_or(ParseError::MissingAccount)?;
-            match segments.as_slice() {
-                [] => return Err(ParseError::MissingContainer),
-                [container, rest @ ..] => (account, container.clone(), rest),
-            }
-        }
-        AzureAddressing::PathStyle => match segments.as_slice() {
-            [] => return Err(ParseError::MissingAccount),
-            [_] => return Err(ParseError::MissingContainer),
-            [account, container, rest @ ..] => (account.clone(), container.clone(), rest),
-        },
-    };
+    let (account, container, prefix_segments) =
+        resolve_azure_components(addressing, &host, &segments)?;
 
     if !is_valid_account(&account) {
         return Err(ParseError::InvalidAccount(account));
@@ -582,6 +587,29 @@ fn finish_azure(
         addressing,
         flags,
     })
+}
+
+/// Extract the storage account, container, and prefix segments from the
+/// URL's host and path, according to the resolved addressing style.
+fn resolve_azure_components<'a>(
+    addressing: AzureAddressing,
+    host: &str,
+    segments: &'a [String],
+) -> Result<(String, String, &'a [String]), ParseError> {
+    match addressing {
+        AzureAddressing::VirtualHosted => {
+            let account = leftmost_label(host).ok_or(ParseError::MissingAccount)?;
+            match segments {
+                [] => Err(ParseError::MissingContainer),
+                [container, rest @ ..] => Ok((account, container.clone(), rest)),
+            }
+        }
+        AzureAddressing::PathStyle => match segments {
+            [] => Err(ParseError::MissingAccount),
+            [_] => Err(ParseError::MissingContainer),
+            [account, container, rest @ ..] => Ok((account.clone(), container.clone(), rest)),
+        },
+    }
 }
 
 fn detect_azure_addressing(host: &str) -> AzureAddressing {

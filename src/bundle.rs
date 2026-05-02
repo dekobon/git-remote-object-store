@@ -66,49 +66,15 @@ impl BundleHeader {
         loop {
             line.clear();
             file.read_line(&mut line)?;
-            let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-
-            if trimmed.is_empty() {
-                break;
-            }
-
-            if let Some(rest) = trimmed.strip_prefix('-') {
-                // Prerequisite line: -<sha40> [optional comment]
-                let sha_hex = rest.split_once(' ').map_or(rest, |(s, _)| s);
-                let oid = ObjectId::from_hex(sha_hex.as_bytes()).map_err(|_| {
-                    BundleError::InvalidHeader(format!("bad prerequisite SHA: {sha_hex:?}"))
-                })?;
-                prerequisites.push(oid);
-            } else {
-                // Ref line: <sha40> <refname>
-                let mut parts = trimmed.splitn(2, ' ');
-                let sha_hex = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
-                    BundleError::InvalidHeader(format!("empty ref line: {trimmed:?}"))
-                })?;
-                let ref_name = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
-                    BundleError::InvalidHeader(format!("missing ref name: {trimmed:?}"))
-                })?;
-                let oid = ObjectId::from_hex(sha_hex.as_bytes())
-                    .map_err(|_| BundleError::InvalidHeader(format!("bad ref SHA: {sha_hex:?}")))?;
-                refs.push((oid, ref_name.as_bytes().to_vec()));
+            match parse_header_entry(&line)? {
+                HeaderEntry::End => break,
+                HeaderEntry::Prerequisite(oid) => prerequisites.push(oid),
+                HeaderEntry::Ref(oid, name) => refs.push((oid, name)),
             }
         }
 
         let pack_offset = file.stream_position()?;
-
-        // Sanity check: the next four bytes must be b"PACK".
-        let mut magic_buf = [0u8; 4];
-        let n = file.read(&mut magic_buf)?;
-        if n < 4 {
-            return Err(BundleError::InvalidHeader(
-                "bundle truncated before PACK data".to_owned(),
-            ));
-        }
-        if &magic_buf != b"PACK" {
-            return Err(BundleError::InvalidHeader(
-                "expected PACK magic after bundle header".to_owned(),
-            ));
-        }
+        verify_pack_magic(&mut file)?;
 
         Ok(BundleHeader {
             version: 2,
@@ -117,6 +83,64 @@ impl BundleHeader {
             pack_offset,
         })
     }
+}
+
+/// A single entry from the bundle v2 text header.
+enum HeaderEntry {
+    /// The blank line that terminates the header section.
+    End,
+    /// A `-<sha40>` prerequisite line.
+    Prerequisite(ObjectId),
+    /// A `<sha40> <refname>` ref line.
+    Ref(ObjectId, Vec<u8>),
+}
+
+/// Classify one header line as a prerequisite, ref, or end-of-header.
+///
+/// The trailing `\n` / `\r\n` is stripped before classification.
+fn parse_header_entry(line: &str) -> Result<HeaderEntry, BundleError> {
+    let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+    if trimmed.is_empty() {
+        return Ok(HeaderEntry::End);
+    }
+    if let Some(rest) = trimmed.strip_prefix('-') {
+        // Prerequisite line: -<sha40> [optional comment]
+        let sha_hex = rest.split_once(' ').map_or(rest, |(s, _)| s);
+        let oid = ObjectId::from_hex(sha_hex.as_bytes()).map_err(|_| {
+            BundleError::InvalidHeader(format!("bad prerequisite SHA: {sha_hex:?}"))
+        })?;
+        return Ok(HeaderEntry::Prerequisite(oid));
+    }
+    // Ref line: <sha40> <refname>
+    let mut parts = trimmed.splitn(2, ' ');
+    let sha_hex = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| BundleError::InvalidHeader(format!("empty ref line: {trimmed:?}")))?;
+    let ref_name = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| BundleError::InvalidHeader(format!("missing ref name: {trimmed:?}")))?;
+    let oid = ObjectId::from_hex(sha_hex.as_bytes())
+        .map_err(|_| BundleError::InvalidHeader(format!("bad ref SHA: {sha_hex:?}")))?;
+    Ok(HeaderEntry::Ref(oid, ref_name.as_bytes().to_vec()))
+}
+
+/// Verify that the next four bytes in `file` are the `PACK` magic.
+fn verify_pack_magic<R: Read>(file: &mut R) -> Result<(), BundleError> {
+    let mut buf = [0u8; 4];
+    let n = file.read(&mut buf)?;
+    if n < 4 {
+        return Err(BundleError::InvalidHeader(
+            "bundle truncated before PACK data".to_owned(),
+        ));
+    }
+    if &buf != b"PACK" {
+        return Err(BundleError::InvalidHeader(
+            "expected PACK magic after bundle header".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Create a git bundle v2 file at `<folder>/<sha>.bundle` and return the path.
@@ -134,15 +158,7 @@ pub fn create(cwd: &Path, folder: &Path, sha: Sha, spec: &str) -> Result<PathBuf
     // this call; divergence (e.g. a concurrent ref update) produces a bundle
     // whose header SHA does not match its pack content.
     let (tip_id, ref_name_bytes) = resolve_spec_to_ref(&repo, spec)?;
-
-    // Walk all commits reachable from tip_id and collect their OIDs.
-    let commit_ids: Vec<ObjectId> = repo
-        .rev_walk([tip_id])
-        .all()
-        .map_err(|e| BundleError::Walk(Box::new(e)))?
-        .map(|info| info.map(|i| i.id))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| BundleError::Walk(Box::new(e)))?;
+    let commit_ids = collect_commit_ids(&repo, tip_id)?;
 
     // Strip the Proxy wrapper to expose the gix_pack::Find impl needed by the
     // output pipeline (gix::OdbHandle = Proxy<Cache<...>> does not implement
@@ -188,14 +204,7 @@ pub fn create(cwd: &Path, folder: &Path, sha: Sha, spec: &str) -> Result<PathBuf
     let bundle_path = folder.join(format!("{sha}.bundle"));
     let mut tmp = NamedTempFile::new_in(&folder)?;
 
-    // Bundle v2 text header: magic, one ref line, blank separator.
-    writeln!(tmp, "{BUNDLE_V2_MAGIC}")?;
-    // ref_name_bytes originates from gix::FullNameRef (always UTF-8) or from
-    // spec.as_bytes() (str is always UTF-8), so the conversion cannot fail.
-    let ref_name_str =
-        std::str::from_utf8(&ref_name_bytes).expect("git ref names are guaranteed UTF-8");
-    writeln!(tmp, "{sha} {ref_name_str}")?;
-    writeln!(tmp)?;
+    write_bundle_header(&mut tmp, sha, &ref_name_bytes)?;
 
     let pack_iter = FromEntriesIter::new(
         entries_iter,
@@ -211,6 +220,36 @@ pub fn create(cwd: &Path, folder: &Path, sha: Sha, spec: &str) -> Result<PathBuf
     tmp.persist(&bundle_path)
         .map_err(|e| BundleError::Io(e.error))?;
     Ok(bundle_path)
+}
+
+/// Walk all commits reachable from `tip_id` and return their OIDs.
+fn collect_commit_ids(
+    repo: &gix::Repository,
+    tip_id: ObjectId,
+) -> Result<Vec<ObjectId>, BundleError> {
+    repo.rev_walk([tip_id])
+        .all()
+        .map_err(|e| BundleError::Walk(Box::new(e)))?
+        .map(|info| info.map(|i| i.id))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| BundleError::Walk(Box::new(e)))
+}
+
+/// Write the bundle v2 text header (magic line, one ref line, blank separator).
+///
+/// `ref_name_bytes` must be valid UTF-8; this is guaranteed by the caller
+/// since ref names come from `gix::FullNameRef` or from a `&str` spec.
+fn write_bundle_header<W: Write>(
+    writer: &mut W,
+    sha: Sha,
+    ref_name_bytes: &[u8],
+) -> Result<(), BundleError> {
+    let ref_name_str =
+        std::str::from_utf8(ref_name_bytes).expect("git ref names are guaranteed UTF-8");
+    writeln!(writer, "{BUNDLE_V2_MAGIC}")?;
+    writeln!(writer, "{sha} {ref_name_str}")?;
+    writeln!(writer)?;
+    Ok(())
 }
 
 /// Install the pack from `<folder>/<sha>.bundle` into the repository at `cwd`.
