@@ -136,12 +136,27 @@ used by every other `error <ref>` line in the helper. The existing test
 was found by audit, not by the test suite. The strengthened test now
 pins the byte-exact line.
 
+**Shallow-boundary depth-reset test used a root commit that made the
+test vacuous** (#50, d32741cb). The `depth_resets_between_batches`
+integration test sent a second fetch batch targeting an orphan (root)
+commit — a commit with no parents. `shallow_boundaries` on a root
+commit always returns `[]` for any depth value because there are no
+parent edges to walk. The test passed even when the depth option
+*did* leak between batches, because the structural choice of input
+made the assertion unconditionally true. The fix replaced the orphan
+target with a commit that has parents, so depth-leak actually
+produces a non-empty boundary that the assertion can catch.
+
 **Lesson**: For any output that is part of a protocol contract (helper
 stdout, LFS JSON events, exit codes that downstream parses), assert
 byte-exact equality on the relevant span. Reserve `contains` for
 human-readable diagnostic strings where exact wording is allowed to
-drift. The `audit-tests` skill exists for this category — use it on
-new protocol tests before merge.
+drift. The same principle extends to test *inputs*: verify that the
+chosen fixture is capable of falsifying the assertion — a structurally
+vacuous input (no parents, empty set, zero length) makes any depth,
+presence, or boundary check unconditionally true and hides the very
+bug the test was written to catch. The `audit-tests` skill exists for
+this category — use it on new protocol tests before merge.
 
 ---
 
@@ -298,5 +313,40 @@ fold the missing step into `spec_helper.sh` (or the analogous
 fixture) so the harness is self-contained. Cross-link from the
 fixture comment to the README section so a future reader sees the
 production/test parallel.
+
+---
+
+## 9. Feature-gated integration tests hide visibility regressions from `cargo test`
+
+Integration test files in `tests/` that start with
+`#![cfg(feature = "...")]` compile as empty translation units when
+the feature is not enabled. Every identifier resolution, every
+visibility check (E0603), and every type error inside the file is
+skipped. A plain `cargo test` (no `--all-features`) reports zero
+failures even when the file references items that became inaccessible
+— so a visibility regression such as narrowing `pub mod X` to
+`pub(crate) mod X` passes `cargo test` cleanly but breaks
+`cargo test --all-features` (what `make pre-commit` uses).
+
+**`pub(crate)` narrowing of `fetch` and `push` modules broke
+`make pre-commit`** (b691d90, dcfc73a). `b691d90` changed
+`pub mod fetch` and `pub mod push` in `src/protocol/mod.rs` to
+`pub(crate)`. The integration test files `tests/protocol_fetch.rs`
+and `tests/protocol_smoke.rs` reference `protocol::fetch::FetchError`
+and `protocol::push::PushError` from outside the crate. Both files
+are gated with `#![cfg(feature = "test-util")]`. Plain `cargo test`
+silently skipped both files; `make pre-commit` (with `--all-features`)
+caught the E0603 visibility errors. The regression shipped in a
+commit (b691d90) aimed at tightening visibility and was caught only
+when `make pre-commit` ran.
+
+**Lesson**: Treat `#![cfg(feature = "...")]`-gated integration test
+files as invisible to `cargo test` — they do not validate visibility
+or type-correctness under normal CI unless `--all-features` is
+explicitly passed. When narrowing the visibility of a `pub` item,
+check whether any gated test file under `tests/` references it;
+`make pre-commit` (or an equivalent `--all-features` check) must be
+part of the pre-merge gate. If CI runs `cargo test` without
+`--all-features`, it cannot be the sole correctness check.
 
 ---
