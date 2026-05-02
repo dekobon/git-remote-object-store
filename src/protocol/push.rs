@@ -655,11 +655,12 @@ async fn perform_push_under_lock(
         engine,
         _temp_dir,
     } = state;
+    let remote_ref_str = remote_ref.as_str().to_owned();
 
     let current = bundles_for_ref(store, prefix, &remote_ref).await?;
     if current.len() > 1 {
         return Ok(PushOutcome::Error {
-            remote_ref: remote_ref.as_str().to_owned(),
+            remote_ref: remote_ref_str,
             message: r#""multiple bundles exists for the same ref on server. Run git-remote-object-store doctor to fix."?"#.to_owned(),
         });
     }
@@ -668,7 +669,7 @@ async fn perform_push_under_lock(
         && prev != now_key
     {
         return Ok(PushOutcome::Error {
-            remote_ref: remote_ref.as_str().to_owned(),
+            remote_ref: remote_ref_str.clone(),
             message: r#""stale remote. Please fetch and retry."?"#.to_owned(),
         });
     }
@@ -724,7 +725,7 @@ async fn perform_push_under_lock(
     }
 
     Ok(PushOutcome::Ok {
-        remote_ref: remote_ref.as_str().to_owned(),
+        remote_ref: remote_ref_str,
     })
 }
 

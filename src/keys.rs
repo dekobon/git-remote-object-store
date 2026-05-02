@@ -23,16 +23,6 @@ use std::fmt;
 /// Callers who carry the prefix as `Option<&str>` should pass
 /// `prefix.unwrap_or("")`. `Some("")` and `None` collapse to the same
 /// "no prefix" key shape.
-/// Build the bundle key `<prefix>/<ref_name>/<sha>.bundle`, applying the
-/// same empty-prefix rule as [`join`].
-pub(crate) fn bundle_key(
-    prefix: Option<&str>,
-    ref_name: impl fmt::Display,
-    sha: impl fmt::Display,
-) -> String {
-    join(prefix.unwrap_or(""), &format!("{ref_name}/{sha}.bundle"))
-}
-
 pub(crate) fn join(prefix: &str, suffix: &str) -> String {
     if prefix.is_empty() {
         suffix.to_owned()
@@ -40,6 +30,19 @@ pub(crate) fn join(prefix: &str, suffix: &str) -> String {
         format!("{prefix}/")
     } else {
         format!("{prefix}/{suffix}")
+    }
+}
+
+/// Build the bundle key `<prefix>/<ref_name>/<sha>.bundle`, applying the
+/// same empty-prefix rule as [`join`].
+pub(crate) fn bundle_key(
+    prefix: Option<&str>,
+    ref_name: impl fmt::Display,
+    sha: impl fmt::Display,
+) -> String {
+    match prefix.unwrap_or("") {
+        "" => format!("{ref_name}/{sha}.bundle"),
+        p => format!("{p}/{ref_name}/{sha}.bundle"),
     }
 }
 
