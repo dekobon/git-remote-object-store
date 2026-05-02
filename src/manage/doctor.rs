@@ -238,7 +238,6 @@ impl<'a> Doctor<'a> {
     ) -> Result<(), ManageError> {
         if self.opts.delete_bundle {
             println!("Removing {}", losing.sha);
-            self.store.delete(&losing.key).await?;
         } else {
             // `Uuid::Simple`'s `Display` impl does NOT honor the
             // precision specifier (`{:.8}`), so encode into a stack
@@ -251,8 +250,8 @@ impl<'a> Doctor<'a> {
             let dst_key = keys::join(&self.prefix, &format!("{new_ref}/{}.bundle", losing.sha));
             println!("Moving {} to new branch {new_ref}", losing.sha);
             self.store.copy(&losing.key, &dst_key).await?;
-            self.store.delete(&losing.key).await?;
         }
+        self.store.delete(&losing.key).await?;
         Ok(())
     }
 
