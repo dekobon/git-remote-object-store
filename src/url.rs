@@ -505,7 +505,7 @@ fn resolve_s3_components<'a>(
 /// containing dots — or even a literal `.s3.` segment — survives
 /// intact and only the AWS service marker before the region is
 /// consumed.
-const AWS_S3_INFIXES: &[&str] = &[".s3.", ".s3-"];
+pub(crate) const AWS_S3_INFIXES: &[&str] = &[".s3.", ".s3-"];
 
 /// Extract the bucket prefix that precedes the AWS `.s3.` or `.s3-`
 /// service infix in `host`. Returns `None` for hosts that don't carry
@@ -517,7 +517,7 @@ const AWS_S3_INFIXES: &[&str] = &[".s3.", ".s3-"];
 /// extracted in full instead of being truncated at the first match.
 /// The returned string is the entire substring before the chosen
 /// infix, so dotted bucket names like `bucketname.com` survive intact.
-fn s3_virtual_hosted_bucket(host: &str) -> Option<String> {
+pub(crate) fn s3_virtual_hosted_bucket(host: &str) -> Option<String> {
     // Both infixes are 4 bytes, so the one whose rfind position is
     // numerically largest is the rightmost match in the string — no need
     // to track which infix won after taking the max.
@@ -868,6 +868,17 @@ mod tests {
         assert_eq!(
             detect_azure_addressing("127.0.0.1"),
             AzureAddressing::PathStyle
+        );
+    }
+
+    #[test]
+    fn azure_path_style_with_account_only_rejects_missing_container() {
+        // Path-style: host/account/container/prefix. Exactly one path
+        // segment means the container is absent — must be a parse error.
+        let err = parse("az+https://127.0.0.1/myaccount").unwrap_err();
+        assert!(
+            matches!(err, ParseError::MissingContainer),
+            "expected MissingContainer, got {err:?}",
         );
     }
 

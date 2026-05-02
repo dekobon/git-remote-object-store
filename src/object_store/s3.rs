@@ -90,7 +90,7 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use url::Url;
 
-use crate::url::{RemoteUrl, S3Addressing};
+use crate::url::{AWS_S3_INFIXES, RemoteUrl, S3Addressing, s3_virtual_hosted_bucket};
 
 use super::error::{network_boxed, other_boxed};
 use super::{
@@ -309,15 +309,22 @@ pub(crate) fn normalize_endpoint(
         let host = rewritten
             .host_str()
             .ok_or_else(|| ObjectStoreError::Other("endpoint URL has no host".into()))?;
-        let regional_host = host
-            .split_once('.')
-            .map(|(_bucket, rest)| rest)
+        // Use `s3_virtual_hosted_bucket` (rightmost-infix rfind) to find the
+        // bucket label length, then strip `bucket.` from the front. This
+        // handles dotted bucket names like `bucketname.com.s3.region.amazonaws.com`
+        // correctly; a plain `split_once('.')` would stop at the first dot
+        // and leave `com.s3.…` as the endpoint instead of `s3.…`.
+        // For non-AWS virtual-hosted endpoints without the `.s3.` infix
+        // (e.g. MinIO with `bucket.minio.example.com`), fall back to
+        // stripping just the leftmost label.
+        let regional_host = s3_virtual_hosted_bucket(host)
+            .map(|bucket| host[bucket.len() + 1..].to_owned())
+            .or_else(|| host.split_once('.').map(|(_, rest)| rest.to_owned()))
             .ok_or_else(|| {
                 ObjectStoreError::Other(
                     format!("virtual-hosted endpoint host `{host}` has no dot separator").into(),
                 )
-            })?
-            .to_owned();
+            })?;
         rewritten
             .set_host(Some(&regional_host))
             .map_err(other_boxed)?;
@@ -346,17 +353,32 @@ pub(crate) fn resolve_region(endpoint: &Url, flag: Option<&str>) -> Option<Strin
 fn extract_aws_region(host: &str) -> Option<String> {
     let trimmed = host.strip_suffix(".amazonaws.com")?;
     // Patterns we accept (in priority order):
-    //   <bucket>.s3.<region>      → middle is "s3", trailing label is region
-    //   s3.<region>               → leading "s3"
-    //   s3-<region>               → legacy hyphenated form
     //   s3                        → legacy us-east-1 (no region segment) → None
+    //   s3.<region>               → path-style regional
+    //   s3-<region>               → legacy hyphenated form
+    //   <bucket>.s3.<region>      → simple virtual-hosted (single-label bucket)
+    //   <dotted.bucket>.s3.<region>  → dotted-bucket virtual-hosted (4+ labels)
     let labels: Vec<&str> = trimmed.split('.').collect();
     match labels.as_slice() {
         ["s3"] => None,
         ["s3", region] => Some((*region).to_owned()),
         [_bucket, "s3", region] => Some((*region).to_owned()),
         [head] if head.starts_with("s3-") => Some(head["s3-".len()..].to_owned()),
-        _ => None,
+        // Dotted-bucket virtual-hosted: find the rightmost service infix
+        // (.s3. or .s3-) and return the segment after it as the region.
+        // e.g. "bucketname.com.s3.us-west-2" → "us-west-2"
+        // Use max by byte position so we pick the rightmost infix when
+        // both `.s3.` and `.s3-` appear in the host.
+        _ => AWS_S3_INFIXES
+            .iter()
+            .filter_map(|infix| {
+                trimmed
+                    .rfind(infix)
+                    .map(|idx| (idx, trimmed[idx + infix.len()..].to_owned()))
+            })
+            .max_by_key(|(idx, _)| *idx)
+            .map(|(_, region)| region)
+            .filter(|region| !region.is_empty() && !region.contains('.')),
     }
 }
 
@@ -1174,6 +1196,19 @@ mod tests {
         assert!(out.query().is_none());
     }
 
+    #[test]
+    fn normalize_endpoint_dotted_bucket_virtual_hosted() {
+        // Bucket name contains dots (e.g. "bucketname.com"). A plain
+        // `split_once('.')` would stop at the first dot and produce
+        // "com.s3.us-west-2.amazonaws.com" instead of the correct
+        // "s3.us-west-2.amazonaws.com".
+        let url = parse_endpoint("https://bucketname.com.s3.us-west-2.amazonaws.com/some/path");
+        let out = normalize_endpoint(&url, S3Addressing::VirtualHosted).unwrap();
+        assert_eq!(out.host_str(), Some("s3.us-west-2.amazonaws.com"));
+        assert_eq!(out.path(), "/");
+        assert!(out.query().is_none());
+    }
+
     // --- resolve_region -----------------------------------------------
 
     #[test]
@@ -1221,6 +1256,14 @@ mod tests {
     fn resolve_region_r2_endpoint_defaults_to_us_east_1() {
         let url = parse_endpoint("https://abc123.r2.cloudflarestorage.com/my-bucket");
         assert_eq!(resolve_region(&url, None), Some("us-east-1".to_owned()));
+    }
+
+    #[test]
+    fn resolve_region_dotted_bucket_virtual_hosted() {
+        // Bucket name contains dots. The host has 4+ labels after stripping
+        // `.amazonaws.com`; `extract_aws_region` must still find the region.
+        let url = parse_endpoint("https://bucketname.com.s3.us-west-2.amazonaws.com/some/path");
+        assert_eq!(resolve_region(&url, None), Some("us-west-2".to_owned()));
     }
 
     // --- encode_copy_source -------------------------------------------

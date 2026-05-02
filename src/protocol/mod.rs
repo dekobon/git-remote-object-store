@@ -123,12 +123,14 @@ impl BatchState {
         }
     }
 
-    /// Record one command for `incoming` mode, resetting the other
-    /// accumulator if the mode has changed.
+    /// Record one command for `incoming` mode, resetting the OTHER
+    /// mode's accumulator if the mode has changed.
     fn accumulate(&mut self, incoming: Mode, cmd: String) {
         if self.mode != Some(incoming) {
-            self.fetch_cmds.clear();
-            self.push_cmds.clear();
+            match incoming {
+                Mode::Fetch => self.push_cmds.clear(),
+                Mode::Push => self.fetch_cmds.clear(),
+            }
             self.mode = Some(incoming);
         }
         match incoming {

@@ -169,8 +169,16 @@ async fn validate_format(
     };
 
     // Trim ASCII whitespace so a trailing newline in the stored value does
-    // not cause a spurious parse failure.
-    let stored_name = String::from_utf8_lossy(&bytes);
+    // not cause a spurious parse failure. Use `from_utf8` (not lossy) so
+    // non-UTF-8 bytes in the FORMAT key surface as an error rather than
+    // silently producing a replacement-character engine name that would
+    // never match a valid StorageEngine variant.
+    let stored_name =
+        std::str::from_utf8(&bytes).map_err(|_| BackendError::InvalidCredentials {
+            source: ObjectStoreError::Other(Box::new(std::io::Error::other(
+                "FORMAT key contains non-UTF-8 bytes",
+            ))),
+        })?;
     let stored_name = stored_name.trim();
 
     let stored_engine =

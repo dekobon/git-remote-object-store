@@ -198,6 +198,7 @@ pub trait ObjectStore: Send + Sync {
              buffering the entire file in memory"
         );
         let body = tokio::fs::read(src).await.map_err(other_boxed)?;
+        // `usize` is at most 64 bits wide, so this cast never truncates.
         let len = body.len() as u64;
         let progress = opts.progress.clone();
         // Strip progress from the inner `put_bytes` call so the sink
@@ -209,8 +210,7 @@ pub trait ObjectStore: Send + Sync {
         };
         self.put_bytes(key, Bytes::from(body), inner_opts).await?;
         // Single-shot fallback emits a final progress event with the
-        // full body size so the LFS agent's "saw at least one event"
-        // post-condition holds even on backends without chunking.
+        // full body size. Zero-byte bodies produce no progress event.
         if let Some(sink) = progress
             && len > 0
         {

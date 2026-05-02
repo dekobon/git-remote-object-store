@@ -65,7 +65,12 @@ impl BundleHeader {
 
         loop {
             line.clear();
-            file.read_line(&mut line)?;
+            let n = file.read_line(&mut line)?;
+            if n == 0 {
+                return Err(BundleError::InvalidHeader(
+                    "unexpected end of bundle header".to_owned(),
+                ));
+            }
             match parse_header_entry(&line)? {
                 HeaderEntry::End => break,
                 HeaderEntry::Prerequisite(oid) => prerequisites.push(oid),
@@ -73,6 +78,9 @@ impl BundleHeader {
             }
         }
 
+        // `pack_offset` captures the position of the PACK magic bytes. The
+        // seek in `unbundle` jumps here so the magic is included in the data
+        // handed to `gix_pack::Bundle::write_to_directory`.
         let pack_offset = file.stream_position()?;
         verify_pack_magic(&mut file)?;
 
@@ -132,12 +140,15 @@ fn parse_oid(sha_hex: &str, context: &str) -> Result<ObjectId, BundleError> {
 /// Verify that the next four bytes in `file` are the `PACK` magic.
 fn verify_pack_magic<R: Read>(file: &mut R) -> Result<(), BundleError> {
     let mut buf = [0u8; 4];
-    let n = file.read(&mut buf)?;
-    if n < 4 {
-        return Err(BundleError::InvalidHeader(
-            "bundle truncated before PACK data".to_owned(),
-        ));
-    }
+    // `read_exact` guarantees all 4 bytes are filled or returns an error;
+    // `read` may legally return fewer bytes on the first call.
+    file.read_exact(&mut buf).map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            BundleError::InvalidHeader("bundle truncated before PACK data".to_owned())
+        } else {
+            BundleError::Io(e)
+        }
+    })?;
     if &buf != b"PACK" {
         return Err(BundleError::InvalidHeader(
             "expected PACK magic after bundle header".to_owned(),
