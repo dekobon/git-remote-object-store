@@ -461,7 +461,10 @@ mod tests {
         //
         // The empty store acts as the natural tripwire: any accidental
         // store.get_to_file() call would return NotFound and propagate as
-        // Err, which the Ok(()) assertion below would catch.
+        // Err, which the Ok(()) assertion below would catch. Note that
+        // store.list() on an empty store returns Ok([]) — a silent no-op
+        // that would not be caught here. That is acceptable because
+        // fetch_batch / fetch_one make no list() calls.
         let mock = Arc::new(MockStore::new());
         let repo_dir = tempfile::tempdir().expect("tempdir");
         let ctx = BatchCtx {

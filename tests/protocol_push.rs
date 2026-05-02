@@ -251,7 +251,7 @@ async fn multi_bundle_pre_lock_rejects_push() {
     // in `?` so operators see a consistent format across branches.
     assert_eq!(
         text,
-        "error refs/heads/main \"multiple bundles exists on server. \
+        "error refs/heads/main \"multiple bundles exist on server. \
          Run git-remote-object-store doctor to fix.\"?\n\n",
         "got {text:?}",
     );
@@ -675,7 +675,7 @@ async fn pre_lock_multi_bundle_rejection_surfaces_unchanged() {
     // missed that regression.
     assert_eq!(
         text,
-        "error refs/heads/main \"multiple bundles exists on server. \
+        "error refs/heads/main \"multiple bundles exist on server. \
          Run git-remote-object-store doctor to fix.\"?\n\n",
         "got {text:?}",
     );
