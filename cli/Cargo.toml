@@ -77,7 +77,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Git repository discovery — git-remote-object-store.rs and
 # git-lfs-object-store.rs call gix::discover() directly.
-gix = "0.82"
+gix = "0.83"
 
 # Error handling
 anyhow = "1"
