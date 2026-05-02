@@ -1430,4 +1430,40 @@ mod tests {
             "expected stale-remote error, got {outcome:?}",
         );
     }
+
+    /// Under-lock re-listing sees two bundles for the same ref (two clients
+    /// raced and both uploaded before either acquired the lock). Must return
+    /// the under-lock duplicate-bundle error before reaching the stale-remote
+    /// guard or the upload.
+    #[tokio::test]
+    async fn perform_push_under_lock_rejects_two_bundles_seen_under_lock() {
+        let store = MockStore::new();
+        let sha_a = "1111111111111111111111111111111111111111";
+        let sha_b = "2222222222222222222222222222222222222222";
+        store.insert(
+            format!("repo/refs/heads/main/{sha_a}.bundle"),
+            Bytes::from_static(b"bundle_a"),
+        );
+        store.insert(
+            format!("repo/refs/heads/main/{sha_b}.bundle"),
+            Bytes::from_static(b"bundle_b"),
+        );
+        // Pre-lock snapshot saw zero bundles; under-lock sees two.
+        let state = push_state_with_pre_existing(Some("repo"), None);
+        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                &outcome,
+                PushOutcome::Error { message, .. }
+                    if message == r#""multiple bundles exist for the same ref on server. Run git-remote-object-store doctor to fix."?"#
+            ),
+            "expected under-lock multi-bundle error, got {outcome:?}",
+        );
+        // Neither bundle was overwritten or deleted.
+        assert!(store.contains(&format!("repo/refs/heads/main/{sha_a}.bundle")));
+        assert!(store.contains(&format!("repo/refs/heads/main/{sha_b}.bundle")));
+    }
+
 }
