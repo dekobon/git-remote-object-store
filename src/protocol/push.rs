@@ -1466,4 +1466,25 @@ mod tests {
         assert!(store.contains(&format!("repo/refs/heads/main/{sha_b}.bundle")));
     }
 
+    /// Stale lock is deleted but another client re-acquires it before our
+    /// retry `put_if_absent`. Must return `Ok(false)` — the caller maps
+    /// this to a "lock held" user error, not a hard failure.
+    #[tokio::test]
+    async fn acquire_lock_stale_retry_loses_second_race() {
+        use crate::object_store::mock::Fault;
+        let store = MockStore::new();
+        let now = OffsetDateTime::now_utc();
+        let stale = now - Duration::seconds(120);
+        store.insert_with("k", Bytes::new(), stale, PutOpts::default());
+        // Another client wins the race between our delete and retry.
+        store.arm(Fault::ContendedPutIfAbsent { key: "k".into() });
+        let acquired = acquire_lock(&store, "k", Duration::seconds(60), now)
+            .await
+            .unwrap();
+        assert!(!acquired);
+        // Fault fired — confirms the retry put_if_absent was called.
+        assert_eq!(store.pending_faults(), 0);
+        // The stale lock was removed; no key remains.
+        assert!(!store.contains("k"));
+    }
 }
