@@ -522,18 +522,18 @@ async fn prepare_push(
     let pre_existing = pre_bundles.into_iter().next().map(|m| m.key);
 
     let pre_existing_sha = match pre_existing.as_deref() {
-        Some(key) => match parse_remote_sha_from_key(key) {
-            Some(s) => Some(s),
-            None => {
+        None => None,
+        Some(key) => {
+            let Some(s) = parse_remote_sha_from_key(key) else {
                 return Ok(PrepareOutcome::Done(PushOutcome::Error {
                     remote_ref: remote_ref_str,
                     message: format!(
                         r#""unable to parse remote bundle key {key:?}; run git-remote-object-store doctor to fix."?"#,
                     ),
                 }));
-            }
-        },
-        None => None,
+            };
+            Some(s)
+        }
     };
 
     // Sync gix work (rev-parse / ancestor / archive) runs in a

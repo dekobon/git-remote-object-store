@@ -22,7 +22,7 @@ use crate::url::{RemoteUrl, StorageEngine};
 pub mod backend;
 pub(crate) mod capabilities;
 pub mod fetch;
-pub mod list;
+pub(crate) mod list;
 pub(crate) mod option;
 pub mod push;
 pub mod tracing_init;
