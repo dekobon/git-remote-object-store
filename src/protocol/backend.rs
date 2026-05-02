@@ -24,15 +24,7 @@ use crate::object_store::s3::S3Store;
 use crate::object_store::{ObjectStore, ObjectStoreError};
 use crate::url::{RemoteUrl, StorageEngine};
 
-/// Which backend a [`BackendError`] refers to. Drives the wording in
-/// [`fatal_message`] (S3 says "bucket"; Azure says "container").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendKind {
-    /// Amazon S3 (or any S3-compatible) backend.
-    S3,
-    /// Azure Blob Storage backend.
-    Azure,
-}
+pub use crate::url::BackendKind;
 
 /// Errors surfaced by [`build`]. The three variants line up with the
 /// three categorical fatal lines upstream's Python helper emits at

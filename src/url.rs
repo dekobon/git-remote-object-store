@@ -122,6 +122,29 @@ impl fmt::Display for StorageEngine {
     }
 }
 
+/// Which backend a URL (or error) refers to.
+///
+/// Used as a discriminant in [`protocol::backend::BackendError`] to select
+/// S3 vs Azure error wording, and internally in `url::parse` to route the
+/// URL to the right parsing path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    /// Amazon S3 (or any S3-compatible) backend.
+    S3,
+    /// Azure Blob Storage backend.
+    Azure,
+}
+
+impl BackendKind {
+    /// The URL scheme prefix for this backend (`"s3+"` or `"az+"`).
+    pub(crate) fn scheme_prefix(self) -> &'static str {
+        match self {
+            BackendKind::S3 => "s3+",
+            BackendKind::Azure => "az+",
+        }
+    }
+}
+
 /// Query-string flags described in §3.2 / §3.3.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemoteFlags {
@@ -236,8 +259,8 @@ pub fn parse(input: &str) -> Result<RemoteUrl, ParseError> {
     let (flags, addressing_override) = extract_flags(&endpoint)?;
 
     match backend {
-        Backend::S3 => finish_s3(endpoint, flags, addressing_override),
-        Backend::Azure => finish_azure(endpoint, flags, addressing_override),
+        BackendKind::S3 => finish_s3(endpoint, flags, addressing_override),
+        BackendKind::Azure => finish_azure(endpoint, flags, addressing_override),
     }
 }
 
@@ -289,31 +312,16 @@ impl RemoteUrl {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Backend {
-    S3,
-    Azure,
-}
-
-impl Backend {
-    fn scheme_prefix(self) -> &'static str {
-        match self {
-            Backend::S3 => "s3+",
-            Backend::Azure => "az+",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AddressingOverride {
     Path,
     Virtual,
 }
 
-fn detect_backend(input: &str) -> Result<Backend, ParseError> {
+fn detect_backend(input: &str) -> Result<BackendKind, ParseError> {
     if input.starts_with("s3+https://") || input.starts_with("s3+http://") {
-        Ok(Backend::S3)
+        Ok(BackendKind::S3)
     } else if input.starts_with("az+https://") || input.starts_with("az+http://") {
-        Ok(Backend::Azure)
+        Ok(BackendKind::Azure)
     } else {
         Err(ParseError::UnsupportedScheme(scheme_of(input)))
     }

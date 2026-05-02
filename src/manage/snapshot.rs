@@ -5,7 +5,6 @@
 //! single-repo case (one CLI invocation == one prefix).
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use time::OffsetDateTime;
 use tracing::warn;
@@ -83,7 +82,7 @@ impl RepoSnapshot {
 /// Returns [`ManageError::Store`] if the list or HEAD-object get calls
 /// fail.
 pub async fn analyze(
-    store: &Arc<dyn ObjectStore>,
+    store: &dyn ObjectStore,
     prefix: &str,
 ) -> Result<RepoSnapshot, ManageError> {
     let list_prefix = keys::join(prefix, "");
@@ -102,7 +101,7 @@ pub async fn analyze(
 pub async fn analyze_objects(
     objects: &[ObjectMeta],
     list_prefix: &str,
-    store: &Arc<dyn ObjectStore>,
+    store: &dyn ObjectStore,
 ) -> Result<RepoSnapshot, ManageError> {
     let mut snapshot = RepoSnapshot::default();
     for object in objects {
@@ -120,7 +119,7 @@ async fn classify_into(
     list_prefix: &str,
     object: &ObjectMeta,
     snapshot: &mut RepoSnapshot,
-    store: &Arc<dyn ObjectStore>,
+    store: &dyn ObjectStore,
 ) -> Result<(), ManageError> {
     let Some(relative) = object.key.strip_prefix(list_prefix) else {
         // Defensive: `list` should only return keys that share the
@@ -172,6 +171,8 @@ async fn classify_into(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::object_store::ObjectStore;
     use crate::object_store::mock::MockStore;

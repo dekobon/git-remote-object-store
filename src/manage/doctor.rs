@@ -132,7 +132,8 @@ impl<'a> Doctor<'a> {
     /// Render the snapshot to a human-readable report. Returns the
     /// finished string (with trailing newline) so callers can route
     /// it to stdout, a logger, or a test buffer.
-    fn report(&self, snapshot: &RepoSnapshot) -> String {
+    #[must_use]
+    pub fn report(&self, snapshot: &RepoSnapshot) -> String {
         use std::fmt::Write;
         let mut out = String::new();
         let _ = writeln!(out, "{}:", self.report_label());

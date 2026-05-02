@@ -24,7 +24,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tempfile::NamedTempFile;
 use time::OffsetDateTime;
-use tracing::debug;
+use tracing::warn;
 
 use self::error::other_boxed;
 pub use self::error::{BoxError, ObjectStoreError};
@@ -191,7 +191,12 @@ pub trait ObjectStore: Send + Sync {
     /// the file into memory and delegates to [`put_bytes`](Self::put_bytes);
     /// this is correct but defeats the streaming intent for large files.
     async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), ObjectStoreError> {
-        debug!(key, path = %src.display(), "put_path: default read-then-put_bytes fallback");
+        warn!(
+            key,
+            path = %src.display(),
+            "put_path: falling back to read-then-put_bytes; override this method to avoid \
+             buffering the entire file in memory"
+        );
         let body = tokio::fs::read(src).await.map_err(other_boxed)?;
         let len = body.len() as u64;
         let progress = opts.progress.clone();
@@ -222,20 +227,75 @@ pub trait ObjectStore: Send + Sync {
     /// Fetch metadata for an exact key.
     async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError>;
 
-    /// Copy `src` to `dst`. The body is preserved on every backend.
+    /// Copy `src` to `dst`. The body is preserved on every backend;
+    /// user metadata is **not** guaranteed to survive — callers must not
+    /// rely on metadata round-tripping through `copy`.
     ///
-    /// User metadata propagation is **best-effort**: backends that
-    /// implement copy as a true server-side operation
-    /// (`S3Store::copy` via `CopyObject`) do propagate it, but backends
-    /// that emulate copy via download-then-upload (`AzureStore::copy`,
-    /// because `azure_storage_blob` 0.12 does not ergonomically expose
-    /// `Copy Blob` with shared-key auth) currently drop it. Callers
-    /// must not depend on metadata round-tripping through `copy`. The
-    /// trait's only in-tree consumer is `Doctor::evict_losing_bundle`,
+    /// The trait's only in-tree consumer is `Doctor::evict_losing_bundle`,
     /// which carries no user metadata on bundle objects.
     async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError>;
 
     /// Delete `key`. Returns `Err(ObjectStoreError::NotFound)` if the key was
     /// not present.
     async fn delete(&self, key: &str) -> Result<(), ObjectStoreError>;
+}
+
+/// Blanket impl so `Arc<T>` is usable wherever `&dyn ObjectStore` is
+/// expected, without callers having to dereference explicitly.
+///
+/// `T: ObjectStore + ?Sized` covers both concrete types (`Arc<S3Store>`)
+/// and erased trait objects (`Arc<dyn ObjectStore>`). Every method simply
+/// forwards to the inner `T` through the `Deref` impl.
+#[async_trait::async_trait]
+impl<T: ObjectStore + ?Sized> ObjectStore for Arc<T> {
+    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, ObjectStoreError> {
+        (**self).list(prefix).await
+    }
+
+    async fn get_to_file(
+        &self,
+        key: &str,
+        dest: &Path,
+        opts: GetOpts,
+    ) -> Result<(), ObjectStoreError> {
+        (**self).get_to_file(key, dest, opts).await
+    }
+
+    async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+        (**self).get_bytes(key).await
+    }
+
+    async fn put_bytes(
+        &self,
+        key: &str,
+        body: Bytes,
+        opts: PutOpts,
+    ) -> Result<(), ObjectStoreError> {
+        (**self).put_bytes(key, body, opts).await
+    }
+
+    async fn put_path(
+        &self,
+        key: &str,
+        src: &Path,
+        opts: PutOpts,
+    ) -> Result<(), ObjectStoreError> {
+        (**self).put_path(key, src, opts).await
+    }
+
+    async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
+        (**self).put_if_absent(key, body).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
+        (**self).head(key).await
+    }
+
+    async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
+        (**self).copy(src, dst).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
+        (**self).delete(key).await
+    }
 }
