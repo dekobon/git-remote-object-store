@@ -1333,4 +1333,101 @@ mod tests {
         let content = store.get_bytes("repo/FORMAT").await.unwrap();
         assert_eq!(content.as_ref(), b"bundle\n");
     }
+
+    // --- stale-remote guard -------------------------------------------
+
+    /// Build a `PushReadyState` with a specific `pre_existing` key and a
+    /// matching `bundle_path` on disk. The store is left in whatever state
+    /// the caller configured (e.g. with a pre-seeded bundle key).
+    fn push_state_with_pre_existing(
+        prefix: Option<&str>,
+        pre_existing: Option<String>,
+    ) -> PushReadyState {
+        let r = rn("refs/heads/main");
+        let temp_dir = tempfile::Builder::new()
+            .prefix("test_push_")
+            .tempdir()
+            .unwrap();
+        let bundle_path = temp_dir.path().join("bundle");
+        std::fs::write(&bundle_path, b"fake bundle").unwrap();
+        let _ = prefix; // consumed by the caller when seeding the store
+        PushReadyState {
+            remote_ref: r,
+            local_sha: Sha::from_hex(SHA).unwrap(),
+            pre_existing,
+            bundle_path,
+            zip_artifacts: None,
+            engine: StorageEngine::Bundle,
+            _temp_dir: temp_dir,
+        }
+    }
+
+    /// `pre_existing=None`, `current_key=Some(...)`: a concurrent push
+    /// created a bundle after our pre-lock list but before we acquired
+    /// the lock.
+    #[tokio::test]
+    async fn perform_push_under_lock_rejects_none_to_some_stale_remote() {
+        let store = MockStore::new();
+        let existing_key = format!("repo/refs/heads/main/{SHA}.bundle");
+        store.insert(&existing_key, Bytes::from_static(b"old bundle"));
+        let state = push_state_with_pre_existing(Some("repo"), None);
+        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                &outcome,
+                PushOutcome::Error { message, .. }
+                    if message == r#""stale remote. Please fetch and retry."?"#
+            ),
+            "expected stale-remote error, got {outcome:?}",
+        );
+    }
+
+    /// `pre_existing=Some(key)`, `current_key=None`: the bundle was
+    /// deleted between our pre-lock list and the lock acquisition (e.g.
+    /// a concurrent `git push :<ref>` delete).
+    #[tokio::test]
+    async fn perform_push_under_lock_rejects_some_to_none_stale_remote() {
+        let store = MockStore::new();
+        let old_key = format!("repo/refs/heads/main/{SHA}.bundle");
+        let state = push_state_with_pre_existing(Some("repo"), Some(old_key.clone()));
+        // Store is empty — the previously-seen bundle is gone.
+        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                &outcome,
+                PushOutcome::Error { message, .. }
+                    if message == r#""stale remote. Please fetch and retry."?"#
+            ),
+            "expected stale-remote error, got {outcome:?}",
+        );
+    }
+
+    /// `pre_existing=Some(key_a)`, `current_key=Some(key_b)` where
+    /// `key_a != key_b`: a concurrent push replaced our bundle.
+    #[tokio::test]
+    async fn perform_push_under_lock_rejects_replaced_bundle_stale_remote() {
+        let store = MockStore::new();
+        let old_sha = SHA;
+        let new_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let old_key = format!("repo/refs/heads/main/{old_sha}.bundle");
+        let new_key = format!("repo/refs/heads/main/{new_sha}.bundle");
+        // Under-lock the store shows the *new* key.
+        store.insert(&new_key, Bytes::from_static(b"new bundle"));
+        let state = push_state_with_pre_existing(Some("repo"), Some(old_key));
+        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                &outcome,
+                PushOutcome::Error { message, .. }
+                    if message == r#""stale remote. Please fetch and retry."?"#
+            ),
+            "expected stale-remote error, got {outcome:?}",
+        );
+    }
 }
