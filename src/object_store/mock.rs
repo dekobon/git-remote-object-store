@@ -81,6 +81,16 @@ pub enum Fault {
         /// Key being downloaded.
         key: String,
     },
+    /// Force `put_if_absent(key, _)` to return `Ok(false)` even when the
+    /// key is currently absent, simulating a concurrent write winning the
+    /// CAS race between our absence-check and our own write. S3 surfaces
+    /// this as 409 `ConditionalRequestConflict`; this fault lets tests
+    /// exercise callers' contention-handling without re-inserting the key
+    /// between two awaits.
+    ContendedPutIfAbsent {
+        /// Key being written.
+        key: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -362,6 +372,17 @@ impl ObjectStore for MockStore {
                 _ => None,
             })?;
             if s.objects.contains_key(key) {
+                return Ok(false);
+            }
+            // `ContendedPutIfAbsent` fires only when the key is absent above
+            // — this models the CAS race where another client writes between
+            // our absence-check and our own conditional PUT.
+            if let Some(pos) = s
+                .faults
+                .iter()
+                .position(|f| matches!(f, Fault::ContendedPutIfAbsent { key: k } if k == key))
+            {
+                s.faults.remove(pos);
                 return Ok(false);
             }
             s.objects.insert(
