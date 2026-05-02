@@ -318,6 +318,10 @@ pub(crate) fn normalize_endpoint(
         // (e.g. MinIO with `bucket.minio.example.com`), fall back to
         // stripping just the leftmost label.
         let regional_host = s3_virtual_hosted_bucket(host)
+            // `s3_virtual_hosted_bucket` returns the bucket label (a strict
+            // prefix of `host` ending just before the `.s3.` or `.s3-`
+            // infix). The byte at `host[bucket.len()]` is always `.` (ASCII
+            // 0x2E), so slicing at `+ 1` is always a valid UTF-8 boundary.
             .map(|bucket| host[bucket.len() + 1..].to_owned())
             .or_else(|| host.split_once('.').map(|(_, rest)| rest.to_owned()))
             .ok_or_else(|| {

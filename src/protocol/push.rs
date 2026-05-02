@@ -1113,7 +1113,9 @@ mod tests {
             .await
             .unwrap();
         match outcome {
-            PushOutcome::Error { message, .. } => assert!(message.contains("not found")),
+            PushOutcome::Error { message, .. } => {
+                assert_eq!(message, r#""not found"?"#);
+            }
             PushOutcome::Ok { .. } => panic!("expected Error outcome"),
         }
     }
@@ -1133,7 +1135,12 @@ mod tests {
             .await
             .unwrap();
         match outcome {
-            PushOutcome::Error { message, .. } => assert!(message.contains("multiple bundles")),
+            PushOutcome::Error { message, .. } => {
+                assert_eq!(
+                    message,
+                    r#""multiple bundles exist on server. Run git-remote-object-store doctor to fix."?"#,
+                );
+            }
             PushOutcome::Ok { .. } => panic!("expected Error outcome"),
         }
         // Both keys must remain — a regression that deleted on the way
