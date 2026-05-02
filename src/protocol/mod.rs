@@ -98,7 +98,7 @@ enum Mode {
 pub(crate) struct BatchCtx {
     pub(crate) store: Arc<dyn ObjectStore>,
     /// Optional repository prefix within the bucket / container.
-    pub(crate) prefix: Option<String>,
+    pub(crate) prefix: Option<Arc<str>>,
     pub(crate) repo_dir: Arc<PathBuf>,
 }
 
@@ -222,7 +222,7 @@ where
     let engine = remote.flags().engine.unwrap_or(StorageEngine::Bundle);
     let ctx = BatchCtx {
         store,
-        prefix: remote.prefix().map(str::to_owned),
+        prefix: remote.prefix().map(Arc::from),
         repo_dir: Arc::new(repo_dir),
     };
 
