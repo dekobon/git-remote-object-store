@@ -463,13 +463,12 @@ fn check_aws_s3_host(host: &str) -> Result<(), ParseError> {
         || trimmed.contains(".s3.")
         || trimmed.contains(".s3-");
 
-    if valid {
-        Ok(())
-    } else {
-        Err(ParseError::InvalidAwsS3Endpoint {
+    if !valid {
+        return Err(ParseError::InvalidAwsS3Endpoint {
             host: host.to_owned(),
-        })
+        });
     }
+    Ok(())
 }
 
 fn finish_s3(
