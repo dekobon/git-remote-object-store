@@ -67,6 +67,12 @@ pub enum Fault {
         /// Prefix being listed.
         prefix: String,
     },
+    /// Force every `list(_)` call to return [`ObjectStoreError::AccessDenied`],
+    /// regardless of prefix. Use this when the test wants to assert that a
+    /// given code path makes ZERO list calls — armed-and-still-pending
+    /// after the call proves no `list` happened, even on an unanticipated
+    /// prefix that an exact-match [`Fault::AccessDeniedOnList`] would miss.
+    AccessDeniedOnAnyList,
     /// Force `delete(key)` to return [`ObjectStoreError::Network`].
     NetworkOnDelete {
         /// Key being deleted.
@@ -281,6 +287,9 @@ impl ObjectStore for MockStore {
             Self::check_fault(s, |f| match f {
                 Fault::AccessDeniedOnList { prefix: p } if p == prefix => {
                     Some(ObjectStoreError::AccessDenied(p.clone()))
+                }
+                Fault::AccessDeniedOnAnyList => {
+                    Some(ObjectStoreError::AccessDenied(prefix.to_string()))
                 }
                 _ => None,
             })?;

@@ -152,26 +152,20 @@ const fn container_word(kind: BackendKind) -> &'static str {
 /// upstream wording lives in [`BackendError`]'s `Display` derive — see the
 /// type-level doc comment.
 ///
-/// [`BackendError::InvalidCredentials`] and [`BackendError::Network`] both
-/// incorporate their immediate source via `{source}` in the format string.
-/// This function walks one level deeper into the error chain to surface root
-/// causes that are not yet visible — for example, the io / DNS error nested
-/// inside the SDK dispatch failure stored in [`BackendError::Network`].
+/// Variants like [`BackendError::InvalidCredentials`] and
+/// [`BackendError::Network`] inline their immediate source via
+/// `{source}`/`{0}` in the format string, sometimes transitively when
+/// the source itself wraps another typed error. The chain-walk is done
+/// by [`super::append_source_chain`], which dedups any level whose
+/// `Display` text is already at the tail of `msg` — so the `fatal:`
+/// line surfaces deeper root causes (e.g. the io / DNS error nested
+/// inside the SDK dispatch failure) without producing the duplicated
+/// "network error: network error: …" rendering that a naive walk
+/// would.
 #[must_use]
 pub fn fatal_message(err: &BackendError) -> String {
-    use std::error::Error as StdError;
-    use std::fmt::Write as _;
-
     let mut msg = format!("fatal: {err}");
-    // BackendError::InvalidCredentials and BackendError::Network both include
-    // their direct source in the Display via `{source}`, so start chain-walking
-    // one level past that to avoid duplication while still surfacing deeper
-    // SDK / transport causes.
-    let mut next = err.source().and_then(StdError::source);
-    while let Some(s) = next {
-        write!(msg, ": {s}").expect("writing to a String is infallible");
-        next = s.source();
-    }
+    super::append_source_chain(&mut msg, err);
     msg
 }
 

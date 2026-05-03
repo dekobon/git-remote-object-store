@@ -373,20 +373,18 @@ pub(crate) async fn push_batch(
 /// `error <ref>` wire line and the stderr log carry every level of
 /// causal context.
 ///
-/// `thiserror`-derived `Display` for `PushError` already inlines the
-/// direct source (e.g. `"object-store error during push: {0}"`), so we
-/// start chain-walking one level past it to avoid duplicating the
-/// first-level source — matching the same pattern used by
-/// [`super::backend::fatal_message`].
+/// `PushError`'s `thiserror` formats inline the immediate source via
+/// `{0}` / `{source}`, and some of those sources (notably
+/// [`ObjectStoreError::Network`], whose own Display embeds its boxed
+/// inner error) themselves inline a further level — so a naive
+/// chain-walk would produce `"object-store error during push: network
+/// error: dns failure: dns failure"`. [`super::append_source_chain`]
+/// dedups any level whose text is already at the tail of `msg`, so
+/// the rendered chain is uniform across `Store`, `Git`, `Io`, and `Sha`
+/// variants without per-variant special-casing.
 fn full_error_chain(err: &PushError) -> String {
-    use std::error::Error as StdError;
-    use std::fmt::Write as _;
     let mut msg = err.to_string();
-    let mut next = err.source().and_then(StdError::source);
-    while let Some(src) = next {
-        write!(msg, ": {src}").expect("writing to a String is infallible");
-        next = src.source();
-    }
+    super::append_source_chain(&mut msg, err);
     msg
 }
 
@@ -829,6 +827,29 @@ mod tests {
     use crate::object_store::mock::MockStore;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    /// A second 40-char hex SHA distinct from `SHA`. Used by tests that
+    /// need to seed pre-existing state under a SHA different from
+    /// `local_sha` so a regression cannot pass through coincidental key
+    /// alignment between `pre_existing` and `bundle_dest`.
+    const OTHER_SHA: &str = "ffffffffffffffffffffffffffffffffffffffff";
+
+    /// Compile-time guard: replaces the runtime `assert_ne!(other_sha, SHA, …)`
+    /// that the constant lift removed. A typo making the two consts equal
+    /// fails the build rather than silently letting a stale-remote test
+    /// pass for the wrong reason.
+    const _: () = {
+        let a = SHA.as_bytes();
+        let b = OTHER_SHA.as_bytes();
+        let mut i = 0;
+        let mut differs = a.len() != b.len();
+        while i < a.len() && i < b.len() {
+            if a[i] != b[i] {
+                differs = true;
+            }
+            i += 1;
+        }
+        assert!(differs, "OTHER_SHA must differ from SHA");
+    };
 
     fn rn(s: &str) -> RefName {
         RefName::new(s).expect("RefName")
@@ -1407,8 +1428,7 @@ mod tests {
     #[tokio::test]
     async fn perform_push_under_lock_rejects_none_to_some_stale_remote() {
         let store = MockStore::new();
-        let other_sha = "ffffffffffffffffffffffffffffffffffffffff";
-        let existing_key = format!("repo/refs/heads/main/{other_sha}.bundle");
+        let existing_key = format!("repo/refs/heads/main/{OTHER_SHA}.bundle");
         store.insert(&existing_key, Bytes::from_static(b"old bundle"));
         let state = push_state_with_pre_existing(None);
         let outcome = perform_push_under_lock(&store, Some("repo"), state)
@@ -1512,14 +1532,27 @@ mod tests {
     /// `Ok(remote_ref)` push outcome — without it, a regression that
     /// flipped the comparison to always-mismatch would pass every drift
     /// test and silently break every real push.
+    ///
+    /// `pre_existing` is seeded under SHA distinct from `local_sha`
+    /// (mirroring the `rejects_none_to_some` hardening): so a buggy
+    /// regression that compared `current_key` against `bundle_dest`
+    /// (the key derived from `local_sha`) instead of against
+    /// `pre_existing` cannot pass for the wrong reason — the keys
+    /// are deliberately different. The push must:
+    ///   1. produce `Ok(remote_ref)`
+    ///   2. upload the new bundle at `bundle_dest` (SHA = `local_sha`)
+    ///   3. delete the old bundle (SHA = `OTHER_SHA`) via the
+    ///      post-upload cleanup branch
+    ///   4. write `HEAD` and `FORMAT`
     #[tokio::test]
     async fn perform_push_under_lock_passes_through_when_pre_existing_matches_current() {
         let store = MockStore::new();
-        let pre_key = format!("repo/refs/heads/main/{SHA}.bundle");
-        // Seed the store so the under-lock list returns the same key the
-        // pre-lock snapshot saw. (Same SHA as `local_sha` is intentional
-        // here: a force-push that re-uploads against the same SHA is the
-        // canonical happy-path case.)
+        let pre_key = format!("repo/refs/heads/main/{OTHER_SHA}.bundle");
+        // Seed under `OTHER_SHA` so under-lock list returns this key.
+        // The local push's `local_sha` is `SHA`, so `bundle_dest` is a
+        // DIFFERENT key. The stale-remote check passes (pre_existing ==
+        // current_key, both = pre_key); the function then uploads the
+        // new bundle at `bundle_dest` and deletes the old one.
         store.insert(&pre_key, Bytes::from_static(b"old bundle"));
         let state = push_state_with_pre_existing(Some(pre_key.clone()));
         let outcome = perform_push_under_lock(&store, Some("repo"), state)
@@ -1529,14 +1562,23 @@ mod tests {
             matches!(&outcome, PushOutcome::Ok { remote_ref } if remote_ref == "refs/heads/main"),
             "expected Ok(refs/heads/main), got {outcome:?}",
         );
-        // Verify the push actually ran end-to-end, not just the comparison.
-        // A regression that early-returned Ok after the match-check would pass
-        // the outcome assertion above but skip every real side effect.
-        let bundle_bytes = store.get_bytes(&pre_key).await.unwrap();
+        // The new bundle must land at the bundle_dest derived from
+        // local_sha, not at pre_key.
+        let bundle_dest = format!("repo/refs/heads/main/{SHA}.bundle");
+        let new_bytes = store
+            .get_bytes(&bundle_dest)
+            .await
+            .expect("new bundle must be uploaded at bundle_dest");
         assert_eq!(
-            bundle_bytes.as_ref(),
+            new_bytes.as_ref(),
             b"fake bundle",
-            "bundle must be re-uploaded with the local payload, not left as the seed",
+            "new bundle must contain the local payload",
+        );
+        // The old bundle must be deleted by the post-upload cleanup
+        // branch (`if prev != bundle_dest { delete_idempotent }`).
+        assert!(
+            !store.contains(&pre_key),
+            "old bundle at pre_key must be deleted",
         );
         assert!(
             store.contains("repo/FORMAT"),
@@ -1600,5 +1642,28 @@ mod tests {
         assert_eq!(store.pending_faults(), 0);
         // The stale lock was removed; no key remains.
         assert!(!store.contains("k"));
+    }
+
+    // --- full_error_chain dedup --------------------------------------
+
+    /// Tripwire for the dedup-by-suffix fix: a naive chain-walk on
+    /// `PushError::Store(ObjectStoreError::Network(_))` produces a
+    /// duplicated tail because both `PushError::Store` and
+    /// `ObjectStoreError::Network` inline their immediate source via
+    /// `{0}` in the `Display` derive. The shared
+    /// `super::append_source_chain` helper skips levels whose text is
+    /// already at the tail of the message. A regression that
+    /// re-introduced the always-append walk would render
+    /// `"…network error: dns failure: dns failure"` (or even longer
+    /// for deeper chains), failing this byte-exact assertion.
+    #[test]
+    fn full_error_chain_deduplicates_inlined_source_text() {
+        let inner: crate::object_store::BoxError = Box::new(std::io::Error::other("dns failure"));
+        let err = PushError::Store(ObjectStoreError::Network(inner));
+        let rendered = full_error_chain(&err);
+        assert_eq!(
+            rendered, "object-store error during push: network error: dns failure",
+            "PushError::Store(Network(_)) must not duplicate the inner source",
+        );
     }
 }

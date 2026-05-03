@@ -439,19 +439,16 @@ mod tests {
         // (the REPL never calls `fetch_batch` with an empty Vec because
         // `BatchState::take_pending` guards on non-empty cmds).
         //
-        // Tripwire: arm an `AccessDeniedOnList` fault for an empty
-        // prefix. If a regression accidentally introduces a `list()` call
-        // before the empty-cmds check, the fault fires (consumed from the
-        // queue) and `pending_faults()` drops to 0; the `assert_eq!` below
-        // would fail. The result must also be Ok — a fault firing would
-        // surface as Err.
+        // Tripwire: `Fault::AccessDeniedOnAnyList` matches `list(_)` on
+        // ANY prefix. A regression that introduces a `list("anything")`
+        // call into `fetch_batch` before the empty-cmds check fires the
+        // fault, which propagates as `Err(Store(AccessDenied(...)))` —
+        // failing the `Ok(())` assertion. The exact-prefix
+        // `AccessDeniedOnList` variant would miss any list call whose
+        // prefix didn't match the armed string; the wildcard form
+        // closes that gap.
         let mock = Arc::new(MockStore::new());
-        mock.arm(Fault::AccessDeniedOnList {
-            prefix: String::new(),
-        });
-        mock.arm(Fault::AccessDeniedOnList {
-            prefix: "repo".into(),
-        });
+        mock.arm(Fault::AccessDeniedOnAnyList);
         let repo_dir = tempfile::tempdir().expect("tempdir");
         let ctx = BatchCtx {
             store: Arc::clone(&mock) as Arc<dyn ObjectStore>,
@@ -460,12 +457,12 @@ mod tests {
         };
         let result = fetch_batch(&ctx, Vec::new(), FetchedRefs::new(), None).await;
         assert!(matches!(result, Ok(())));
-        // Both faults must remain pending — `fetch_batch` made no `list`
-        // calls on either prefix.
+        // The wildcard fault must remain pending — `fetch_batch` made
+        // zero `list` calls regardless of prefix.
         assert_eq!(
             mock.pending_faults(),
-            2,
-            "fetch_batch with empty cmds must make zero store calls",
+            1,
+            "fetch_batch with empty cmds must make zero list calls",
         );
     }
 }
