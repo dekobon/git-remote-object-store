@@ -31,7 +31,7 @@ FIND_EXCLUDE   := $(foreach dir,$(EXCLUDE_DIRS),! -path "./$(dir)/*")
 # --warn-undefined-variables warnings, e.g. $(call find-by-ext,md,,).
 find-by-ext = $(if $(FD),$(FD) --extension $(1) $(FD_EXCLUDE) $(2),find . -name "*.$(1)" -type f $(FIND_EXCLUDE) $(3))
 
-.PHONY: help check-tools build build-release test test-all test-integration-s3 test-integration-azure fmt fmt-check markdown-fmt markdown-check markdown-lint shellcheck sh-fmt sh-fmt-check toml-fmt toml-fmt-check toml-lint makefile-check lint check deny shellspec shellspec-integration shellspec-integration-s3 shellspec-integration-azure shellspec-live shellspec-live-s3 shellspec-live-sweep image-pin-check clean install doc doc-open bench all pre-commit ci _pc-fmt _pc-clippy _pc-test _pc-build _pc-shellspec _pc-shellcheck _pc-markdown-lint _pc-toml-lint _pc-makefile-check _pc-deny _ci-fmt-check _ci-clippy _ci-test _ci-build _ci-shellspec _ci-shellcheck _ci-markdown-check _ci-toml-lint _ci-makefile-check _ci-deny _ci-cargo-pipeline
+.PHONY: help check-tools build build-release test test-all test-integration-s3 test-integration-azure fmt fmt-check markdown-fmt markdown-check markdown-lint shellcheck sh-fmt sh-fmt-check toml-fmt toml-fmt-check toml-lint makefile-check lint check deny shellspec shellspec-integration shellspec-integration-s3 shellspec-integration-azure shellspec-live shellspec-live-s3 shellspec-live-azure shellspec-live-sweep image-pin-check clean install doc doc-open bench all pre-commit ci _pc-fmt _pc-clippy _pc-test _pc-build _pc-shellspec _pc-shellcheck _pc-markdown-lint _pc-toml-lint _pc-makefile-check _pc-deny _ci-fmt-check _ci-clippy _ci-test _ci-build _ci-shellspec _ci-shellcheck _ci-markdown-check _ci-toml-lint _ci-makefile-check _ci-deny _ci-cargo-pipeline
 
 # Default target
 help:
@@ -53,7 +53,8 @@ help:
 	@echo "  test-integration-azure               Run Azure integration tests against Azurite (Docker)"
 	@echo "  shellspec                            Run shellspec CLI integration tests"
 	@echo "  shellspec-live-s3                    Run live AWS S3 shellspec suite (opt-in, costs money)"
-	@echo "  shellspec-live                       Umbrella for all live-cloud suites (currently S3 only)"
+	@echo "  shellspec-live-azure                 Run live Azure Blob shellspec suite (opt-in, costs money)"
+	@echo "  shellspec-live                       Umbrella for all live-cloud suites (S3 + Azure)"
 	@echo "  shellspec-live-sweep                 List/delete stale live-test prefixes (AGE=24h, COMMIT=0)"
 	@echo ""
 	@echo "Code quality:"
@@ -207,7 +208,7 @@ deny:
 # ---------------------------------------------------------------------------
 shellspec: build
 	@echo "Running shellspec CLI + support-module unit tests..."
-	@shellspec --shell bash spec/cli_basics_spec.sh spec/live_common_spec.sh
+	@shellspec --shell bash spec/cli_basics_spec.sh spec/live_common_spec.sh spec/live_az_spec.sh
 
 # End-to-end integration suites that drive `git push` / `git fetch` /
 # `git clone` against a real rustfs (S3) or Azurite (Azure Blob)
@@ -225,16 +226,15 @@ shellspec-integration-azure: build
 
 shellspec-integration: shellspec-integration-s3 shellspec-integration-azure
 
-# Live-cloud test tier — opt-in, runs against real AWS S3 (and, in the
-# future, real Azure Blob). Never invoked by `make ci`, `make pre-commit`,
-# `make test`, `make shellspec-integration`, or `make all`. Requires the
-# explicit acknowledgement variable
-# `LIVE_TESTS_I_UNDERSTAND_THIS_COSTS_MONEY=1` to be exported in the
-# operator's environment; without it every spec aborts at `BeforeAll`
-# with a loud message. See `spec/live/README.md` for setup, env vars,
-# costs, and cleanup details. `ENGINE` defaults to `bundle`; pass
-# `ENGINE=...` to forward a different storage engine through to the
-# helper URL.
+# Live-cloud test tier — opt-in, runs against real AWS S3 and real
+# Azure Blob. Never invoked by `make ci`, `make pre-commit`, `make test`,
+# `make shellspec-integration`, or `make all`. Requires the explicit
+# acknowledgement variable `LIVE_TESTS_I_UNDERSTAND_THIS_COSTS_MONEY=1`
+# to be exported in the operator's environment; without it every spec
+# aborts at `BeforeAll` with a loud message. See `spec/live/README.md`
+# for setup, env vars, costs, and cleanup details. `ENGINE` defaults
+# to `bundle`; pass `ENGINE=...` to forward a different storage engine
+# through to the helper URL.
 ENGINE ?= bundle
 
 shellspec-live-s3: build
@@ -242,9 +242,15 @@ shellspec-live-s3: build
 	@LIVE_S3=1 LIVE_ENGINE="$(ENGINE)" shellspec --shell bash -j 1 \
 	  spec/cli_basics_spec.sh spec/live/s3
 
-# Umbrella target. Currently fans out to S3 only — Azure is a follow-up
-# (issue #59). When `shellspec-live-azure` ships, append it here.
-shellspec-live: shellspec-live-s3
+shellspec-live-azure: build
+	@echo "Running shellspec live Azure Blob suite..."
+	@LIVE_AZ=1 LIVE_ENGINE="$(ENGINE)" shellspec --shell bash -j 1 \
+	  spec/cli_basics_spec.sh spec/live/az
+
+# Umbrella target. Fans out to every live-cloud suite. The S3 and Azure
+# targets are independent — operators can run either or both depending
+# on which credentials they have configured.
+shellspec-live: shellspec-live-s3 shellspec-live-azure
 
 # Manual cross-run sweep. Lists prefixes under `live-test/` older than
 # `AGE` (default 24 hours). Pass `COMMIT=1` to actually delete; otherwise
@@ -360,7 +366,7 @@ _pc-build: _pc-test
 	cargo build --workspace --all-targets
 
 _pc-shellspec: _pc-build
-	shellspec --shell bash spec/cli_basics_spec.sh spec/live_common_spec.sh
+	shellspec --shell bash spec/cli_basics_spec.sh spec/live_common_spec.sh spec/live_az_spec.sh
 
 _pc-shellcheck: _pc-fmt
 	$(MAKE) shellcheck
@@ -408,7 +414,7 @@ _ci-build:
 _ci-shellspec:
 	mkdir -p reports
 	shellspec --shell bash --format progress --output junit --reportdir reports \
-	  spec/cli_basics_spec.sh spec/live_common_spec.sh
+	  spec/cli_basics_spec.sh spec/live_common_spec.sh spec/live_az_spec.sh
 
 _ci-shellcheck:
 	$(MAKE) shellcheck
