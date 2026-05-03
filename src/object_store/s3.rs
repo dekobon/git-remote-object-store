@@ -51,15 +51,24 @@
 //! 412 retry in [`ObjectStore::get_to_file`] is a deliberate-server-
 //! response retry, so forcing a fresh connection there does not help.
 //! Instead, the SDK's [`aws_config::timeout::TimeoutConfig`] is given
-//! a [`READ_TIMEOUT`] so a stuck download or small-body request fails
-//! fast and the SDK's internal retry layer can pick a fresh one.
-//! `connect_timeout` is left at the SDK default (3.1 s, already
-//! aggressive). Tracking issue: #26.
+//! a [`READ_TIMEOUT`] so a stuck request fails fast and the SDK's
+//! internal retry layer can pick a fresh one. `connect_timeout` is
+//! left at the SDK default (3.1 s, already aggressive). Tracking
+//! issue: #26.
 //!
-//! Note: smithy's `read_timeout` wraps the entire HTTP connector call
-//! (request body upload + response), not just response headers. Large
-//! bundle uploads use a per-operation timeout override in `put_body` to
-//! avoid being cut off after 30 s.
+//! Note: smithy's `read_timeout` resolves the HTTP connector future at
+//! "response-headers received." That bounds:
+//! - **Uploads** in full — the connector future cannot resolve until
+//!   the request body is sent and the response status arrives, so a
+//!   stuck upload trips at [`READ_TIMEOUT`]. `put_body` therefore
+//!   overrides the timeout per-operation so large bundle uploads are
+//!   not cut off at 30 s.
+//! - **Downloads** only up to time-to-first-byte. Once response
+//!   headers arrive the future resolves; subsequent body-chunk reads
+//!   are not bounded by `read_timeout`. A peer that wedges mid-body
+//!   on a GET (e.g. a stuck multipart range) is still subject to the
+//!   pool-idle / TCP-keepalive layers, but not to `READ_TIMEOUT`.
+//!   Lesson #2 in `docs/development/lessons_learned.md` covers this.
 //!
 //! TCP keepalive (the second knob suggested in #27) is **not** wired
 //! on the S3 path: `aws-smithy-http-client` 1.1.12's public `Builder`
@@ -157,11 +166,26 @@ pub(crate) const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`POOL_IDLE_TIMEOUT`] — both budgets are "give up and let the SDK
 /// retry pick a fresh connection" budgets.
 ///
-/// Note: smithy's `read_timeout` covers the entire HTTP round-trip
-/// (request upload + response), not just response headers. `put_body`
-/// overrides it per-operation to `None` so large bundle uploads are not
-/// cut off at 30 s. See the module-level transport docs and issue #26.
+/// Note: smithy's `read_timeout` resolves the HTTP connector future at
+/// "response-headers received." For uploads that includes the request
+/// body (the connector cannot resolve until the response arrives), so
+/// [`S3Store::put_body`] overrides the timeout per-operation to keep
+/// large bundle uploads from being cut off at 30 s. For downloads it
+/// is a time-to-first-byte bound only — body chunks streamed after the
+/// headers are not subject to `READ_TIMEOUT`. See the module-level
+/// transport docs and lesson #2 in `docs/development/lessons_learned.md`.
 pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-operation timeout config applied to every S3 PUT (object upload).
+///
+/// `disable_read_timeout()` is the entire point of this helper: a
+/// regression that returns `TimeoutConfig::builder().build()` (all
+/// fields `Unset`) re-introduces issue #26 (large uploads aborted at
+/// 30 s). Pinned by `put_body_upload_override_disables_read_timeout`
+/// so the fix cannot silently revert.
+fn upload_timeout_config() -> TimeoutConfig {
+    TimeoutConfig::builder().disable_read_timeout().build()
+}
 
 /// Production [`ObjectStore`] backed by `aws-sdk-s3`.
 #[derive(Debug)]
@@ -380,6 +404,11 @@ fn extract_aws_region(trimmed: &str) -> Option<String> {
     //   <bucket>.s3.<region>      → simple virtual-hosted (single-label bucket)
     //   <dotted.bucket>.s3.<region>  → dotted-bucket virtual-hosted (4+ labels)
     let labels: Vec<&str> = trimmed.split('.').collect();
+    // The explicit arms below match a fixed label count (1, 2, or 3),
+    // which guarantees the captured `region` is a single dot-free label.
+    // Only the fallback arm operates on the unbounded "4+ labels" shape,
+    // where the captured region could in principle still contain a `.`
+    // (a malformed host); the dot-filter on that arm rejects those.
     match labels.as_slice() {
         ["s3"] => None,
         ["s3", region] => Some((*region).to_owned()),
@@ -822,22 +851,25 @@ impl S3Store {
             req = req.metadata(k, v);
         }
         // Disable read_timeout for this operation: smithy's read_timeout
-        // wraps the entire HTTP connector call including the request body
-        // upload, so the global READ_TIMEOUT (30 s) would abort any bundle
+        // resolves the HTTP connector future at "response-headers received,"
+        // which for uploads includes the entire request body upload. The
+        // global READ_TIMEOUT (30 s) would otherwise abort any bundle
         // upload that takes longer than 30 s. GET/HEAD/LIST operations keep
         // the timeout via the client-level config; uploads opt out here.
         //
-        // Use `disable_read_timeout()` rather than a bare `.build()` (all
-        // fields Unset). Smithy's `MergeTimeoutConfig::merge_iter` treats
-        // an all-Unset TimeoutConfig as equivalent to `TimeoutConfig::disabled()`
-        // — it does NOT inherit unset fields from the client-level config.
-        // `.disable_read_timeout()` sets `read_timeout = Disabled` explicitly
-        // while leaving other fields (connect_timeout, etc.) as Unset, so they
-        // are inherited from the client config if set there in the future.
+        // Caveat: smithy's `MergeTimeoutConfig::merge_iter` treats an
+        // override whose `has_timeouts()` is false (no field in `Set` state
+        // — only `Disabled` and `Unset` count as "no timeouts") as a no-op
+        // and skips inheriting from the client-level config. So this
+        // override does NOT inherit `connect_timeout` (or any future
+        // client-level timeout) from the SDK's config. That is fine for the
+        // current use case — the only timeout we configure at the client
+        // level is `read_timeout`, which we explicitly want to disable —
+        // but a future client-level `connect_timeout` would have to be
+        // duplicated here to take effect on uploads.
         req.customize()
             .config_override(
-                aws_sdk_s3::config::Builder::new()
-                    .timeout_config(TimeoutConfig::builder().disable_read_timeout().build()),
+                aws_sdk_s3::config::Builder::new().timeout_config(upload_timeout_config()),
             )
             .send()
             .await
@@ -1521,5 +1553,38 @@ mod tests {
     fn timeout_constants_have_expected_values() {
         assert_eq!(POOL_IDLE_TIMEOUT, Duration::from_secs(30));
         assert_eq!(READ_TIMEOUT, Duration::from_secs(30));
+    }
+
+    /// Tripwire for the `disable_read_timeout()` fix in commit bfec2f4.
+    ///
+    /// `put_body` overrides the SDK timeout config per-operation so
+    /// large bundle uploads are not aborted at [`READ_TIMEOUT`].
+    /// A regression that drops `.disable_read_timeout()` from the
+    /// override (e.g. a bare `TimeoutConfig::builder().build()`) would
+    /// re-introduce the upload-abort bug silently.
+    ///
+    /// `TimeoutConfig` does not expose the per-field state via getters
+    /// (both `Unset` and `Disabled` return `None`), so the assertion
+    /// uses the merge semantics: build a base config that *does* set
+    /// `read_timeout`, then verify that merging via `take_defaults_from`
+    /// keeps `read_timeout` disabled rather than inheriting the base.
+    #[test]
+    fn put_body_upload_override_disables_read_timeout() {
+        let base = TimeoutConfig::builder()
+            .read_timeout(Duration::from_secs(99))
+            .build();
+
+        // `upload_timeout_config()` is the function `put_body` calls.
+        let mut override_cfg = upload_timeout_config();
+        let merged = override_cfg.take_defaults_from(&base);
+
+        // If `disable_read_timeout()` is in place, the merged config
+        // returns `None` (Disabled). If a regression dropped it, the
+        // merged config would inherit `Some(99s)` from the base.
+        assert_eq!(
+            merged.read_timeout(),
+            None,
+            "upload override must disable read_timeout, not just leave it Unset",
+        );
     }
 }
