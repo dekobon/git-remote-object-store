@@ -329,6 +329,87 @@ async fn copy_with_special_chars_in_key() {
 }
 
 #[tokio::test]
+async fn copy_drops_user_metadata_and_content_disposition() {
+    // Tripwire for the `MetadataDirective::Replace` choice in
+    // `S3Store::copy`. The trait contract (see
+    // `ObjectStore::copy`) does NOT promise metadata propagation
+    // because the Azure backend cannot guarantee it (its copy is
+    // implemented as download-then-reupload and drops user
+    // metadata). The S3 backend matches Azure by passing
+    // `MetadataDirective::Replace` with no metadata fields set.
+    //
+    // A regression that flips back to `MetadataDirective::Copy` (or
+    // omits the directive entirely — S3 defaults to Copy) would
+    // silently restore S3 metadata propagation and break parity
+    // with Azure without any test failure. This pins the contract.
+    let (store, bucket) = fresh_bucket().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src_path = tmp.path().join("src.txt");
+    tokio::fs::write(&src_path, b"copy contract")
+        .await
+        .expect("write src");
+
+    let opts = PutOpts {
+        content_disposition: Some("attachment; filename=orig.txt".into()),
+        user_metadata: vec![("x-original".into(), "yes".into())],
+        progress: None,
+    };
+    store
+        .put_path("src", &src_path, opts)
+        .await
+        .expect("put_path");
+
+    let fixture = fixture();
+    let client = setup_client(fixture.port).await;
+
+    // Sanity-check the fixture before testing the contract: if a
+    // regression in `put_path` silently dropped these fields, the
+    // post-copy "absent" assertions below would pass vacuously. Pin
+    // the source state so the test only ever fails for the right
+    // reason (a regression in `copy`, not in the put helper).
+    let src_head = client
+        .head_object()
+        .bucket(&bucket)
+        .key("src")
+        .send()
+        .await
+        .expect("head_object src");
+    assert_eq!(
+        src_head.content_disposition(),
+        Some("attachment; filename=orig.txt"),
+        "fixture precondition: put_path must persist content_disposition",
+    );
+    assert!(
+        src_head
+            .metadata()
+            .is_some_and(|m| m.get("x-original").is_some_and(|v| v == "yes")),
+        "fixture precondition: put_path must persist user metadata; got {:?}",
+        src_head.metadata(),
+    );
+
+    store.copy("src", "dst").await.expect("copy");
+
+    let head = client
+        .head_object()
+        .bucket(&bucket)
+        .key("dst")
+        .send()
+        .await
+        .expect("head_object dst");
+    assert_eq!(
+        head.content_disposition(),
+        None,
+        "copy must drop content_disposition (Azure parity)",
+    );
+    let user_meta = head.metadata();
+    let has_original = user_meta.is_some_and(|m| m.contains_key("x-original"));
+    assert!(
+        !has_original,
+        "copy must drop user metadata (Azure parity); got {user_meta:?}",
+    );
+}
+
+#[tokio::test]
 async fn copy_missing_source_is_not_found() {
     let (store, _bucket) = fresh_bucket().await;
     let err = store
