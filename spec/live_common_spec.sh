@@ -94,6 +94,63 @@ Describe "live_common.sh: live_engine"
 	End
 End
 
+Describe "live_common.sh: live_filter_stale_prefixes"
+	Include spec/support/live_common.sh
+
+	# The function is the lexicographic-cutoff core of `live-sweep.sh`.
+	# Run-id format is `YYYYMMDDTHHMMSSZ-<pid>-<rand>`, so the leading
+	# 16-char timestamp is compared as a string.
+	It "passes through prefixes whose timestamp is strictly older than the cutoff"
+		Data
+			#|live-test/20260101T000000Z-100-aaaa/
+			#|live-test/20260601T000000Z-200-bbbb/
+		End
+		When call live_filter_stale_prefixes 20260301T000000Z
+		The status should equal 0
+		The output should equal "live-test/20260101T000000Z-100-aaaa/"
+	End
+
+	It "treats the cutoff itself as not stale (strict less-than)"
+		Data
+			#|live-test/20260301T000000Z-100-aaaa/
+		End
+		When call live_filter_stale_prefixes 20260301T000000Z
+		The status should equal 0
+		The output should equal ""
+	End
+
+	It "ignores empty input lines"
+		Data
+			#|
+			#|live-test/20260101T000000Z-1-aa/
+			#|
+		End
+		When call live_filter_stale_prefixes 20260601T000000Z
+		The output should equal "live-test/20260101T000000Z-1-aa/"
+	End
+
+	It "tolerates prefixes without a trailing slash"
+		Data
+			#|live-test/20260101T000000Z-1-aa
+		End
+		When call live_filter_stale_prefixes 20260601T000000Z
+		The output should equal "live-test/20260101T000000Z-1-aa"
+	End
+
+	It "fails fast when cutoff is missing"
+		When call live_filter_stale_prefixes ""
+		The status should not equal 0
+		The stderr should include "requires <cutoff_stamp>"
+	End
+
+	It "emits nothing when input is empty"
+		Data ""
+		When call live_filter_stale_prefixes 20260301T000000Z
+		The status should equal 0
+		The output should equal ""
+	End
+End
+
 Describe "live_common.sh: live_engine_is_bundle"
 	Include spec/support/live_common.sh
 

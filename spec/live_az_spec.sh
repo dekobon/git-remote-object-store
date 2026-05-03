@@ -116,6 +116,87 @@ Describe "live_az.sh: live_az_url"
 	End
 End
 
+Describe "live_az.sh: live_az credential→argv translation"
+	Include spec/support/live_common.sh
+	Include spec/support/live_az.sh
+
+	# Mock the `az` binary by defining a shell function with the same
+	# name. Bash function definitions take precedence over PATH lookups,
+	# so every call to `az ...` inside this Describe block prints its
+	# argv on stdout instead of touching the network.
+	az() {
+		printf '%s\n' "$@"
+	}
+
+	clear_creds() {
+		unset AZSTORE_PROD_KEY AZSTORE_PROD_CONNECTION_STRING AZSTORE_PROD_SAS
+	}
+
+	It "passes --account-name + --account-key BEFORE user args when KEY is set"
+		export LIVE_AZ_ACCOUNT=myacct
+		export LIVE_AZ_CREDENTIAL_NAME=PROD
+		clear_creds
+		export AZSTORE_PROD_KEY=secret-key
+		When call live_az blob list --container-name foo --prefix bar
+		The status should equal 0
+		# Auth flags first, then the user's subcommand args.
+		The line 1 of output should equal "storage"
+		The line 2 of output should equal "--account-name"
+		The line 3 of output should equal "myacct"
+		The line 4 of output should equal "--account-key"
+		The line 5 of output should equal "secret-key"
+		The line 6 of output should equal "blob"
+		The line 7 of output should equal "list"
+	End
+
+	It "passes --connection-string when CONNECTION_STRING is set and KEY is absent"
+		export LIVE_AZ_ACCOUNT=myacct
+		export LIVE_AZ_CREDENTIAL_NAME=PROD
+		clear_creds
+		export AZSTORE_PROD_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=myacct;AccountKey=foo;"
+		When call live_az blob list --container-name foo
+		The status should equal 0
+		The line 1 of output should equal "storage"
+		The line 2 of output should equal "--connection-string"
+		The line 3 of output should equal "DefaultEndpointsProtocol=https;AccountName=myacct;AccountKey=foo;"
+		The line 4 of output should equal "blob"
+	End
+
+	It "passes --sas-token (with leading ? stripped) when only SAS is set"
+		export LIVE_AZ_ACCOUNT=myacct
+		export LIVE_AZ_CREDENTIAL_NAME=PROD
+		clear_creds
+		export AZSTORE_PROD_SAS="?sv=2025&sig=abc"
+		When call live_az blob list --container-name foo
+		The status should equal 0
+		The line 1 of output should equal "storage"
+		The line 2 of output should equal "--account-name"
+		The line 3 of output should equal "myacct"
+		The line 4 of output should equal "--sas-token"
+		# Leading `?` is stripped (az CLI rejects the prefix).
+		The line 5 of output should equal "sv=2025&sig=abc"
+		The line 6 of output should equal "blob"
+	End
+
+	It "accepts a SAS token without the leading ?"
+		export LIVE_AZ_ACCOUNT=myacct
+		export LIVE_AZ_CREDENTIAL_NAME=PROD
+		clear_creds
+		export AZSTORE_PROD_SAS="sv=2025&sig=abc"
+		When call live_az blob list --container-name foo
+		The line 5 of output should equal "sv=2025&sig=abc"
+	End
+
+	It "fails fast with a clear message when no env var is set"
+		export LIVE_AZ_ACCOUNT=myacct
+		export LIVE_AZ_CREDENTIAL_NAME=PROD
+		clear_creds
+		When call live_az blob list --container-name foo
+		The status should not equal 0
+		The stderr should include "AZSTORE_PROD_KEY"
+	End
+End
+
 Describe "live_az.sh: live_az_clear_prefix safety guard"
 	Include spec/support/live_common.sh
 	Include spec/support/live_az.sh
