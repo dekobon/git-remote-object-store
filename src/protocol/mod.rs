@@ -134,8 +134,24 @@ impl BatchState {
             self.mode = Some(incoming);
         }
         match incoming {
-            Mode::Fetch => self.fetch_cmds.push(cmd),
-            Mode::Push => self.push_cmds.push(cmd),
+            Mode::Fetch => {
+                // Defense-in-depth: the OTHER-mode accumulator was just
+                // cleared on a switch (or was already empty); if a
+                // future bug ever leaves it non-empty across a drain,
+                // panic in debug rather than silently mixing modes.
+                debug_assert!(
+                    self.push_cmds.is_empty(),
+                    "push_cmds must be empty when accumulating a Fetch command",
+                );
+                self.fetch_cmds.push(cmd);
+            }
+            Mode::Push => {
+                debug_assert!(
+                    self.fetch_cmds.is_empty(),
+                    "fetch_cmds must be empty when accumulating a Push command",
+                );
+                self.push_cmds.push(cmd);
+            }
         }
     }
 
@@ -329,6 +345,13 @@ mod tests {
         // strict `cmd == "\n"` blank-line check; only a literal blank
         // line is the batch separator).
         assert_eq!(parse_command("   \n"), None);
+        // Double-space inside a recognised command is rejected. Pinning
+        // strict byte-exact matching on the protocol verbs against any
+        // future "be lenient with whitespace" regression — `"list  for-push"`
+        // (two spaces) must NOT collapse to `Command::List { for_push: true }`.
+        assert_eq!(parse_command("list  for-push\n"), None);
+        // Trailing space after a verb is also rejected.
+        assert_eq!(parse_command("list \n"), None);
     }
 
     #[test]

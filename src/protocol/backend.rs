@@ -45,6 +45,20 @@ pub use crate::url::BackendKind;
 /// in its format string.** Omitting `{source}` while keeping
 /// `#[source]` causes `fatal_message` to silently drop the first
 /// source level from the rendered message.
+///
+/// # Invariant for `Network` classification
+///
+/// When [`classify`] or [`validate_format`] encounter
+/// [`ObjectStoreError::Network`], they extract the inner [`BoxError`]
+/// and store it directly in [`BackendError::Network::source`]. They
+/// must **never** wrap the whole `ObjectStoreError::Network` (whose
+/// own `Display` is `"network error: <inner>"`) into another
+/// `BackendError` variant whose `Display` also includes the source —
+/// that produces the redundant `"network error: network error: ..."`
+/// rendering [`fatal_message`] is documented to avoid. New
+/// `ObjectStoreError` variants that carry transport semantics must
+/// either add a dedicated `BackendError::Network`-style classification
+/// arm or store the inner cause directly.
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
     /// Bucket (S3) or container (Azure) does not exist. Maps from a
@@ -490,17 +504,28 @@ mod tests {
 
     #[test]
     fn fatal_message_engine_mismatch() {
-        // With a single-variant enum both fields are Bundle; the test still
-        // pins the format string against accidental wording changes.
+        // Pinning the wording. While `StorageEngine` has only one
+        // variant (`Bundle`), both fields will be `Bundle` and the
+        // pinned string is structurally degenerate ("but this bucket
+        // uses `bundle`" against a URL that "specifies engine
+        // `bundle`"). Lesson #6 says expected values must be derived
+        // from the spec — here, the spec is the `#[error(...)]` format
+        // string on `BackendError::EngineMismatch` itself, so the
+        // expected message is computed by interpolating the engine
+        // names and prefixing with `"fatal: "`. When a second
+        // `StorageEngine` variant ships, replace this with two
+        // distinct engines so the test ceases to be circular.
+        let url_engine = StorageEngine::Bundle;
+        let stored_engine = StorageEngine::Bundle;
         let err = BackendError::EngineMismatch {
-            url_engine: StorageEngine::Bundle,
-            stored_engine: StorageEngine::Bundle,
+            url_engine,
+            stored_engine,
         };
-        assert_eq!(
-            fatal_message(&err),
-            "fatal: URL specifies engine `bundle` but this bucket uses `bundle`; \
+        let expected = format!(
+            "fatal: URL specifies engine `{url_engine}` but this bucket uses `{stored_engine}`; \
              remove the `?engine=` parameter from the remote URL",
         );
+        assert_eq!(fatal_message(&err), expected);
     }
 
     // --- validate_format --------------------------------------------------
@@ -557,11 +582,69 @@ mod tests {
         store.insert("my-repo/FORMAT", Bytes::from_static(b"bundle"));
         // Conflicting/invalid content at the root path — if the prefix is
         // ignored, the "with prefix" call below would read this and fail.
-        store.insert("FORMAT", Bytes::from_static(b"unknown-format"));
-        // Without prefix: reads root FORMAT = "unknown-format" → UnknownStoredEngine.
-        assert!(validate_format(&store, "", None).await.is_err());
+        // The sentinel value ("INVALID_SENTINEL_NEVER_AN_ENGINE") is
+        // structurally impossible to be a valid `StorageEngine` name now
+        // or in the future (uppercase, contains underscores), so the
+        // assertion holds even if a future engine variant is added.
+        store.insert(
+            "FORMAT",
+            Bytes::from_static(b"INVALID_SENTINEL_NEVER_AN_ENGINE"),
+        );
+        // Without prefix: reads root FORMAT → must be specifically the
+        // `UnknownStoredEngine` variant. A regression that mapped this
+        // through `Network` or `InvalidCredentials` would still produce
+        // an error but for the wrong reason.
+        let err = validate_format(&store, "", None).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BackendError::UnknownStoredEngine { ref stored }
+                    if stored == "INVALID_SENTINEL_NEVER_AN_ENGINE"
+            ),
+            "expected UnknownStoredEngine(INVALID_SENTINEL_NEVER_AN_ENGINE), got {err:?}",
+        );
         // With prefix "my-repo": reads "my-repo/FORMAT" = "bundle" → Ok.
         validate_format(&store, "my-repo", None).await.unwrap();
+    }
+
+    /// T1 tripwire: the `from_utf8` hardening in `validate_format` (vs
+    /// the prior `from_utf8_lossy`) must surface non-UTF-8 bytes as
+    /// `BackendError::InvalidCredentials` carrying an `io::Error` whose
+    /// message names the FORMAT key. A regression that revives
+    /// `from_utf8_lossy()` would silently produce a replacement-character
+    /// engine name and fail later at `from_name`'s lookup with the wrong
+    /// error variant.
+    #[tokio::test]
+    async fn validate_format_rejects_non_utf8_format_bytes() {
+        let store = MockStore::new();
+        store.insert("FORMAT", Bytes::from_static(b"\xff\xff\xff"));
+        let err = validate_format(&store, "", None).await.unwrap_err();
+        let BackendError::InvalidCredentials { source } = &err else {
+            panic!("expected InvalidCredentials, got {err:?}");
+        };
+        let ObjectStoreError::Other(inner) = source else {
+            panic!("expected Other inside InvalidCredentials, got {source:?}");
+        };
+        let msg = inner.to_string();
+        // Both substrings together pin the wording the docstring claims:
+        // the message must surface the encoding category ("non-UTF-8")
+        // AND identify which key carried the bytes ("FORMAT"). Either
+        // assertion alone could false-pass on a generic "invalid utf-8"
+        // wording or a different-key error.
+        assert!(
+            msg.contains("non-UTF-8") && msg.contains("FORMAT"),
+            "expected message naming the FORMAT key and non-UTF-8 cause, got `{msg}`",
+        );
+        // The fatal message must surface BOTH the variant prefix
+        // ("invalid credentials") AND the inner non-UTF-8 cause through
+        // the chain-walk in `fatal_message`. This catches a regression
+        // that drops the source level (e.g. by removing `{source}` from
+        // the `InvalidCredentials` `#[error(...)]` format).
+        let fatal = fatal_message(&err);
+        assert!(
+            fatal.contains("invalid credentials") && fatal.contains("non-UTF-8"),
+            "fatal_message must surface variant + non-UTF-8 source, got `{fatal}`",
+        );
     }
 
     #[test]
