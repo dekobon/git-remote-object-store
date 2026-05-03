@@ -264,18 +264,19 @@ pub fn parse(input: &str) -> Result<RemoteUrl, ParseError> {
         .ok_or_else(|| ParseError::UnsupportedScheme(scheme_of(trimmed)))?;
     let endpoint = Url::parse(body)?;
 
-    let host = endpoint.host_str().ok_or(ParseError::MissingHost)?;
+    let host = endpoint
+        .host_str()
+        .ok_or(ParseError::MissingHost)?
+        .to_owned();
     if endpoint.scheme() == "http" && !is_loopback(&endpoint) && !http_allowed_by_env() {
-        return Err(ParseError::CleartextHttpForbidden {
-            host: host.to_owned(),
-        });
+        return Err(ParseError::CleartextHttpForbidden { host });
     }
 
     let (flags, addressing_override) = extract_flags(&endpoint)?;
 
     match backend {
-        BackendKind::S3 => finish_s3(endpoint, flags, addressing_override),
-        BackendKind::Azure => finish_azure(endpoint, flags, addressing_override),
+        BackendKind::S3 => finish_s3(endpoint, &host, flags, addressing_override),
+        BackendKind::Azure => finish_azure(endpoint, &host, flags, addressing_override),
     }
 }
 
@@ -429,25 +430,69 @@ fn set_canonical_path(u: &mut Url, segments: &[&str]) {
 // S3
 // ---------------------------------------------------------------------------
 
-/// Reject `.amazonaws.com` hostnames that cannot be valid S3 endpoints.
+/// AWS partition suffixes that are owned by AWS and therefore subject to
+/// `check_aws_s3_host` validation. Hosts ending in any of these must
+/// match a recognised S3 endpoint shape; hosts ending in anything else
+/// are treated as third-party S3-compatible endpoints (`MinIO`,
+/// Cloudflare R2, …) and skip the check entirely.
 ///
-/// Non-AWS hosts (custom endpoints, `MinIO`, etc.) are passed through
-/// unconditionally. For AWS hosts the hostname must either:
-/// - be `s3.amazonaws.com` or `s3.<region>.amazonaws.com` (path-style), or
-/// - contain `.s3.` or `.s3-` (virtual-hosted with the service marker).
+/// Order is irrelevant for correctness: a host that ends in
+/// `.amazonaws.com.cn` does not end in `.amazonaws.com` (the trailing
+/// `.cn` rules that out), so the two suffixes are mutually exclusive on
+/// any given host. The China entry is listed first by convention only.
+pub(crate) const AWS_HOST_SUFFIXES: &[&str] = &[".amazonaws.com.cn", ".amazonaws.com"];
+
+/// If `host` ends in one of [`AWS_HOST_SUFFIXES`], return the host with
+/// that suffix stripped; otherwise return `None`. Single source of truth
+/// for "is this an AWS partition host, and what is the leading portion?"
+pub(crate) fn strip_aws_host_suffix(host: &str) -> Option<&str> {
+    AWS_HOST_SUFFIXES
+        .iter()
+        .find_map(|suffix| host.strip_suffix(suffix))
+}
+
+/// Reject AWS hostnames (`.amazonaws.com` and `.amazonaws.com.cn`) that
+/// cannot be valid S3 endpoints.
+///
+/// Third-party S3-compatible endpoints (custom hosts, `MinIO`, R2, …)
+/// are passed through unconditionally — they do not end in an AWS
+/// partition suffix. For AWS hosts, after stripping the partition
+/// suffix the remainder must match one of:
+///
+/// - `s3` (legacy global path-style: `s3.amazonaws.com`)
+/// - `s3.<region>` (path-style with region: `s3.us-west-2.amazonaws.com`)
+/// - `s3-<region>` (legacy hyphenated path-style:
+///   `s3-us-east-1.amazonaws.com`)
+/// - end with `.s3` (no-region virtual-hosted:
+///   `<bucket>.s3.amazonaws.com`, where the trailing `.s3` label is
+///   the AWS service marker for the legacy global form)
+/// - contain `.s3.` or `.s3-` (virtual-hosted with region:
+///   `<bucket>.s3.<region>.amazonaws.com` /
+///   `<bucket>.s3-<region>.amazonaws.com`)
 ///
 /// The common mistake `<bucket>.<region>.amazonaws.com` — missing the
 /// `.s3.` service marker — would otherwise silently fall through to
-/// path-style addressing with a non-existent endpoint hostname, producing
-/// an inscrutable DNS-resolution error at connect time.
+/// path-style addressing with a non-existent endpoint hostname,
+/// producing an inscrutable DNS-resolution error at connect time.
+///
+/// **Policy on `?addressing=` override:** this check runs before the
+/// addressing override is applied, so `?addressing=path` (or
+/// `=virtual`) on an AWS hostname does not bypass it. AWS owns
+/// `.amazonaws.com[.cn]`; any host on those suffixes that is not a
+/// recognised S3 endpoint is a typo, and a fast-fail with the helpful
+/// `InvalidAwsS3Endpoint` error is preferable to letting the user pick
+/// any addressing style they want against a non-existent endpoint.
 fn check_aws_s3_host(host: &str) -> Result<(), ParseError> {
-    let Some(trimmed) = host.strip_suffix(".amazonaws.com") else {
-        // Not an AWS host — custom/S3-compatible endpoint, always OK.
+    let Some(trimmed) = strip_aws_host_suffix(host) else {
+        // Not an AWS host — third-party S3-compatible endpoint, always OK.
         return Ok(());
     };
 
     // `<bucket>.s3.amazonaws.com` → trimmed is `<bucket>.s3`; the last
     // dot-separated label is "s3" (global virtual-hosted, no region).
+    // This is the only branch that catches the no-region virtual-hosted
+    // shape — it is NOT redundant with the `.s3.` / `.s3-` infix checks
+    // (which require a region segment after the marker).
     let last_label_is_s3 = trimmed.split('.').next_back() == Some("s3");
 
     let valid = trimmed == "s3"
@@ -473,19 +518,16 @@ fn check_aws_s3_host(host: &str) -> Result<(), ParseError> {
 
 fn finish_s3(
     mut endpoint: Url,
+    host: &str,
     flags: RemoteFlags,
     addressing_override: Option<AddressingOverride>,
 ) -> Result<RemoteUrl, ParseError> {
     let segments = path_segments(&endpoint);
-    let host = endpoint
-        .host_str()
-        .ok_or(ParseError::MissingHost)?
-        .to_owned();
 
-    check_aws_s3_host(&host)?;
+    check_aws_s3_host(host)?;
 
     let (addressing, bucket, prefix_segments) =
-        resolve_s3_components(&host, &segments, addressing_override)?;
+        resolve_s3_components(host, &segments, addressing_override)?;
 
     if !is_valid_bucket(&bucket) {
         return Err(ParseError::InvalidBucket(bucket));
@@ -601,23 +643,20 @@ fn leftmost_label(host: &str) -> Option<String> {
 
 fn finish_azure(
     mut endpoint: Url,
+    host: &str,
     flags: RemoteFlags,
     addressing_override: Option<AddressingOverride>,
 ) -> Result<RemoteUrl, ParseError> {
     let segments = path_segments(&endpoint);
-    let host = endpoint
-        .host_str()
-        .ok_or(ParseError::MissingHost)?
-        .to_owned();
 
     let addressing = match addressing_override {
         Some(AddressingOverride::Path) => AzureAddressing::PathStyle,
         Some(AddressingOverride::Virtual) => AzureAddressing::VirtualHosted,
-        None => detect_azure_addressing(&host),
+        None => detect_azure_addressing(host),
     };
 
     let (account, container, prefix_segments) =
-        resolve_azure_components(addressing, &host, &segments)?;
+        resolve_azure_components(addressing, host, &segments)?;
 
     if !is_valid_account(&account) {
         return Err(ParseError::InvalidAccount(account));
@@ -1028,6 +1067,44 @@ mod tests {
         parse("s3+https://s3.amazonaws.com/my-bucket/repo").unwrap();
         // Path-style legacy hyphenated region (`s3-<region>.amazonaws.com`).
         parse("s3+https://s3-us-east-1.amazonaws.com/my-bucket/repo").unwrap();
+        // China partition (`.amazonaws.com.cn`): both addressing styles.
+        parse("s3+https://my-bucket.s3.cn-north-1.amazonaws.com.cn/repo").unwrap();
+        parse("s3+https://s3.cn-north-1.amazonaws.com.cn/my-bucket/repo").unwrap();
+    }
+
+    #[test]
+    fn rejects_china_amazonaws_host_missing_s3_service_marker() {
+        // Same typo class as `rejects_amazonaws_host_missing_s3_service_marker`
+        // but on the China partition (`.amazonaws.com.cn`). The typo
+        // `<bucket>.<region>.amazonaws.com.cn` (no `.s3.` marker) must
+        // produce the helpful `InvalidAwsS3Endpoint`, not a silent fall-
+        // through to PathStyle and a DNS error at connect time.
+        let err = parse("s3+https://git-test.cn-north-1.amazonaws.com.cn/repo").unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidAwsS3Endpoint { ref host } if host == "git-test.cn-north-1.amazonaws.com.cn"),
+            "expected InvalidAwsS3Endpoint, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn check_aws_s3_host_runs_before_addressing_override() {
+        // Policy: `?addressing=path` (or `=virtual`) on an AWS hostname
+        // does NOT bypass the validator. AWS owns `.amazonaws.com[.cn]`,
+        // so any host on those suffixes that is not a recognised S3
+        // endpoint is a typo. A user who needs path-style addressing on a
+        // vanity host should use a domain they own, not `.amazonaws.com`.
+        let err =
+            parse("s3+https://corp.amazonaws.com/my-bucket/repo?addressing=path").unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidAwsS3Endpoint { ref host } if host == "corp.amazonaws.com"),
+            "expected InvalidAwsS3Endpoint, got {err:?}",
+        );
+        let err =
+            parse("s3+https://corp.amazonaws.com/my-bucket/repo?addressing=virtual").unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidAwsS3Endpoint { ref host } if host == "corp.amazonaws.com"),
+            "expected InvalidAwsS3Endpoint, got {err:?}",
+        );
     }
 
     #[test]
