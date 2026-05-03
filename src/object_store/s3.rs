@@ -122,6 +122,12 @@ pub(crate) const MULTIPART_CHUNK_SIZE: u64 = 16 * 1024 * 1024;
 /// Maximum simultaneous in-flight ranged GETs in the multipart download path.
 pub(crate) const MULTIPART_MAX_CONCURRENCY: usize = 8;
 
+/// S3's hard ceiling on a single `PutObject` body. Reported in
+/// [`ObjectStoreError::PayloadTooLarge`] when the SDK surfaces
+/// `EntityTooLarge` (HTTP 400) or HTTP 413 so the wire-line names the
+/// number rather than dumping an opaque SDK chain.
+pub(crate) const SINGLE_PUT_LIMIT_BYTES: u64 = 5 * (1 << 30);
+
 /// Percent-encode set used for `x-amz-copy-source` keys: every non-
 /// alphanumeric ASCII byte except the path-structural and unreserved
 /// characters (`/`, `.`, `-`, `_`, `~`).
@@ -581,6 +587,14 @@ fn classify_status_and_code(
         403 => return Some(ObjectStoreError::AccessDenied(key.to_owned())),
         412 => return Some(ObjectStoreError::PreconditionFailed(key.to_owned())),
         409 => return Some(ObjectStoreError::Conflict(key.to_owned())),
+        // S3 occasionally surfaces HTTP 413 directly (front-door / proxy
+        // path); the canonical EntityTooLarge response is HTTP 400, but
+        // the status mapping is the same regardless of the SDK code.
+        413 => {
+            return Some(ObjectStoreError::PayloadTooLarge {
+                limit_bytes: SINGLE_PUT_LIMIT_BYTES,
+            });
+        }
         _ => {}
     }
     match code {
@@ -590,6 +604,12 @@ fn classify_status_and_code(
         Some("AccessDenied") => Some(ObjectStoreError::AccessDenied(key.to_owned())),
         Some("PreconditionFailed") => Some(ObjectStoreError::PreconditionFailed(key.to_owned())),
         Some("ConditionalRequestConflict") => Some(ObjectStoreError::Conflict(key.to_owned())),
+        // S3 returns HTTP 400 + `EntityTooLarge` when a single-PUT body
+        // exceeds 5 GiB. The status alone is too broad to hang
+        // `PayloadTooLarge` on, so route via the code.
+        Some("EntityTooLarge") => Some(ObjectStoreError::PayloadTooLarge {
+            limit_bytes: SINGLE_PUT_LIMIT_BYTES,
+        }),
         _ => None,
     }
 }
@@ -1445,9 +1465,35 @@ mod tests {
     }
 
     #[test]
+    fn classify_entity_too_large_code_is_payload_too_large() {
+        // S3 returns HTTP 400 + `EntityTooLarge` when a single-PUT body
+        // exceeds 5 GiB. Status 400 alone is too broad; route via code.
+        assert!(matches!(
+            classify_status_and_code(400, Some("EntityTooLarge"), "k"),
+            Some(ObjectStoreError::PayloadTooLarge { limit_bytes })
+                if limit_bytes == SINGLE_PUT_LIMIT_BYTES
+        ));
+    }
+
+    #[test]
+    fn classify_413_status_is_payload_too_large() {
+        // Front-door / proxy paths can surface HTTP 413 directly even
+        // when the canonical S3 response is 400; treat 413 the same.
+        assert!(matches!(
+            classify_status_and_code(413, None, "k"),
+            Some(ObjectStoreError::PayloadTooLarge { limit_bytes })
+                if limit_bytes == SINGLE_PUT_LIMIT_BYTES
+        ));
+    }
+
+    #[test]
     fn classify_unrecognised_returns_none() {
         assert!(classify_status_and_code(500, Some("InternalError"), "k").is_none());
         assert!(classify_status_and_code(500, None, "k").is_none());
+        // Plain 400 with no recognised code stays in `Other` so callers
+        // see the SDK chain rather than a misleading PayloadTooLarge.
+        assert!(classify_status_and_code(400, None, "k").is_none());
+        assert!(classify_status_and_code(400, Some("MalformedXML"), "k").is_none());
     }
 
     // --- from_remote_url constructor branch ---------------------------

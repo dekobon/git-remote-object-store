@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ObjectStoreError::PayloadTooLarge { limit_bytes }` variant for
+  upload-body-too-big failures. The S3 classifier maps
+  `EntityTooLarge` (HTTP 400) and HTTP 413 onto it (limit 5 GiB single
+  PUT); the Azure classifier maps HTTP 413 and `RequestBodyTooLarge`
+  onto it (limit 5000 MiB single Put Blob). The push wire-line now
+  reads `"upload exceeds backend size limit (5 GiB)"` instead of
+  dumping an opaque SDK chain when a bundle exceeds the single-PUT
+  ceiling. (#54)
 - Live-cloud shellspec tier under `spec/live/s3/` exercising the helper
   binaries against real AWS S3 (Azure Blob is a follow-up). New make
   targets `shellspec-live-s3`, `shellspec-live`, and

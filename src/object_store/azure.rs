@@ -150,6 +150,13 @@ use super::{
     GetOpts, ObjectMeta, ObjectStore, ObjectStoreError, ProgressSink, PutOpts, persist_temp,
 };
 
+/// Azure Blob's hard ceiling on a single Put Blob body for the wire
+/// versions we negotiate (2019-12-12+). Reported in
+/// [`ObjectStoreError::PayloadTooLarge`] when the SDK surfaces HTTP 413
+/// or `RequestBodyTooLarge`, so the wire-line names a concrete number
+/// rather than dumping an opaque SDK chain.
+pub(crate) const SINGLE_PUT_BLOB_LIMIT_BYTES: u64 = 5_000 * (1 << 20);
+
 /// Bound on how long an idle pooled HTTPS connection lingers before
 /// the [`reqwest`] connection pool drops it. Short enough that DNS
 /// rotation rarely hits a stale pooled connection; long enough that
@@ -354,8 +361,11 @@ pub(crate) fn build_account_url(
 /// resulting [`ObjectStoreError::NotFound`] / [`ObjectStoreError::AccessDenied`] /
 /// [`ObjectStoreError::PreconditionFailed`] / [`ObjectStoreError::Conflict`] payload.
 fn classify(err: azure_core::Error, key: &str) -> ObjectStoreError {
-    if let Some(status) = err.http_status()
-        && let Some(mapped) = classify_status(u16::from(status), key)
+    if let azure_core::error::ErrorKind::HttpResponse {
+        status, error_code, ..
+    } = err.kind()
+        && let Some(mapped) =
+            classify_status_and_code(u16::from(*status), error_code.as_deref(), key)
     {
         return mapped;
     }
@@ -365,14 +375,34 @@ fn classify(err: azure_core::Error, key: &str) -> ObjectStoreError {
     other_boxed(err)
 }
 
-/// Pure status-code classifier (key context, no SDK types) so unit
+/// Pure status/code classifier (key context, no SDK types) so unit
 /// tests can exercise every branch without synthesising an SDK error.
-fn classify_status(status: u16, key: &str) -> Option<ObjectStoreError> {
+fn classify_status_and_code(
+    status: u16,
+    code: Option<&str>,
+    key: &str,
+) -> Option<ObjectStoreError> {
     match status {
-        404 => Some(ObjectStoreError::NotFound(key.to_owned())),
-        403 => Some(ObjectStoreError::AccessDenied(key.to_owned())),
-        412 => Some(ObjectStoreError::PreconditionFailed(key.to_owned())),
-        409 => Some(ObjectStoreError::Conflict(key.to_owned())),
+        404 => return Some(ObjectStoreError::NotFound(key.to_owned())),
+        403 => return Some(ObjectStoreError::AccessDenied(key.to_owned())),
+        412 => return Some(ObjectStoreError::PreconditionFailed(key.to_owned())),
+        409 => return Some(ObjectStoreError::Conflict(key.to_owned())),
+        // Azure surfaces a Put Blob body over the single-PUT ceiling as
+        // HTTP 413 with code `RequestBodyTooLarge`; the status alone is
+        // sufficient (HTTP 413 is the canonical "Payload Too Large").
+        413 => {
+            return Some(ObjectStoreError::PayloadTooLarge {
+                limit_bytes: SINGLE_PUT_BLOB_LIMIT_BYTES,
+            });
+        }
+        _ => {}
+    }
+    // Defensive backstop for the (rare) case where the SDK exposes the
+    // service code without a 413 status: route on the code alone.
+    match code {
+        Some("RequestBodyTooLarge") => Some(ObjectStoreError::PayloadTooLarge {
+            limit_bytes: SINGLE_PUT_BLOB_LIMIT_BYTES,
+        }),
         _ => None,
     }
 }
@@ -793,12 +823,12 @@ mod tests {
         assert_eq!(out, "https://acct.blob.core.windows.net/");
     }
 
-    // --- classify_status ----------------------------------------------
+    // --- classify_status_and_code -------------------------------------
 
     #[test]
     fn classify_404_is_not_found() {
         assert!(matches!(
-            classify_status(404, "k"),
+            classify_status_and_code(404, None, "k"),
             Some(ObjectStoreError::NotFound(s)) if s == "k"
         ));
     }
@@ -806,7 +836,7 @@ mod tests {
     #[test]
     fn classify_403_is_access_denied() {
         assert!(matches!(
-            classify_status(403, "k"),
+            classify_status_and_code(403, None, "k"),
             Some(ObjectStoreError::AccessDenied(s)) if s == "k"
         ));
     }
@@ -814,7 +844,7 @@ mod tests {
     #[test]
     fn classify_412_is_precondition_failed() {
         assert!(matches!(
-            classify_status(412, "k"),
+            classify_status_and_code(412, None, "k"),
             Some(ObjectStoreError::PreconditionFailed(s)) if s == "k"
         ));
     }
@@ -825,15 +855,40 @@ mod tests {
         // contention path). Without this branch, `put_if_absent` would
         // surface contention as a hard error instead of `Ok(false)`.
         assert!(matches!(
-            classify_status(409, "k"),
+            classify_status_and_code(409, None, "k"),
             Some(ObjectStoreError::Conflict(s)) if s == "k"
         ));
     }
 
     #[test]
+    fn classify_413_is_payload_too_large() {
+        // Azure surfaces a Put Blob body over the 5_000 MiB ceiling as
+        // HTTP 413 with code `RequestBodyTooLarge`. Test the status
+        // branch — the canonical "Payload Too Large" status alone
+        // suffices to classify the error.
+        assert!(matches!(
+            classify_status_and_code(413, Some("RequestBodyTooLarge"), "k"),
+            Some(ObjectStoreError::PayloadTooLarge { limit_bytes })
+                if limit_bytes == SINGLE_PUT_BLOB_LIMIT_BYTES
+        ));
+    }
+
+    #[test]
+    fn classify_request_body_too_large_code_is_payload_too_large() {
+        // Defensive backstop: if the SDK delivers the service code on a
+        // non-413 status (e.g. 400), the code branch still catches it.
+        assert!(matches!(
+            classify_status_and_code(400, Some("RequestBodyTooLarge"), "k"),
+            Some(ObjectStoreError::PayloadTooLarge { limit_bytes })
+                if limit_bytes == SINGLE_PUT_BLOB_LIMIT_BYTES
+        ));
+    }
+
+    #[test]
     fn classify_unrecognised_status_returns_none() {
-        assert!(classify_status(500, "k").is_none());
-        assert!(classify_status(429, "k").is_none());
+        assert!(classify_status_and_code(500, None, "k").is_none());
+        assert!(classify_status_and_code(429, None, "k").is_none());
+        assert!(classify_status_and_code(500, Some("InternalError"), "k").is_none());
     }
 
     // --- properties_to_meta ------------------------------------------
