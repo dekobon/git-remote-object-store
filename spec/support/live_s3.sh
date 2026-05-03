@@ -181,12 +181,18 @@ live_s3_preflight() {
 	}
 	echo "preflight" >"$body"
 
-	if ! live_s3_put_object "$LIVE_S3_BUCKET" "$key" "$body" 2>/dev/null; then
+	# Pre-flight is the operator's diagnostic surface for auth /
+	# permission / region / endpoint issues. Let aws-cli's stderr
+	# through verbatim — the "<op> failed" categorization line is a
+	# summary, not a substitute for the underlying error message
+	# (e.g. "Your session has expired", "AccessDenied: ... is not
+	# authorized to perform: s3:PutObject", "InvalidLocationConstraint").
+	if ! live_s3_put_object "$LIVE_S3_BUCKET" "$key" "$body"; then
 		echo "live_s3_preflight: PUT failed (s3:PutObject)" >&2
 		rm -f "$body" "$downloaded"
 		return 1
 	fi
-	if ! live_s3_get_object "$LIVE_S3_BUCKET" "$key" "$downloaded" 2>/dev/null; then
+	if ! live_s3_get_object "$LIVE_S3_BUCKET" "$key" "$downloaded"; then
 		echo "live_s3_preflight: GET failed (s3:GetObject)" >&2
 		live_s3_delete_object "$LIVE_S3_BUCKET" "$key"
 		rm -f "$body" "$downloaded"
@@ -199,7 +205,7 @@ live_s3_preflight() {
 		return 1
 	fi
 	if ! live_s3_aws s3api delete-object \
-		--bucket "$LIVE_S3_BUCKET" --key "$key" >/dev/null 2>&1; then
+		--bucket "$LIVE_S3_BUCKET" --key "$key" >/dev/null; then
 		echo "live_s3_preflight: DELETE failed (s3:DeleteObject)" >&2
 		rm -f "$body" "$downloaded"
 		return 1
