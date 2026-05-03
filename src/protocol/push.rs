@@ -355,10 +355,11 @@ pub(crate) async fn push_batch(
                     PushError::Store(_) | PushError::Git(_) | PushError::Io(_) | PushError::Sha(_)
                 ) =>
             {
-                warn!(ref = %remote_ref_str, error = %e, "push ref failed");
+                let chain = full_error_chain(&e);
+                warn!(ref = %remote_ref_str, error = %chain, "push ref failed");
                 PushOutcome::Error {
                     remote_ref: remote_ref_str,
-                    message: format!(r#""{e}"?"#),
+                    message: format!(r#""{chain}"?"#),
                 }
             }
             Err(e) => return Err(e),
@@ -366,6 +367,27 @@ pub(crate) async fn push_batch(
         outcomes.push(outcome);
     }
     Ok(outcomes)
+}
+
+/// Render a [`PushError`] as a colon-separated chain so the
+/// `error <ref>` wire line and the stderr log carry every level of
+/// causal context.
+///
+/// `thiserror`-derived `Display` for `PushError` already inlines the
+/// direct source (e.g. `"object-store error during push: {0}"`), so we
+/// start chain-walking one level past it to avoid duplicating the
+/// first-level source — matching the same pattern used by
+/// [`super::backend::fatal_message`].
+fn full_error_chain(err: &PushError) -> String {
+    use std::error::Error as StdError;
+    use std::fmt::Write as _;
+    let mut msg = err.to_string();
+    let mut next = err.source().and_then(StdError::source);
+    while let Some(src) = next {
+        write!(msg, ": {src}").expect("writing to a String is infallible");
+        next = src.source();
+    }
+    msg
 }
 
 /// Recoverable per-push errors discovered while talking to the local
@@ -622,7 +644,7 @@ async fn push_one(
     // error takes priority — do not mask it with the release failure.
     match (&result, release_result) {
         (Ok(PushOutcome::Ok { .. }), Err(e)) => {
-            warn!(key = %lock, "failed to release lock: {e}");
+            warn!(key = %lock, error = %e, "failed to release lock");
             Ok(PushOutcome::Error {
                 remote_ref: remote_ref_str,
                 message: format!(
@@ -636,7 +658,7 @@ async fn push_one(
         // so operators can spot dangling locks that coincide with push
         // errors; the lock TTL will eventually clean up.
         (_, Err(e)) => {
-            warn!(key = %lock, "lock release failed (push already errored): {e}");
+            warn!(key = %lock, error = %e, "lock release failed (push already errored)");
             result
         }
         _ => result,
@@ -670,13 +692,22 @@ async fn perform_push_under_lock(
         });
     }
     let current_key = current.into_iter().next().map(|m| m.key);
-    // Compare the pre-lock snapshot to the under-lock reality. All four
-    // cases (None/None, Some/Some-same, Some/Some-diff, None/Some, Some/None)
-    // must be checked: a concurrent push that created or replaced the bundle
-    // while we prepared ours would be silently overwritten without this guard.
+    // Compare the pre-lock snapshot to the under-lock reality. All five
+    // (pre / under) cases must agree:
+    //   None / None           — happy path, no bundle existed before or now.
+    //   Some(K) / Some(K)     — happy path, same bundle (e.g. force-push that
+    //                           re-uploads against the same SHA).
+    //   Some(A) / Some(B)     — concurrent push replaced our snapshot's
+    //                           bundle. Reject: we'd silently overwrite it.
+    //   None / Some           — concurrent push created a bundle after our
+    //                           pre-lock list. Reject.
+    //   Some / None           — concurrent delete (`git push :ref`) removed
+    //                           our snapshot's bundle. Reject.
+    // Without this guard a concurrent writer between the pre-lock list and
+    // the lock acquisition would be silently overwritten.
     if pre_existing.as_deref() != current_key.as_deref() {
         return Ok(PushOutcome::Error {
-            remote_ref: remote_ref_str.clone(),
+            remote_ref: remote_ref_str,
             message: r#""stale remote. Please fetch and retry."?"#.to_owned(),
         });
     }
@@ -1339,11 +1370,10 @@ mod tests {
 
     /// Build a `PushReadyState` with a specific `pre_existing` key and a
     /// matching `bundle_path` on disk. The store is left in whatever state
-    /// the caller configured (e.g. with a pre-seeded bundle key).
-    fn push_state_with_pre_existing(
-        prefix: Option<&str>,
-        pre_existing: Option<String>,
-    ) -> PushReadyState {
+    /// the caller configured (e.g. with a pre-seeded bundle key); the
+    /// caller already knows which prefix it seeded under, so this helper
+    /// does not need to take it.
+    fn push_state_with_pre_existing(pre_existing: Option<String>) -> PushReadyState {
         let r = rn("refs/heads/main");
         let temp_dir = tempfile::Builder::new()
             .prefix("test_push_")
@@ -1351,7 +1381,6 @@ mod tests {
             .unwrap();
         let bundle_path = temp_dir.path().join("bundle");
         std::fs::write(&bundle_path, b"fake bundle").unwrap();
-        let _ = prefix; // consumed by the caller when seeding the store
         PushReadyState {
             remote_ref: r,
             local_sha: Sha::from_hex(SHA).unwrap(),
@@ -1366,12 +1395,22 @@ mod tests {
     /// `pre_existing=None`, `current_key=Some(...)`: a concurrent push
     /// created a bundle after our pre-lock list but before we acquired
     /// the lock.
+    ///
+    /// The seeded `existing_key` deliberately uses a SHA distinct from
+    /// the local push's `local_sha` (= `SHA`). If they matched, a
+    /// regression that compared `current_key` against `bundle_dest`
+    /// (the key derived from `local_sha`) instead of against
+    /// `pre_existing` could pass for the wrong reason — the keys
+    /// happen to align. With distinct SHAs the only way the test
+    /// passes is the correct comparison: `pre_existing(None) !=
+    /// current_key(Some)`.
     #[tokio::test]
     async fn perform_push_under_lock_rejects_none_to_some_stale_remote() {
         let store = MockStore::new();
-        let existing_key = format!("repo/refs/heads/main/{SHA}.bundle");
+        let other_sha = "ffffffffffffffffffffffffffffffffffffffff";
+        let existing_key = format!("repo/refs/heads/main/{other_sha}.bundle");
         store.insert(&existing_key, Bytes::from_static(b"old bundle"));
-        let state = push_state_with_pre_existing(Some("repo"), None);
+        let state = push_state_with_pre_existing(None);
         let outcome = perform_push_under_lock(&store, Some("repo"), state)
             .await
             .unwrap();
@@ -1392,7 +1431,7 @@ mod tests {
     async fn perform_push_under_lock_rejects_some_to_none_stale_remote() {
         let store = MockStore::new();
         let old_key = format!("repo/refs/heads/main/{SHA}.bundle");
-        let state = push_state_with_pre_existing(Some("repo"), Some(old_key.clone()));
+        let state = push_state_with_pre_existing(Some(old_key.clone()));
         // Store is empty — the previously-seen bundle is gone.
         let outcome = perform_push_under_lock(&store, Some("repo"), state)
             .await
@@ -1418,7 +1457,7 @@ mod tests {
         let new_key = format!("repo/refs/heads/main/{new_sha}.bundle");
         // Under-lock the store shows the *new* key.
         store.insert(&new_key, Bytes::from_static(b"new bundle"));
-        let state = push_state_with_pre_existing(Some("repo"), Some(old_key));
+        let state = push_state_with_pre_existing(Some(old_key));
         let outcome = perform_push_under_lock(&store, Some("repo"), state)
             .await
             .unwrap();
@@ -1450,7 +1489,7 @@ mod tests {
             Bytes::from_static(b"bundle_b"),
         );
         // Pre-lock snapshot saw zero bundles; under-lock sees two.
-        let state = push_state_with_pre_existing(Some("repo"), None);
+        let state = push_state_with_pre_existing(None);
         let outcome = perform_push_under_lock(&store, Some("repo"), state)
             .await
             .unwrap();
@@ -1465,6 +1504,80 @@ mod tests {
         // Neither bundle was overwritten or deleted.
         assert!(store.contains(&format!("repo/refs/heads/main/{sha_a}.bundle")));
         assert!(store.contains(&format!("repo/refs/heads/main/{sha_b}.bundle")));
+    }
+
+    /// Stale-remote happy path: `pre_existing == current_key`. The four
+    /// drift scenarios above all assert that mismatch produces an error.
+    /// This case asserts that the *match* path goes through to a normal
+    /// `Ok(remote_ref)` push outcome — without it, a regression that
+    /// flipped the comparison to always-mismatch would pass every drift
+    /// test and silently break every real push.
+    #[tokio::test]
+    async fn perform_push_under_lock_passes_through_when_pre_existing_matches_current() {
+        let store = MockStore::new();
+        let pre_key = format!("repo/refs/heads/main/{SHA}.bundle");
+        // Seed the store so the under-lock list returns the same key the
+        // pre-lock snapshot saw. (Same SHA as `local_sha` is intentional
+        // here: a force-push that re-uploads against the same SHA is the
+        // canonical happy-path case.)
+        store.insert(&pre_key, Bytes::from_static(b"old bundle"));
+        let state = push_state_with_pre_existing(Some(pre_key.clone()));
+        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&outcome, PushOutcome::Ok { remote_ref } if remote_ref == "refs/heads/main"),
+            "expected Ok(refs/heads/main), got {outcome:?}",
+        );
+        // Verify the push actually ran end-to-end, not just the comparison.
+        // A regression that early-returned Ok after the match-check would pass
+        // the outcome assertion above but skip every real side effect.
+        let bundle_bytes = store.get_bytes(&pre_key).await.unwrap();
+        assert_eq!(
+            bundle_bytes.as_ref(),
+            b"fake bundle",
+            "bundle must be re-uploaded with the local payload, not left as the seed",
+        );
+        assert!(
+            store.contains("repo/FORMAT"),
+            "FORMAT key must be written by the push",
+        );
+        assert!(
+            store.contains("repo/HEAD"),
+            "HEAD key must be written by the push",
+        );
+    }
+
+    // --- delete_remote_ref --------------------------------------------
+
+    /// A ref whose only remaining object is a stale `LOCK#.lock` deletes
+    /// that lock as if it were the bundle and returns `ok` — the
+    /// listing is unfiltered on purpose. Mirrors upstream
+    /// `git_remote_s3/remote.py:172-196`.
+    ///
+    /// A regression that filtered `LOCK#.lock` out of the listing (e.g.
+    /// reusing `bundles_for_ref` here) would silently turn this into
+    /// `error <ref> "not found"?` and leave the stale lock dangling
+    /// for the full TTL.
+    #[tokio::test]
+    async fn delete_remote_ref_removes_stale_lock_as_if_bundle() {
+        let store = MockStore::new();
+        let lock_key = "repo/refs/heads/main/LOCK#.lock";
+        store.insert(lock_key, Bytes::from_static(b"stale-lock-payload"));
+        let r = rn("refs/heads/main");
+
+        let outcome = delete_remote_ref(&store, Some("repo"), &r, false)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&outcome, PushOutcome::Ok { remote_ref } if remote_ref == "refs/heads/main"),
+            "expected Ok(refs/heads/main), got {outcome:?}",
+        );
+        assert!(
+            !store.contains(lock_key),
+            "stale lock must be removed by delete_remote_ref",
+        );
     }
 
     /// Stale lock is deleted but another client re-acquires it before our
