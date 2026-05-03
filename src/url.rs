@@ -762,11 +762,7 @@ fn is_valid_bucket(s: &str) -> bool {
 
 /// `[a-z0-9]{3,24}` — Azure storage-account naming rule.
 fn is_valid_account(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    if !(3..=24).contains(&bytes.len()) {
-        return false;
-    }
-    bytes.iter().copied().all(is_ascii_alphanum_lower)
+    (3..=24).contains(&s.len()) && s.bytes().all(is_ascii_alphanum_lower)
 }
 
 /// Azure container-naming rule: 3–63 chars, lowercase alphanumerics plus
