@@ -88,6 +88,24 @@ The runner verifies these are on `PATH`:
 
 Missing tools fail fast with the missing list (not one-by-one).
 
+### Side effects on your home directory
+
+The live suite preserves the operator's real `HOME` (the integration
+suite does not — it isolates `HOME` to a scratch dir). This is required
+so the AWS SDK can resolve `~/.aws/credentials`, `~/.aws/config`, and
+the SSO cache. Two consequences worth knowing:
+
+- `lfs_spec.sh` runs `git lfs install --skip-repo`, which writes a
+  `[filter "lfs"]` section to `~/.gitconfig` if not already present.
+  Operators who already have `git lfs install` in their environment
+  (which is most LFS users) see no change. Operators who don't can
+  remove the section by hand or by re-running `git lfs install --skip-repo`
+  with a different config target.
+- The repo-local `user.name`, `user.email`, and `commit.gpgsign=false`
+  set by `git_scenarios_init` override your global `~/.gitconfig` for
+  the per-test repos, so test commits don't pick up your real identity
+  or signing key.
+
 ## Run
 
 ```bash

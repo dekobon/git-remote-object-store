@@ -38,6 +38,11 @@ live_s3_aws() {
 # Print the helper-protocol URL for a (bucket, prefix) pair on real AWS.
 # The host follows virtual-hosted style; the path is `<prefix>` with
 # `?engine=` appended (and `?profile=` when set, joined with `&`).
+#
+# NOTE: This signature deliberately differs from `rustfs_url <bucket>
+# <prefix>` — the live tier always targets the operator-owned, fixed
+# `$LIVE_S3_BUCKET` set in `BeforeAll`, so accepting a per-call bucket
+# would invite mismatches between cleanup target and test target.
 live_s3_url() {
 	local prefix="$1"
 	if [[ -z "$prefix" ]]; then
