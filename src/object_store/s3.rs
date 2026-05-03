@@ -95,7 +95,7 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use url::Url;
 
-use crate::url::{AWS_S3_INFIXES, RemoteUrl, S3Addressing, s3_virtual_hosted_bucket};
+use crate::url::{AWS_S3_INFIXES, RemoteUrl, S3Addressing, s3_virtual_hosted_bucket, strip_aws_host_suffix};
 
 use super::error::{network_boxed, other_boxed};
 use super::{
@@ -355,15 +355,24 @@ pub(crate) fn resolve_region(endpoint: &Url, flag: Option<&str>) -> Option<Strin
         return Some(r.to_owned());
     }
     let host = endpoint.host_str()?;
-    if !host.ends_with(".amazonaws.com") && host != "amazonaws.com" {
-        return Some("us-east-1".to_owned());
+    // Bare `amazonaws.com` is an AWS host with no leading content (no
+    // region segment), so it short-circuits to `None` like `s3.amazonaws.com`
+    // does — the SDK provider chain picks the region. Everything else
+    // that does not end in an AWS partition suffix is treated as a
+    // third-party S3-compatible endpoint and gets the safe `us-east-1`
+    // default.
+    if host == "amazonaws.com" {
+        return None;
     }
-    extract_aws_region(host)
+    let Some(trimmed) = strip_aws_host_suffix(host) else {
+        return Some("us-east-1".to_owned());
+    };
+    extract_aws_region(trimmed)
 }
 
-/// Try to parse the AWS region out of an `*.amazonaws.com` hostname.
-fn extract_aws_region(host: &str) -> Option<String> {
-    let trimmed = host.strip_suffix(".amazonaws.com")?;
+/// Parse the AWS region out of an AWS hostname's leading portion (the
+/// host with its [`AWS_HOST_SUFFIXES`] suffix already stripped).
+fn extract_aws_region(trimmed: &str) -> Option<String> {
     // Patterns we accept (in priority order):
     //   s3                        → legacy us-east-1 (no region segment) → None
     //   s3.<region>               → path-style regional
@@ -1293,9 +1302,26 @@ mod tests {
     #[test]
     fn resolve_region_dotted_bucket_virtual_hosted() {
         // Bucket name contains dots. The host has 4+ labels after stripping
-        // `.amazonaws.com`; `extract_aws_region` must still find the region.
+        // `.amazonaws.com`; `resolve_region` must still find the region.
         let url = parse_endpoint("https://bucketname.com.s3.us-west-2.amazonaws.com/some/path");
         assert_eq!(resolve_region(&url, None), Some("us-west-2".to_owned()));
+    }
+
+    #[test]
+    fn resolve_region_china_partition_virtual_hosted() {
+        // China partition (`.amazonaws.com.cn`) — the suffix list in
+        // `crate::url::AWS_HOST_SUFFIXES` is the single source of truth
+        // for which suffixes count as AWS. This test pins parity between
+        // `check_aws_s3_host` (which accepts the suffix) and
+        // `resolve_region` (which must extract the region from it).
+        let url = parse_endpoint("https://my-bucket.s3.cn-north-1.amazonaws.com.cn/repo");
+        assert_eq!(resolve_region(&url, None), Some("cn-north-1".to_owned()));
+    }
+
+    #[test]
+    fn resolve_region_china_partition_path_style() {
+        let url = parse_endpoint("https://s3.cn-northwest-1.amazonaws.com.cn/my-bucket");
+        assert_eq!(resolve_region(&url, None), Some("cn-northwest-1".to_owned()));
     }
 
     // --- encode_copy_source -------------------------------------------
