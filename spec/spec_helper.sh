@@ -34,24 +34,34 @@ LFS_AGENT_BIN="git-lfs-object-store"
 FIXTURE_DIR="${BASE_DIR}/spec/fixtures"
 
 # Isolate from the host environment so tests cannot leak credentials or
-# pick up a developer's real cloud configuration.
-unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
-	AWS_PROFILE AWS_REGION AWS_DEFAULT_REGION AWS_DEFAULT_PROFILE \
-	AWS_CONFIG_FILE AWS_SHARED_CREDENTIALS_FILE AWS_ENDPOINT_URL
-unset AZURE_STORAGE_ACCOUNT AZURE_STORAGE_KEY AZURE_STORAGE_CONNECTION_STRING \
-	AZURE_STORAGE_SAS_TOKEN AZURE_STORAGE_AUTH_MODE
-# AZSTORE_<NAME>_{KEY,CONNECTION_STRING,SAS} is the helper's credential
-# alias surface (see src/object_store/azure.rs); strip every variant.
-while IFS= read -r _var; do
-	unset "$_var"
-done < <(env | awk -F= '/^AZSTORE_/{print $1}')
-unset _var
+# pick up a developer's real cloud configuration. Skipped when a live
+# suite is enabled (`LIVE_S3=1`, future `LIVE_AZ=1`) — those tests need
+# the user's real AWS / Azure provider chain (env vars, profile files,
+# IMDS) to authenticate against real cloud endpoints.
+if [[ "${LIVE_S3:-0}" != "1" ]]; then
+	unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
+		AWS_PROFILE AWS_REGION AWS_DEFAULT_REGION AWS_DEFAULT_PROFILE \
+		AWS_CONFIG_FILE AWS_SHARED_CREDENTIALS_FILE AWS_ENDPOINT_URL
+	unset AZURE_STORAGE_ACCOUNT AZURE_STORAGE_KEY AZURE_STORAGE_CONNECTION_STRING \
+		AZURE_STORAGE_SAS_TOKEN AZURE_STORAGE_AUTH_MODE
+	# AZSTORE_<NAME>_{KEY,CONNECTION_STRING,SAS} is the helper's credential
+	# alias surface (see src/object_store/azure.rs); strip every variant.
+	while IFS= read -r _var; do
+		unset "$_var"
+	done < <(env | awk -F= '/^AZSTORE_/{print $1}')
+	unset _var
+fi
 
 # Per-run scratch directory; the runtime cleans this up by way of the OS.
+# For live suites, preserve the operator's HOME so `~/.aws/credentials`
+# (and `~/.aws/config`) remain visible to the SDK provider chain. The
+# scratch dir is still allocated for git's per-test workspace.
 SHELLSPEC_TMP_HOME="$(mktemp -d)"
 export XDG_CONFIG_HOME="${SHELLSPEC_TMP_HOME}/config"
 export XDG_DATA_HOME="${SHELLSPEC_TMP_HOME}/data"
-export HOME="${SHELLSPEC_TMP_HOME}"
+if [[ "${LIVE_S3:-0}" != "1" ]]; then
+	export HOME="${SHELLSPEC_TMP_HOME}"
+fi
 mkdir -p "${XDG_CONFIG_HOME}" "${XDG_DATA_HOME}"
 
 # git looks for `git-remote-s3+http`, `git-remote-az+https`, etc. when
@@ -84,6 +94,11 @@ flag_unset() { [[ "${!1:-0}" != "1" ]]; }
 # shellspec. Each integration spec opens with a `Skip if` guard.
 INTEGRATION_S3="${INTEGRATION_S3:-0}"
 INTEGRATION_AZ="${INTEGRATION_AZ:-0}"
+# Live-cloud-suite gating. Default off; the `shellspec-live-s3` make
+# target sets `LIVE_S3=1` before invoking shellspec. The acknowledgement
+# variable `LIVE_TESTS_I_UNDERSTAND_THIS_COSTS_MONEY=1` is a separate
+# loud-fail guard checked inside the suite's `BeforeAll`.
+LIVE_S3="${LIVE_S3:-0}"
 
 # Allow the helper binaries to talk to local docker backends over plain
 # HTTP. The URL parser already permits cleartext on loopback hosts
