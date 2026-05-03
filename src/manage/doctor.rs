@@ -133,7 +133,7 @@ impl<'a> Doctor<'a> {
     /// finished string (with trailing newline) so callers can route
     /// it to stdout, a logger, or a test buffer.
     #[must_use]
-    pub fn report(&self, snapshot: &RepoSnapshot) -> String {
+    pub(crate) fn report(&self, snapshot: &RepoSnapshot) -> String {
         use std::fmt::Write;
         let mut out = String::new();
         let _ = writeln!(out, "{}:", self.report_label());
@@ -236,6 +236,13 @@ impl<'a> Doctor<'a> {
         ref_path: &str,
         losing: &BundleEntry,
     ) -> Result<(), ManageError> {
+        // Both branches end with `self.store.delete(&losing.key)` (after
+        // this `if/else`): the bundle is always removed from its losing
+        // location. The branches differ only in whether the bundle is
+        // first quarantined under a new ref. Adding a "dry-run" or
+        // "preserve in place" branch here must NOT fall through to the
+        // unconditional delete below — keep the delete inside the
+        // appropriate branch when adding new modes.
         if self.opts.delete_bundle {
             println!("Removing {}", losing.sha);
         } else {
@@ -352,10 +359,15 @@ impl<'a> Doctor<'a> {
 /// Last `/`-separated segment of a ref path, used as the human label in
 /// `fix_head`'s branch picker. Returns the full path if it has no
 /// slashes (e.g. a single-component ref).
+///
+/// `unwrap_or(full)` is the identity fallback: `rsplit` always yields
+/// at least one element, so the fallback is unreachable for any
+/// non-empty input — but if `rsplit`'s contract ever relaxes (or the
+/// input is empty), returning the input verbatim is strictly safer
+/// than panicking, since the caller only uses the result as a display
+/// label.
 fn short_branch_name(full: &str) -> &str {
-    full.rsplit('/')
-        .next()
-        .expect("rsplit always yields at least one element")
+    full.rsplit('/').next().unwrap_or(full)
 }
 
 #[cfg(test)]

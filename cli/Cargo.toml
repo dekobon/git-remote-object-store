@@ -88,7 +88,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 # AWS config — `tests/s3_store_integration.rs` builds `aws_config::defaults`
-# directly for the S3 client setup. Must match the library's feature set.
+# directly for the S3 client setup. The library enables additional features
+# (`credentials-login` for IAM Identity Center support) via the workspace
+# `Cargo.toml`; cargo unifies features across the workspace, so this
+# dev-dep does not need to mirror the full set — only the features the
+# integration tests use directly.
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 
 # Bytes — imported directly in integration tests for object assertions.
