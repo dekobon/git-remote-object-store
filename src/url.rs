@@ -452,6 +452,12 @@ fn check_aws_s3_host(host: &str) -> Result<(), ParseError> {
 
     let valid = trimmed == "s3"
         || trimmed.starts_with("s3.")
+        // Legacy path-style hyphenated form: `s3-<region>.amazonaws.com`.
+        // Accepts any `s3-*` prefix without validating the region name, so
+        // `s3-mybucket.amazonaws.com` is a known false-negative (passes the
+        // check but is not a real S3 endpoint; user sees a DNS error rather
+        // than this helpful message). Tightening would require a region
+        // allowlist, which is fragile as AWS adds regions.
         || trimmed.starts_with("s3-")
         || last_label_is_s3
         || trimmed.contains(".s3.")
@@ -1021,6 +1027,21 @@ mod tests {
         parse("s3+https://s3.us-west-2.amazonaws.com/my-bucket/repo").unwrap();
         // Path-style without region (legacy global).
         parse("s3+https://s3.amazonaws.com/my-bucket/repo").unwrap();
+        // Path-style legacy hyphenated region (`s3-<region>.amazonaws.com`).
+        parse("s3+https://s3-us-east-1.amazonaws.com/my-bucket/repo").unwrap();
+    }
+
+    #[test]
+    fn accepts_s3_prefix_known_false_negative() {
+        // `s3-<non-region>.amazonaws.com` passes `check_aws_s3_host` because
+        // the `starts_with("s3-")` guard does not validate the region name.
+        // Pinned here to document the known false-negative: the parse
+        // succeeds, but the user will see a DNS error at connect time rather
+        // than the helpful `InvalidAwsS3Endpoint` message. The valid legacy
+        // form (`s3-us-east-1`) and this false-negative are accepted by the
+        // same branch; a tightening that rejects false-negatives must not
+        // break valid legacy inputs.
+        parse("s3+https://s3-mybucket.amazonaws.com/my-bucket/repo").unwrap();
     }
 
     #[test]
