@@ -32,6 +32,45 @@ use self::option::{OptionEffect, handle_option};
 use self::push::push_batch;
 use self::tracing_init::ReloadHandle;
 
+/// Walk `err`'s `source()` chain and append each level's `Display` to
+/// `msg`, **skipping any level whose text is already at the tail of
+/// `msg`**.
+///
+/// `thiserror`-derived `#[error]` formats often inline `{0}` or
+/// `{source}` of the immediate source at the *tail* of the format
+/// string — sometimes recursively. For example: `PushError::Store(
+/// "object-store error during push: {0}")` where `{0}` is
+/// `ObjectStoreError::Network("network error: {0}")`, which itself
+/// inlines its boxed source at the tail. A naive chain-walk that
+/// always appends produces `"... network error: dns failure: dns
+/// failure"` because `dns failure` is already at the tail. The
+/// suffix-only dedup handles every variant currently in this crate.
+///
+/// Caveat: a wrapper that inlines `{source}` *mid*-string (e.g.
+/// `"network error: {0} (transient)"`) is **not** deduped — the inner
+/// source would be appended a second time. No such wrapper exists
+/// today; if one is added, prefer reformulating its `#[error]` to
+/// keep `{source}` at the tail (or extend this helper) rather than
+/// living with the duplication.
+///
+/// Used by both [`backend::fatal_message`] (for the operator-facing
+/// `fatal:` line) and [`push`] (for the per-ref `error <ref>` wire
+/// line). Sharing the helper keeps the two diagnostics in sync.
+pub(crate) fn append_source_chain<E: std::error::Error + ?Sized>(msg: &mut String, err: &E) {
+    let mut next = err.source();
+    while let Some(src) = next {
+        // We need the rendered string twice (once for the suffix check,
+        // once to append) so format it once and reuse — `write!` would
+        // re-format it via the `Display` impl.
+        let rendered = src.to_string();
+        if !msg.ends_with(&rendered) {
+            msg.push_str(": ");
+            msg.push_str(&rendered);
+        }
+        next = src.source();
+    }
+}
+
 /// Errors surfaced by the REPL loop.
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -352,6 +391,85 @@ mod tests {
         assert_eq!(parse_command("list  for-push\n"), None);
         // Trailing space after a verb is also rejected.
         assert_eq!(parse_command("list \n"), None);
+    }
+
+    /// `parse_command` matches the strip-prefix verbs (`option`, `fetch`,
+    /// `push`) on a single space — the rest is passed through verbatim
+    /// to the per-verb argument parser. Pin this contract so a
+    /// regression that collapses internal whitespace before the strip
+    /// (e.g. `trimmed.split_whitespace().collect()`) is caught here
+    /// rather than bouncing off the per-verb parser with a confusing
+    /// error.
+    #[test]
+    fn parse_command_passes_strip_prefix_args_verbatim() {
+        // Double space after the verb produces a leading-space arg, NOT
+        // a no-op collapse. The downstream parser (e.g. parse_fetch_args)
+        // is responsible for rejecting bad arg shapes; parse_command's
+        // job ends at the verb match.
+        assert_eq!(
+            parse_command("fetch  abc def\n"),
+            Some(Command::Fetch(" abc def".into())),
+        );
+        assert_eq!(
+            parse_command("push  +ref:ref\n"),
+            Some(Command::Push(" +ref:ref".into())),
+        );
+        // Empty args after the verb are also passed through (rejected
+        // by parse_fetch_args / parse_push_args, not here).
+        assert_eq!(
+            parse_command("fetch \n"),
+            Some(Command::Fetch(String::new()))
+        );
+    }
+
+    // --- append_source_chain ----------------------------------------
+
+    /// Layered wrapper for testing the dedup behaviour of
+    /// `append_source_chain`. The inner is a `BoxError` so we can stack
+    /// arbitrary depth without writing one struct per level.
+    #[derive(Debug, thiserror::Error)]
+    #[error("layer: {0}")]
+    struct LayerError(#[source] crate::object_store::BoxError);
+
+    #[test]
+    fn append_source_chain_skips_levels_already_in_display() {
+        // BoxError is a leaf (`io::Error::other`'s Display is just the
+        // message). LayerError's Display inlines `{0}` recursively so
+        // the top-level `to_string()` already contains every level.
+        // append_source_chain must NOT duplicate any of them.
+        let inner: crate::object_store::BoxError = Box::new(std::io::Error::other("dns failure"));
+        let mid: crate::object_store::BoxError = Box::new(LayerError(inner));
+        let top = LayerError(mid);
+
+        let mut msg = top.to_string();
+        // `top.to_string()` inlines every level via `{0}`:
+        // "layer: layer: dns failure"
+        assert_eq!(msg, "layer: layer: dns failure");
+
+        append_source_chain(&mut msg, &top);
+        // Walk would land on each source's Display — all already at the
+        // tail of `msg` — so dedup must skip every level.
+        assert_eq!(
+            msg, "layer: layer: dns failure",
+            "append_source_chain must not duplicate already-inlined sources",
+        );
+    }
+
+    #[test]
+    fn append_source_chain_appends_when_source_text_is_not_in_display() {
+        // A wrapper whose Display does NOT inline its source. The chain
+        // walk must surface the inner cause.
+        #[derive(Debug, thiserror::Error)]
+        #[error("opaque wrapper")]
+        struct OpaqueWrapper(#[source] crate::object_store::BoxError);
+
+        let inner: crate::object_store::BoxError = Box::new(std::io::Error::other("dns failure"));
+        let top = OpaqueWrapper(inner);
+
+        let mut msg = top.to_string();
+        assert_eq!(msg, "opaque wrapper");
+        append_source_chain(&mut msg, &top);
+        assert_eq!(msg, "opaque wrapper: dns failure");
     }
 
     #[test]
