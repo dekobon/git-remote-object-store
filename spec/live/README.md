@@ -4,8 +4,11 @@ This directory hosts shellspec specs that exercise the helper binaries
 and the management CLI against **real cloud backends**, not the
 container emulators that drive `make shellspec-integration`.
 
-The first cut covers AWS S3 only. Real Azure Blob coverage is a
-follow-up; tracking issue [#59].
+Coverage spans AWS S3 and Azure Blob. The two suites are independent —
+operators can run either or both depending on which credentials they
+have configured. Each backend is gated behind a per-suite flag (`LIVE_S3=1`
+for S3, `LIVE_AZ=1` for Azure) plus the global cost-acknowledgement
+guard.
 
 ## Why a separate tier
 
@@ -31,9 +34,9 @@ they make.
 
 Two guards prevent accidental invocation:
 
-1. The `LIVE_*` per-suite flag (`LIVE_S3=1`) gates spec inclusion at
-   `Skip if`, so a stray `shellspec spec/` invocation does not trigger
-   them.
+1. The per-suite flag (`LIVE_S3=1` for AWS, `LIVE_AZ=1` for Azure)
+   gates spec inclusion at `Skip if`, so a stray `shellspec spec/`
+   invocation does not trigger them.
 2. The acknowledgement variable
    `LIVE_TESTS_I_UNDERSTAND_THIS_COSTS_MONEY=1` gates the suite at
    `BeforeAll` with a loud failure if unset.
@@ -106,7 +109,68 @@ the SSO cache. Two consequences worth knowing:
   the per-test repos, so test commits don't pick up your real identity
   or signing key.
 
+## Azure Blob setup
+
+### Required environment
+
+| Variable | Purpose |
+|---|---|
+| `LIVE_TESTS_I_UNDERSTAND_THIS_COSTS_MONEY=1` | Acknowledgement guard. |
+| `LIVE_AZ_ACCOUNT` | Storage-account name. |
+| `LIVE_AZ_CONTAINER` | Pre-existing blob container you own. |
+| `LIVE_AZ_CREDENTIAL_NAME` | Logical alias the helper resolves at runtime; passed through as `?credential=` on every test URL. |
+
+### Optional environment
+
+| Variable | Purpose |
+|---|---|
+| `LIVE_AZ_ENDPOINT_SUFFIX` | Endpoint suffix (default `blob.core.windows.net`). Override for sovereign-cloud accounts (`blob.core.usgovcloudapi.net`, `blob.core.chinacloudapi.cn`, …). |
+| `LIVE_ENGINE` | Storage engine (default `bundle`). Plumbed through as `?engine=`. |
+
+In addition, **one** of the following env vars must be set so that the
+helper and the cleanup CLI can resolve the credential alias to actual
+secrets. The helper reads these at runtime per
+`src/object_store/azure/auth.rs`:
+
+| Env var | Auth scheme |
+|---|---|
+| `AZSTORE_<ALIAS>_KEY` | Base64 account key (shared-key signing). |
+| `AZSTORE_<ALIAS>_CONNECTION_STRING` | Full connection string (parsed for `AccountKey=`). |
+| `AZSTORE_<ALIAS>_SAS` | SAS token (appended to every outgoing request). |
+
+`<ALIAS>` is the ASCII-uppercased value of `LIVE_AZ_CREDENTIAL_NAME`.
+Resolution order is KEY → CONNECTION_STRING → SAS; the first set
+variable wins.
+
+### RBAC / role permissions
+
+The credential must allow the following data-plane operations against
+the `live-test/*` blob path inside `$LIVE_AZ_CONTAINER`:
+
+- `Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read`
+- `Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write`
+- `Microsoft.Storage/storageAccounts/blobServices/containers/blobs/delete`
+
+The built-in role **Storage Blob Data Contributor** scoped to the
+container is the simplest way to grant these. The pre-flight (write,
+read, delete a sentinel under `live-test/<run-id>/.preflight`)
+validates the contract before any scenario runs and names the failed
+operation if a permission is missing.
+
+### Tools
+
+The runner verifies these are on `PATH`:
+
+- `az` (Azure CLI v2.50+)
+- `git` (>= 2.40)
+- `git-lfs` (only required for `lfs_spec.sh`)
+- `jq`
+
+Missing tools fail fast with the missing list (not one-by-one).
+
 ## Run
+
+### AWS S3
 
 ```bash
 export LIVE_TESTS_I_UNDERSTAND_THIS_COSTS_MONEY=1
@@ -117,10 +181,29 @@ export LIVE_S3_PROFILE=my-test-profile  # optional
 make shellspec-live-s3
 ```
 
+### Azure Blob
+
+```bash
+export LIVE_TESTS_I_UNDERSTAND_THIS_COSTS_MONEY=1
+export LIVE_AZ_ACCOUNT=mystorageaccount
+export LIVE_AZ_CONTAINER=git-remote-tests
+export LIVE_AZ_CREDENTIAL_NAME=PROD
+export AZSTORE_PROD_KEY=$(az storage account keys list ... --query '[0].value' -o tsv)
+
+make shellspec-live-azure
+```
+
+### Both backends in one run
+
+```bash
+make shellspec-live   # fans out to S3 + Azure if both are configured
+```
+
 To pass a different storage engine through to the helper URL:
 
 ```bash
 make shellspec-live-s3 ENGINE=bundle
+make shellspec-live-azure ENGINE=bundle
 ```
 
 ## Cleanup
@@ -140,7 +223,7 @@ cannot wipe the bucket root.
 `SIGKILL` and host-crash leave orphans. The recovery path is:
 
 ```bash
-# Dry-run: list run-ids older than 24h.
+# Dry-run: list run-ids older than 24h on every configured backend.
 make shellspec-live-sweep
 
 # Override the cutoff.
@@ -148,11 +231,18 @@ make shellspec-live-sweep AGE=7d
 
 # Actually delete (not just list).
 make shellspec-live-sweep COMMIT=1
+
+# Restrict to a single backend (skips the other regardless of env).
+bash utils/live-sweep.sh --backend s3
+bash utils/live-sweep.sh --backend az --commit 1
 ```
 
-Run-ids start with a UTC timestamp so the sweep is a single
-list-objects-v2 call plus a lexicographic comparison against a
-synthetic cutoff string. No clock skew assumptions; no recursive scan.
+Run-ids start with a UTC timestamp so the sweep is a single list call
+per backend plus a lexicographic comparison against a synthetic cutoff
+string. No clock skew assumptions; no recursive scan. Backends whose
+required env vars are not set are skipped with a warning rather than a
+hard failure, so an operator who has only S3 (or only Azure) configured
+can still run the umbrella sweep.
 
 ## What the suite does **not** do
 
@@ -172,12 +262,12 @@ synthetic cutoff string. No clock skew assumptions; no recursive scan.
 | Path | Role |
 |---|---|
 | `spec/live/s3/*.sh` | AWS S3 spec mirrors of `spec/integration/s3/`. |
+| `spec/live/az/*.sh` | Azure Blob spec mirrors of `spec/integration/az/`. |
 | `spec/support/live_common.sh` | Guard, env loader, run-id, prefix-safety, engine helpers. |
 | `spec/support/live_s3.sh` | AWS-specific list / get / put / delete / pre-flight / setup / teardown. |
-| `utils/live-sweep.sh` | Cross-run prefix sweep (driven by `make shellspec-live-sweep`). |
+| `spec/support/live_az.sh` | Azure-specific list / get / put / delete / pre-flight / setup / teardown. |
+| `utils/live-sweep.sh` | Cross-run prefix sweep across every configured backend. |
 
 The integration-tier files at `spec/integration/{s3,az}/` and the
 backend-agnostic helpers at `spec/support/{git_scenarios,bucket_assertions}.sh`
 are reused unchanged.
-
-[#59]: https://github.com/dekobon/git-remote-object-store/issues/59
