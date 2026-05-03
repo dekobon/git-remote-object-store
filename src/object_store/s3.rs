@@ -817,9 +817,18 @@ impl S3Store {
         // upload, so the global READ_TIMEOUT (30 s) would abort any bundle
         // upload that takes longer than 30 s. GET/HEAD/LIST operations keep
         // the timeout via the client-level config; uploads opt out here.
+        //
+        // Use `disable_read_timeout()` rather than a bare `.build()` (all
+        // fields Unset). Smithy's `MergeTimeoutConfig::merge_iter` treats
+        // an all-Unset TimeoutConfig as equivalent to `TimeoutConfig::disabled()`
+        // — it does NOT inherit unset fields from the client-level config.
+        // `.disable_read_timeout()` sets `read_timeout = Disabled` explicitly
+        // while leaving other fields (connect_timeout, etc.) as Unset, so they
+        // are inherited from the client config if set there in the future.
         req.customize()
             .config_override(
-                aws_sdk_s3::config::Builder::new().timeout_config(TimeoutConfig::builder().build()),
+                aws_sdk_s3::config::Builder::new()
+                    .timeout_config(TimeoutConfig::builder().disable_read_timeout().build()),
             )
             .send()
             .await
