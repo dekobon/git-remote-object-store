@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Live-cloud shellspec tier under `spec/live/s3/` exercising the helper
+  binaries against real AWS S3 (Azure Blob is a follow-up). New make
+  targets `shellspec-live-s3`, `shellspec-live`, and
+  `shellspec-live-sweep` are not invoked by `make ci`, `make pre-commit`,
+  `make test`, or `make shellspec-integration`. Suite is gated by both
+  `LIVE_S3=1` (per-suite enable, set by the make target) and the
+  acknowledgement variable `LIVE_TESTS_I_UNDERSTAND_THIS_COSTS_MONEY=1`
+  (loud-fail at `BeforeAll`). Every run scopes writes under
+  `live-test/<run-id>/`; `AfterAll` plus an `EXIT`/`INT`/`TERM` trap
+  delete the run prefix; the cleanup helper refuses to run unless the
+  target prefix is non-empty and starts with `live-test/`. `BeforeAll`
+  runs a sentinel write/read/delete pre-flight to catch missing IAM
+  permissions before any scenario starts. Operator setup, env vars,
+  costs, and recovery via `make shellspec-live-sweep` are documented in
+  `spec/live/README.md`. (#59)
 - Storage-engine selector: `?engine=<name>` URL query parameter and
   `<prefix>/FORMAT` bucket-level lock key. The only supported engine is
   `bundle` (the existing git bundle v2 format, also the default when
