@@ -862,12 +862,12 @@ mod tests {
 
     #[test]
     fn classify_413_is_payload_too_large() {
-        // Azure surfaces a Put Blob body over the 5_000 MiB ceiling as
-        // HTTP 413 with code `RequestBodyTooLarge`. Test the status
-        // branch — the canonical "Payload Too Large" status alone
-        // suffices to classify the error.
+        // Pass `code=None` so the assertion isolates the 413-status
+        // branch; passing a recognised code would still pass even if
+        // the status arm regressed (the code arm would catch it). The
+        // canonical "Payload Too Large" status alone suffices.
         assert!(matches!(
-            classify_status_and_code(413, Some("RequestBodyTooLarge"), "k"),
+            classify_status_and_code(413, None, "k"),
             Some(ObjectStoreError::PayloadTooLarge { limit_bytes })
                 if limit_bytes == SINGLE_PUT_BLOB_LIMIT_BYTES
         ));
