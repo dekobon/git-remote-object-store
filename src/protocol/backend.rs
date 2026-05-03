@@ -8,7 +8,7 @@
 //! Mirrors upstream's `S3Remote.__init__` (`../git-remote-s3/git_remote_s3/remote.py:78-85`):
 //! after constructing the SDK client, [`build`] runs a single low-cost listing
 //! call (`max_keys=1` for S3, `maxresults=1` for Azure) and folds well-known
-//! failures into one of three categorical [`BackendError`] variants. Helper
+//! failures into categorical [`BackendError`] variants. Helper
 //! binaries pattern-match on these variants via [`fatal_message`] to emit
 //! single-line `fatal:` diagnostics that match upstream's wording at
 //! `remote.py:574-593`.
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use crate::keys;
 use crate::object_store::azure::AzureStore;
 use crate::object_store::s3::S3Store;
-use crate::object_store::{ObjectStore, ObjectStoreError};
+use crate::object_store::{BoxError, ObjectStore, ObjectStoreError};
 use crate::url::{RemoteUrl, StorageEngine};
 
 pub use crate::url::BackendKind;
@@ -70,11 +70,25 @@ pub enum BackendError {
         name: String,
     },
 
+    /// Transport-level failure during backend construction (probe or FORMAT
+    /// key read): DNS resolution failed, connection refused, TLS handshake
+    /// error, or request timeout. This indicates a URL or network
+    /// configuration problem — not a credentials problem. The inner error is
+    /// extracted from [`ObjectStoreError::Network`] and stored directly to
+    /// avoid the redundant "network error: network error" display that would
+    /// result from wrapping it whole.
+    #[error("connection error: {source}")]
+    Network {
+        /// The underlying transport error preserved for chain-walking.
+        #[source]
+        source: BoxError,
+    },
+
     /// Catch-all for credential acquisition failures (missing AWS
-    /// profile, expired creds, missing Azure credential alias, ...) and
-    /// transport-level failures during the probe. Mirrors upstream's
-    /// `(ClientError, ProfileNotFound, CredentialRetrievalError,
-    /// NoCredentialsError, UnknownCredentialError)` arm at `remote.py:586-593`.
+    /// profile, expired creds, missing Azure credential alias, ...).
+    /// Mirrors upstream's `(ClientError, ProfileNotFound,
+    /// CredentialRetrievalError, NoCredentialsError, UnknownCredentialError)`
+    /// arm at `remote.py:586-593`.
     #[error("invalid credentials {source}")]
     InvalidCredentials {
         /// The underlying [`ObjectStoreError`] preserved as `#[source]`.
@@ -124,20 +138,21 @@ const fn container_word(kind: BackendKind) -> &'static str {
 /// upstream wording lives in [`BackendError`]'s `Display` derive — see the
 /// type-level doc comment.
 ///
-/// [`BackendError::InvalidCredentials`]'s `Display` already incorporates its
-/// immediate source via `{source}` in the format string. This function walks
-/// one level deeper into the error chain to surface root causes that are not
-/// yet visible — for example, the underlying SDK dispatch error wrapped inside
-/// [`ObjectStoreError::Network`].
+/// [`BackendError::InvalidCredentials`] and [`BackendError::Network`] both
+/// incorporate their immediate source via `{source}` in the format string.
+/// This function walks one level deeper into the error chain to surface root
+/// causes that are not yet visible — for example, the io / DNS error nested
+/// inside the SDK dispatch failure stored in [`BackendError::Network`].
 #[must_use]
 pub fn fatal_message(err: &BackendError) -> String {
     use std::error::Error as StdError;
     use std::fmt::Write as _;
 
     let mut msg = format!("fatal: {err}");
-    // BackendError::InvalidCredentials already includes its direct source in
-    // the Display via `{source}`, so start chain-walking one level past that
-    // to avoid duplication while still surfacing deeper SDK / transport causes.
+    // BackendError::InvalidCredentials and BackendError::Network both include
+    // their direct source in the Display via `{source}`, so start chain-walking
+    // one level past that to avoid duplication while still surfacing deeper
+    // SDK / transport causes.
     let mut next = err.source().and_then(StdError::source);
     while let Some(s) = next {
         write!(msg, ": {s}").expect("writing to a String is infallible");
@@ -165,6 +180,7 @@ fn classify(
             action: action.to_owned(),
             name: name.to_owned(),
         },
+        ObjectStoreError::Network(inner) => BackendError::Network { source: inner },
         other => BackendError::InvalidCredentials { source: other },
     }
 }
@@ -181,8 +197,10 @@ fn classify(
 ///   recognised engine name.
 /// - [`BackendError::EngineMismatch`] when the URL engine conflicts with the
 ///   stored engine.
-/// - [`BackendError::InvalidCredentials`] for transport / auth failures reading
-///   the key.
+/// - [`BackendError::Network`] for transport failures (DNS, TLS, timeout)
+///   reading the key.
+/// - [`BackendError::InvalidCredentials`] for auth / credential failures
+///   reading the key.
 async fn validate_format(
     store: &dyn ObjectStore,
     prefix: &str,
@@ -194,6 +212,9 @@ async fn validate_format(
         // No FORMAT key — this is a new or legacy bucket. The engine will
         // be written on the first push.
         Err(ObjectStoreError::NotFound(_)) => return Ok(()),
+        Err(ObjectStoreError::Network(inner)) => {
+            return Err(BackendError::Network { source: inner });
+        }
         Err(e) => return Err(BackendError::InvalidCredentials { source: e }),
     };
 
@@ -330,26 +351,19 @@ mod tests {
     }
 
     #[test]
-    fn classify_maps_network_to_invalid_credentials() {
-        use std::error::Error as _;
+    fn classify_maps_network_to_network_error() {
         let err = classify(
             BackendKind::S3,
             "mybucket",
             "ListObjectsV2",
             ObjectStoreError::Network(boxed("dns failure")),
         );
-        let BackendError::InvalidCredentials { source } = err else {
-            panic!("expected InvalidCredentials, got {err:?}");
+        let BackendError::Network { source } = err else {
+            panic!("expected Network, got {err:?}");
         };
-        // Source must round-trip the original error so operators see
-        // the underlying cause (e.g. "dns failure"), not a placeholder.
-        assert!(matches!(source, ObjectStoreError::Network(_)));
-        assert!(
-            source
-                .source()
-                .is_some_and(|s| s.to_string() == "dns failure"),
-            "Network source must preserve the original error chain",
-        );
+        // The BoxError is extracted from ObjectStoreError::Network directly,
+        // so its Display is the inner message, not "network error".
+        assert_eq!(source.to_string(), "dns failure");
     }
 
     #[test]
@@ -425,18 +439,16 @@ mod tests {
     }
 
     #[test]
-    fn fatal_message_invalid_credentials_network_includes_root_cause() {
-        // ObjectStoreError::Network wraps a boxed source. The first level
-        // ("network error") is already included in BackendError's Display via
-        // `{source}`; fatal_message must walk one level deeper to surface the
-        // root cause (e.g. the SDK dispatch error) without duplicating "network
-        // error".
-        let err = BackendError::InvalidCredentials {
-            source: ObjectStoreError::Network(boxed("dns lookup failed")),
+    fn fatal_message_network_includes_root_cause() {
+        // BackendError::Network stores the BoxError directly (not wrapped in
+        // ObjectStoreError::Network), so the Display is "connection error: <source>"
+        // and fatal_message walks one level deeper from source.
+        let err = BackendError::Network {
+            source: boxed("dns lookup failed"),
         };
         assert_eq!(
             fatal_message(&err),
-            "fatal: invalid credentials network error: dns lookup failed"
+            "fatal: connection error: dns lookup failed"
         );
     }
 
@@ -445,8 +457,8 @@ mod tests {
         use std::error::Error as StdError;
         use std::fmt;
 
-        // A two-level chain: Network(mid) where mid itself has a source.
-        // Verifies that the `while` loop in fatal_message appends every
+        // A two-level chain: Network { source: mid } where mid itself has a
+        // source. Verifies the `while` loop in fatal_message appends every
         // level, not just the first one it reaches.
         #[derive(Debug)]
         struct WrappedError {
@@ -464,15 +476,15 @@ mod tests {
             }
         }
 
-        let err = BackendError::InvalidCredentials {
-            source: ObjectStoreError::Network(Box::new(WrappedError {
+        let err = BackendError::Network {
+            source: Box::new(WrappedError {
                 msg: "dispatch failure",
                 inner: boxed("connection refused"),
-            })),
+            }),
         };
         assert_eq!(
             fatal_message(&err),
-            "fatal: invalid credentials network error: dispatch failure: connection refused"
+            "fatal: connection error: dispatch failure: connection refused"
         );
     }
 
@@ -564,7 +576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_format_returns_invalid_credentials_on_transport_error() {
+    async fn validate_format_returns_network_error_on_transport_failure() {
         use crate::object_store::mock::Fault;
         let store = MockStore::new();
         store.arm(Fault::NetworkOnGetBytes {
@@ -572,8 +584,8 @@ mod tests {
         });
         let err = validate_format(&store, "", None).await.unwrap_err();
         assert!(
-            matches!(err, BackendError::InvalidCredentials { .. }),
-            "expected InvalidCredentials, got {err:?}",
+            matches!(err, BackendError::Network { .. }),
+            "expected Network, got {err:?}",
         );
     }
 }
