@@ -360,31 +360,11 @@ mod tests {
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
-    #[test]
-    fn bundle_key_with_prefix_joins_with_slash() {
-        let sha = Sha::from_hex(SHA).unwrap();
-        let ref_name = RefName::new("refs/heads/main").unwrap();
-        assert_eq!(
-            keys::bundle_key(Some("repo"), &ref_name, sha),
-            format!("repo/refs/heads/main/{SHA}.bundle"),
-        );
-    }
-
-    #[test]
-    fn bundle_key_no_prefix_omits_leading_slash() {
-        let sha = Sha::from_hex(SHA).unwrap();
-        let ref_name = RefName::new("refs/heads/main").unwrap();
-        assert_eq!(
-            keys::bundle_key(None, &ref_name, sha),
-            format!("refs/heads/main/{SHA}.bundle"),
-        );
-        // Empty-string prefix is treated identically to None — guards
-        // against an accidental `/refs/...` bundle key.
-        assert_eq!(
-            keys::bundle_key(Some(""), &ref_name, sha),
-            format!("refs/heads/main/{SHA}.bundle"),
-        );
-    }
+    // bundle_key tests live in `crate::keys` (the helper's home);
+    // duplicating them here would test the same join logic twice. The
+    // typed-input flow (`Sha`, `&RefName` as `impl Display`) is
+    // exercised end-to-end by the fetch integration tests in
+    // `tests/protocol_fetch.rs`.
 
     #[test]
     fn parse_fetch_args_accepts_canonical_form() {
