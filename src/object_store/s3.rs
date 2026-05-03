@@ -51,10 +51,15 @@
 //! 412 retry in [`ObjectStore::get_to_file`] is a deliberate-server-
 //! response retry, so forcing a fresh connection there does not help.
 //! Instead, the SDK's [`aws_config::timeout::TimeoutConfig`] is given
-//! a [`READ_TIMEOUT`] (time-to-first-byte bound, not a body-transfer
-//! bound) so a stuck connection fails fast and the SDK's internal
-//! retry layer can pick a fresh one. `connect_timeout` is left at the
-//! SDK default (3.1 s, already aggressive). Tracking issue: #26.
+//! a [`READ_TIMEOUT`] so a stuck download or small-body request fails
+//! fast and the SDK's internal retry layer can pick a fresh one.
+//! `connect_timeout` is left at the SDK default (3.1 s, already
+//! aggressive). Tracking issue: #26.
+//!
+//! Note: smithy's `read_timeout` wraps the entire HTTP connector call
+//! (request body upload + response), not just response headers. Large
+//! bundle uploads use a per-operation timeout override in `put_body` to
+//! avoid being cut off after 30 s.
 //!
 //! TCP keepalive (the second knob suggested in #27) is **not** wired
 //! on the S3 path: `aws-smithy-http-client` 1.1.12's public `Builder`
@@ -146,13 +151,16 @@ const COPY_SOURCE_ENCODE: &AsciiSet = &CONTROLS
 /// module-level "HTTP transport tuning" docs and issue #26.
 pub(crate) const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Time-to-first-byte bound for any single S3 request. Catches a hot
-/// pooled connection that has gone silent (e.g. mid-LFS push when the
-/// server VIP rotates) without limiting body-transfer time, since
-/// smithy's `read_timeout` covers only the response-headers phase.
-/// Sized to match [`POOL_IDLE_TIMEOUT`] — both budgets are "give up
-/// and let the SDK retry pick a fresh connection" budgets. See the
-/// module-level "HTTP transport tuning" docs and issue #26.
+/// Timeout applied to every S3 GET, HEAD, LIST, and lock-write request.
+/// Catches a hot pooled connection that has gone silent (e.g. mid-LFS
+/// session when the server VIP rotates). Sized to match
+/// [`POOL_IDLE_TIMEOUT`] — both budgets are "give up and let the SDK
+/// retry pick a fresh connection" budgets.
+///
+/// Note: smithy's `read_timeout` covers the entire HTTP round-trip
+/// (request upload + response), not just response headers. `put_body`
+/// overrides it per-operation to `None` so large bundle uploads are not
+/// cut off at 30 s. See the module-level transport docs and issue #26.
 pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Production [`ObjectStore`] backed by `aws-sdk-s3`.
@@ -257,10 +265,10 @@ impl S3Store {
 /// 1. Load the AWS SDK provider chain with `BehaviorVersion::latest()`.
 /// 2. Install a custom HTTP client with [`POOL_IDLE_TIMEOUT`] so DNS
 ///    rotation does not wedge long-running sessions (#26).
-/// 3. Apply [`READ_TIMEOUT`] so a hot pooled connection that has gone
-///    silent fails fast instead of waiting for the OS-level TCP
-///    retransmit timeout (#26). `connect_timeout` is left at the SDK
-///    default (3.1 s).
+/// 3. Apply [`READ_TIMEOUT`] so a stuck GET/HEAD/LIST/lock request fails
+///    fast instead of waiting for the OS-level TCP retransmit timeout
+///    (#26). `connect_timeout` is left at the SDK default (3.1 s).
+///    `put_body` overrides this per-operation to allow large uploads.
 /// 4. Apply `endpoint_url`, `profile`, `region` from the resolved decisions.
 /// 5. Override `force_path_style` on the resulting `aws_sdk_s3::Config`.
 pub(crate) async fn build_s3_config(resolved: &ResolvedS3Config) -> aws_sdk_s3::Config {
@@ -804,7 +812,18 @@ impl S3Store {
             // non-ASCII upstream).
             req = req.metadata(k, v);
         }
-        req.send().await.map_err(|e| classify(e, key))?;
+        // Disable read_timeout for this operation: smithy's read_timeout
+        // wraps the entire HTTP connector call including the request body
+        // upload, so the global READ_TIMEOUT (30 s) would abort any bundle
+        // upload that takes longer than 30 s. GET/HEAD/LIST operations keep
+        // the timeout via the client-level config; uploads opt out here.
+        req.customize()
+            .config_override(
+                aws_sdk_s3::config::Builder::new().timeout_config(TimeoutConfig::builder().build()),
+            )
+            .send()
+            .await
+            .map_err(|e| classify(e, key))?;
         Ok(())
     }
 
