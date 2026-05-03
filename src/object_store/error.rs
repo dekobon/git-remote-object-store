@@ -52,6 +52,18 @@ pub enum ObjectStoreError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// Upload body exceeded the backend's size ceiling for the API call
+    /// in use. Maps from S3 `EntityTooLarge` (single-PUT > 5 GiB) and
+    /// Azure 413 / `RequestBodyTooLarge` (single Put Blob > 5000 MiB).
+    /// `limit_bytes` is the backend-specific ceiling at the time the
+    /// classifier ran, surfaced so the wire-line message names a concrete
+    /// number rather than dumping an opaque SDK error chain.
+    #[error("upload exceeds backend size limit ({})", format_byte_limit(*limit_bytes))]
+    PayloadTooLarge {
+        /// The backend's documented single-call size ceiling, in bytes.
+        limit_bytes: u64,
+    },
+
     /// Transport-level failure (DNS, TLS, timeout, connection reset).
     /// Carries the original SDK error as `#[source]` so the chain is
     /// preserved. The inner error is included in the display so the
@@ -63,6 +75,22 @@ pub enum ObjectStoreError {
     /// Any backend failure that does not fit the variants above.
     #[error(transparent)]
     Other(BoxError),
+}
+
+/// Render a byte ceiling as the largest unit that divides it cleanly
+/// (`5 GiB`, `5000 MiB`, otherwise raw bytes). Used in
+/// [`ObjectStoreError::PayloadTooLarge`]'s `Display` so the wire-line
+/// reads as a familiar quota number rather than "5368709120".
+fn format_byte_limit(bytes: u64) -> String {
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+    if bytes >= GIB && bytes.is_multiple_of(GIB) {
+        format!("{} GiB", bytes / GIB)
+    } else if bytes >= MIB && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Wrap any concrete `std::error::Error` into [`ObjectStoreError::Other`].
@@ -124,5 +152,34 @@ mod tests {
         let err = ObjectStoreError::Other(boxed_io("boom"));
         // `transparent` forwards Display to the inner error.
         assert_eq!(err.to_string(), "boom");
+    }
+
+    #[test]
+    fn payload_too_large_renders_gib_when_exact() {
+        let err = ObjectStoreError::PayloadTooLarge {
+            limit_bytes: 5 * (1 << 30),
+        };
+        assert_eq!(err.to_string(), "upload exceeds backend size limit (5 GiB)");
+    }
+
+    #[test]
+    fn payload_too_large_renders_mib_when_not_a_clean_gib() {
+        // Azure single-PUT ceiling is 5000 MiB — close to but not 5 GiB.
+        let err = ObjectStoreError::PayloadTooLarge {
+            limit_bytes: 5_000 * (1 << 20),
+        };
+        assert_eq!(
+            err.to_string(),
+            "upload exceeds backend size limit (5000 MiB)"
+        );
+    }
+
+    #[test]
+    fn payload_too_large_falls_back_to_raw_bytes() {
+        let err = ObjectStoreError::PayloadTooLarge { limit_bytes: 1_234 };
+        assert_eq!(
+            err.to_string(),
+            "upload exceeds backend size limit (1234 B)"
+        );
     }
 }
