@@ -54,8 +54,10 @@ pub enum ObjectStoreError {
 
     /// Transport-level failure (DNS, TLS, timeout, connection reset).
     /// Carries the original SDK error as `#[source]` so the chain is
-    /// preserved.
-    #[error("network error")]
+    /// preserved. The inner error is included in the display so the
+    /// SDK-level detail (e.g. "operation timed out") surfaces in the
+    /// push `error <ref>` wire line without requiring verbose logging.
+    #[error("network error: {0}")]
     Network(#[source] BoxError),
 
     /// Any backend failure that does not fit the variants above.
@@ -112,7 +114,7 @@ mod tests {
     #[test]
     fn network_preserves_source_chain() {
         let err = ObjectStoreError::Network(boxed_io("dns failure"));
-        assert_eq!(err.to_string(), "network error");
+        assert_eq!(err.to_string(), "network error: dns failure");
         let source = err.source().expect("Network exposes its #[source]");
         assert_eq!(source.to_string(), "dns failure");
     }

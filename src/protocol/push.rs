@@ -355,6 +355,7 @@ pub(crate) async fn push_batch(
                     PushError::Store(_) | PushError::Git(_) | PushError::Io(_) | PushError::Sha(_)
                 ) =>
             {
+                warn!(ref = %remote_ref_str, error = %e, "push ref failed");
                 PushOutcome::Error {
                     remote_ref: remote_ref_str,
                     message: format!(r#""{e}"?"#),
