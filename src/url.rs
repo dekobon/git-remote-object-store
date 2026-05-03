@@ -226,6 +226,20 @@ pub enum ParseError {
     /// `?engine=` value is not a recognised engine name.
     #[error("unknown engine `{0}`; expected `bundle`")]
     UnknownEngine(String),
+    /// An `amazonaws.com` hostname that cannot be a valid S3 endpoint.
+    ///
+    /// Valid patterns are:
+    /// - virtual-hosted: `<bucket>.s3[.<region>].amazonaws.com`
+    /// - path-style: `s3[.<region>|-<region>].amazonaws.com`
+    #[error(
+        "hostname `{host}` is not a recognized AWS S3 endpoint; \
+         for virtual-hosted use `<bucket>.s3[.<region>].amazonaws.com`, \
+         for path-style use `s3[.<region>|-<region>].amazonaws.com`"
+    )]
+    InvalidAwsS3Endpoint {
+        /// The offending hostname.
+        host: String,
+    },
 }
 
 /// Parse a remote URL.
@@ -235,8 +249,9 @@ pub enum ParseError {
 /// Returns [`ParseError`] if the input is empty, uses an unsupported
 /// scheme, contains a malformed URL, is missing required components
 /// (host, bucket, container, account), contains invalid component names,
-/// or uses cleartext `http://` against a non-loopback host without the
-/// [`ENV_ALLOW_HTTP`] environment override.
+/// uses an `amazonaws.com` hostname that does not match a known S3
+/// endpoint pattern, or uses cleartext `http://` against a non-loopback
+/// host without the [`ENV_ALLOW_HTTP`] environment override.
 pub fn parse(input: &str) -> Result<RemoteUrl, ParseError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -414,6 +429,43 @@ fn set_canonical_path(u: &mut Url, segments: &[&str]) {
 // S3
 // ---------------------------------------------------------------------------
 
+/// Reject `.amazonaws.com` hostnames that cannot be valid S3 endpoints.
+///
+/// Non-AWS hosts (custom endpoints, `MinIO`, etc.) are passed through
+/// unconditionally. For AWS hosts the hostname must either:
+/// - be `s3.amazonaws.com` or `s3.<region>.amazonaws.com` (path-style), or
+/// - contain `.s3.` or `.s3-` (virtual-hosted with the service marker).
+///
+/// The common mistake `<bucket>.<region>.amazonaws.com` — missing the
+/// `.s3.` service marker — would otherwise silently fall through to
+/// path-style addressing with a non-existent endpoint hostname, producing
+/// an inscrutable DNS-resolution error at connect time.
+fn check_aws_s3_host(host: &str) -> Result<(), ParseError> {
+    let Some(trimmed) = host.strip_suffix(".amazonaws.com") else {
+        // Not an AWS host — custom/S3-compatible endpoint, always OK.
+        return Ok(());
+    };
+
+    // `<bucket>.s3.amazonaws.com` → trimmed is `<bucket>.s3`; the last
+    // dot-separated label is "s3" (global virtual-hosted, no region).
+    let last_label_is_s3 = trimmed.split('.').next_back() == Some("s3");
+
+    let valid = trimmed == "s3"
+        || trimmed.starts_with("s3.")
+        || trimmed.starts_with("s3-")
+        || last_label_is_s3
+        || trimmed.contains(".s3.")
+        || trimmed.contains(".s3-");
+
+    if valid {
+        Ok(())
+    } else {
+        Err(ParseError::InvalidAwsS3Endpoint {
+            host: host.to_owned(),
+        })
+    }
+}
+
 fn finish_s3(
     mut endpoint: Url,
     flags: RemoteFlags,
@@ -424,6 +476,8 @@ fn finish_s3(
         .host_str()
         .ok_or(ParseError::MissingHost)?
         .to_owned();
+
+    check_aws_s3_host(&host)?;
 
     let (addressing, bucket, prefix_segments) =
         resolve_s3_components(&host, &segments, addressing_override)?;
@@ -940,5 +994,41 @@ mod tests {
             parse("az+https://myaccount.blob.core.windows.net/my-container/repo?engine=bundle")
                 .unwrap();
         assert_eq!(url.flags().engine, Some(StorageEngine::Bundle));
+    }
+
+    // --- AWS S3 endpoint host validation ------------------------------------
+
+    #[test]
+    fn rejects_amazonaws_host_missing_s3_service_marker() {
+        // The common mistake: <bucket>.<region>.amazonaws.com — no `.s3.`.
+        let err = parse("s3+https://git-test-2224.us-west-2.amazonaws.com/git-remote-object-store")
+            .unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidAwsS3Endpoint { ref host } if host == "git-test-2224.us-west-2.amazonaws.com"),
+            "expected InvalidAwsS3Endpoint, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn accepts_valid_aws_s3_hosts() {
+        // Virtual-hosted with region.
+        parse("s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo").unwrap();
+        // Virtual-hosted without region (legacy global).
+        parse("s3+https://my-bucket.s3.amazonaws.com/repo").unwrap();
+        // Virtual-hosted legacy hyphenated region.
+        parse("s3+https://my-bucket.s3-us-west-2.amazonaws.com/repo").unwrap();
+        // Path-style with region.
+        parse("s3+https://s3.us-west-2.amazonaws.com/my-bucket/repo").unwrap();
+        // Path-style without region (legacy global).
+        parse("s3+https://s3.amazonaws.com/my-bucket/repo").unwrap();
+    }
+
+    #[test]
+    fn accepts_non_aws_s3_compatible_hosts() {
+        // MinIO, Cloudflare R2, and other S3-compatible services that do
+        // not use `.amazonaws.com` are not subject to the service-marker check.
+        parse("s3+https://play.min.io/my-bucket/repo").unwrap();
+        parse("s3+https://acc.r2.cloudflarestorage.com/my-bucket/repo").unwrap();
+        parse("s3+https://localhost/my-bucket/repo?zip=0").unwrap();
     }
 }
