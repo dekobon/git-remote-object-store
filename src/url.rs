@@ -127,7 +127,14 @@ impl fmt::Display for StorageEngine {
 /// Used as a discriminant in [`protocol::backend::BackendError`] to select
 /// S3 vs Azure error wording, and internally in `url::parse` to route the
 /// URL to the right parsing path.
+///
+/// Marked `#[non_exhaustive]` so adding a new backend (e.g. GCS) is not
+/// a breaking change for downstream `match` arms — they will see a
+/// compiler error reminding them to handle the new variant via an
+/// explicit wildcard branch rather than silently picking up the wrong
+/// behaviour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BackendKind {
     /// Amazon S3 (or any S3-compatible) backend.
     S3,

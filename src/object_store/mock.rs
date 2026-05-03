@@ -569,6 +569,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn contended_put_if_absent_fault_returns_false_and_consumes_once() {
+        // Sibling tripwire to `put_if_absent_fault_returns_precondition_...`.
+        // Models the S3 409 ConditionalRequestConflict response: a CAS
+        // race where the key is currently absent but a concurrent writer
+        // wins between our absence-check and our own write. The fault must:
+        //   1. fire on `put_if_absent(absent_key, _)` and return Ok(false)
+        //   2. be consumed (`pending_faults()` drops to 0)
+        //   3. NOT insert the key on the contended path
+        //   4. allow a subsequent fault-free call to succeed normally
+        let store = MockStore::new();
+        store.arm(Fault::ContendedPutIfAbsent { key: "k".into() });
+
+        // Key is absent; fault armed → Ok(false), no insert.
+        let inserted = store.put_if_absent("k", body(b"x")).await.unwrap();
+        assert!(!inserted, "contended fault must return Ok(false)");
+        assert!(
+            !store.contains("k"),
+            "contended fault must NOT insert the key",
+        );
+        assert_eq!(
+            store.pending_faults(),
+            0,
+            "contended fault must be consumed once",
+        );
+
+        // Without a fault, the same call now succeeds and inserts.
+        let inserted = store.put_if_absent("k", body(b"x")).await.unwrap();
+        assert!(inserted, "next put_if_absent must succeed and insert");
+        assert!(store.contains("k"));
+    }
+
+    #[tokio::test]
     async fn delete_missing_key_is_not_found() {
         let store = MockStore::new();
         let err = store.delete("missing").await.unwrap_err();

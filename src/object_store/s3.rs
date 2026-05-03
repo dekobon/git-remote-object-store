@@ -104,7 +104,9 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use url::Url;
 
-use crate::url::{AWS_S3_INFIXES, RemoteUrl, S3Addressing, s3_virtual_hosted_bucket, strip_aws_host_suffix};
+use crate::url::{
+    AWS_S3_INFIXES, RemoteUrl, S3Addressing, s3_virtual_hosted_bucket, strip_aws_host_suffix,
+};
 
 use super::error::{network_boxed, other_boxed};
 use super::{
@@ -1353,7 +1355,10 @@ mod tests {
     #[test]
     fn resolve_region_china_partition_path_style() {
         let url = parse_endpoint("https://s3.cn-northwest-1.amazonaws.com.cn/my-bucket");
-        assert_eq!(resolve_region(&url, None), Some("cn-northwest-1".to_owned()));
+        assert_eq!(
+            resolve_region(&url, None),
+            Some("cn-northwest-1".to_owned())
+        );
     }
 
     // --- encode_copy_source -------------------------------------------

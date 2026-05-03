@@ -240,12 +240,19 @@ pub trait ObjectStore: Send + Sync {
     async fn delete(&self, key: &str) -> Result<(), ObjectStoreError>;
 }
 
-/// Blanket impl so `Arc<T>` is usable wherever `&dyn ObjectStore` is
-/// expected, without callers having to dereference explicitly.
+/// Blanket impl so `&Arc<T>` coerces to `&dyn ObjectStore` and so
+/// `Arc<T>` is itself usable as an `ObjectStore` value.
 ///
-/// `T: ObjectStore + ?Sized` covers both concrete types (`Arc<S3Store>`)
-/// and erased trait objects (`Arc<dyn ObjectStore>`). Every method simply
-/// forwards to the inner `T` through the `Deref` impl.
+/// `T: ObjectStore + ?Sized` covers both concrete types (`Arc<S3Store>`,
+/// `Arc<MockStore>`) and erased trait objects (`Arc<dyn ObjectStore>`).
+/// Every method forwards to the inner `T` through the `Deref` impl.
+///
+/// Verified non-removable: dropping this impl breaks call sites that
+/// pass `&Arc<dyn ObjectStore>` to a function taking `&dyn ObjectStore`.
+/// Plain `Arc::deref` lets `arc.list()` work via Rust's auto-deref on
+/// method calls, but the *coercion* `&Arc<T>` → `&dyn ObjectStore`
+/// requires `Arc<T>` itself to implement the trait — and that is what
+/// this impl provides.
 #[async_trait::async_trait]
 impl<T: ObjectStore + ?Sized> ObjectStore for Arc<T> {
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, ObjectStoreError> {
