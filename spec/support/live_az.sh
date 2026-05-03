@@ -39,10 +39,11 @@ live_az_endpoint_suffix() {
 # tag (`KEY` / `CONN` / `SAS`) so callers know how to pass it to the
 # `az` CLI. Empty output (status non-zero) when no env var is set.
 live_az_credential_env_value() {
-	# `tr` matches the helper's own ASCII-uppercase normalisation of the
+	# `${var^^}` matches the helper's ASCII-uppercase normalisation of the
 	# alias (see resolve_alias() in src/object_store/azure/auth.rs).
-	local upper
-	upper=$(echo "$LIVE_AZ_CREDENTIAL_NAME" | tr '[:lower:]' '[:upper:]')
+	# Aliases are constrained to `[A-Za-z0-9_]+` upstream, so locale-
+	# sensitive uppercasing differences cannot apply.
+	local upper="${LIVE_AZ_CREDENTIAL_NAME^^}"
 	local key_var="AZSTORE_${upper}_KEY"
 	local conn_var="AZSTORE_${upper}_CONNECTION_STRING"
 	local sas_var="AZSTORE_${upper}_SAS"
@@ -63,13 +64,17 @@ live_az_credential_env_value() {
 }
 
 # live_az
-# Wrapper around `az storage blob` that translates the resolved
+# Wrapper around `az storage <subcommand>` that translates the resolved
 # credential alias into the appropriate `--account-name --account-key`
 # / `--connection-string` / `--account-name --sas-token` flag set, then
 # invokes the requested subcommand. Centralising prevents a stray call
 # from inheriting whatever auth state the operator's shell happens to
 # have configured (e.g. a previous `az login` that points at a
 # different subscription).
+#
+# Auth flags are placed BEFORE the user's args so that `set -x` traces
+# read in the conventional order (`az storage --account-name X
+# --account-key Y blob list ...`). Az CLI itself is order-agnostic.
 #
 # Usage: live_az <storage-subcommand> [args...]
 #   e.g. live_az blob list --container-name foo --prefix bar
@@ -95,7 +100,7 @@ live_az() {
 			return 1
 			;;
 	esac
-	az storage "$@" "${auth_args[@]}"
+	az storage "${auth_args[@]}" "$@"
 }
 
 # live_az_url <prefix>
@@ -290,14 +295,10 @@ live_az_setup() {
 	live_require_cmd az git jq || return 1
 	live_az_require_env || return 1
 	live_init_run_prefix || return 1
-	# Surface a clear error if the operator named a credential alias
-	# but forgot to export the matching env var. The pre-flight would
-	# fail anyway, but with `az`-cli's "AuthenticationFailed" — far
-	# less actionable than naming the missing variable.
-	if ! live_az_credential_env_value >/dev/null; then
-		echo "live_az_setup: credential alias '$LIVE_AZ_CREDENTIAL_NAME' has no env var set" >&2
-		return 1
-	fi
+	# `live_az_preflight` runs `live_az_put_object`, which threads
+	# through `live_az` → `live_az_credential_env_value`. A missing
+	# alias env var fails there with the named-variable error message,
+	# so no separate pre-check is needed.
 	if ! live_az_preflight; then
 		echo "live_az_setup: pre-flight failed; aborting before any test runs" >&2
 		return 1

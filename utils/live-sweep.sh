@@ -90,22 +90,6 @@ cutoff_stamp=$(date -u -d "@${cutoff_epoch}" +%Y%m%dT%H%M%SZ)
 
 echo "live-sweep: cutoff=$cutoff_stamp (anything strictly less is a candidate)"
 
-# Print stale prefixes from the supplied newline-delimited list. The
-# run-id's first `-`-separated segment is the timestamp; older than
-# cutoff = stale.
-filter_stale() {
-	local stamp id
-	while IFS= read -r p; do
-		[[ -z "$p" ]] && continue
-		id="${p#"${LIVE_TOP_PREFIX}"/}"
-		id="${id%/}"
-		stamp="${id%%-*}"
-		if [[ "$stamp" < "$cutoff_stamp" ]]; then
-			printf '%s\n' "$p"
-		fi
-	done
-}
-
 # sweep_s3 — list, report, optionally delete stale S3 run-prefixes.
 sweep_s3() {
 	if ! command -v aws >/dev/null 2>&1; then
@@ -134,7 +118,7 @@ sweep_s3() {
 		echo "live-sweep[s3]: no run prefixes found under ${LIVE_TOP_PREFIX}/"
 		return 0
 	fi
-	mapfile -t stale < <(printf '%s\n' "$listing" | filter_stale)
+	mapfile -t stale < <(printf '%s\n' "$listing" | live_filter_stale_prefixes "$cutoff_stamp")
 	if [[ ${#stale[@]} -eq 0 ]]; then
 		echo "live-sweep[s3]: no stale prefixes (none older than $AGE)"
 		return 0
@@ -187,7 +171,7 @@ sweep_az() {
 		echo "live-sweep[az]: no run prefixes found under ${LIVE_TOP_PREFIX}/"
 		return 0
 	fi
-	mapfile -t stale < <(printf '%s\n' "$listing" | filter_stale)
+	mapfile -t stale < <(printf '%s\n' "$listing" | live_filter_stale_prefixes "$cutoff_stamp")
 	if [[ ${#stale[@]} -eq 0 ]]; then
 		echo "live-sweep[az]: no stale prefixes (none older than $AGE)"
 		return 0

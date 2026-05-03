@@ -142,6 +142,18 @@ secrets. The helper reads these at runtime per
 Resolution order is KEY → CONNECTION_STRING → SAS; the first set
 variable wins.
 
+### Note: account key is visible in `ps` output during cleanup
+
+The Azure suite passes the resolved account key to the `az` CLI as
+`--account-key <value>` on argv (the only env-based alternative,
+`AZURE_STORAGE_KEY`, is process-global and would shadow any other
+shell state the operator has). For the lifetime of each `az` call,
+the key is readable in `ps aux` / `/proc/<pid>/cmdline` by other
+local users on the same host. Treat the live-tier credential as
+disposable: scope it to the test container only, and rotate it after
+suspicious activity. SAS tokens and connection strings have the same
+exposure surface.
+
 ### RBAC / role permissions
 
 The credential must allow the following data-plane operations against

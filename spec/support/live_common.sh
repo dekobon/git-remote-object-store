@@ -136,6 +136,34 @@ live_engine_is_bundle() {
 	[[ "$(live_engine)" == "bundle" ]]
 }
 
+# live_filter_stale_prefixes <cutoff_stamp>
+# Read run-prefix candidates (one per line on stdin, e.g.
+# `live-test/20260101T000000Z-pid-rand/`) and print those whose leading
+# timestamp segment sorts strictly less than `<cutoff_stamp>`. The run-id
+# format is `YYYYMMDDTHHMMSSZ-<pid>-<rand>`; the timestamp is everything
+# up to the first `-`. Lexicographic comparison is correct because the
+# format is fixed-width and timezone-fixed (UTC).
+#
+# Pure I/O — no side effects, no env reads beyond `${LIVE_TOP_PREFIX}`.
+# `utils/live-sweep.sh` calls this once per backend.
+live_filter_stale_prefixes() {
+	local cutoff_stamp="$1"
+	if [[ -z "$cutoff_stamp" ]]; then
+		echo "live_filter_stale_prefixes: requires <cutoff_stamp>" >&2
+		return 1
+	fi
+	local stamp id p
+	while IFS= read -r p; do
+		[[ -z "$p" ]] && continue
+		id="${p#"${LIVE_TOP_PREFIX}"/}"
+		id="${id%/}"
+		stamp="${id%%-*}"
+		if [[ "$stamp" < "$cutoff_stamp" ]]; then
+			printf '%s\n' "$p"
+		fi
+	done
+}
+
 # live_assert_safe_prefix
 # Return non-zero unless `LIVE_RUN_PREFIX` is non-empty AND begins with
 # `${LIVE_TOP_PREFIX}/`. Belt-and-suspenders against the empty-variable
