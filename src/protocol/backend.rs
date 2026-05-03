@@ -31,9 +31,20 @@ pub use crate::url::BackendKind;
 /// `../git-remote-s3/git_remote_s3/remote.py:574-593`.
 ///
 /// The `Display` strings deliberately match upstream's wording (no
-/// colons, "user" prefix on `NotAuthorized`) so that
-/// [`fatal_message`] is just `format!("fatal: {err}")` — a single
-/// source of truth for the operator-facing wording.
+/// colons, "user" prefix on `NotAuthorized`) and are the single
+/// source of truth for the operator-facing wording rendered by
+/// [`fatal_message`].
+///
+/// # Invariant for `fatal_message`
+///
+/// [`fatal_message`] walks the error source chain starting one level
+/// past `err.source()`, because any variant with a `#[source]` field
+/// already embeds `{source}` in its `Display` format string (making
+/// the first level visible without chain-walking). **Every future
+/// variant that adds a `#[source]` field must also include `{source}`
+/// in its format string.** Omitting `{source}` while keeping
+/// `#[source]` causes `fatal_message` to silently drop the first
+/// source level from the rendered message.
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
     /// Bucket (S3) or container (Azure) does not exist. Maps from a
@@ -112,9 +123,27 @@ const fn container_word(kind: BackendKind) -> &'static str {
 /// (no upstream Python equivalent — Azure support is Rust-port-only). The
 /// upstream wording lives in [`BackendError`]'s `Display` derive — see the
 /// type-level doc comment.
+///
+/// [`BackendError::InvalidCredentials`]'s `Display` already incorporates its
+/// immediate source via `{source}` in the format string. This function walks
+/// one level deeper into the error chain to surface root causes that are not
+/// yet visible — for example, the underlying SDK dispatch error wrapped inside
+/// [`ObjectStoreError::Network`].
 #[must_use]
 pub fn fatal_message(err: &BackendError) -> String {
-    format!("fatal: {err}")
+    use std::error::Error as StdError;
+    use std::fmt::Write as _;
+
+    let mut msg = format!("fatal: {err}");
+    // BackendError::InvalidCredentials already includes its direct source in
+    // the Display via `{source}`, so start chain-walking one level past that
+    // to avoid duplication while still surfacing deeper SDK / transport causes.
+    let mut next = err.source().and_then(StdError::source);
+    while let Some(s) = next {
+        write!(msg, ": {s}").expect("writing to a String is infallible");
+        next = s.source();
+    }
+    msg
 }
 
 /// Fold an [`ObjectStoreError`] from backend construction or the eager
@@ -392,6 +421,58 @@ mod tests {
         assert_eq!(
             fatal_message(&err),
             "fatal: invalid credentials credential acquisition failed"
+        );
+    }
+
+    #[test]
+    fn fatal_message_invalid_credentials_network_includes_root_cause() {
+        // ObjectStoreError::Network wraps a boxed source. The first level
+        // ("network error") is already included in BackendError's Display via
+        // `{source}`; fatal_message must walk one level deeper to surface the
+        // root cause (e.g. the SDK dispatch error) without duplicating "network
+        // error".
+        let err = BackendError::InvalidCredentials {
+            source: ObjectStoreError::Network(boxed("dns lookup failed")),
+        };
+        assert_eq!(
+            fatal_message(&err),
+            "fatal: invalid credentials network error: dns lookup failed"
+        );
+    }
+
+    #[test]
+    fn fatal_message_walks_full_chain() {
+        use std::error::Error as StdError;
+        use std::fmt;
+
+        // A two-level chain: Network(mid) where mid itself has a source.
+        // Verifies that the `while` loop in fatal_message appends every
+        // level, not just the first one it reaches.
+        #[derive(Debug)]
+        struct WrappedError {
+            msg: &'static str,
+            inner: Box<dyn StdError + Send + Sync + 'static>,
+        }
+        impl fmt::Display for WrappedError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.msg)
+            }
+        }
+        impl StdError for WrappedError {
+            fn source(&self) -> Option<&(dyn StdError + 'static)> {
+                Some(self.inner.as_ref())
+            }
+        }
+
+        let err = BackendError::InvalidCredentials {
+            source: ObjectStoreError::Network(Box::new(WrappedError {
+                msg: "dispatch failure",
+                inner: boxed("connection refused"),
+            })),
+        };
+        assert_eq!(
+            fatal_message(&err),
+            "fatal: invalid credentials network error: dispatch failure: connection refused"
         );
     }
 
