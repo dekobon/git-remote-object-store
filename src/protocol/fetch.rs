@@ -452,20 +452,26 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_batch_empty_cmds_short_circuits() {
-        use crate::object_store::mock::MockStore;
+        use crate::object_store::mock::{Fault, MockStore};
         use crate::protocol::BatchCtx;
         // Empty-cmds early return — no store call, no spawn. Covers the
         // internal short-circuit that the integration test cannot reach
         // (the REPL never calls `fetch_batch` with an empty Vec because
         // `BatchState::take_pending` guards on non-empty cmds).
         //
-        // The empty store acts as the natural tripwire: any accidental
-        // store.get_to_file() call would return NotFound and propagate as
-        // Err, which the Ok(()) assertion below would catch. Note that
-        // store.list() on an empty store returns Ok([]) — a silent no-op
-        // that would not be caught here. That is acceptable because
-        // fetch_batch / fetch_one make no list() calls.
+        // Tripwire: arm an `AccessDeniedOnList` fault for an empty
+        // prefix. If a regression accidentally introduces a `list()` call
+        // before the empty-cmds check, the fault fires (consumed from the
+        // queue) and `pending_faults()` drops to 0; the `assert_eq!` below
+        // would fail. The result must also be Ok — a fault firing would
+        // surface as Err.
         let mock = Arc::new(MockStore::new());
+        mock.arm(Fault::AccessDeniedOnList {
+            prefix: String::new(),
+        });
+        mock.arm(Fault::AccessDeniedOnList {
+            prefix: "repo".into(),
+        });
         let repo_dir = tempfile::tempdir().expect("tempdir");
         let ctx = BatchCtx {
             store: Arc::clone(&mock) as Arc<dyn ObjectStore>,
@@ -474,5 +480,12 @@ mod tests {
         };
         let result = fetch_batch(&ctx, Vec::new(), FetchedRefs::new(), None).await;
         assert!(matches!(result, Ok(())));
+        // Both faults must remain pending — `fetch_batch` made no `list`
+        // calls on either prefix.
+        assert_eq!(
+            mock.pending_faults(),
+            2,
+            "fetch_batch with empty cmds must make zero store calls",
+        );
     }
 }

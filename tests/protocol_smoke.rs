@@ -398,3 +398,35 @@ async fn head_with_empty_body_is_ignored() {
     assert!(!text.contains("HEAD\n"));
     assert_eq!(text, format!("{SHA_A} refs/heads/main\n\n"));
 }
+
+/// Mid-batch fetch → push mode flip discards the buffered fetch.
+///
+/// Spec-allowed but uncommon: the REPL's `BatchState::accumulate`
+/// resets the OTHER mode's accumulator on a switch. A regression that
+/// kept the buffered fetch would either:
+///   - run the fetch and crash on a missing bundle (since the script
+///     never seeds it), turning the script's `Ok(())` into `Err`, or
+///   - emit fetch-side stdout bytes before the push outcome.
+///
+/// This test seeds nothing for the fetch and asserts the script
+/// produces ONLY the push outcome line (with no fetch traffic), so the
+/// fetch must have been dropped.
+#[tokio::test]
+async fn fetch_then_push_mode_flip_drops_buffered_fetch() {
+    // The push is `:refs/heads/main` (delete a ref). With nothing
+    // seeded in the store, this returns the upstream-style
+    // `error <ref> "not found"?` outcome — a deterministic byte-exact
+    // line we can pin. The fetch line targets a SHA that is NOT in the
+    // store; if the fetch ran, the helper would error with
+    // ProtocolError::Fetch (NotFound) instead of producing this output.
+    let script = format!("fetch {SHA_A} refs/heads/main\npush :refs/heads/main\n\n");
+    let (out, result) = drive(s3_url(Some("repo")), Arc::new(MockStore::new()), &script).await;
+    result.expect("mode flip script should succeed");
+    let text = std::str::from_utf8(&out).expect("stdout utf-8");
+    // Byte-exact: the push outcome line, then the trailing blank-line
+    // batch terminator. No fetch-side bytes leaked through.
+    assert_eq!(
+        text, "error refs/heads/main \"not found\"?\n\n",
+        "expected only the push outcome line, got {text:?}",
+    );
+}
