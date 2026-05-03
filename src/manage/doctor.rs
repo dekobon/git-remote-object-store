@@ -247,7 +247,11 @@ impl<'a> Doctor<'a> {
             let mut buf = [0u8; uuid::fmt::Simple::LENGTH];
             let suffix = &Uuid::new_v4().simple().encode_lower(&mut buf)[..8];
             let new_ref = format!("{ref_path}_{suffix}");
-            let dst_key = keys::join(&self.prefix, &format!("{new_ref}/{}.bundle", losing.sha));
+            // `keys::bundle_key` accepts an `Option<&str>` prefix and
+            // collapses `Some("")` to the no-prefix shape; passing
+            // `Some(&self.prefix)` therefore handles both the prefixed
+            // and root-of-bucket cases without an explicit branch.
+            let dst_key = keys::bundle_key(Some(&self.prefix), &new_ref, &losing.sha);
             println!("Moving {} to new branch {new_ref}", losing.sha);
             self.store.copy(&losing.key, &dst_key).await?;
         }

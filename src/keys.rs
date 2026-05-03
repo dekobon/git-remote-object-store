@@ -35,12 +35,29 @@ pub(crate) fn join(prefix: &str, suffix: &str) -> String {
 
 /// Build the bundle key `<prefix>/<ref_name>/<sha>.bundle`, applying the
 /// same empty-prefix rule as [`join`].
+///
+/// **Precondition:** `ref_name` must be a valid git ref name and `sha`
+/// must be 40 lowercase hex characters. The signature accepts
+/// `impl fmt::Display` rather than `&RefName` / `&Sha` so the management
+/// CLI (which holds these as raw `String` from listing output) can call
+/// the helper without re-parsing; production helper-protocol callers
+/// always pass the validated newtypes (`RefName`, `Sha`). Pre-validate
+/// untyped strings before reaching here — `bundle_key` performs no
+/// charset or length check, and a malformed input produces a key with
+/// the same shape that subsequent storage operations will accept and
+/// then fail to round-trip.
+///
+/// Renders into a single allocation regardless of whether `prefix` is
+/// present (prior implementations chained two `format!` calls).
 pub(crate) fn bundle_key(
     prefix: Option<&str>,
     ref_name: impl fmt::Display,
     sha: impl fmt::Display,
 ) -> String {
-    join(prefix.unwrap_or(""), &format!("{ref_name}/{sha}.bundle"))
+    match prefix {
+        Some(p) if !p.is_empty() => format!("{p}/{ref_name}/{sha}.bundle"),
+        _ => format!("{ref_name}/{sha}.bundle"),
+    }
 }
 
 #[cfg(test)]

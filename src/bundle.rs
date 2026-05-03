@@ -94,6 +94,7 @@ impl BundleHeader {
 }
 
 /// A single entry from the bundle v2 text header.
+#[cfg_attr(test, derive(Debug))]
 enum HeaderEntry {
     /// The blank line that terminates the header section.
     End,
@@ -114,7 +115,7 @@ fn parse_header_entry(line: &str) -> Result<HeaderEntry, BundleError> {
     if let Some(rest) = trimmed.strip_prefix('-') {
         // Prerequisite line: -<sha40> [optional comment]
         let sha_hex = rest.split_once(' ').map_or(rest, |(s, _)| s);
-        let oid = parse_oid(sha_hex, "prerequisite")?;
+        let oid = parse_header_oid(sha_hex, "prerequisite")?;
         return Ok(HeaderEntry::Prerequisite(oid));
     }
     // Ref line: <sha40> <refname>
@@ -127,12 +128,17 @@ fn parse_header_entry(line: &str) -> Result<HeaderEntry, BundleError> {
         .next()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| BundleError::InvalidHeader(format!("missing ref name: {trimmed:?}")))?;
-    let oid = parse_oid(sha_hex, "ref")?;
+    let oid = parse_header_oid(sha_hex, "ref")?;
     Ok(HeaderEntry::Ref(oid, ref_name.as_bytes().to_vec()))
 }
 
-/// Parse a 40-hex object ID, returning a [`BundleError::InvalidHeader`] on failure.
-fn parse_oid(sha_hex: &str, context: &str) -> Result<ObjectId, BundleError> {
+/// Parse a 40-hex object ID from a bundle header line, returning a
+/// [`BundleError::InvalidHeader`] on failure.
+///
+/// Distinct from `lfs::agent::parse_oid` which validates LFS oid
+/// strings (different format and error type) — the suffix `_header`
+/// makes the call site unambiguous.
+fn parse_header_oid(sha_hex: &str, context: &str) -> Result<ObjectId, BundleError> {
     ObjectId::from_hex(sha_hex.as_bytes())
         .map_err(|_| BundleError::InvalidHeader(format!("bad {context} SHA: {sha_hex:?}")))
 }
@@ -171,7 +177,7 @@ pub fn create(cwd: &Path, folder: &Path, sha: Sha, spec: &str) -> Result<PathBuf
     // must ensure `sha` was derived from the same `spec` immediately before
     // this call; divergence (e.g. a concurrent ref update) produces a bundle
     // whose header SHA does not match its pack content.
-    let (tip_id, ref_name_bytes) = resolve_spec_to_ref(&repo, spec)?;
+    let (tip_id, ref_name) = resolve_spec_to_ref(&repo, spec)?;
     let commit_ids = collect_commit_ids(&repo, tip_id)?;
 
     // Strip the Proxy wrapper to expose the gix_pack::Find impl needed by the
@@ -218,7 +224,7 @@ pub fn create(cwd: &Path, folder: &Path, sha: Sha, spec: &str) -> Result<PathBuf
     let bundle_path = folder.join(format!("{sha}.bundle"));
     let mut tmp = NamedTempFile::new_in(&folder)?;
 
-    write_bundle_header(&mut tmp, sha, &ref_name_bytes)?;
+    write_bundle_header(&mut tmp, sha, &ref_name)?;
 
     let pack_iter = FromEntriesIter::new(
         entries_iter,
@@ -251,17 +257,17 @@ fn collect_commit_ids(
 
 /// Write the bundle v2 text header (magic line, one ref line, blank separator).
 ///
-/// `ref_name_bytes` must be valid UTF-8; this is guaranteed by the caller
-/// since ref names come from `gix::FullNameRef` or from a `&str` spec.
+/// `ref_name` must be a valid git ref name (gix-validated upstream by
+/// `resolve_spec_to_ref`). Taking `&str` rather than `&[u8]` pushes the
+/// UTF-8 invariant into the type system so the function body has no
+/// `expect()` to fall over on a malformed caller.
 fn write_bundle_header<W: Write>(
     writer: &mut W,
     sha: Sha,
-    ref_name_bytes: &[u8],
+    ref_name: &str,
 ) -> Result<(), BundleError> {
-    let ref_name_str =
-        std::str::from_utf8(ref_name_bytes).expect("git ref names are guaranteed UTF-8");
     writeln!(writer, "{BUNDLE_V2_MAGIC}")?;
-    writeln!(writer, "{sha} {ref_name_str}")?;
+    writeln!(writer, "{sha} {ref_name}")?;
     writeln!(writer)?;
     Ok(())
 }
@@ -334,10 +340,15 @@ pub fn unbundle(
 }
 
 /// Resolve `spec` in `repo` to `(commit_oid, canonical_ref_name)`.
+///
+/// gix ref names are required to be valid UTF-8 by `gix-validate`, so
+/// the conversion below cannot fail in practice; it is wrapped in an
+/// explicit `from_utf8` check anyway so the conversion error has a
+/// clear cause if a future gix version relaxes the rule.
 fn resolve_spec_to_ref(
     repo: &gix::Repository,
     spec: &str,
-) -> Result<(ObjectId, Vec<u8>), BundleError> {
+) -> Result<(ObjectId, String), BundleError> {
     let tip_id = repo
         .rev_parse_single(BStr::new(spec))?
         .object()?
@@ -345,19 +356,21 @@ fn resolve_spec_to_ref(
         .id;
 
     // Follow symrefs one level (HEAD -> refs/heads/main) for the bundle ref line.
-    let ref_name_bytes = match repo.try_find_reference(spec) {
+    let ref_name = match repo.try_find_reference(spec) {
         Ok(Some(r)) => {
-            if let Some(Ok(followed)) = r.follow() {
+            let bytes = if let Some(Ok(followed)) = r.follow() {
                 followed.name().as_bstr().to_vec()
             } else {
                 r.name().as_bstr().to_vec()
-            }
+            };
+            String::from_utf8(bytes)
+                .map_err(|_| BundleError::InvalidHeader("ref name is not valid UTF-8".to_owned()))?
         }
-        // Bare SHA or any unresolvable spec: use spec as-is.
-        _ => spec.as_bytes().to_vec(),
+        // Bare SHA or any unresolvable spec: use spec as-is (already &str).
+        _ => spec.to_owned(),
     };
 
-    Ok((tip_id, ref_name_bytes))
+    Ok((tip_id, ref_name))
 }
 
 /// Errors from [`create`] and [`unbundle`].
@@ -434,5 +447,173 @@ impl From<count::objects::Error> for BundleError {
 impl From<gix_pack::bundle::write::Error> for BundleError {
     fn from(e: gix_pack::bundle::write::Error) -> Self {
         Self::PackWrite(Box::new(e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    const OTHER_SHA: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    // --- parse_header_entry --------------------------------------------
+
+    #[test]
+    fn parse_header_entry_recognises_blank_line_as_end() {
+        match parse_header_entry("\n").expect("parse") {
+            HeaderEntry::End => {}
+            other => panic!("expected End, got {other:?}"),
+        }
+        match parse_header_entry("\r\n").expect("parse") {
+            HeaderEntry::End => {}
+            other => panic!("expected End, got {other:?}"),
+        }
+        match parse_header_entry("").expect("parse") {
+            HeaderEntry::End => {}
+            other => panic!("expected End, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_header_entry_parses_prerequisite_with_optional_comment() {
+        let line = format!("-{SHA}\n");
+        let entry = parse_header_entry(&line).expect("parse");
+        let HeaderEntry::Prerequisite(oid) = entry else {
+            panic!("expected Prerequisite, got {entry:?}");
+        };
+        assert_eq!(oid.to_hex().to_string(), SHA);
+
+        // Prerequisite with trailing comment is also accepted.
+        let with_comment = format!("-{OTHER_SHA} a comment\n");
+        let entry = parse_header_entry(&with_comment).expect("parse");
+        let HeaderEntry::Prerequisite(oid) = entry else {
+            panic!("expected Prerequisite, got {entry:?}");
+        };
+        assert_eq!(oid.to_hex().to_string(), OTHER_SHA);
+    }
+
+    #[test]
+    fn parse_header_entry_parses_ref_line() {
+        let line = format!("{SHA} refs/heads/main\n");
+        let entry = parse_header_entry(&line).expect("parse");
+        let HeaderEntry::Ref(oid, name_bytes) = entry else {
+            panic!("expected Ref, got {entry:?}");
+        };
+        assert_eq!(oid.to_hex().to_string(), SHA);
+        assert_eq!(name_bytes, b"refs/heads/main");
+    }
+
+    #[test]
+    fn parse_header_entry_rejects_truncated_ref_line() {
+        // SHA but no ref name.
+        let line = format!("{SHA}\n");
+        match parse_header_entry(&line) {
+            Err(BundleError::InvalidHeader(msg)) => {
+                assert!(
+                    msg.contains("missing ref name"),
+                    "expected missing-ref-name wording, got {msg:?}",
+                );
+            }
+            other => panic!("expected InvalidHeader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_header_entry_rejects_bad_sha_in_ref_line() {
+        // 39 hex chars — off-by-one short of the required 40, the
+        // boundary case most likely to slip through a length check.
+        let bad = "0123456789abcdef0123456789abcdef0123456";
+        assert_eq!(bad.len(), 39);
+        let line = format!("{bad} refs/heads/main\n");
+        match parse_header_entry(&line) {
+            Err(BundleError::InvalidHeader(msg)) => {
+                assert!(
+                    msg.contains("bad ref SHA"),
+                    "expected ref SHA wording, got {msg:?}",
+                );
+                // The bad input is echoed back so operators can see
+                // what was rejected; without this the wording check
+                // would pass on any future "bad ref SHA: <unrelated>".
+                assert!(
+                    msg.contains(bad),
+                    "expected echoed SHA in message, got {msg:?}",
+                );
+            }
+            other => panic!("expected InvalidHeader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_header_entry_rejects_bad_sha_in_prerequisite_line() {
+        let line = "-not-a-sha\n";
+        match parse_header_entry(line) {
+            Err(BundleError::InvalidHeader(msg)) => {
+                assert!(
+                    msg.contains("bad prerequisite SHA"),
+                    "expected prerequisite SHA wording, got {msg:?}",
+                );
+            }
+            other => panic!("expected InvalidHeader, got {other:?}"),
+        }
+    }
+
+    // --- parse_header_oid ---------------------------------------------
+
+    #[test]
+    fn parse_header_oid_accepts_lowercase_hex() {
+        let oid = parse_header_oid(SHA, "test").expect("parse");
+        assert_eq!(oid.to_hex().to_string(), SHA);
+    }
+
+    #[test]
+    fn parse_header_oid_rejects_short_hex_and_names_context() {
+        let err = parse_header_oid("abc", "ref").unwrap_err();
+        let BundleError::InvalidHeader(msg) = err else {
+            panic!("expected InvalidHeader, got {err:?}");
+        };
+        // Context is interpolated into the error message.
+        assert!(msg.contains("bad ref SHA"), "context not in message: {msg}");
+    }
+
+    // --- verify_pack_magic --------------------------------------------
+
+    #[test]
+    fn verify_pack_magic_accepts_pack_bytes() {
+        let mut data: &[u8] = b"PACK extra";
+        verify_pack_magic(&mut data).expect("PACK accepted");
+        // The slice's `Read` impl advances by exactly the bytes read,
+        // so after a successful 4-byte `read_exact` the remainder must
+        // be everything past `PACK`. Asserting on the residue catches a
+        // regression where a future implementation reads past the
+        // magic (e.g. peeks the pack version) without rewinding.
+        assert_eq!(data, b" extra");
+    }
+
+    #[test]
+    fn verify_pack_magic_rejects_non_pack_bytes() {
+        let mut data: &[u8] = b"NOPE";
+        match verify_pack_magic(&mut data) {
+            Err(BundleError::InvalidHeader(msg)) => {
+                assert!(msg.contains("expected PACK magic"), "wrong wording: {msg}");
+            }
+            other => panic!("expected InvalidHeader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_pack_magic_rejects_truncated_input_with_specific_error() {
+        // Less than 4 bytes — UnexpectedEof must surface as the
+        // truncation-specific InvalidHeader, not the generic Io variant.
+        let mut data: &[u8] = b"PA";
+        match verify_pack_magic(&mut data) {
+            Err(BundleError::InvalidHeader(msg)) => {
+                assert!(
+                    msg.contains("truncated before PACK"),
+                    "wrong wording: {msg}",
+                );
+            }
+            other => panic!("expected InvalidHeader for truncation, got {other:?}"),
+        }
     }
 }
