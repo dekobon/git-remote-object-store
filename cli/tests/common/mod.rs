@@ -150,7 +150,10 @@ pub async fn write_repeating_pattern_file(
 /// `MULTIPART_PUT_THRESHOLD`, so the dispatch picks the multipart path
 /// and the sink should see one event per completed part / staged
 /// block. Used by both per-backend integration suites to pin issue
-/// #55's bundle-progress acceptance criterion.
+/// #55's bundle-progress acceptance criterion. Sibling of
+/// [`assert_put_bytes_emits_chunked_progress`]; the two helpers stay
+/// parallel so each per-backend test reads as a two-liner that names
+/// the variant under test.
 pub async fn assert_put_path_emits_chunked_progress<S: ObjectStore + ?Sized>(store: &S, key: &str) {
     let payload = deterministic_payload(MULTIPART_TEST_SIZE);
     let tmp = tempfile::tempdir().expect("tempdir");
