@@ -92,7 +92,7 @@ use std::time::Duration;
 use aws_config::timeout::TimeoutConfig;
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::primitives::{ByteStream, Length};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, MetadataDirective};
 use aws_smithy_http_client::tls::{Provider as TlsProvider, rustls_provider::CryptoMode};
 use aws_smithy_types_convert::date_time::DateTimeExt;
@@ -717,18 +717,26 @@ impl ObjectStore for S3Store {
     }
 
     async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), ObjectStoreError> {
-        // Read the file length up front: it both feeds the size-based
-        // multipart dispatch (issue #53) and drives the post-transfer
-        // progress event on the single-PUT path. `tokio::fs::metadata`
-        // is the cheap source of truth.
-        let body_len = tokio::fs::metadata(src).await.map_err(other_boxed)?.len();
+        // Open the file once and read size from the open handle. This
+        // closes the metadata/upload race that would let a concurrent
+        // truncate or rename produce a body whose length disagrees
+        // with the size we used for multipart planning. The size-based
+        // multipart dispatch (issue #53) and the post-transfer
+        // progress event both consume the same `body_len`.
+        let file = tokio::fs::File::open(src).await.map_err(other_boxed)?;
+        let body_len = file.metadata().await.map_err(other_boxed)?.len();
         if should_use_multipart(body_len) {
-            return self.multipart_put_path(key, src, body_len, opts).await;
+            return self.multipart_put_path(key, file, body_len, opts).await;
         }
-        // Below the threshold: single PutObject. `ByteStream::from_path`
-        // streams from disk via tokio's async file I/O, avoiding a full
-        // in-memory copy.
-        let stream = ByteStream::from_path(src).await.map_err(other_boxed)?;
+        // Below the threshold: single PutObject. `FsBuilder::file`
+        // consumes our already-open handle so the SDK does not
+        // re-open by path (which would re-introduce the race).
+        let stream = ByteStream::read_from()
+            .file(file)
+            .length(Length::Exact(body_len))
+            .build()
+            .await
+            .map_err(other_boxed)?;
         let progress = opts.progress.clone();
         self.put_body(key, stream, opts).await?;
         if let Some(sink) = progress
@@ -1094,23 +1102,27 @@ impl S3Store {
 
     /// Drive a multipart upload by streaming a local file part-by-part.
     ///
-    /// Each spawned task opens its own `tokio::fs::File`, seeks to the
-    /// part's offset, and reads the part into a `Bytes` before calling
-    /// `upload_part`. With `MULTIPART_PUT_MAX_CONCURRENCY = 8` and
+    /// All tasks share one `Arc<std::fs::File>`; per-task
+    /// `read_file_part` uses `pread` so reads are concurrent without
+    /// offset contention. Sharing one open file description closes
+    /// the metadata/upload race that would otherwise let a
+    /// concurrent rename or truncate produce parts with inconsistent
+    /// content. With `MULTIPART_PUT_MAX_CONCURRENCY = 8` and
     /// `MULTIPART_PUT_PART_SIZE = 16 MiB`, peak memory is bounded at
     /// 128 MiB regardless of file size — acceptable for LFS uploads.
     async fn multipart_put_path(
         &self,
         key: &str,
-        src: &Path,
+        file: tokio::fs::File,
         size: u64,
         opts: PutOpts,
     ) -> Result<(), ObjectStoreError> {
         let parts = plan_upload_parts(size, MULTIPART_PUT_PART_SIZE, S3_MAX_PARTS);
         let upload_id = self.start_multipart_upload(key, &opts).await?;
         let progress = opts.progress.clone();
+        let file: Arc<std::fs::File> = Arc::new(file.into_std().await);
         let result = self
-            .upload_parts_from_path(key, &upload_id, src, &parts, progress)
+            .upload_parts_from_file(key, &upload_id, file, &parts, progress)
             .await;
         self.finish_multipart_upload(key, &upload_id, result).await
     }
@@ -1250,21 +1262,19 @@ impl S3Store {
         join_completed_parts(tasks, parts.len()).await
     }
 
-    /// Spawn parallel `UploadPart` tasks that read each part directly
-    /// from disk. Each task opens its own file handle so the reads
-    /// run independently; with concurrency 8 and 16 MiB parts, peak
-    /// memory is 128 MiB.
-    async fn upload_parts_from_path(
+    /// Spawn parallel `UploadPart` tasks that each read their part
+    /// from the shared `Arc<std::fs::File>` via `pread`. With
+    /// concurrency 8 and 16 MiB parts, peak memory is 128 MiB.
+    async fn upload_parts_from_file(
         &self,
         key: &str,
         upload_id: &str,
-        src: &Path,
+        file: Arc<std::fs::File>,
         parts: &[UploadPart],
         progress: Option<ProgressSink>,
     ) -> Result<Vec<CompletedPart>, ObjectStoreError> {
         let semaphore = Arc::new(Semaphore::new(MULTIPART_PUT_MAX_CONCURRENCY));
         let mut tasks: JoinSet<Result<CompletedPart, ObjectStoreError>> = JoinSet::new();
-        let src_owned: Arc<Path> = Arc::from(src);
         for (idx, part) in parts.iter().enumerate() {
             let part = *part;
             // S3 caps multipart uploads at S3_MAX_PARTS = 10 000
@@ -1276,12 +1286,12 @@ impl S3Store {
             let bucket = self.bucket.clone();
             let key = key.to_owned();
             let upload_id = upload_id.to_owned();
-            let src = Arc::clone(&src_owned);
+            let task_file = Arc::clone(&file);
             let semaphore = Arc::clone(&semaphore);
             let progress = progress.clone();
             tasks.spawn(async move {
                 let _permit = semaphore.acquire_owned().await.map_err(other_boxed)?;
-                let body = read_file_part(&src, part).await?;
+                let body = read_file_part(task_file, part).await?;
                 let resp = client
                     .upload_part()
                     .bucket(&bucket)
