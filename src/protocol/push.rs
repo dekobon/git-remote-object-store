@@ -1763,19 +1763,13 @@ mod tests {
     /// alone keeps the test tightly scoped — there is no fault
     /// injection, no chunking knob, just a Vec of "did `put_path` get
     /// a sink?" booleans keyed by the destination key.
+    #[derive(Default)]
     struct RecordingPutPathStore {
         inner: MockStore,
         put_path_progress_seen: std::sync::Mutex<Vec<(String, bool)>>,
     }
 
     impl RecordingPutPathStore {
-        fn new() -> Self {
-            Self {
-                inner: MockStore::new(),
-                put_path_progress_seen: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-
         fn observed(&self) -> Vec<(String, bool)> {
             self.put_path_progress_seen
                 .lock()
@@ -1841,7 +1835,7 @@ mod tests {
     /// 20 GiB push.
     #[tokio::test]
     async fn perform_push_under_lock_attaches_progress_sink_to_bundle_put_path() {
-        let store = RecordingPutPathStore::new();
+        let store = RecordingPutPathStore::default();
         let r = rn("refs/heads/main");
         let temp_dir = tempfile::Builder::new()
             .prefix("test_push_progress_")
