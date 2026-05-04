@@ -93,6 +93,16 @@ pub enum ProtocolError {
     /// An input line did not match any recognised command.
     #[error("invalid command: {0:?}")]
     InvalidCommand(String),
+
+    /// The bucket's resolved storage engine is not implemented in this
+    /// build. Phase 1 of issue #52 lands the `packchain` plumbing
+    /// without push/fetch logic; selecting that engine surfaces here.
+    #[error("storage engine `{0}` is not yet implemented (issue #52)")]
+    EngineNotImplemented(StorageEngine),
+
+    /// `FORMAT` validation / engine resolution failed during connect.
+    #[error("backend resolution failed: {0}")]
+    Backend(#[from] backend::BackendError),
 }
 
 impl ProtocolError {
@@ -254,10 +264,16 @@ fn parse_command(line: &str) -> Option<Command> {
 /// [`ProtocolError::InvalidCommand`] for an unrecognised command,
 /// [`ProtocolError::List`] / [`ProtocolError::Fetch`] /
 /// [`ProtocolError::Push`] for backend errors in the respective
-/// operations.
+/// operations, and [`ProtocolError::EngineNotImplemented`] when
+/// `engine` has no Phase-1 push/fetch logic (issue #52).
+///
+/// `engine` is the resolved engine returned by [`backend::build`].
+/// Threading it through the call chain (rather than re-reading
+/// `FORMAT` here) avoids a duplicate round trip per helper invocation.
 pub async fn run<R, W>(
     remote: RemoteUrl,
     store: Arc<dyn ObjectStore>,
+    engine: StorageEngine,
     reader: R,
     mut writer: W,
     reload: Option<ReloadHandle>,
@@ -267,6 +283,16 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    // A Phase 1 build that lacks the resolved engine's logic must
+    // abort before running any command — silently routing a packchain
+    // bucket through the bundle engine would corrupt on-bucket state.
+    if matches!(engine, StorageEngine::Packchain) {
+        error!(
+            engine = %engine,
+            "packchain engine is not yet implemented; aborting helper",
+        );
+        return Err(ProtocolError::EngineNotImplemented(engine));
+    }
     let mut lines = reader.lines();
     let fetched_refs = FetchedRefs::new();
     let mut batch = BatchState::new();
@@ -276,7 +302,6 @@ where
     // shallow operation.
     let mut depth: Option<NonZeroU32> = None;
     let zip = remote.flags().zip;
-    let engine = remote.flags().engine.unwrap_or(StorageEngine::Bundle);
     let ctx = BatchCtx {
         store,
         prefix: remote.prefix().map(Arc::from),

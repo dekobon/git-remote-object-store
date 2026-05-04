@@ -43,6 +43,7 @@ pub(crate) mod keys;
 pub mod lfs;
 pub mod manage;
 pub mod object_store;
+pub(crate) mod packchain;
 pub mod protocol;
 pub mod remote;
 pub mod url;

@@ -126,7 +126,10 @@ impl RemoteResolver for GitRemoteResolver {
         let raw = crate::git::remote_url(&repo, remote_name)?;
         let parsed = url::parse(&raw)?;
         let prefix = parsed.prefix().map(str::to_owned);
-        let store = backend::build(&parsed).await?;
+        // LFS is engine-independent (objects live at `<prefix>/lfs/<oid>`
+        // regardless of the bundle/packchain choice); discard the
+        // resolved engine.
+        let (store, _engine) = backend::build(&parsed).await?;
         Ok((store, prefix))
     }
 }

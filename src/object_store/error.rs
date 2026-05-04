@@ -64,6 +64,19 @@ pub enum ObjectStoreError {
         limit_bytes: u64,
     },
 
+    /// Ranged GET requested a byte range that the backend cannot
+    /// satisfy. Maps from HTTP 416 on both S3 and Azure, and surfaces
+    /// caller-side range bugs (`start > end`) without issuing a network
+    /// call. The `requested` range is the half-open `[start, end)` the
+    /// caller passed to `get_bytes_range`.
+    #[error("range {}..{} not satisfiable for key `{key}`", requested.start, requested.end)]
+    RangeNotSatisfiable {
+        /// Key being read.
+        key: String,
+        /// Range the caller asked for (half-open, end-exclusive).
+        requested: std::ops::Range<u64>,
+    },
+
     /// Transport-level failure (DNS, TLS, timeout, connection reset).
     /// Carries the original SDK error as `#[source]` so the chain is
     /// preserved. The inner error is included in the display so the
@@ -180,6 +193,18 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "upload exceeds backend size limit (1234 B)"
+        );
+    }
+
+    #[test]
+    fn range_not_satisfiable_names_key_and_range() {
+        let err = ObjectStoreError::RangeNotSatisfiable {
+            key: "packs/abc.pack".to_string(),
+            requested: 100..200,
+        };
+        assert_eq!(
+            err.to_string(),
+            "range 100..200 not satisfiable for key `packs/abc.pack`"
         );
     }
 }

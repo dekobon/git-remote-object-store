@@ -564,6 +564,56 @@ impl ObjectStore for AzureStore {
         Ok(bytes)
     }
 
+    /// Issue a Get Blob with a `Range<usize>` covering `[start, end)`.
+    /// HTTP 416 maps to [`ObjectStoreError::RangeNotSatisfiable`] with
+    /// the original `Range<u64>` so the wire-line names what the
+    /// caller asked for. All other failures route through [`classify`].
+    ///
+    /// The Azure SDK exposes `BlobClientDownloadOptions::range` as
+    /// `Option<Range<usize>>`. `usize` is at least 64 bits on every
+    /// supported target, so casting from `u64` is lossless; the cast
+    /// is documented here so a future 32-bit port surfaces as a
+    /// compile error rather than silent truncation.
+    async fn get_bytes_range(
+        &self,
+        key: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<Bytes, ObjectStoreError> {
+        // Compile-time guarantee: every supported target has a 64-bit
+        // usize, so the `u64 → usize` conversions below cannot
+        // truncate. A future 32-bit port surfaces as a build break,
+        // not silent corruption.
+        const _USIZE_AT_LEAST_64_BIT: () =
+            assert!(usize::BITS >= 64, "Azure backend requires 64-bit usize");
+
+        if let Some(empty) = super::precheck_range(key, &range)? {
+            return Ok(empty);
+        }
+        let sdk_start = usize::try_from(range.start).expect("invariant: usize is at least 64 bits");
+        let sdk_end = usize::try_from(range.end).expect("invariant: usize is at least 64 bits");
+        let opts = BlobClientDownloadOptions {
+            range: Some(sdk_start..sdk_end),
+            ..Default::default()
+        };
+        let blob = self.blob_client(key);
+        let result = match blob.download(Some(opts)).await {
+            Ok(result) => result,
+            Err(err) => {
+                if let azure_core::error::ErrorKind::HttpResponse { status, .. } = err.kind()
+                    && u16::from(*status) == 416
+                {
+                    return Err(ObjectStoreError::RangeNotSatisfiable {
+                        key: key.to_owned(),
+                        requested: range,
+                    });
+                }
+                return Err(classify(err, key));
+            }
+        };
+        let bytes = result.body.collect().await.map_err(network_boxed)?;
+        Ok(bytes)
+    }
+
     async fn put_bytes(
         &self,
         key: &str,

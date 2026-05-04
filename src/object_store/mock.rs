@@ -347,6 +347,42 @@ impl ObjectStore for MockStore {
         })
     }
 
+    /// Slice the in-memory body. Mirrors the trait contract:
+    /// `start == end` short-circuits to `Ok(Bytes::new())` without
+    /// touching the store; `start > end` and out-of-bounds `end` both
+    /// produce [`ObjectStoreError::RangeNotSatisfiable`].
+    async fn get_bytes_range(
+        &self,
+        key: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<Bytes, ObjectStoreError> {
+        if let Some(empty) = super::precheck_range(key, &range)? {
+            return Ok(empty);
+        }
+        self.with_state(|s| {
+            let object = s
+                .objects
+                .get(key)
+                .ok_or_else(|| ObjectStoreError::NotFound(key.to_string()))?;
+            let len = object.body.len() as u64;
+            if range.end > len {
+                return Err(ObjectStoreError::RangeNotSatisfiable {
+                    key: key.to_string(),
+                    requested: range,
+                });
+            }
+            // Both bounds fit in `usize` because `range.end <= len` and
+            // `len` came from `Bytes::len() -> usize`. The
+            // `try_from` is infallible on every target where len fits
+            // in u64 — a 32-bit port would surface here, not silently
+            // truncate.
+            let start =
+                usize::try_from(range.start).expect("range.start <= len; len fits in usize");
+            let end = usize::try_from(range.end).expect("range.end <= len; len fits in usize");
+            Ok(object.body.slice(start..end))
+        })
+    }
+
     async fn put_bytes(
         &self,
         key: &str,
@@ -758,6 +794,80 @@ mod tests {
         let meta = store.head("k").await.unwrap();
         assert_eq!(meta.key, "k");
         assert_eq!(meta.size, 3);
+    }
+
+    #[tokio::test]
+    async fn get_bytes_range_returns_slice() {
+        let store = MockStore::new();
+        store.insert("k", body(b"abcdefghij")); // 10 bytes
+        let got = store.get_bytes_range("k", 2..6).await.unwrap();
+        assert_eq!(&got[..], b"cdef");
+    }
+
+    #[tokio::test]
+    async fn get_bytes_range_empty_range_returns_empty_without_lookup() {
+        let store = MockStore::new();
+        // Key absent — empty range must not surface NotFound; it must
+        // short-circuit before consulting the store.
+        let got = store.get_bytes_range("missing", 5..5).await.unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_bytes_range_inverted_returns_range_not_satisfiable() {
+        let store = MockStore::new();
+        store.insert("k", body(b"abcdefghij"));
+        // Construct the inverted range via the struct literal so
+        // clippy's `reversed_empty_ranges` lint (which only fires on
+        // `5..2` written inline) does not block the test. The trait
+        // contract expects this exact shape.
+        let inverted = std::ops::Range {
+            start: 5_u64,
+            end: 2_u64,
+        };
+        let err = store.get_bytes_range("k", inverted).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ObjectStoreError::RangeNotSatisfiable {
+                    ref key,
+                    requested: ref r,
+                } if key == "k" && r.start == 5 && r.end == 2,
+            ),
+            "expected RangeNotSatisfiable(key=k, 5..2), got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn get_bytes_range_past_end_returns_range_not_satisfiable() {
+        let store = MockStore::new();
+        store.insert("k", body(b"abc"));
+        let err = store.get_bytes_range("k", 0..10).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ObjectStoreError::RangeNotSatisfiable {
+                    ref key,
+                    requested: ref r,
+                } if key == "k" && r.start == 0 && r.end == 10,
+            ),
+            "expected RangeNotSatisfiable(key=k, 0..10), got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn get_bytes_range_missing_key_is_not_found() {
+        let store = MockStore::new();
+        let err = store.get_bytes_range("missing", 0..1).await.unwrap_err();
+        assert!(matches!(err, ObjectStoreError::NotFound(ref k) if k == "missing"));
+    }
+
+    #[tokio::test]
+    async fn get_bytes_range_full_object_round_trips() {
+        let store = MockStore::new();
+        store.insert("k", body(b"hello"));
+        let got = store.get_bytes_range("k", 0..5).await.unwrap();
+        assert_eq!(&got[..], b"hello");
     }
 
     #[tokio::test]

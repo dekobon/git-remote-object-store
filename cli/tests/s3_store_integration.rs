@@ -195,6 +195,65 @@ async fn put_then_get_round_trips() {
 }
 
 #[tokio::test]
+async fn get_bytes_range_returns_slice_via_http_range_header() {
+    // Real-RustFS exercise of the `Range: bytes=<start>-<end-1>` path.
+    // This is the only way to confirm the header format is wire-correct
+    // for the packchain engine's pack-blob direct-access path (issue
+    // #52); the unit tests cover the trait contract but not the header.
+    let (store, _bucket) = fresh_bucket().await;
+    let body = Bytes::from_static(b"abcdefghijklmnopqrstuvwxyz"); // 26 bytes
+    store
+        .put_bytes("k", body.clone(), PutOpts::default())
+        .await
+        .expect("put");
+
+    // Aligned middle slice.
+    let mid = store.get_bytes_range("k", 5..10).await.expect("get range");
+    assert_eq!(&mid[..], b"fghij");
+
+    // Single byte at the end (boundary).
+    let last = store
+        .get_bytes_range("k", 25..26)
+        .await
+        .expect("get last byte");
+    assert_eq!(&last[..], b"z");
+
+    // Full body via range matches `get_bytes`.
+    let whole = store.get_bytes_range("k", 0..26).await.expect("get whole");
+    assert_eq!(whole, body);
+
+    // Empty range short-circuits without a network call.
+    let empty = store.get_bytes_range("k", 7..7).await.expect("empty range");
+    assert!(empty.is_empty());
+}
+
+#[tokio::test]
+async fn get_bytes_range_past_end_maps_to_range_not_satisfiable() {
+    // S3 returns HTTP 416 when `Range:` falls past the body. Our
+    // mapping must surface the original `Range<u64>` so the wire-line
+    // names what the caller asked for, not the server's translation.
+    let (store, _bucket) = fresh_bucket().await;
+    store
+        .put_bytes("k", Bytes::from_static(b"abc"), PutOpts::default())
+        .await
+        .expect("put");
+    let err = store
+        .get_bytes_range("k", 100..200)
+        .await
+        .expect_err("range past end must error");
+    assert!(
+        matches!(
+            err,
+            ObjectStoreError::RangeNotSatisfiable {
+                ref key,
+                requested: ref r,
+            } if key == "k" && r.start == 100 && r.end == 200,
+        ),
+        "expected RangeNotSatisfiable(k, 100..200), got {err:?}",
+    );
+}
+
+#[tokio::test]
 async fn head_returns_size_and_recent_last_modified() {
     let (store, _bucket) = fresh_bucket().await;
     let body = Bytes::from_static(b"abcdefghij");

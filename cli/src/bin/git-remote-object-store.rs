@@ -197,7 +197,10 @@ async fn open_target(target: &Target) -> Result<(Arc<dyn ObjectStore>, String)> 
     // No `.context()` wrap: surface the typed `BackendError` so the
     // catch-all in `main` can downcast and emit a single-line `fatal:`
     // matching upstream `git-remote-s3`.
-    let store = backend::build(&url).await?;
+    // Management CLI is engine-independent for Phase 1 (every
+    // subcommand reads/writes engine-shared keys: HEAD, FORMAT,
+    // PROTECTED#, lock files). Drop the resolved engine for now.
+    let (store, _engine) = backend::build(&url).await?;
     Ok((store, prefix))
 }
 
