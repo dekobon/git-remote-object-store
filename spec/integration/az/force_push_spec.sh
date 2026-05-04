@@ -55,6 +55,13 @@ Describe "Azure helper: force-push and protected refs"
 	End
 
 	Describe "force-push silently degraded when PROTECTED# present"
+		# The helper strips the leading `+` from the refspec when a
+		# PROTECTED# marker exists for the target ref (see
+		# src/protocol/push.rs — `force_push` is forced to false). A
+		# divergent commit then fails the ancestor check; the helper
+		# emits `error <ref> "remote ref is not ancestor of <local>."`
+		# (NOT_ANCESTOR_TOKEN in src/protocol/push.rs). Exit code is
+		# non-zero; the bundle on the remote is unchanged.
 		BeforeEach 'setup_divergent'
 		BeforeEach 'git-remote-object-store protect "$URL" main >/dev/null 2>&1'
 
@@ -65,6 +72,10 @@ Describe "Azure helper: force-push and protected refs"
 		It "rejects the push and leaves the bundle SHA unchanged"
 			When call quiet_push_force
 			The status should not equal 0
+			# "not ancestor" is the documented contract token
+			# (src/protocol/push.rs:NOT_ANCESTOR_TOKEN). Asserted here
+			# to distinguish the ancestor-mismatch failure mode from
+			# unrelated push failures (network, permission, ...).
 			The variable LAST_GIT_OUTPUT should include "not ancestor"
 
 			assert_bundle_count azurite_list "$CONTAINER" "$PREFIX" \

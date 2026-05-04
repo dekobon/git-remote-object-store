@@ -181,8 +181,11 @@ Describe "S3 helper (live AWS): core git operations"
 					refs/heads/feature 0
 			fi
 
-			refs_listed=$(git ls-remote "$URL" refs/heads/feature 2>/dev/null || true)
-			The variable refs_listed should equal ""
+			# Distinguish "ref absent" (ls-remote exit==0, empty output)
+			# from "ls-remote failed" (the latter would also produce empty
+			# stdout under `2>/dev/null || true`). See
+			# `assert_ls_remote_ref_absent` in spec/support/git_scenarios.sh.
+			assert_ls_remote_ref_absent "$URL" refs/heads/feature
 		End
 	End
 End

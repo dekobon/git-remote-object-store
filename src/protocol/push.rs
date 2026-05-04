@@ -49,6 +49,17 @@ struct PushConfig {
 /// from upstream for cross-implementation parity.
 pub(crate) const ENV_LOCK_TTL_SECONDS: &str = "GIT_REMOTE_S3_LOCK_TTL_SECONDS";
 
+/// Stable substring embedded in the rejection message returned when the
+/// remote ref is not an ancestor of the pushed local ref. Treated as a
+/// user-facing contract: shellspec suites assert on this token to
+/// distinguish the ancestor-mismatch failure mode from unrelated push
+/// failures (network, permission, malformed URL, ...). Reword the
+/// surrounding sentence freely; do not change this token without
+/// updating every call site, including the spec files under
+/// `spec/integration/*/force_push_spec.sh` and
+/// `spec/live/*/force_push_spec.sh`.
+pub(crate) const NOT_ANCESTOR_TOKEN: &str = "not ancestor";
+
 /// Errors surfaced by the push path. These abort the helper — per-ref
 /// failures (multi-bundle, ancestor mismatch, lock contention, ...) are
 /// returned as [`PushOutcome::Error`] without aborting the batch.
@@ -581,7 +592,7 @@ async fn prepare_push(
         Err(GitProbeError::NotAncestor) => {
             return Ok(PrepareOutcome::Done(PushOutcome::Error {
                 remote_ref: remote_ref_str,
-                message: format!(r#""remote ref is not ancestor of {local_spec}."?"#),
+                message: format!(r#""remote ref is {NOT_ANCESTOR_TOKEN} of {local_spec}."?"#),
             }));
         }
     };
