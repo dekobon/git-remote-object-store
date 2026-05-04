@@ -146,3 +146,45 @@ pub fn git_capture(args: &[&str], cwd: &Path) -> String {
     );
     String::from_utf8(output.stdout).expect("git stdout utf-8")
 }
+
+/// Initialise a fresh repo with `n` linear commits on `refs/heads/main`
+/// and return the dir + Vec<sha> in commit order (oldest first).
+///
+/// `salt` differentiates blob contents so two repos seeded in the same
+/// wall-clock second still produce distinct commit SHAs (commit time
+/// resolution is one second; without per-call salt, two seeded repos
+/// can hash-collide and break tests that compare their tip SHAs).
+pub fn make_seed_repo(n: usize, salt: &str) -> (tempfile::TempDir, Vec<String>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git(&["init", "--quiet", "--initial-branch=main"], dir.path());
+    git(&["config", "user.email", "test@example.com"], dir.path());
+    git(&["config", "user.name", "Test"], dir.path());
+    git(&["config", "commit.gpgsign", "false"], dir.path());
+
+    let mut shas = Vec::with_capacity(n);
+    for i in 0..n {
+        let body = format!("{salt}-{i}\n");
+        std::fs::write(dir.path().join(format!("f{i}.txt")), body.as_bytes()).unwrap();
+        git(&["add", "."], dir.path());
+        git(
+            &["commit", "--quiet", "-m", "step", "--no-gpg-sign"],
+            dir.path(),
+        );
+        let sha = git_capture(&["rev-parse", "HEAD"], dir.path())
+            .trim()
+            .to_owned();
+        shas.push(sha);
+    }
+    (dir, shas)
+}
+
+/// Build a `?engine=packchain` URL pointing at a fake S3 bucket.
+pub fn s3_url_packchain(prefix: Option<&str>) -> RemoteUrl {
+    let raw = match prefix {
+        Some(p) => {
+            format!("s3+https://my-bucket.s3.us-west-2.amazonaws.com/{p}?engine=packchain")
+        }
+        None => "s3+https://my-bucket.s3.us-west-2.amazonaws.com/?engine=packchain".to_owned(),
+    };
+    url::parse(&raw).expect("packchain test URL must parse")
+}

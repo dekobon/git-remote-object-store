@@ -95,6 +95,14 @@ pub enum PushError {
     /// Local I/O failure (tempdir, file read).
     #[error("local I/O error during push: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Packchain-engine-specific failure surfaced by
+    /// [`crate::packchain::push::push_batch`]. Wrapped here so the
+    /// per-ref `error <ref>` arm in [`push_batch`] can render a
+    /// uniform wire line regardless of which engine produced the
+    /// error.
+    #[error("packchain engine error during push: {0}")]
+    Packchain(#[from] crate::packchain::PackchainError),
 }
 
 /// Result of a single push within a batch. Rendered to stdout by the REPL
@@ -134,18 +142,18 @@ impl PushOutcome {
 
 /// Parsed `push` command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PushSpec {
+pub(crate) struct PushSpec {
     /// `+` was present — the user requested a force push.
-    force: bool,
+    pub(crate) force: bool,
     /// User-supplied local rev-spec. Empty means "delete the remote ref".
-    local_spec: String,
+    pub(crate) local_spec: String,
     /// Strict, fully-qualified remote ref.
-    remote_ref: RefName,
+    pub(crate) remote_ref: RefName,
 }
 
 /// Parse the payload of a `push <refspec>` line (the bytes after the
 /// `push ` prefix have already been stripped by the REPL).
-fn parse_push_args(args: &str) -> Result<PushSpec, PushError> {
+pub(crate) fn parse_push_args(args: &str) -> Result<PushSpec, PushError> {
     let parse_err = || PushError::Parse {
         line: args.to_owned(),
     };
@@ -173,12 +181,12 @@ fn parse_push_args(args: &str) -> Result<PushSpec, PushError> {
 
 /// Build the `<prefix>/<ref>/` listing prefix used by lock and bundle
 /// listings. Empty / absent prefix collapses to a bare `<ref>/`.
-fn ref_listing_prefix(prefix: Option<&str>, remote_ref: &RefName) -> String {
+pub(crate) fn ref_listing_prefix(prefix: Option<&str>, remote_ref: &RefName) -> String {
     keys::join(prefix.unwrap_or(""), &format!("{remote_ref}/"))
 }
 
 /// Build the lock key: `<prefix>/<ref>/LOCK#.lock`.
-fn lock_key(prefix: Option<&str>, remote_ref: &RefName) -> String {
+pub(crate) fn lock_key(prefix: Option<&str>, remote_ref: &RefName) -> String {
     format!("{}LOCK#.lock", ref_listing_prefix(prefix, remote_ref))
 }
 
@@ -188,7 +196,7 @@ fn archive_key(prefix: Option<&str>, remote_ref: &RefName) -> String {
 }
 
 /// Build the HEAD key: `<prefix>/HEAD` (no slash when prefix is absent).
-fn head_key(prefix: Option<&str>) -> String {
+pub(crate) fn head_key(prefix: Option<&str>) -> String {
     keys::join(prefix.unwrap_or(""), "HEAD")
 }
 
@@ -222,7 +230,7 @@ async fn bundles_for_ref(
 }
 
 /// Returns `true` iff a `<prefix>/<ref>/PROTECTED#…` marker exists.
-async fn is_protected(
+pub(crate) async fn is_protected(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
     remote_ref: &RefName,
@@ -304,7 +312,10 @@ pub(crate) async fn release_lock(
 
 /// Idempotent delete: treats `NotFound` as success (another client may
 /// have raced ahead) but propagates every other error.
-async fn delete_idempotent(store: &dyn ObjectStore, key: &str) -> Result<(), ObjectStoreError> {
+pub(crate) async fn delete_idempotent(
+    store: &dyn ObjectStore,
+    key: &str,
+) -> Result<(), ObjectStoreError> {
     match store.delete(key).await {
         Ok(()) | Err(ObjectStoreError::NotFound(_)) => Ok(()),
         Err(e) => Err(e),
@@ -820,7 +831,7 @@ async fn perform_push_under_lock(
 /// one event total for bodies below it. With the default 16 MiB
 /// part size and 8-way concurrency, a 1 GiB bundle emits ~64 lines
 /// — ample motion to spot a stall, far short of log spam.
-fn bundle_progress_sink(key: &str, total: Option<u64>) -> ProgressSink {
+pub(crate) fn bundle_progress_sink(key: &str, total: Option<u64>) -> ProgressSink {
     // The closure needs an owned `String` because `ProgressSink` is
     // `'static`; cloning here keeps the call sites' borrow intact so
     // they can pass `&bundle_dest` to `put_path` without juggling

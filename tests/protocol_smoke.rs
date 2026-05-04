@@ -36,64 +36,77 @@ async fn drive(
 }
 
 #[tokio::test]
-async fn packchain_url_aborts_with_engine_not_implemented_and_no_stdout() {
-    // Phase 1 of issue #52 ships the `packchain` plumbing without
-    // push/fetch logic. Any helper invocation against
-    // `?engine=packchain` must abort cleanly **before** running any
-    // command, with no bytes on stdout (per
-    // `.claude/rules/protocol-stdout.md`). A regression that silently
-    // routed packchain through the bundle engine would corrupt
-    // on-bucket state.
+async fn packchain_capabilities_succeeds() {
+    // Phase 2 (issue #63) lights up packchain push. Engine-agnostic
+    // commands like `capabilities` must succeed for the packchain
+    // engine just as they do for the bundle engine — pinning this
+    // catches a regression that re-introduces a blanket
+    // engine-not-implemented gate at REPL entry.
     let raw = "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=packchain";
     let remote = git_remote_object_store::url::parse(raw).expect("URL parses");
 
     let store: Arc<dyn ObjectStore> = Arc::new(MockStore::new());
     let (out, result) = drive(remote, store, "capabilities\n").await;
 
-    // Match the variant structurally (per lesson #4) rather than via
-    // Debug-string substring. A future change that wrapped the error in
-    // another variant — `ProtocolError::Backend(BackendError::EngineNotImplemented(...))`
-    // for example — would still contain both substrings in its Debug
-    // output and let the regression through.
-    let err = result.expect_err("packchain helper must abort");
+    result.expect("capabilities must succeed for packchain");
+    assert_eq!(&out, b"*push\n*fetch\noption\n\n");
+}
+
+#[tokio::test]
+async fn packchain_fetch_aborts_with_engine_not_implemented() {
+    // Phase 3 will land packchain fetch; until then a `fetch` batch
+    // against a packchain bucket must abort with a clear error rather
+    // than silently routing through the bundle code path. Stdout
+    // discipline is asserted at the variant level — the abort should
+    // happen before any `fetch` reply is written.
+    let raw = "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=packchain";
+    let remote = git_remote_object_store::url::parse(raw).expect("URL parses");
+
+    let store: Arc<dyn ObjectStore> = Arc::new(MockStore::new());
+    let (_out, result) = drive(
+        remote,
+        store,
+        "fetch 0123456789abcdef0123456789abcdef01234567 refs/heads/main\n\n",
+    )
+    .await;
+    let err = result.expect_err("packchain fetch must abort");
     assert!(
         matches!(
             err,
             ProtocolError::EngineNotImplemented(StorageEngine::Packchain)
         ),
         "expected EngineNotImplemented(Packchain), got {err:?}",
-    );
-    // Stdout discipline: not a single byte must reach git's reader
-    // before the abort. Even the capabilities banner is suppressed —
-    // the helper aborts before the REPL loop starts.
-    assert!(
-        out.is_empty(),
-        "packchain abort must produce zero stdout bytes, got {out:?}",
     );
 }
 
 #[tokio::test]
-async fn packchain_format_aborts_even_when_url_omits_engine_flag() {
+async fn packchain_format_resolves_engine_even_without_url_flag() {
     // FORMAT is authoritative for the resolved engine. A bucket
-    // already locked to `packchain` must abort the helper even when
-    // the URL omits `?engine=` — otherwise a bundle-helper would walk
-    // a packchain bucket's keys and either return empty results or
-    // overwrite chain.json with bundle artifacts.
+    // already locked to `packchain` must dispatch through the
+    // packchain code paths even when the URL omits `?engine=` —
+    // otherwise a bundle-helper would walk a packchain bucket's keys
+    // and either return empty results or overwrite chain.json.
+    //
+    // Capabilities is engine-agnostic; the meaningful regression is
+    // that subsequent fetch / push gets routed by FORMAT, not by URL.
     let store = MockStore::new();
     store.insert("repo/FORMAT", Bytes::from_static(b"packchain"));
     let store: Arc<dyn ObjectStore> = Arc::new(store);
 
-    let (out, result) = drive(s3_url(Some("repo")), store, "capabilities\n").await;
-
-    let err = result.expect_err("packchain helper must abort");
+    let (_out, result) = drive(
+        s3_url(Some("repo")),
+        store,
+        "fetch 0123456789abcdef0123456789abcdef01234567 refs/heads/main\n\n",
+    )
+    .await;
+    let err = result.expect_err("packchain fetch must abort even without URL flag");
     assert!(
         matches!(
             err,
             ProtocolError::EngineNotImplemented(StorageEngine::Packchain)
         ),
-        "expected EngineNotImplemented(Packchain), got {err:?}",
+        "FORMAT must drive engine resolution; got {err:?}",
     );
-    assert!(out.is_empty(), "no stdout bytes before abort, got {out:?}");
 }
 
 #[tokio::test]
