@@ -33,9 +33,7 @@ use azure_core::http::Method;
 use azure_core::http::headers::{HeaderName, Headers};
 use bytes::Bytes;
 use git_remote_object_store::object_store::azure::AzureStore;
-use git_remote_object_store::object_store::{
-    GetOpts, ObjectStore, ObjectStoreError, ProgressSink, PutOpts,
-};
+use git_remote_object_store::object_store::{GetOpts, ObjectStore, ObjectStoreError, PutOpts};
 use git_remote_object_store::protocol::backend::{self, BackendError, BackendKind};
 use git_remote_object_store::url::{ENV_ALLOW_HTTP, RemoteUrl, parse};
 use sha2::{Digest, Sha256};
@@ -1181,33 +1179,7 @@ async fn multipart_put_path_round_trips() {
 #[tokio::test]
 async fn multipart_put_emits_per_block_progress_events() {
     let store = fresh_container().await;
-    let payload = deterministic_payload(MULTIPART_TEST_SIZE);
-
-    let events: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&events);
-    let sink = ProgressSink::new(move |bytes| {
-        recorded.lock().expect("progress lock").push(bytes);
-    });
-
-    let opts = PutOpts {
-        progress: Some(sink),
-        ..PutOpts::default()
-    };
-    store
-        .put_bytes("progress-events", Bytes::from(payload), opts)
-        .await
-        .expect("multipart put_bytes with progress");
-
-    let observed = events.lock().expect("progress lock").clone();
-    assert!(
-        observed.len() >= 2,
-        "expected ≥ 2 progress events, got {observed:?}",
-    );
-    let total: u64 = observed.iter().sum();
-    assert_eq!(
-        total, MULTIPART_TEST_SIZE as u64,
-        "progress events must sum to the body size",
-    );
+    common::assert_put_bytes_emits_chunked_progress(&store, "progress-events").await;
 }
 
 /// `put_path` above the multipart threshold also emits per-block

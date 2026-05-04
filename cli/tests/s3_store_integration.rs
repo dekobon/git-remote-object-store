@@ -32,9 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 use git_remote_object_store::object_store::s3::S3Store;
-use git_remote_object_store::object_store::{
-    GetOpts, ObjectStore, ObjectStoreError, ProgressSink, PutOpts,
-};
+use git_remote_object_store::object_store::{GetOpts, ObjectStore, ObjectStoreError, PutOpts};
 use git_remote_object_store::protocol::backend::{self, BackendError, BackendKind};
 use git_remote_object_store::url::{ENV_ALLOW_HTTP, RemoteUrl, parse};
 use sha2::{Digest, Sha256};
@@ -1197,41 +1195,11 @@ async fn copy_with_stale_source_if_match_returns_precondition_failed() {
 
 /// Multipart uploads emit one progress event per completed part so
 /// the LFS agent can render a live progress bar. With an 80 MiB body
-/// and 16 MiB parts, expect exactly 5 events.
+/// and 16 MiB parts, expect at least 2 events.
 #[tokio::test]
 async fn multipart_put_emits_per_part_progress_events() {
     let (store, _bucket) = fresh_bucket().await;
-    let payload = deterministic_payload(MULTIPART_TEST_SIZE);
-
-    let events: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&events);
-    let sink = ProgressSink::new(move |bytes| {
-        recorded.lock().expect("progress lock").push(bytes);
-    });
-
-    let opts = PutOpts {
-        progress: Some(sink),
-        ..PutOpts::default()
-    };
-    store
-        .put_bytes("progress-events", Bytes::from(payload), opts)
-        .await
-        .expect("multipart put_bytes with progress");
-
-    let observed = events.lock().expect("progress lock").clone();
-    // 80 MiB / 16 MiB = 5 parts; expect at least 5 events. Exact
-    // equality would couple the test to the part-size constant —
-    // bumping it for a future tuning pass shouldn't break the test
-    // as long as multiple events still arrive.
-    assert!(
-        observed.len() >= 2,
-        "expected ≥ 2 progress events, got {observed:?}",
-    );
-    let total: u64 = observed.iter().sum();
-    assert_eq!(
-        total, MULTIPART_TEST_SIZE as u64,
-        "progress events must sum to the body size",
-    );
+    common::assert_put_bytes_emits_chunked_progress(&store, "progress-events").await;
 }
 
 /// `put_path` above the multipart threshold also emits per-part
