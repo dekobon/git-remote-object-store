@@ -32,7 +32,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 use git_remote_object_store::object_store::s3::S3Store;
-use git_remote_object_store::object_store::{GetOpts, ObjectStore, ObjectStoreError, PutOpts};
+use git_remote_object_store::object_store::{
+    GetOpts, ObjectStore, ObjectStoreError, ProgressSink, PutOpts,
+};
 use git_remote_object_store::protocol::backend::{self, BackendError, BackendKind};
 use git_remote_object_store::url::{ENV_ALLOW_HTTP, RemoteUrl, parse};
 use sha2::{Digest, Sha256};
@@ -1035,4 +1037,194 @@ async fn build_against_missing_bucket_returns_bucket_not_found() {
     };
     assert_eq!(kind, BackendKind::S3);
     assert_eq!(name, bucket);
+}
+
+mod common;
+use common::{MULTIPART_TEST_SIZE, deterministic_payload, sha256_of, sha256_of_file};
+
+/// `put_bytes` above the multipart threshold drives the hand-rolled
+/// multipart upload path (issue #53). 80 MiB body splits into 5 parts
+/// at the 16 MiB part size, exercising parallelism and the
+/// last-part-short case.
+#[tokio::test]
+async fn multipart_put_bytes_round_trips() {
+    let (store, _bucket) = fresh_bucket().await;
+    let payload = deterministic_payload(MULTIPART_TEST_SIZE);
+    let expected = sha256_of(&payload);
+
+    store
+        .put_bytes("multipart-bytes", Bytes::from(payload), PutOpts::default())
+        .await
+        .expect("multipart put_bytes");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dest = tmp.path().join("downloaded");
+    store
+        .get_to_file("multipart-bytes", &dest, GetOpts::default())
+        .await
+        .expect("get_to_file");
+    assert_eq!(
+        sha256_of_file(&dest),
+        expected,
+        "multipart upload corrupted the body"
+    );
+}
+
+/// `put_path` above the multipart threshold drives the streaming
+/// multipart upload path (each part read from disk independently).
+/// Issue #53.
+#[tokio::test]
+async fn multipart_put_path_round_trips() {
+    let (store, _bucket) = fresh_bucket().await;
+    let payload = deterministic_payload(MULTIPART_TEST_SIZE);
+    let expected = sha256_of(&payload);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("multipart-src.bin");
+    tokio::fs::write(&src, &payload).await.expect("write src");
+
+    store
+        .put_path("multipart-path", &src, PutOpts::default())
+        .await
+        .expect("multipart put_path");
+
+    let dest = tmp.path().join("multipart-dst.bin");
+    store
+        .get_to_file("multipart-path", &dest, GetOpts::default())
+        .await
+        .expect("get_to_file");
+    assert_eq!(sha256_of_file(&dest), expected);
+}
+
+/// `copy` above the multipart threshold drives `UploadPartCopy`
+/// (server-side copy in chunks). Closes the
+/// `manage doctor --fix` quarantine gap on large bundles. Issue #53.
+#[tokio::test]
+async fn multipart_copy_round_trips() {
+    let (store, _bucket) = fresh_bucket().await;
+    let payload = deterministic_payload(MULTIPART_TEST_SIZE);
+    let expected = sha256_of(&payload);
+
+    store
+        .put_bytes("copy-src", Bytes::from(payload), PutOpts::default())
+        .await
+        .expect("seed src via multipart");
+    store
+        .copy("copy-src", "copy-dst")
+        .await
+        .expect("multipart copy");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dest = tmp.path().join("downloaded");
+    store
+        .get_to_file("copy-dst", &dest, GetOpts::default())
+        .await
+        .expect("get_to_file dst");
+    assert_eq!(
+        sha256_of_file(&dest),
+        expected,
+        "multipart copy corrupted body"
+    );
+}
+
+/// Multipart uploads emit one progress event per completed part so
+/// the LFS agent can render a live progress bar. With an 80 MiB body
+/// and 16 MiB parts, expect exactly 5 events.
+#[tokio::test]
+async fn multipart_put_emits_per_part_progress_events() {
+    let (store, _bucket) = fresh_bucket().await;
+    let payload = deterministic_payload(MULTIPART_TEST_SIZE);
+
+    let events: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&events);
+    let sink = ProgressSink::new(move |bytes| {
+        recorded.lock().expect("progress lock").push(bytes);
+    });
+
+    let opts = PutOpts {
+        progress: Some(sink),
+        ..PutOpts::default()
+    };
+    store
+        .put_bytes("progress-events", Bytes::from(payload), opts)
+        .await
+        .expect("multipart put_bytes with progress");
+
+    let observed = events.lock().expect("progress lock").clone();
+    // 80 MiB / 16 MiB = 5 parts; expect at least 5 events. Exact
+    // equality would couple the test to the part-size constant —
+    // bumping it for a future tuning pass shouldn't break the test
+    // as long as multiple events still arrive.
+    assert!(
+        observed.len() >= 2,
+        "expected ≥ 2 progress events, got {observed:?}",
+    );
+    let total: u64 = observed.iter().sum();
+    assert_eq!(
+        total, MULTIPART_TEST_SIZE as u64,
+        "progress events must sum to the body size",
+    );
+}
+
+/// Optional regression test for the > 5 GiB AWS hard limit. Skipped
+/// by default because a ~6 GiB body needs ~12 GiB of free disk for
+/// the round-trip check. Enable with `RUN_LARGE_BODY_TESTS=1`.
+///
+/// This is the single AC item from issue #53 that the cheaper 80 MiB
+/// tests above cannot exercise directly: the actual `EntityTooLarge`
+/// failure mode of bare `PutObject` only triggers above 5 GiB.
+#[tokio::test]
+#[ignore = "requires RUN_LARGE_BODY_TESTS=1 and ~12 GiB of free disk"]
+async fn multipart_put_path_above_5_gib_round_trips() {
+    use std::io::Read;
+    use tokio::io::AsyncWriteExt;
+
+    // 6 GiB — 1 GiB above the AWS single-PUT ceiling.
+    const SIZE: u64 = 6 * 1024 * 1024 * 1024;
+
+    if std::env::var_os("RUN_LARGE_BODY_TESTS").is_none() {
+        eprintln!("skipping: RUN_LARGE_BODY_TESTS not set");
+        return;
+    }
+    let (store, _bucket) = fresh_bucket().await;
+    let chunk = deterministic_payload(64 * 1024 * 1024);
+    let chunk_hash_byte = chunk[0];
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("six-gib.bin");
+    {
+        let mut file = tokio::fs::File::create(&src).await.expect("create src");
+        let mut written: u64 = 0;
+        while written < SIZE {
+            let remaining = SIZE - written;
+            // Both `remaining` and `chunk.len()` fit in usize on this
+            // 64-bit test target (and the chunk is well below 4 GiB),
+            // so `usize::try_from` of their min is safe.
+            let chunk_len = u64::try_from(chunk.len()).expect("chunk fits in u64");
+            let n = usize::try_from(remaining.min(chunk_len)).expect("min fits in usize");
+            file.write_all(&chunk[..n]).await.expect("write chunk");
+            written += u64::try_from(n).expect("usize fits in u64");
+        }
+        file.flush().await.expect("flush");
+    }
+
+    store
+        .put_path("six-gib", &src, PutOpts::default())
+        .await
+        .expect("multipart put_path > 5 GiB");
+
+    let head = store.head("six-gib").await.expect("head");
+    assert_eq!(head.size, SIZE);
+    // Cheap sanity: first byte downloads correctly.
+    let dest = tmp.path().join("six-gib.dl");
+    store
+        .get_to_file("six-gib", &dest, GetOpts::default())
+        .await
+        .expect("get_to_file");
+    let mut byte_buf = [0u8; 1];
+    std::fs::File::open(&dest)
+        .expect("open dl")
+        .read_exact(&mut byte_buf)
+        .expect("read first byte");
+    assert_eq!(byte_buf[0], chunk_hash_byte);
 }

@@ -93,7 +93,7 @@ use aws_config::timeout::TimeoutConfig;
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::MetadataDirective;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, MetadataDirective};
 use aws_smithy_http_client::tls::{Provider as TlsProvider, rustls_provider::CryptoMode};
 use aws_smithy_types_convert::date_time::DateTimeExt;
 use bytes::Bytes;
@@ -109,6 +109,10 @@ use crate::url::{
 };
 
 use super::error::{network_boxed, other_boxed};
+use super::multipart::{
+    MULTIPART_PUT_MAX_CONCURRENCY, MULTIPART_PUT_PART_SIZE, S3_MAX_PARTS, UploadPart,
+    plan_upload_parts, read_file_part, should_use_multipart, slice_bytes_part,
+};
 use super::{
     GetOpts, ObjectMeta, ObjectStore, ObjectStoreError, ProgressSink, PutOpts, persist_temp,
 };
@@ -694,38 +698,36 @@ impl ObjectStore for S3Store {
         body: Bytes,
         opts: PutOpts,
     ) -> Result<(), ObjectStoreError> {
-        // Note: aws-sdk-s3 1.x rejects PutObject bodies > 5 GiB; larger
-        // payloads need multipart upload. Bundle objects in our schema
-        // do not approach that limit; LFS-driven needs may extend the
-        // trait in a later phase.
-        self.put_body(key, ByteStream::from(body), opts).await
+        // PutObject rejects bodies > 5 GiB; above [`MULTIPART_PUT_THRESHOLD`]
+        // we hand off to the multipart path which lifts that ceiling and
+        // emits per-part progress events. Below the threshold we keep the
+        // single round trip (no `CreateMultipartUpload` cost). Issue #53.
+        let size = body.len() as u64;
+        if should_use_multipart(size) {
+            return self.multipart_put_bytes(key, body, size, opts).await;
+        }
+        let progress = opts.progress.clone();
+        self.put_body(key, ByteStream::from(body), opts).await?;
+        if let Some(sink) = progress
+            && size > 0
+        {
+            sink.report(size);
+        }
+        Ok(())
     }
 
     async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), ObjectStoreError> {
-        // `ByteStream::from_path` streams from disk via tokio's async
-        // file I/O, avoiding a full in-memory copy. Note: the 5 GiB
-        // single-PUT ceiling still applies — `aws-sdk-s3` PutObject
-        // does not auto-switch to multipart (that requires the separate
-        // `aws-s3-transfer-manager` crate). Bundles well below 5 GiB;
-        // LFS phase may need a multipart wrapper.
-        //
-        // The Azure backend streams via `FileStream` →
-        // `Body::SeekableStream` → `stage_block` + `commit_block_list`
-        // (see `azure.rs` `put_path`), giving cross-backend parity on
-        // the memory bound for large LFS / bundle uploads (issue #21
-        // closed for S3, issue #42 for Azure).
-        //
-        // Progress reporting is a single end-of-transfer event (the
-        // SDK's PutObject body is opaque — there's no per-part hook
-        // short of the in-development `aws-s3-transfer-manager` crate).
-        // `git-lfs` accepts any number of progress events including
-        // one; the multipart download path above is what gives long
-        // *fetches* live progress.
-        // Read the file length up front for the post-transfer progress
-        // event. `tokio::fs::metadata` is the cheap source of truth;
-        // `ByteStream::size_hint()` returns a `(lower, upper)` tuple
-        // whose semantics are the SDK's, not the body's.
+        // Read the file length up front: it both feeds the size-based
+        // multipart dispatch (issue #53) and drives the post-transfer
+        // progress event on the single-PUT path. `tokio::fs::metadata`
+        // is the cheap source of truth.
         let body_len = tokio::fs::metadata(src).await.map_err(other_boxed)?.len();
+        if should_use_multipart(body_len) {
+            return self.multipart_put_path(key, src, body_len, opts).await;
+        }
+        // Below the threshold: single PutObject. `ByteStream::from_path`
+        // streams from disk via tokio's async file I/O, avoiding a full
+        // in-memory copy.
         let stream = ByteStream::from_path(src).await.map_err(other_boxed)?;
         let progress = opts.progress.clone();
         self.put_body(key, stream, opts).await?;
@@ -774,6 +776,17 @@ impl ObjectStore for S3Store {
     }
 
     async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
+        // `CopyObject` rejects bodies > 5 GiB; above the multipart
+        // threshold we HEAD `src` and use `UploadPartCopy` per part
+        // (issue #53). The HEAD adds one round trip for small copies,
+        // but the only production caller (`Doctor::evict_losing_bundle`
+        // at `manage/doctor.rs:263`) is a quarantine path on bundles
+        // that can be multi-GiB — paying one HEAD to learn whether to
+        // multipart is worth it.
+        let meta = self.head(src).await?;
+        if should_use_multipart(meta.size) {
+            return self.multipart_copy(src, dst, meta.size).await;
+        }
         let copy_source = encode_copy_source(&self.bucket, src);
         // `MetadataDirective::Replace` makes S3 consistent with the Azure
         // backend (which drops metadata on copy via download-then-reupload):
@@ -1041,6 +1054,392 @@ impl S3Store {
         }
         Ok(())
     }
+
+    /// Drive a multipart upload from a fully-buffered `Bytes` body.
+    ///
+    /// `Bytes::slice` is zero-copy — every part borrows into the same
+    /// underlying allocation, so peak memory equals the caller's body
+    /// rather than `body × parts`.
+    async fn multipart_put_bytes(
+        &self,
+        key: &str,
+        body: Bytes,
+        size: u64,
+        opts: PutOpts,
+    ) -> Result<(), ObjectStoreError> {
+        let parts = plan_upload_parts(size, MULTIPART_PUT_PART_SIZE, S3_MAX_PARTS);
+        let upload_id = self.start_multipart_upload(key, &opts).await?;
+        let progress = opts.progress.clone();
+        let result = self
+            .upload_parts_with_bodies(key, &upload_id, &parts, progress, |part| {
+                slice_bytes_part(&body, part)
+            })
+            .await;
+        self.finish_multipart_upload(key, &upload_id, result).await
+    }
+
+    /// Drive a multipart upload by streaming a local file part-by-part.
+    ///
+    /// Each spawned task opens its own `tokio::fs::File`, seeks to the
+    /// part's offset, and reads the part into a `Bytes` before calling
+    /// `upload_part`. With `MULTIPART_PUT_MAX_CONCURRENCY = 8` and
+    /// `MULTIPART_PUT_PART_SIZE = 16 MiB`, peak memory is bounded at
+    /// 128 MiB regardless of file size — acceptable for LFS uploads.
+    async fn multipart_put_path(
+        &self,
+        key: &str,
+        src: &Path,
+        size: u64,
+        opts: PutOpts,
+    ) -> Result<(), ObjectStoreError> {
+        let parts = plan_upload_parts(size, MULTIPART_PUT_PART_SIZE, S3_MAX_PARTS);
+        let upload_id = self.start_multipart_upload(key, &opts).await?;
+        let progress = opts.progress.clone();
+        let result = self
+            .upload_parts_from_path(key, &upload_id, src, &parts, progress)
+            .await;
+        self.finish_multipart_upload(key, &upload_id, result).await
+    }
+
+    /// Drive a multipart server-side copy via `UploadPartCopy`.
+    ///
+    /// Each part issues an `UploadPartCopy` request with
+    /// `x-amz-copy-source` (the bucket+key, percent-encoded) and
+    /// `x-amz-copy-source-range: bytes=<start>-<end>` so the copy
+    /// runs entirely server-side — no body crosses the wire.
+    /// The destination object's metadata starts empty (matching the
+    /// trait contract: copy drops user metadata) because
+    /// `CreateMultipartUpload` is invoked without any metadata.
+    async fn multipart_copy(
+        &self,
+        src: &str,
+        dst: &str,
+        size: u64,
+    ) -> Result<(), ObjectStoreError> {
+        let parts = plan_upload_parts(size, MULTIPART_PUT_PART_SIZE, S3_MAX_PARTS);
+        // `copy()` uses default opts (no progress, no metadata) so the
+        // create-call below also carries no metadata. That preserves
+        // the "copy drops user metadata" contract.
+        let upload_id = self
+            .start_multipart_upload(dst, &PutOpts::default())
+            .await?;
+        let copy_source = encode_copy_source(&self.bucket, src);
+        let result = self
+            .upload_parts_via_copy(src, dst, &upload_id, &copy_source, &parts)
+            .await;
+        // Pass `dst` as the key for finish/abort: the upload_id lives
+        // under `dst` even though the bytes come from `src`. Errors
+        // mid-copy are reported with `src` as context inside the
+        // per-part task (matches single-call `copy()` at the trait
+        // surface).
+        self.finish_multipart_upload(dst, &upload_id, result).await
+    }
+
+    /// Begin a multipart upload, returning the upload-id.
+    ///
+    /// `content_disposition` and `user_metadata` from `PutOpts` flow
+    /// onto `CreateMultipartUpload` — the destination object inherits
+    /// them on `CompleteMultipartUpload` (`UploadPart`/`UploadPartCopy`
+    /// have no metadata fields of their own).
+    async fn start_multipart_upload(
+        &self,
+        key: &str,
+        opts: &PutOpts,
+    ) -> Result<String, ObjectStoreError> {
+        let mut req = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key);
+        if let Some(cd) = &opts.content_disposition {
+            req = req.content_disposition(cd);
+        }
+        for (k, v) in &opts.user_metadata {
+            req = req.metadata(k, v);
+        }
+        let resp = req.send().await.map_err(|e| classify(e, key))?;
+        resp.upload_id().map(str::to_owned).ok_or_else(|| {
+            ObjectStoreError::Other(
+                format!("CreateMultipartUpload for `{key}` returned no upload-id").into(),
+            )
+        })
+    }
+
+    /// Spawn parallel `UploadPart` tasks, one per planned part, with
+    /// the part body produced by `make_body(part) -> Bytes`. Used by
+    /// `multipart_put_bytes` (slice from in-memory `Bytes`).
+    async fn upload_parts_with_bodies<F>(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: &[UploadPart],
+        progress: Option<ProgressSink>,
+        make_body: F,
+    ) -> Result<Vec<CompletedPart>, ObjectStoreError>
+    where
+        F: Fn(UploadPart) -> Result<Bytes, ObjectStoreError>,
+    {
+        let semaphore = Arc::new(Semaphore::new(MULTIPART_PUT_MAX_CONCURRENCY));
+        let mut tasks: JoinSet<Result<CompletedPart, ObjectStoreError>> = JoinSet::new();
+        for (idx, part) in parts.iter().enumerate() {
+            let part = *part;
+            // S3 caps multipart uploads at S3_MAX_PARTS = 10 000
+            // (`plan_upload_parts` enforces this), so `idx + 1` always
+            // fits in i32.
+            let part_number = i32::try_from(idx + 1)
+                .expect("plan_upload_parts caps parts <= S3_MAX_PARTS = 10_000");
+            let body = make_body(part)?;
+            let client = self.client.clone();
+            let bucket = self.bucket.clone();
+            let key = key.to_owned();
+            let upload_id = upload_id.to_owned();
+            let semaphore = Arc::clone(&semaphore);
+            let progress = progress.clone();
+            tasks.spawn(async move {
+                let _permit = semaphore.acquire_owned().await.map_err(other_boxed)?;
+                let resp = client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .upload_id(&upload_id)
+                    .part_number(part_number)
+                    .body(ByteStream::from(body))
+                    .customize()
+                    .config_override(
+                        aws_sdk_s3::config::Builder::new().timeout_config(upload_timeout_config()),
+                    )
+                    .send()
+                    .await
+                    .map_err(|e| classify(e, &key))?;
+                let etag = resp.e_tag().map(str::to_owned).ok_or_else(|| {
+                    ObjectStoreError::Other(
+                        format!("UploadPart for `{key}` part {part_number} returned no ETag")
+                            .into(),
+                    )
+                })?;
+                if let Some(sink) = &progress {
+                    sink.report(part.length);
+                }
+                Ok(CompletedPart::builder()
+                    .part_number(part_number)
+                    .e_tag(etag)
+                    .build())
+            });
+        }
+        join_completed_parts(tasks, parts.len()).await
+    }
+
+    /// Spawn parallel `UploadPart` tasks that read each part directly
+    /// from disk. Each task opens its own file handle so the reads
+    /// run independently; with concurrency 8 and 16 MiB parts, peak
+    /// memory is 128 MiB.
+    async fn upload_parts_from_path(
+        &self,
+        key: &str,
+        upload_id: &str,
+        src: &Path,
+        parts: &[UploadPart],
+        progress: Option<ProgressSink>,
+    ) -> Result<Vec<CompletedPart>, ObjectStoreError> {
+        let semaphore = Arc::new(Semaphore::new(MULTIPART_PUT_MAX_CONCURRENCY));
+        let mut tasks: JoinSet<Result<CompletedPart, ObjectStoreError>> = JoinSet::new();
+        let src_owned: Arc<Path> = Arc::from(src);
+        for (idx, part) in parts.iter().enumerate() {
+            let part = *part;
+            // S3 caps multipart uploads at S3_MAX_PARTS = 10 000
+            // (`plan_upload_parts` enforces this), so `idx + 1` always
+            // fits in i32.
+            let part_number = i32::try_from(idx + 1)
+                .expect("plan_upload_parts caps parts <= S3_MAX_PARTS = 10_000");
+            let client = self.client.clone();
+            let bucket = self.bucket.clone();
+            let key = key.to_owned();
+            let upload_id = upload_id.to_owned();
+            let src = Arc::clone(&src_owned);
+            let semaphore = Arc::clone(&semaphore);
+            let progress = progress.clone();
+            tasks.spawn(async move {
+                let _permit = semaphore.acquire_owned().await.map_err(other_boxed)?;
+                let body = read_file_part(&src, part).await?;
+                let resp = client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .upload_id(&upload_id)
+                    .part_number(part_number)
+                    .body(ByteStream::from(body))
+                    .customize()
+                    .config_override(
+                        aws_sdk_s3::config::Builder::new().timeout_config(upload_timeout_config()),
+                    )
+                    .send()
+                    .await
+                    .map_err(|e| classify(e, &key))?;
+                let etag = resp.e_tag().map(str::to_owned).ok_or_else(|| {
+                    ObjectStoreError::Other(
+                        format!("UploadPart for `{key}` part {part_number} returned no ETag")
+                            .into(),
+                    )
+                })?;
+                if let Some(sink) = &progress {
+                    sink.report(part.length);
+                }
+                Ok(CompletedPart::builder()
+                    .part_number(part_number)
+                    .e_tag(etag)
+                    .build())
+            });
+        }
+        join_completed_parts(tasks, parts.len()).await
+    }
+
+    /// Spawn parallel `UploadPartCopy` tasks for a server-side
+    /// multipart copy. No body crosses the wire — each task only
+    /// sends the source identifier and a byte range header.
+    async fn upload_parts_via_copy(
+        &self,
+        src: &str,
+        dst: &str,
+        upload_id: &str,
+        copy_source: &str,
+        parts: &[UploadPart],
+    ) -> Result<Vec<CompletedPart>, ObjectStoreError> {
+        let semaphore = Arc::new(Semaphore::new(MULTIPART_PUT_MAX_CONCURRENCY));
+        let mut tasks: JoinSet<Result<CompletedPart, ObjectStoreError>> = JoinSet::new();
+        for (idx, part) in parts.iter().enumerate() {
+            let part = *part;
+            // S3 caps multipart uploads at S3_MAX_PARTS = 10 000
+            // (`plan_upload_parts` enforces this), so `idx + 1` always
+            // fits in i32.
+            let part_number = i32::try_from(idx + 1)
+                .expect("plan_upload_parts caps parts <= S3_MAX_PARTS = 10_000");
+            let client = self.client.clone();
+            let bucket = self.bucket.clone();
+            let dst = dst.to_owned();
+            let src_ctx = src.to_owned();
+            let upload_id = upload_id.to_owned();
+            let copy_source = copy_source.to_owned();
+            let range = format!("bytes={}-{}", part.offset, part.offset + part.length - 1);
+            let semaphore = Arc::clone(&semaphore);
+            tasks.spawn(async move {
+                let _permit = semaphore.acquire_owned().await.map_err(other_boxed)?;
+                // `UploadPartCopy` failures point at the source (a 404
+                // or 403 means the source went away or is now denied)
+                // so classify against `src_ctx`, mirroring single-call
+                // `copy()` at the trait surface.
+                // Disable read_timeout for the same reason `put_body`
+                // does (lessons_learned.md #2 / issue #26): smithy
+                // resolves the connector future at "response-headers
+                // received," but `UploadPartCopy` doesn't return until
+                // the server-side copy completes — which for a 16 MiB
+                // part on a slow region can exceed the 30 s
+                // [`READ_TIMEOUT`].
+                let resp = client
+                    .upload_part_copy()
+                    .bucket(&bucket)
+                    .key(&dst)
+                    .upload_id(&upload_id)
+                    .part_number(part_number)
+                    .copy_source(&copy_source)
+                    .copy_source_range(&range)
+                    .customize()
+                    .config_override(
+                        aws_sdk_s3::config::Builder::new().timeout_config(upload_timeout_config()),
+                    )
+                    .send()
+                    .await
+                    .map_err(|e| classify(e, &src_ctx))?;
+                let etag = resp
+                    .copy_part_result()
+                    .and_then(|r| r.e_tag())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        ObjectStoreError::Other(
+                            format!(
+                                "UploadPartCopy for `{src_ctx}` → `{dst}` part {part_number} returned no ETag"
+                            )
+                            .into(),
+                        )
+                    })?;
+                Ok(CompletedPart::builder()
+                    .part_number(part_number)
+                    .e_tag(etag)
+                    .build())
+            });
+        }
+        join_completed_parts(tasks, parts.len()).await
+    }
+
+    /// Finalize a multipart upload: complete on success, best-effort
+    /// abort on error.
+    ///
+    /// On any per-part error or join failure, issue
+    /// `AbortMultipartUpload` so the user is not billed for the
+    /// orphaned upload (S3 retains uncompleted parts indefinitely
+    /// without an explicit lifecycle rule). Abort failures are logged
+    /// via `tracing::warn` but the original error wins — surfacing
+    /// the abort error would mask the cause.
+    async fn finish_multipart_upload(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: Result<Vec<CompletedPart>, ObjectStoreError>,
+    ) -> Result<(), ObjectStoreError> {
+        match parts {
+            Ok(parts) => {
+                let multipart = CompletedMultipartUpload::builder()
+                    .set_parts(Some(parts))
+                    .build();
+                self.client
+                    .complete_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .multipart_upload(multipart)
+                    .send()
+                    .await
+                    .map_err(|e| classify(e, key))?;
+                Ok(())
+            }
+            Err(err) => {
+                if let Err(abort_err) = self
+                    .client
+                    .abort_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .send()
+                    .await
+                {
+                    tracing::warn!(
+                        key,
+                        upload_id,
+                        ?abort_err,
+                        "AbortMultipartUpload failed; orphan upload may incur storage cost \
+                         until lifecycle expiry",
+                    );
+                }
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Drain a `JoinSet` of part-upload tasks into a `Vec<CompletedPart>`,
+/// short-circuiting on the first error and sorting the result by
+/// `part_number` so the `CompleteMultipartUpload` request honours
+/// S3's "parts in part-number order" requirement.
+async fn join_completed_parts(
+    mut tasks: JoinSet<Result<CompletedPart, ObjectStoreError>>,
+    capacity: usize,
+) -> Result<Vec<CompletedPart>, ObjectStoreError> {
+    let mut completed = Vec::with_capacity(capacity);
+    while let Some(joined) = tasks.join_next().await {
+        let part = joined.map_err(other_boxed)??;
+        completed.push(part);
+    }
+    completed.sort_by_key(|p| p.part_number().unwrap_or(0));
+    Ok(completed)
 }
 
 #[cfg(test)]
@@ -1604,6 +2003,29 @@ mod tests {
     fn timeout_constants_have_expected_values() {
         assert_eq!(POOL_IDLE_TIMEOUT, Duration::from_secs(30));
         assert_eq!(READ_TIMEOUT, Duration::from_secs(30));
+    }
+
+    /// Tripwire for the multipart-upload dispatch (issue #53).
+    ///
+    /// `put_bytes`, `put_path`, and `copy` all branch on
+    /// `should_use_multipart(size)`. A regression that re-introduces a
+    /// bare `PutObject` / `CopyObject` for sizes above the threshold
+    /// would re-introduce the 5 GiB ceiling and `EntityTooLarge`
+    /// failures on large bundle pushes / LFS uploads. The
+    /// `MULTIPART_PUT_THRESHOLD` constant is the single decision point
+    /// shared with the Azure backend; pin its semantics here so a
+    /// future code-style sweep cannot move the value out from under
+    /// the dispatch sites.
+    #[test]
+    fn multipart_dispatch_threshold_matches_shared_constant() {
+        use super::super::multipart::MULTIPART_PUT_THRESHOLD;
+        assert!(!should_use_multipart(MULTIPART_PUT_THRESHOLD - 1));
+        assert!(should_use_multipart(MULTIPART_PUT_THRESHOLD));
+        assert!(should_use_multipart(MULTIPART_PUT_THRESHOLD + 1));
+        // A 6 GiB body must take the multipart path: this is the
+        // failure mode named in the issue (`EntityTooLarge` on bare
+        // `PutObject`).
+        assert!(should_use_multipart(6 * (1 << 30)));
     }
 
     /// Tripwire for the `disable_read_timeout()` fix in commit bfec2f4.

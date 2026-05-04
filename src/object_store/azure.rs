@@ -129,11 +129,13 @@ use std::time::Duration;
 use azure_core::http::headers::{HeaderName, Headers};
 use azure_core::http::request::RequestContent;
 use azure_core::http::{ClientOptions, Transport};
-use azure_storage_blob::clients::{BlobClient, BlobContainerClient, BlobContainerClientOptions};
+use azure_storage_blob::clients::{
+    BlobClient, BlobContainerClient, BlobContainerClientOptions, BlockBlobClient,
+};
 use azure_storage_blob::models::method_options::BlockBlobClientUploadOptions;
 use azure_storage_blob::models::{
     BlobClientDeleteOptions, BlobClientDownloadOptions, BlobClientGetPropertiesOptions,
-    BlobContainerClientListBlobsOptions,
+    BlobContainerClientListBlobsOptions, BlockBlobClientCommitBlockListOptions, BlockLookupList,
 };
 use azure_storage_blob::stream::tokio::FileStream;
 use bytes::Bytes;
@@ -141,11 +143,17 @@ use futures::StreamExt;
 use tempfile::NamedTempFile;
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use url::Url;
 
 use crate::url::{AzureAddressing, RemoteUrl};
 
 use super::error::{network_boxed, other_boxed};
+use super::multipart::{
+    AZURE_MAX_BLOCKS, MULTIPART_PUT_MAX_CONCURRENCY, MULTIPART_PUT_PART_SIZE, UploadPart,
+    plan_upload_parts, read_file_part, should_use_multipart, slice_bytes_part,
+};
 use super::{
     GetOpts, ObjectMeta, ObjectStore, ObjectStoreError, ProgressSink, PutOpts, persist_temp,
 };
@@ -552,41 +560,58 @@ impl ObjectStore for AzureStore {
         body: Bytes,
         opts: PutOpts,
     ) -> Result<(), ObjectStoreError> {
+        // Same threshold as the S3 backend: above
+        // [`MULTIPART_PUT_THRESHOLD`] use explicit `stage_block` +
+        // `commit_block_list` so each block has its own retry budget,
+        // predictable concurrency, and per-block progress events. Below
+        // the threshold keep the single `Put Blob` round trip. Issue #53.
+        let size = body.len() as u64;
+        if should_use_multipart(size) {
+            return self.multipart_put_bytes(key, body, size, opts).await;
+        }
+        let progress = opts.progress.clone();
         let blob = self.blob_client(key);
         let upload_opts = upload_options_from(opts);
         blob.upload(bytes_to_request_content(body), Some(upload_opts))
             .await
             .map_err(|e| classify(e, key))?;
+        if let Some(sink) = progress
+            && size > 0
+        {
+            sink.report(size);
+        }
         Ok(())
     }
 
     /// Stream a local file to `key` without buffering its full body.
     ///
-    /// Mirrors `S3Store::put_path`'s streaming guarantee (issue #21):
-    /// memory usage stays bounded by `parallel × partition_size`
-    /// (defaults to 4 × 4 MiB = 16 MiB) regardless of file size — the
-    /// SDK runs up to `parallel` block uploads concurrently and each
-    /// holds a `partition_size`-sized buffer.
+    /// Above [`MULTIPART_PUT_THRESHOLD`] this routes through explicit
+    /// `stage_block` + `commit_block_list`, paralleling the S3 backend
+    /// (issue #53). Below the threshold the single `Put Blob` path
+    /// preserves the one-round-trip cost for small bundles and lock
+    /// files.
     ///
-    /// Implementation: wrap `tokio::fs::File` in
+    /// On the multipart path each task opens its own
+    /// `tokio::fs::File`, seeks to its part offset, reads the part
+    /// into a `Bytes`, then calls `BlockBlobClient::stage_block`. With
+    /// `MULTIPART_PUT_MAX_CONCURRENCY = 8` and
+    /// `MULTIPART_PUT_PART_SIZE = 16 MiB`, peak memory is bounded at
+    /// 128 MiB regardless of file size.
+    ///
+    /// On the single-PUT path we wrap `tokio::fs::File` in
     /// [`FileStream`] so the body is delivered as
-    /// `Body::SeekableStream`. `BlockBlobClient::upload` then routes
-    /// large bodies through `stage_block` + `commit_block_list` (one
-    /// request per partition; up to 50000 blocks per blob, ample for
-    /// LFS / bundle sizes), while files smaller than one partition
-    /// take a single `Put Blob` round trip — same wire shape as
-    /// `put_bytes`. Auth (shared-key / SAS / token) is unchanged
-    /// because the per-try signing policy reads `request.body().len()`,
-    /// which `SeekableStream` reports faithfully via `len()`.
+    /// `Body::SeekableStream`. The per-try signing policy reads
+    /// `request.body().len()`, which `SeekableStream` reports faithfully
+    /// via `len()`.
     async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), ObjectStoreError> {
+        // Read the file length up front: feeds the size-based dispatch
+        // and drives the post-transfer progress event on the single-PUT
+        // path. Cheap.
+        let body_len = tokio::fs::metadata(src).await.map_err(other_boxed)?.len();
+        if should_use_multipart(body_len) {
+            return self.multipart_put_path(key, src, body_len, opts).await;
+        }
         let file = tokio::fs::File::open(src).await.map_err(other_boxed)?;
-        // `tokio::fs::File::metadata` is the cheap source of truth for
-        // file length; the SDK's `FileStream` knows it internally, but
-        // does not expose it. We need it to drive a final progress
-        // event after the SDK upload completes (the SDK does block-
-        // upload internally without exposing per-block hooks — see
-        // module-level docs).
-        let body_len = file.metadata().await.map_err(other_boxed)?.len();
         let stream = FileStream::builder(file)
             .build()
             .await
@@ -738,6 +763,206 @@ impl AzureStore {
         file.flush().await.map_err(other_boxed)?;
         Ok(())
     }
+
+    /// Drive a multipart upload from a fully-buffered `Bytes` body.
+    ///
+    /// `Bytes::slice` is zero-copy — every block borrows into the same
+    /// underlying allocation, so peak memory equals the caller's body
+    /// rather than `body × blocks`.
+    async fn multipart_put_bytes(
+        &self,
+        key: &str,
+        body: Bytes,
+        size: u64,
+        opts: PutOpts,
+    ) -> Result<(), ObjectStoreError> {
+        let parts = plan_upload_parts(size, MULTIPART_PUT_PART_SIZE, AZURE_MAX_BLOCKS);
+        let progress = opts.progress.clone();
+        let staged = self
+            .stage_blocks_with_bodies(key, &parts, progress, |part| slice_bytes_part(&body, part))
+            .await?;
+        let blob = self.blob_client(key).block_blob_client();
+        commit_block_list(&blob, key, staged, opts).await
+    }
+
+    /// Drive a multipart upload by streaming a local file block-by-block.
+    ///
+    /// Each spawned task opens its own `tokio::fs::File`, seeks to the
+    /// block's offset, and reads the block into a `Bytes` before calling
+    /// `stage_block`. With `MULTIPART_PUT_MAX_CONCURRENCY = 8` and
+    /// `MULTIPART_PUT_PART_SIZE = 16 MiB`, peak memory is bounded at
+    /// 128 MiB regardless of file size.
+    async fn multipart_put_path(
+        &self,
+        key: &str,
+        src: &Path,
+        size: u64,
+        opts: PutOpts,
+    ) -> Result<(), ObjectStoreError> {
+        let parts = plan_upload_parts(size, MULTIPART_PUT_PART_SIZE, AZURE_MAX_BLOCKS);
+        let progress = opts.progress.clone();
+        let staged = self
+            .stage_blocks_from_path(key, src, &parts, progress)
+            .await?;
+        let blob = self.blob_client(key).block_blob_client();
+        commit_block_list(&blob, key, staged, opts).await
+    }
+
+    /// Spawn parallel `stage_block` tasks with bodies sourced from a
+    /// closure (used by `multipart_put_bytes`).
+    ///
+    /// Returns the per-block IDs in part order so the caller can build
+    /// a `BlockLookupList` for `commit_block_list`. On error,
+    /// already-staged blocks are simply not committed and Azure
+    /// auto-expires them after seven days; there is no client-side
+    /// abort call.
+    ///
+    /// `BlockBlobClient` does not implement `Clone`, so each spawned
+    /// task constructs its own via `self.blob_client(...)
+    /// .block_blob_client()`. The container's `blob_client(&self, ..)`
+    /// returns an owned `BlobClient` already (cheap-clone of internal
+    /// `Arc` state), so this stays allocation-light.
+    async fn stage_blocks_with_bodies<F>(
+        &self,
+        key: &str,
+        parts: &[UploadPart],
+        progress: Option<ProgressSink>,
+        make_body: F,
+    ) -> Result<Vec<Vec<u8>>, ObjectStoreError>
+    where
+        F: Fn(UploadPart) -> Result<Bytes, ObjectStoreError>,
+    {
+        let semaphore = Arc::new(Semaphore::new(MULTIPART_PUT_MAX_CONCURRENCY));
+        let mut tasks: JoinSet<Result<(usize, Vec<u8>), ObjectStoreError>> = JoinSet::new();
+        for (idx, part) in parts.iter().enumerate() {
+            let part = *part;
+            let part_index = idx;
+            let block_id = block_id_for(idx);
+            let body = make_body(part)?;
+            let blob = self.blob_client(key).block_blob_client();
+            let key = key.to_owned();
+            let semaphore = Arc::clone(&semaphore);
+            let progress = progress.clone();
+            tasks.spawn(async move {
+                let _permit = semaphore.acquire_owned().await.map_err(other_boxed)?;
+                blob.stage_block(&block_id, part.length, bytes_to_request_content(body), None)
+                    .await
+                    .map_err(|e| classify(e, &key))?;
+                if let Some(sink) = &progress {
+                    sink.report(part.length);
+                }
+                Ok((part_index, block_id))
+            });
+        }
+        join_staged_blocks(tasks, parts.len()).await
+    }
+
+    /// Spawn parallel `stage_block` tasks that read each block
+    /// directly from disk (used by `multipart_put_path`).
+    async fn stage_blocks_from_path(
+        &self,
+        key: &str,
+        src: &Path,
+        parts: &[UploadPart],
+        progress: Option<ProgressSink>,
+    ) -> Result<Vec<Vec<u8>>, ObjectStoreError> {
+        let semaphore = Arc::new(Semaphore::new(MULTIPART_PUT_MAX_CONCURRENCY));
+        let mut tasks: JoinSet<Result<(usize, Vec<u8>), ObjectStoreError>> = JoinSet::new();
+        let src_owned: Arc<Path> = Arc::from(src);
+        for (idx, part) in parts.iter().enumerate() {
+            let part = *part;
+            let part_index = idx;
+            let block_id = block_id_for(idx);
+            let blob = self.blob_client(key).block_blob_client();
+            let key = key.to_owned();
+            let src = Arc::clone(&src_owned);
+            let semaphore = Arc::clone(&semaphore);
+            let progress = progress.clone();
+            tasks.spawn(async move {
+                let _permit = semaphore.acquire_owned().await.map_err(other_boxed)?;
+                let body = read_file_part(&src, part).await?;
+                blob.stage_block(&block_id, part.length, bytes_to_request_content(body), None)
+                    .await
+                    .map_err(|e| classify(e, &key))?;
+                if let Some(sink) = &progress {
+                    sink.report(part.length);
+                }
+                Ok((part_index, block_id))
+            });
+        }
+        join_staged_blocks(tasks, parts.len()).await
+    }
+}
+
+/// Build a deterministic Azure block ID for the `idx`-th part
+/// (zero-indexed).
+///
+/// Azure requires that all block IDs in a single
+/// `commit_block_list` request share a length pre-base64. 32 bytes
+/// of zero-padded ASCII digits accommodates up to 10^32 parts —
+/// vastly above [`AZURE_MAX_BLOCKS`] = 50 000.
+fn block_id_for(idx: usize) -> Vec<u8> {
+    format!("{:032}", idx + 1).into_bytes()
+}
+
+/// Drain a `JoinSet` of `stage_block` tasks into a Vec of block IDs
+/// indexed by part order. Short-circuits on the first error.
+async fn join_staged_blocks(
+    mut tasks: JoinSet<Result<(usize, Vec<u8>), ObjectStoreError>>,
+    expected: usize,
+) -> Result<Vec<Vec<u8>>, ObjectStoreError> {
+    let mut staged: Vec<Option<Vec<u8>>> = (0..expected).map(|_| None).collect();
+    while let Some(joined) = tasks.join_next().await {
+        let (idx, block_id) = joined.map_err(other_boxed)??;
+        staged[idx] = Some(block_id);
+    }
+    staged
+        .into_iter()
+        .enumerate()
+        .map(|(idx, slot)| {
+            slot.ok_or_else(|| {
+                ObjectStoreError::Other(
+                    format!("internal: stage_block task for part {idx} did not return").into(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Commit the staged blocks in order, applying any
+/// `content_disposition` / `user_metadata` from the original `PutOpts`.
+///
+/// Azure has no `AbortMultipartUpload` equivalent: if commit fails
+/// the staged blocks remain on the storage account and expire
+/// automatically (default seven days). Surface the commit error
+/// directly — the caller's error handling already understands the
+/// "operation did not succeed" outcome.
+async fn commit_block_list(
+    blob: &BlockBlobClient,
+    key: &str,
+    block_ids: Vec<Vec<u8>>,
+    opts: PutOpts,
+) -> Result<(), ObjectStoreError> {
+    let block_list = BlockLookupList {
+        latest: Some(block_ids),
+        ..Default::default()
+    };
+    let body: RequestContent<_, _> = block_list.try_into().map_err(other_boxed)?;
+    let mut commit_opts = BlockBlobClientCommitBlockListOptions::default();
+    if let Some(cd) = opts.content_disposition {
+        commit_opts.blob_content_disposition = Some(cd);
+    }
+    if !opts.user_metadata.is_empty() {
+        let mut map = std::collections::HashMap::with_capacity(opts.user_metadata.len());
+        for (k, v) in opts.user_metadata {
+            map.insert(k, v);
+        }
+        commit_opts.metadata = Some(map);
+    }
+    blob.commit_block_list(body, Some(commit_opts))
+        .await
+        .map_err(|e| classify(e, key))?;
+    Ok(())
 }
 
 /// Wrap `Bytes` in a `RequestContent` without copying the buffer.
@@ -1129,5 +1354,43 @@ mod tests {
             "the policy at index 0 must be the same Arc the caller \
              supplied — not a fresh policy constructed inside the helper",
         );
+    }
+
+    /// Tripwire for the multipart-upload dispatch (issue #53).
+    ///
+    /// `put_bytes` and `put_path` branch on
+    /// `should_use_multipart(size)`. The Azure backend technically
+    /// works with a single-shot `BlobClient::upload` for any body the
+    /// SDK accepts (transparent block chunking up to the 5000 MiB
+    /// ceiling) — but the issue's argument is that a single transfer
+    /// at multi-GiB scale is error-prone (no per-block retry budget,
+    /// opaque progress, no client-side back-pressure). The dispatch
+    /// uses the same `MULTIPART_PUT_THRESHOLD` constant as S3 so a
+    /// future refactor cannot accidentally raise the threshold for
+    /// Azure alone and re-introduce the issue. Same shape as the
+    /// S3-side tripwire.
+    #[test]
+    fn multipart_dispatch_threshold_matches_shared_constant() {
+        use super::super::multipart::MULTIPART_PUT_THRESHOLD;
+        assert!(!should_use_multipart(MULTIPART_PUT_THRESHOLD - 1));
+        assert!(should_use_multipart(MULTIPART_PUT_THRESHOLD));
+        assert!(should_use_multipart(MULTIPART_PUT_THRESHOLD + 1));
+        assert!(should_use_multipart(6 * (1 << 30)));
+    }
+
+    /// Pin `block_id_for(idx)` so two parts can never collide on the
+    /// same block ID, and so all IDs in a single `commit_block_list`
+    /// share a length pre-base64 (Azure's hard requirement).
+    #[test]
+    fn block_id_for_is_unique_and_uniform_length() {
+        let id_a = block_id_for(0);
+        let id_b = block_id_for(1);
+        let id_c = block_id_for(99_999);
+        assert_eq!(id_a.len(), id_b.len(), "all IDs share length");
+        assert_eq!(id_a.len(), id_c.len(), "even at the upper end");
+        assert_ne!(id_a, id_b, "two parts get distinct IDs");
+        // 32 ASCII bytes accommodates up to 10^32 parts — vastly above
+        // [`AZURE_MAX_BLOCKS`] = 50 000.
+        assert_eq!(id_a.len(), 32);
     }
 }
