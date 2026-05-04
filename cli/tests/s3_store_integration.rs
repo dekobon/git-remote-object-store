@@ -1127,6 +1127,70 @@ async fn multipart_copy_round_trips() {
     );
 }
 
+/// `copy` sends `x-amz-copy-source-if-match` so a mid-copy mutation
+/// of the source surfaces as an error rather than silently producing
+/// a destination with mixed pre/post-mutation bytes. Verified by
+/// putting an object, capturing its `ETag`, mutating the source,
+/// then using the SDK directly to issue a `CopyObject` with the
+/// *original* (now stale) `ETag` — `RustFS` must return 412 /
+/// `PreconditionFailed`. This pins that the if-match flag is
+/// honoured by the test backend in the small-object copy path; the
+/// multipart copy path threads the same `copy_source_if_match`
+/// through `UploadPartCopy`.
+#[tokio::test]
+async fn copy_with_stale_source_if_match_returns_precondition_failed() {
+    let (_store, bucket) = fresh_bucket().await;
+    let fixture = fixture();
+    let client = setup_client(fixture.port).await;
+
+    // Seed the source twice — second put changes the ETag.
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("race-src")
+        .body(ByteStream::from_static(b"original"))
+        .send()
+        .await
+        .expect("seed src v1");
+    let head = client
+        .head_object()
+        .bucket(&bucket)
+        .key("race-src")
+        .send()
+        .await
+        .expect("head v1");
+    let stale_etag = head.e_tag().expect("S3 returns an ETag").to_owned();
+
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("race-src")
+        .body(ByteStream::from_static(b"replaced"))
+        .send()
+        .await
+        .expect("seed src v2");
+
+    // Now attempt a CopyObject with the stale ETag. RustFS must
+    // refuse — that's the property we rely on for the new
+    // `copy_source_if_match` wiring in `S3Store::copy` and
+    // `S3Store::multipart_copy`.
+    let copy_source = format!("{bucket}/race-src");
+    let err = client
+        .copy_object()
+        .bucket(&bucket)
+        .key("race-dst")
+        .copy_source(&copy_source)
+        .copy_source_if_match(&stale_etag)
+        .send()
+        .await
+        .expect_err("CopyObject with stale ETag must error");
+    let status = err.raw_response().map_or(0, |r| r.status().as_u16());
+    assert_eq!(
+        status, 412,
+        "RustFS returned status {status} for CopyObject with stale source-if-match",
+    );
+}
+
 /// Multipart uploads emit one progress event per completed part so
 /// the LFS agent can render a live progress bar. With an 80 MiB body
 /// and 16 MiB parts, expect exactly 5 events.

@@ -783,9 +783,21 @@ impl ObjectStore for S3Store {
         // at `manage/doctor.rs:263`) is a quarantine path on bundles
         // that can be multi-GiB — paying one HEAD to learn whether to
         // multipart is worth it.
+        //
+        // The HEAD also yields the source `ETag`, which we pass as
+        // `x-amz-copy-source-if-match` on every subsequent
+        // `CopyObject` / `UploadPartCopy`. Without it, a source
+        // mutation between HEAD and copy would silently produce a
+        // destination whose bytes are a mix of the pre- and post-
+        // mutation source. With it, S3 returns 412
+        // (`PreconditionFailed`) and the caller can retry. Azure's
+        // `copy()` already has this property because it routes
+        // through `head_then_download`'s 412 retry.
         let meta = self.head(src).await?;
         if should_use_multipart(meta.size) {
-            return self.multipart_copy(src, dst, meta.size).await;
+            return self
+                .multipart_copy(src, dst, meta.size, meta.etag.as_deref())
+                .await;
         }
         let copy_source = encode_copy_source(&self.bucket, src);
         // `MetadataDirective::Replace` makes S3 consistent with the Azure
@@ -794,15 +806,17 @@ impl ObjectStore for S3Store {
         // contract in `ObjectStore::copy`.
         // Pass `src` as the key context so a 404 surfaces as
         // `NotFound(src)` — that's what the trait promises.
-        self.client
+        let mut req = self
+            .client
             .copy_object()
             .bucket(&self.bucket)
             .key(dst)
             .copy_source(copy_source)
-            .metadata_directive(MetadataDirective::Replace)
-            .send()
-            .await
-            .map_err(|e| classify(e, src))?;
+            .metadata_directive(MetadataDirective::Replace);
+        if let Some(etag) = meta.etag.as_deref() {
+            req = req.copy_source_if_match(etag);
+        }
+        req.send().await.map_err(|e| classify(e, src))?;
         Ok(())
     }
 
@@ -1110,11 +1124,18 @@ impl S3Store {
     /// The destination object's metadata starts empty (matching the
     /// trait contract: copy drops user metadata) because
     /// `CreateMultipartUpload` is invoked without any metadata.
+    ///
+    /// `src_etag`, if `Some`, is forwarded as
+    /// `x-amz-copy-source-if-match` on every part so a mid-copy
+    /// source mutation surfaces as `PreconditionFailed` rather than
+    /// silently producing a destination with mixed pre/post-mutation
+    /// bytes.
     async fn multipart_copy(
         &self,
         src: &str,
         dst: &str,
         size: u64,
+        src_etag: Option<&str>,
     ) -> Result<(), ObjectStoreError> {
         let parts = plan_upload_parts(size, MULTIPART_PUT_PART_SIZE, S3_MAX_PARTS);
         // `copy()` uses default opts (no progress, no metadata) so the
@@ -1125,7 +1146,7 @@ impl S3Store {
             .await?;
         let copy_source = encode_copy_source(&self.bucket, src);
         let result = self
-            .upload_parts_via_copy(src, dst, &upload_id, &copy_source, &parts)
+            .upload_parts_via_copy(src, dst, &upload_id, &copy_source, src_etag, &parts)
             .await;
         // Pass `dst` as the key for finish/abort: the upload_id lives
         // under `dst` even though the bytes come from `src`. Errors
@@ -1296,12 +1317,18 @@ impl S3Store {
     /// Spawn parallel `UploadPartCopy` tasks for a server-side
     /// multipart copy. No body crosses the wire — each task only
     /// sends the source identifier and a byte range header.
+    ///
+    /// `src_etag`, if `Some`, is set as `x-amz-copy-source-if-match`
+    /// on every part. A mid-copy source mutation then surfaces as
+    /// `PreconditionFailed` on the offending part rather than
+    /// silently producing a mixed destination.
     async fn upload_parts_via_copy(
         &self,
         src: &str,
         dst: &str,
         upload_id: &str,
         copy_source: &str,
+        src_etag: Option<&str>,
         parts: &[UploadPart],
     ) -> Result<Vec<CompletedPart>, ObjectStoreError> {
         let semaphore = Arc::new(Semaphore::new(MULTIPART_PUT_MAX_CONCURRENCY));
@@ -1319,6 +1346,7 @@ impl S3Store {
             let src_ctx = src.to_owned();
             let upload_id = upload_id.to_owned();
             let copy_source = copy_source.to_owned();
+            let src_etag = src_etag.map(str::to_owned);
             let range = format!("bytes={}-{}", part.offset, part.offset + part.length - 1);
             let semaphore = Arc::clone(&semaphore);
             tasks.spawn(async move {
@@ -1334,14 +1362,18 @@ impl S3Store {
                 // the server-side copy completes — which for a 16 MiB
                 // part on a slow region can exceed the 30 s
                 // [`READ_TIMEOUT`].
-                let resp = client
+                let mut req = client
                     .upload_part_copy()
                     .bucket(&bucket)
                     .key(&dst)
                     .upload_id(&upload_id)
                     .part_number(part_number)
                     .copy_source(&copy_source)
-                    .copy_source_range(&range)
+                    .copy_source_range(&range);
+                if let Some(etag) = &src_etag {
+                    req = req.copy_source_if_match(etag);
+                }
+                let resp = req
                     .customize()
                     .config_override(
                         aws_sdk_s3::config::Builder::new().timeout_config(upload_timeout_config()),
