@@ -92,7 +92,10 @@ impl Remote {
     ///
     /// Returns [`BackendError`] when the backend is unreachable.
     pub async fn open(url: &RemoteUrl) -> Result<Self, BackendError> {
-        let store = backend::build(url).await?;
+        // The library entry point doesn't dispatch on engine yet; drop
+        // it for now. Phase 2+ may expose it on `Remote` when packchain
+        // gains a public `read_blob` API.
+        let (store, _engine) = backend::build(url).await?;
         let prefix = url.prefix().unwrap_or_default().to_owned();
         Ok(Self { store, prefix })
     }

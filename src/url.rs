@@ -94,6 +94,13 @@ pub enum StorageEngine {
     /// `awslabs/git-remote-s3` implementation. Key layout:
     /// `<prefix>/refs/heads/<branch>/<sha>.bundle`.
     Bundle,
+    /// Incremental pack-chain engine (issue #52).
+    ///
+    /// Phase 1 lands the URL/FORMAT plumbing only — selecting
+    /// `?engine=packchain` against an empty bucket currently aborts with
+    /// `engine not yet implemented`. Push, fetch, direct file access,
+    /// compaction, and GC follow in sub-issues under #52.
+    Packchain,
 }
 
 impl StorageEngine {
@@ -102,6 +109,7 @@ impl StorageEngine {
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         match name {
             "bundle" => Some(Self::Bundle),
+            "packchain" => Some(Self::Packchain),
             _ => None,
         }
     }
@@ -112,6 +120,7 @@ impl StorageEngine {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Bundle => "bundle",
+            Self::Packchain => "packchain",
         }
     }
 }
@@ -1022,6 +1031,8 @@ mod tests {
     fn engine_as_str_roundtrips() {
         assert_eq!(StorageEngine::Bundle.as_str(), "bundle");
         assert_eq!(StorageEngine::Bundle.to_string(), "bundle");
+        assert_eq!(StorageEngine::Packchain.as_str(), "packchain");
+        assert_eq!(StorageEngine::Packchain.to_string(), "packchain");
     }
 
     #[test]
@@ -1030,9 +1041,29 @@ mod tests {
             StorageEngine::from_name("bundle"),
             Some(StorageEngine::Bundle)
         );
+        assert_eq!(
+            StorageEngine::from_name("packchain"),
+            Some(StorageEngine::Packchain)
+        );
         assert_eq!(StorageEngine::from_name("pack"), None);
         assert_eq!(StorageEngine::from_name(""), None);
         assert_eq!(StorageEngine::from_name("Bundle"), None); // case-sensitive
+        assert_eq!(StorageEngine::from_name("Packchain"), None); // case-sensitive
+    }
+
+    #[test]
+    fn engine_flag_packchain_parses() {
+        let url =
+            parse("s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=packchain").unwrap();
+        assert_eq!(url.flags().engine, Some(StorageEngine::Packchain));
+    }
+
+    #[test]
+    fn engine_flag_packchain_on_azure_url() {
+        let url =
+            parse("az+https://myaccount.blob.core.windows.net/my-container/repo?engine=packchain")
+                .unwrap();
+        assert_eq!(url.flags().engine, Some(StorageEngine::Packchain));
     }
 
     #[test]

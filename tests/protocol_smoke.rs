@@ -17,7 +17,7 @@ use bytes::Bytes;
 use git_remote_object_store::object_store::mock::MockStore;
 use git_remote_object_store::object_store::{ObjectStore, PutOpts};
 use git_remote_object_store::protocol::ProtocolError;
-use git_remote_object_store::url::RemoteUrl;
+use git_remote_object_store::url::{RemoteUrl, StorageEngine};
 use time::Duration;
 use time::OffsetDateTime;
 
@@ -33,6 +33,67 @@ async fn drive(
     script: &str,
 ) -> (Vec<u8>, Result<(), ProtocolError>) {
     drive_in(remote, store, script, std::env::temp_dir()).await
+}
+
+#[tokio::test]
+async fn packchain_url_aborts_with_engine_not_implemented_and_no_stdout() {
+    // Phase 1 of issue #52 ships the `packchain` plumbing without
+    // push/fetch logic. Any helper invocation against
+    // `?engine=packchain` must abort cleanly **before** running any
+    // command, with no bytes on stdout (per
+    // `.claude/rules/protocol-stdout.md`). A regression that silently
+    // routed packchain through the bundle engine would corrupt
+    // on-bucket state.
+    let raw = "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=packchain";
+    let remote = git_remote_object_store::url::parse(raw).expect("URL parses");
+
+    let store: Arc<dyn ObjectStore> = Arc::new(MockStore::new());
+    let (out, result) = drive(remote, store, "capabilities\n").await;
+
+    // Match the variant structurally (per lesson #4) rather than via
+    // Debug-string substring. A future change that wrapped the error in
+    // another variant — `ProtocolError::Backend(BackendError::EngineNotImplemented(...))`
+    // for example — would still contain both substrings in its Debug
+    // output and let the regression through.
+    let err = result.expect_err("packchain helper must abort");
+    assert!(
+        matches!(
+            err,
+            ProtocolError::EngineNotImplemented(StorageEngine::Packchain)
+        ),
+        "expected EngineNotImplemented(Packchain), got {err:?}",
+    );
+    // Stdout discipline: not a single byte must reach git's reader
+    // before the abort. Even the capabilities banner is suppressed —
+    // the helper aborts before the REPL loop starts.
+    assert!(
+        out.is_empty(),
+        "packchain abort must produce zero stdout bytes, got {out:?}",
+    );
+}
+
+#[tokio::test]
+async fn packchain_format_aborts_even_when_url_omits_engine_flag() {
+    // FORMAT is authoritative for the resolved engine. A bucket
+    // already locked to `packchain` must abort the helper even when
+    // the URL omits `?engine=` — otherwise a bundle-helper would walk
+    // a packchain bucket's keys and either return empty results or
+    // overwrite chain.json with bundle artifacts.
+    let store = MockStore::new();
+    store.insert("repo/FORMAT", Bytes::from_static(b"packchain"));
+    let store: Arc<dyn ObjectStore> = Arc::new(store);
+
+    let (out, result) = drive(s3_url(Some("repo")), store, "capabilities\n").await;
+
+    let err = result.expect_err("packchain helper must abort");
+    assert!(
+        matches!(
+            err,
+            ProtocolError::EngineNotImplemented(StorageEngine::Packchain)
+        ),
+        "expected EngineNotImplemented(Packchain), got {err:?}",
+    );
+    assert!(out.is_empty(), "no stdout bytes before abort, got {out:?}");
 }
 
 #[tokio::test]

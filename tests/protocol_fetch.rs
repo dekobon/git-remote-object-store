@@ -302,6 +302,7 @@ async fn fetched_refs_dedupes_across_batches() {
         run(
             remote,
             store_for_run,
+            git_remote_object_store::url::StorageEngine::Bundle,
             BufReader::new(helper_in),
             helper_out,
             None,
@@ -579,6 +580,7 @@ async fn depth_resets_between_batches() {
         run(
             remote,
             store_for_run,
+            git_remote_object_store::url::StorageEngine::Bundle,
             BufReader::new(helper_in),
             helper_out,
             None,

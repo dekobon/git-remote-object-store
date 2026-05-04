@@ -199,6 +199,16 @@ fn classify(
 /// - The key does not exist (new bucket — engine will be written on first push).
 /// - The stored engine matches the URL engine (or no engine was declared).
 ///
+/// Returns the resolved engine in priority order:
+///
+/// 1. the engine stored in `FORMAT` when present and recognised,
+/// 2. the URL engine when `FORMAT` is absent and the URL declared one,
+/// 3. [`StorageEngine::Bundle`] otherwise (the default for new buckets).
+///
+/// One FORMAT read per call. [`build`] surfaces the resolved engine to
+/// its caller so [`crate::protocol::run`] can dispatch without a second
+/// network round trip.
+///
 /// # Errors
 ///
 /// - [`BackendError::UnknownStoredEngine`] when the `FORMAT` content is not a
@@ -208,18 +218,21 @@ fn classify(
 /// - [`BackendError::Network`] for transport failures (DNS, TLS, timeout)
 ///   reading the key.
 /// - [`BackendError::InvalidCredentials`] for auth / credential failures
-///   reading the key.
-async fn validate_format(
+///   reading the key, or non-UTF-8 bytes in the FORMAT body.
+pub async fn validate_format(
     store: &dyn ObjectStore,
     prefix: &str,
     url_engine: Option<StorageEngine>,
-) -> Result<(), BackendError> {
+) -> Result<StorageEngine, BackendError> {
     let format_key = keys::join(prefix, "FORMAT");
     let bytes = match store.get_bytes(&format_key).await {
         Ok(b) => b,
-        // No FORMAT key — this is a new or legacy bucket. The engine will
-        // be written on the first push.
-        Err(ObjectStoreError::NotFound(_)) => return Ok(()),
+        // No FORMAT key — this is a new or legacy bucket. The engine
+        // will be written on the first push; until then, the URL value
+        // (or the Bundle default) is authoritative.
+        Err(ObjectStoreError::NotFound(_)) => {
+            return Ok(url_engine.unwrap_or(StorageEngine::Bundle));
+        }
         Err(ObjectStoreError::Network(inner)) => {
             return Err(BackendError::Network { source: inner });
         }
@@ -244,9 +257,6 @@ async fn validate_format(
             stored: stored_name.to_owned(),
         })?;
 
-    // With a single-variant StorageEngine enum this branch is unreachable:
-    // `stored_engine` and `url_engine` are always both `Bundle`. Add a test
-    // for this path when a second engine variant ships.
     if let Some(url_engine) = url_engine
         && url_engine != stored_engine
     {
@@ -256,12 +266,17 @@ async fn validate_format(
         });
     }
 
-    Ok(())
+    Ok(stored_engine)
 }
 
-/// Construct the right [`ObjectStore`] for `remote` and verify it is
-/// reachable with a single low-cost list call. After the probe, reads the
-/// `FORMAT` key to validate the storage engine declared in `?engine=`.
+/// Construct the right [`ObjectStore`] for `remote`, verify it is
+/// reachable with a single low-cost list call, and resolve the storage
+/// engine from the `FORMAT` key in one pass.
+///
+/// Returns the connected store paired with the resolved
+/// [`StorageEngine`]. The engine is computed from `FORMAT` (when
+/// present) plus the URL's `?engine=` flag, with [`StorageEngine::Bundle`]
+/// as the default for buckets that have no `FORMAT` key yet.
 ///
 /// # Errors
 ///
@@ -269,7 +284,9 @@ async fn validate_format(
 /// invalid credentials or endpoint), the probe list call fails (e.g.
 /// bucket/container not found or permission denied), or the `FORMAT` key
 /// conflicts with `?engine=`.
-pub async fn build(remote: &RemoteUrl) -> Result<Arc<dyn ObjectStore>, BackendError> {
+pub async fn build(
+    remote: &RemoteUrl,
+) -> Result<(Arc<dyn ObjectStore>, StorageEngine), BackendError> {
     let prefix = remote.prefix().unwrap_or_default();
     let url_engine = remote.flags().engine;
     let store: Arc<dyn ObjectStore> = match remote {
@@ -294,8 +311,8 @@ pub async fn build(remote: &RemoteUrl) -> Result<Arc<dyn ObjectStore>, BackendEr
             Arc::new(store)
         }
     };
-    validate_format(store.as_ref(), prefix, url_engine).await?;
-    Ok(store)
+    let engine = validate_format(store.as_ref(), prefix, url_engine).await?;
+    Ok((store, engine))
 }
 
 #[cfg(test)]
@@ -498,27 +515,21 @@ mod tests {
 
     #[test]
     fn fatal_message_engine_mismatch() {
-        // Pinning the wording. While `StorageEngine` has only one
-        // variant (`Bundle`), both fields will be `Bundle` and the
-        // pinned string is structurally degenerate ("but this bucket
-        // uses `bundle`" against a URL that "specifies engine
-        // `bundle`"). Lesson #6 says expected values must be derived
-        // from the spec — here, the spec is the `#[error(...)]` format
-        // string on `BackendError::EngineMismatch` itself, so the
-        // expected message is computed by interpolating the engine
-        // names and prefixing with `"fatal: "`. When a second
-        // `StorageEngine` variant ships, replace this with two
-        // distinct engines so the test ceases to be circular.
-        let url_engine = StorageEngine::Bundle;
+        // Pin the wording with two distinct engines so the assertion is
+        // not structurally circular (Lesson #6 — expected values derived
+        // from the spec). Picking `Packchain` URL against a `Bundle`
+        // bucket exercises the realistic operator-error path: someone
+        // adds `?engine=packchain` to a remote that was first pushed as
+        // `bundle`.
+        let url_engine = StorageEngine::Packchain;
         let stored_engine = StorageEngine::Bundle;
         let err = BackendError::EngineMismatch {
             url_engine,
             stored_engine,
         };
-        let expected = format!(
-            "fatal: URL specifies engine `{url_engine}` but this bucket uses `{stored_engine}`; \
-             remove the `?engine=` parameter from the remote URL",
-        );
+        let expected = "\
+            fatal: URL specifies engine `packchain` but this bucket uses `bundle`; \
+            remove the `?engine=` parameter from the remote URL";
         assert_eq!(fatal_message(&err), expected);
     }
 
@@ -527,18 +538,35 @@ mod tests {
     #[tokio::test]
     async fn validate_format_passes_when_key_absent() {
         let store = MockStore::new();
-        // No FORMAT key in the store — should succeed (new bucket).
-        validate_format(&store, "", None).await.unwrap();
-        validate_format(&store, "my-repo", None).await.unwrap();
+        // No FORMAT key in the store — should resolve to Bundle (the
+        // default for new buckets) when the URL also omits the engine.
+        assert_eq!(
+            validate_format(&store, "", None).await.unwrap(),
+            StorageEngine::Bundle,
+        );
+        assert_eq!(
+            validate_format(&store, "my-repo", None).await.unwrap(),
+            StorageEngine::Bundle,
+        );
+        // Empty bucket + URL declares an engine → resolve to URL value.
+        assert_eq!(
+            validate_format(&store, "", Some(StorageEngine::Packchain))
+                .await
+                .unwrap(),
+            StorageEngine::Packchain,
+        );
     }
 
     #[tokio::test]
     async fn validate_format_passes_when_stored_engine_matches_url() {
         let store = MockStore::new();
         store.insert("FORMAT", Bytes::from_static(b"bundle"));
-        validate_format(&store, "", Some(StorageEngine::Bundle))
-            .await
-            .unwrap();
+        assert_eq!(
+            validate_format(&store, "", Some(StorageEngine::Bundle))
+                .await
+                .unwrap(),
+            StorageEngine::Bundle,
+        );
     }
 
     #[tokio::test]
@@ -546,16 +574,89 @@ mod tests {
         let store = MockStore::new();
         store.insert("FORMAT", Bytes::from_static(b"bundle"));
         // No URL engine — stored value is authoritative; no conflict.
-        validate_format(&store, "", None).await.unwrap();
+        assert_eq!(
+            validate_format(&store, "", None).await.unwrap(),
+            StorageEngine::Bundle,
+        );
     }
 
     #[tokio::test]
     async fn validate_format_passes_when_key_has_trailing_newline() {
         let store = MockStore::new();
         store.insert("FORMAT", Bytes::from_static(b"bundle\n"));
-        validate_format(&store, "", Some(StorageEngine::Bundle))
+        assert_eq!(
+            validate_format(&store, "", Some(StorageEngine::Bundle))
+                .await
+                .unwrap(),
+            StorageEngine::Bundle,
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_format_rejects_url_packchain_against_stored_bundle() {
+        // Operator typo: bucket was first pushed as `bundle`, then
+        // `?engine=packchain` was added to the remote URL. Stored value
+        // is authoritative, so we must reject with a clear mismatch.
+        let store = MockStore::new();
+        store.insert("FORMAT", Bytes::from_static(b"bundle"));
+        let err = validate_format(&store, "", Some(StorageEngine::Packchain))
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BackendError::EngineMismatch {
+                    url_engine: StorageEngine::Packchain,
+                    stored_engine: StorageEngine::Bundle,
+                }
+            ),
+            "expected EngineMismatch(url=packchain, stored=bundle), got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_format_rejects_url_bundle_against_stored_packchain() {
+        // Symmetric direction: bucket was first pushed as `packchain`,
+        // then a stale `?engine=bundle` URL is reused. Same rejection.
+        let store = MockStore::new();
+        store.insert("FORMAT", Bytes::from_static(b"packchain"));
+        let err = validate_format(&store, "", Some(StorageEngine::Bundle))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BackendError::EngineMismatch {
+                    url_engine: StorageEngine::Bundle,
+                    stored_engine: StorageEngine::Packchain,
+                }
+            ),
+            "expected EngineMismatch(url=bundle, stored=packchain), got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_format_passes_stored_packchain_with_no_url_engine() {
+        // `FORMAT` already locked to `packchain`; URL omits `?engine=`.
+        // Stored value is authoritative; resolution returns it.
+        let store = MockStore::new();
+        store.insert("FORMAT", Bytes::from_static(b"packchain"));
+        assert_eq!(
+            validate_format(&store, "", None).await.unwrap(),
+            StorageEngine::Packchain,
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_format_passes_stored_packchain_with_matching_url() {
+        let store = MockStore::new();
+        store.insert("FORMAT", Bytes::from_static(b"packchain"));
+        assert_eq!(
+            validate_format(&store, "", Some(StorageEngine::Packchain))
+                .await
+                .unwrap(),
+            StorageEngine::Packchain,
+        );
     }
 
     #[tokio::test]

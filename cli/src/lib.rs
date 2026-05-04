@@ -47,8 +47,8 @@ pub async fn run_main() -> ExitCode {
     #[cfg(unix)]
     install_sigpipe_mask();
 
-    let store = match backend::build(&remote).await {
-        Ok(s) => s,
+    let (store, engine) = match backend::build(&remote).await {
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!("{}", backend::fatal_message(&e));
             return ExitCode::FAILURE;
@@ -75,7 +75,7 @@ pub async fn run_main() -> ExitCode {
     let stdin = BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();
 
-    match protocol::run(remote, store, stdin, stdout, reload, repo_dir).await {
+    match protocol::run(remote, store, engine, stdin, stdout, reload, repo_dir).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) if e.is_broken_pipe() => {
             tracing::debug!("stdout closed (BrokenPipe); exiting cleanly");

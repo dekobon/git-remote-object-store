@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `packchain` storage engine — Phase 1 (foundation) of issue #52: new
+  `Packchain` variant of the `?engine=` URL selector and `FORMAT` key,
+  `get_bytes_range(key, Range<u64>)` on `ObjectStore` (S3 + Azure +
+  mock, with HTTP 416 mapped to `ObjectStoreError::RangeNotSatisfiable`),
+  on-bucket schema types (`chain.json` and nested-tree
+  `path-index.json`) with a validating `Sha40` newtype, and a
+  `git::extract_path_index` tree walker that builds a path-index from
+  a tip commit. Selecting `?engine=packchain` (or connecting to a
+  bucket whose `FORMAT` is already `packchain`) currently aborts the
+  helper with `storage engine packchain is not yet implemented`
+  before any command runs — push, fetch, direct file access, and
+  compact/GC follow in sub-issues filed under #52. (#52)
 - Per-chunk upload progress for `git push`: bundle and zip-archive
   uploads now emit one `tracing::info!` line per completed multipart
   part / staged block (S3 and Azure), routed to stderr to stay within

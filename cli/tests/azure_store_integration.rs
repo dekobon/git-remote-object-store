@@ -300,6 +300,64 @@ async fn put_then_get_round_trips() {
 }
 
 #[tokio::test]
+async fn get_bytes_range_returns_slice_via_x_ms_range_header() {
+    // Real-Azurite exercise of the `BlobClientDownloadOptions::range`
+    // path. The Azure SDK uses end-exclusive Rust ranges natively so
+    // the conversion from our trait's `Range<u64>` is one-to-one — but
+    // only the wire-format test confirms the header reaches the
+    // server correctly. Backs the packchain engine's pack-blob
+    // direct-access path (issue #52).
+    let store = fresh_container().await;
+    let body = Bytes::from_static(b"abcdefghijklmnopqrstuvwxyz");
+    store
+        .put_bytes("k", body.clone(), PutOpts::default())
+        .await
+        .expect("put");
+
+    let mid = store.get_bytes_range("k", 5..10).await.expect("get range");
+    assert_eq!(&mid[..], b"fghij");
+
+    let last = store
+        .get_bytes_range("k", 25..26)
+        .await
+        .expect("get last byte");
+    assert_eq!(&last[..], b"z");
+
+    let whole = store.get_bytes_range("k", 0..26).await.expect("get whole");
+    assert_eq!(whole, body);
+
+    let empty = store.get_bytes_range("k", 7..7).await.expect("empty range");
+    assert!(empty.is_empty());
+}
+
+#[tokio::test]
+async fn get_bytes_range_past_end_maps_to_range_not_satisfiable() {
+    // Azurite returns HTTP 416 (`InvalidRange`) when the requested
+    // window falls past the blob's body. The mapping surfaces the
+    // original `Range<u64>` so the wire-line names what the caller
+    // asked for, not the SDK's `Range<usize>` translation.
+    let store = fresh_container().await;
+    store
+        .put_bytes("k", Bytes::from_static(b"abc"), PutOpts::default())
+        .await
+        .expect("put");
+    let err = store
+        .get_bytes_range("k", 100..200)
+        .await
+        .expect_err("range past end must error");
+    assert!(
+        matches!(
+            err,
+            ObjectStoreError::RangeNotSatisfiable {
+                ref key,
+                requested: ref r,
+            } if key == "k" && r.start == 100 && r.end == 200,
+        ),
+        "expected RangeNotSatisfiable(k, 100..200), got {err:?}",
+    );
+}
+
+#[tokio::test]
 async fn head_returns_size_and_recent_last_modified() {
     let store = fresh_container().await;
     let body = Bytes::from_static(b"abcdefghij");

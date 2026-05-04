@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use git_remote_object_store::object_store::ObjectStore;
+use git_remote_object_store::protocol::backend;
 use git_remote_object_store::protocol::{ProtocolError, run};
 use git_remote_object_store::url::{self, RemoteUrl};
 use tokio::io::AsyncWriteExt;
@@ -59,8 +60,27 @@ pub async fn drive_in(
 
     let script_bytes = script.as_bytes().to_owned();
     let writer_task = tokio::spawn(async move {
-        client_writer.write_all(&script_bytes).await.unwrap();
-        client_writer.shutdown().await.unwrap();
+        // Tolerate `BrokenPipe`: a helper that aborts early (e.g.
+        // engine-not-implemented for `?engine=packchain`) closes its
+        // stdin reader before the full script lands. That is correct
+        // helper behaviour, not a test failure.
+        let suppress_broken_pipe = |e: std::io::Error| {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        };
+        client_writer
+            .write_all(&script_bytes)
+            .await
+            .or_else(suppress_broken_pipe)
+            .unwrap();
+        client_writer
+            .shutdown()
+            .await
+            .or_else(suppress_broken_pipe)
+            .unwrap();
     });
 
     let reader_task = tokio::spawn(async move {
@@ -70,9 +90,21 @@ pub async fn drive_in(
         buf
     });
 
+    // Mirror production wiring: production calls `backend::build` which
+    // computes the engine from FORMAT + URL flag. Tests skip `build`
+    // (their MockStore needs no probe) but still need the same engine
+    // resolution so `protocol::run` dispatches correctly.
+    let engine = backend::validate_format(
+        store.as_ref(),
+        remote.prefix().unwrap_or_default(),
+        remote.flags().engine,
+    )
+    .await
+    .expect("validate_format must succeed in tests with valid setup");
     let result = run(
         remote,
         store,
+        engine,
         tokio::io::BufReader::new(helper_in),
         helper_out,
         None,

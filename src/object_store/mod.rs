@@ -138,6 +138,31 @@ pub struct GetOpts {
     pub progress: Option<ProgressSink>,
 }
 
+/// Caller-side preflight for [`ObjectStore::get_bytes_range`].
+///
+/// Centralises the trait contract for degenerate inputs so every
+/// backend impl renders the same wire-line and the same short-circuit:
+///
+/// - `start == end` → `Ok(Some(Bytes::new()))`; the caller returns the
+///   empty body without issuing a network request.
+/// - `start > end` → `Err(RangeNotSatisfiable)`; the caller propagates.
+/// - otherwise → `Ok(None)`; the caller proceeds with the SDK call.
+pub(crate) fn precheck_range(
+    key: &str,
+    range: &std::ops::Range<u64>,
+) -> Result<Option<Bytes>, ObjectStoreError> {
+    if range.start == range.end {
+        return Ok(Some(Bytes::new()));
+    }
+    if range.start > range.end {
+        return Err(ObjectStoreError::RangeNotSatisfiable {
+            key: key.to_owned(),
+            requested: range.clone(),
+        });
+    }
+    Ok(None)
+}
+
 /// Backend-neutral cloud object-store surface.
 ///
 /// Method semantics — every implementation must satisfy these contracts so
@@ -162,6 +187,10 @@ pub struct GetOpts {
 ///   `src` is absent.
 /// - **`delete`** — returns `Err(NotFound)` on missing key. `release_lock`
 ///   maps `NotFound` to `Ok(())` and propagates other errors.
+/// - **`get_bytes_range`** — half-open `[start, end)` range. `start == end`
+///   returns `Ok(Bytes::new())` with no network call. `start > end` and
+///   server-side 416 both surface as
+///   [`ObjectStoreError::RangeNotSatisfiable`].
 #[async_trait::async_trait]
 pub trait ObjectStore: Send + Sync {
     /// Enumerate every object whose key has `prefix` as a byte prefix.
@@ -179,6 +208,20 @@ pub trait ObjectStore: Send + Sync {
 
     /// Read the entire object body into memory.
     async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError>;
+
+    /// Read a half-open byte range `[start, end)` of the object body.
+    ///
+    /// `start == end` returns `Ok(Bytes::new())` without issuing a
+    /// network request. `start > end`, or a server-side 416, surfaces
+    /// as [`ObjectStoreError::RangeNotSatisfiable`].
+    ///
+    /// Used by the packchain engine (issue #52) to read a single blob
+    /// out of a larger pack file without downloading the whole pack.
+    async fn get_bytes_range(
+        &self,
+        key: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<Bytes, ObjectStoreError>;
 
     /// Write `body` to `key`, overwriting any existing object.
     async fn put_bytes(
@@ -274,6 +317,14 @@ impl<T: ObjectStore + ?Sized> ObjectStore for Arc<T> {
 
     async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
         (**self).get_bytes(key).await
+    }
+
+    async fn get_bytes_range(
+        &self,
+        key: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<Bytes, ObjectStoreError> {
+        (**self).get_bytes_range(key, range).await
     }
 
     async fn put_bytes(

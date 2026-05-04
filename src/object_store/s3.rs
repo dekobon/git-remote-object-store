@@ -702,6 +702,47 @@ impl ObjectStore for S3Store {
         Ok(aggregated.into_bytes())
     }
 
+    /// Issue a `GetObject` with a `Range: bytes=<start>-<end-1>` header.
+    /// HTTP 416 maps to [`ObjectStoreError::RangeNotSatisfiable`] with
+    /// the original requested range (so the wire-line names what the
+    /// caller asked for, not the server's translation). All other
+    /// failures route through [`classify`].
+    async fn get_bytes_range(
+        &self,
+        key: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<Bytes, ObjectStoreError> {
+        if let Some(empty) = super::precheck_range(key, &range)? {
+            return Ok(empty);
+        }
+        // Inclusive end byte for the HTTP `Range` header (RFC 7233).
+        let inclusive_end = range.end - 1;
+        let result = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .range(format!("bytes={}-{}", range.start, inclusive_end))
+            .send()
+            .await;
+        let resp = match result {
+            Ok(resp) => resp,
+            Err(err) => {
+                if let SdkError::ServiceError(svc) = &err
+                    && svc.raw().status().as_u16() == 416
+                {
+                    return Err(ObjectStoreError::RangeNotSatisfiable {
+                        key: key.to_owned(),
+                        requested: range,
+                    });
+                }
+                return Err(classify(err, key));
+            }
+        };
+        let aggregated = resp.body.collect().await.map_err(network_boxed)?;
+        Ok(aggregated.into_bytes())
+    }
+
     async fn put_bytes(
         &self,
         key: &str,

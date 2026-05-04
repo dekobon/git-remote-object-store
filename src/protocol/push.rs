@@ -1825,6 +1825,13 @@ mod tests {
         async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
             self.inner.get_bytes(key).await
         }
+        async fn get_bytes_range(
+            &self,
+            key: &str,
+            range: std::ops::Range<u64>,
+        ) -> Result<Bytes, ObjectStoreError> {
+            self.inner.get_bytes_range(key, range).await
+        }
         async fn put_bytes(
             &self,
             key: &str,
