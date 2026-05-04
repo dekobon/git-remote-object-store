@@ -88,6 +88,16 @@
 //! SDK call against a known-empty blob, which sidesteps the issue
 //! entirely.
 //!
+//! ## Size limits
+//!
+//! Azure caps a block blob at 50 000 committed blocks (~4.75 TiB at
+//! the SDK's default block size) and a single `Put Blob` body at
+//! 5000 MiB; above [`super::multipart::MULTIPART_PUT_THRESHOLD`] the
+//! helper switches to explicit `stage_block` + `commit_block_list`,
+//! so callers do not have to reason about the single-call cutoff.
+//! The upload path is **not resumable** across process death — see
+//! the README "Known limitations" section.
+//!
 //! ## HTTP transport tuning
 //!
 //! `azure_core` 0.35's default transport keeps idle pooled connections

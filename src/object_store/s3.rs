@@ -23,6 +23,16 @@
 //! when two PUTs race. Both collapse to `Ok(false)`; only 412 is in
 //! upstream Python's path.
 //!
+//! ## Size limits
+//!
+//! AWS caps a single `PutObject` body at [`SINGLE_PUT_LIMIT_BYTES`]
+//! (5 GiB) and a multipart upload at [`S3_MAX_PARTS`] (10 000) parts;
+//! the per-object ceiling is 5 TiB. The helper auto-promotes uploads
+//! above [`super::multipart::MULTIPART_PUT_THRESHOLD`] onto the
+//! multipart path, so callers do not have to reason about the 5 GiB
+//! single-PUT cutoff. The upload path is **not resumable** across
+//! process death — see the README "Known limitations" section.
+//!
 //! ## Atomic `get_to_file`
 //!
 //! Both the small-object and multipart download paths write to a sibling
