@@ -168,6 +168,30 @@ the crate that spawns a subprocess, and it enforces the
 helper-protocol stdout discipline (stdin closed, stdout/stderr
 captured, never inherited).
 
+## Known limitations
+
+A push of a multi-GB monorepo will work today on either backend —
+multipart upload is wired into both — but a few sharp edges are worth
+knowing about before you start:
+
+- **No resume after a failed upload.** If the helper process dies
+  mid-push (network blip, signal, reboot), the next `git push`
+  re-uploads the bundle from the beginning. S3 cleans up abandoned
+  multipart sessions per the bucket's lifecycle policy; Azure
+  uncommitted blocks expire after seven days. Neither backend
+  surfaces a "resume from byte N" handle today.
+- **`git push` does not display upload progress.** A push of a
+  multi-GiB bundle prints nothing on stdout until the upload
+  finishes, so a long push can look wedged. Tracking issue:
+  [#55](https://github.com/dekobon/git-remote-object-store/issues/55).
+- **Object-size ceilings are the cloud's, not ours.** S3 caps a
+  single object at 5 TiB and a multipart upload at 10 000 parts; the
+  single-`PutObject` ceiling is still 5 GiB but the helper auto-
+  promotes large bodies to multipart well below that. Azure caps a
+  block blob at 50 000 committed blocks (~4.75 TiB at the SDK's
+  default block size). Repositories whose individual bundles
+  approach those limits are outside what either backend can store.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
