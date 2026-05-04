@@ -10,6 +10,9 @@
 //! but it special-cases `tests/<name>/mod.rs` as a shared module
 //! that does not become an integration-test crate of its own.
 
+use std::sync::{Arc, Mutex};
+
+use git_remote_object_store::object_store::{ObjectStore, ProgressSink, PutOpts};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
@@ -138,4 +141,47 @@ pub async fn write_repeating_pattern_file(
     }
     file.flush().await.expect("flush source file");
     hasher.finalize().into()
+}
+
+/// Drive `put_path` against `store` with a recording progress sink and
+/// assert that at least two events fire and that their byte counts sum
+/// to [`MULTIPART_TEST_SIZE`]. The body crosses
+/// `MULTIPART_PUT_THRESHOLD`, so the dispatch picks the multipart path
+/// and the sink should see one event per completed part / staged
+/// block. Used by both per-backend integration suites to pin issue
+/// #55's bundle-progress acceptance criterion.
+pub async fn assert_put_path_emits_chunked_progress<S: ObjectStore + ?Sized>(store: &S, key: &str) {
+    let payload = deterministic_payload(MULTIPART_TEST_SIZE);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("progress-src.bin");
+    tokio::fs::write(&src, &payload).await.expect("write src");
+
+    let events: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&events);
+    let sink = ProgressSink::new(move |bytes| {
+        recorded.lock().expect("progress lock").push(bytes);
+    });
+
+    store
+        .put_path(
+            key,
+            &src,
+            PutOpts {
+                progress: Some(sink),
+                ..PutOpts::default()
+            },
+        )
+        .await
+        .expect("multipart put_path with progress");
+
+    let observed = events.lock().expect("progress lock").clone();
+    assert!(
+        observed.len() >= 2,
+        "expected ≥ 2 progress events from put_path, got {observed:?}",
+    );
+    let total: u64 = observed.iter().sum();
+    assert_eq!(
+        total, MULTIPART_TEST_SIZE as u64,
+        "put_path progress events must sum to the body size",
+    );
 }
