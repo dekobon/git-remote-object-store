@@ -321,4 +321,49 @@ mod tests {
             assert_eq!(p.length, MULTIPART_PUT_PART_SIZE);
         }
     }
+
+    /// Deterministic mid-body interruption coverage for issue #56.
+    ///
+    /// Pin the io-error propagation site of the multipart upload
+    /// pipeline: when the source file is truncated underneath the
+    /// shared `Arc<File>`, `read_file_part` for an offset past the
+    /// new EOF returns `Err`. Both backends thread this error through
+    /// `JoinSet::join_next` and abort the upload (S3 explicit
+    /// `AbortMultipartUpload`; Azure no `commit_block_list`).
+    #[tokio::test]
+    async fn read_file_part_propagates_eof_after_truncate() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("truncated.bin");
+        // Create a 4 KiB file so the test exercises the read-error
+        // path without paying for a full 16 MiB allocation.
+        {
+            let mut f = std::fs::File::create(&path).expect("create");
+            f.write_all(&[0u8; 4 * 1024]).expect("write");
+        }
+        let file = Arc::new(std::fs::File::open(&path).expect("open"));
+
+        // Truncate to zero through a separate handle. The
+        // already-open `file` still references the same inode, but
+        // every `pread` past the new EOF returns short — exactly
+        // what `multipart_put_path` would observe if the source were
+        // unlinked and replaced mid-upload.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("reopen for truncate")
+            .set_len(0)
+            .expect("truncate");
+
+        let part = UploadPart {
+            offset: 1024,
+            length: 1024,
+        };
+        let result = read_file_part(file, part).await;
+        assert!(
+            result.is_err(),
+            "expected read_file_part to error on truncated source, got Ok"
+        );
+    }
 }

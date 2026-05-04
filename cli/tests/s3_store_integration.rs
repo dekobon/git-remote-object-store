@@ -1040,7 +1040,11 @@ async fn build_against_missing_bucket_returns_bucket_not_found() {
 }
 
 mod common;
-use common::{MULTIPART_TEST_SIZE, deterministic_payload, sha256_of, sha256_of_file};
+use common::{
+    LARGE_BODY_CHUNK_SIZE, LARGE_BODY_ENV_VAR, LARGE_BODY_TEST_SIZE, MIDBODY_ABORT_TEST_SIZE,
+    MULTIPART_TEST_SIZE, deterministic_payload, large_body_tests_enabled, sha256_of,
+    sha256_of_file, spawn_truncator, write_repeating_pattern_file,
+};
 
 /// `put_bytes` above the multipart threshold drives the hand-rolled
 /// multipart upload path (issue #53). 80 MiB body splits into 5 parts
@@ -1234,24 +1238,19 @@ async fn multipart_put_emits_per_part_progress_events() {
 /// by default because a ~6 GiB body needs ~12 GiB of free disk for
 /// the round-trip check. Enable with `RUN_LARGE_BODY_TESTS=1`.
 ///
-/// This is the single AC item from issue #53 that the cheaper 80 MiB
+/// This is the AC item from issues #53 / #56 that the cheaper 80 MiB
 /// tests above cannot exercise directly: the actual `EntityTooLarge`
-/// failure mode of bare `PutObject` only triggers above 5 GiB.
+/// failure mode of bare `PutObject` only triggers above 5 GiB. Now
+/// that hand-rolled multipart upload has landed (issue #53), the
+/// expected outcome is a clean round-trip — no `EntityTooLarge`.
 #[tokio::test]
-#[ignore = "requires RUN_LARGE_BODY_TESTS=1 and ~12 GiB of free disk"]
+#[ignore = "requires RUN_LARGE_BODY_TESTS=1 and ~12 GiB of free disk; see .claude/rules/testing.md"]
 async fn multipart_put_path_above_5_gib_round_trips() {
-    use sha2::{Digest, Sha256};
-    use tokio::io::AsyncWriteExt;
-
-    // 6 GiB — 1 GiB above the AWS single-PUT ceiling.
-    const SIZE: u64 = 6 * 1024 * 1024 * 1024;
-
-    if std::env::var_os("RUN_LARGE_BODY_TESTS").is_none() {
-        eprintln!("skipping: RUN_LARGE_BODY_TESTS not set");
+    if !large_body_tests_enabled() {
+        eprintln!("skipping: {LARGE_BODY_ENV_VAR} not set");
         return;
     }
     let (store, _bucket) = fresh_bucket().await;
-    let chunk = deterministic_payload(64 * 1024 * 1024);
 
     // Build the 6 GiB source on disk and stream-hash it in the same
     // pass. The 6 GiB body is 96 repetitions of the same 64 MiB
@@ -1259,23 +1258,10 @@ async fn multipart_put_path_above_5_gib_round_trips() {
     // would not distinguish a part-swap from the original; SHA256
     // over the whole body catches any reordering or corruption that
     // a multipart implementation could introduce.
+    let chunk = deterministic_payload(LARGE_BODY_CHUNK_SIZE);
     let tmp = tempfile::tempdir().expect("tempdir");
     let src = tmp.path().join("six-gib.bin");
-    let mut hasher = Sha256::new();
-    {
-        let mut file = tokio::fs::File::create(&src).await.expect("create src");
-        let mut written: u64 = 0;
-        while written < SIZE {
-            let remaining = SIZE - written;
-            let chunk_len = u64::try_from(chunk.len()).expect("chunk fits in u64");
-            let n = usize::try_from(remaining.min(chunk_len)).expect("min fits in usize");
-            hasher.update(&chunk[..n]);
-            file.write_all(&chunk[..n]).await.expect("write chunk");
-            written += u64::try_from(n).expect("usize fits in u64");
-        }
-        file.flush().await.expect("flush");
-    }
-    let expected: [u8; 32] = hasher.finalize().into();
+    let expected = write_repeating_pattern_file(&src, &chunk, LARGE_BODY_TEST_SIZE).await;
 
     store
         .put_path("six-gib", &src, PutOpts::default())
@@ -1283,7 +1269,7 @@ async fn multipart_put_path_above_5_gib_round_trips() {
         .expect("multipart put_path > 5 GiB");
 
     let head = store.head("six-gib").await.expect("head");
-    assert_eq!(head.size, SIZE);
+    assert_eq!(head.size, LARGE_BODY_TEST_SIZE);
 
     // Round-trip integrity check: every byte must match the source.
     // `sha256_of_file` reads in 1 MiB chunks so peak memory is
@@ -1297,5 +1283,56 @@ async fn multipart_put_path_above_5_gib_round_trips() {
         sha256_of_file(&dest),
         expected,
         "multipart > 5 GiB round-trip corrupted body",
+    );
+}
+
+/// Mid-body interruption: when a multipart `put_path` source becomes
+/// unreadable, the abort path fires and NO destination object is
+/// visible. The deterministic part-read failure injection lives in
+/// `object_store::multipart::tests::read_file_part_propagates_eof_after_truncate`
+/// (unit test) — that test gives reliable byte-for-byte coverage of
+/// `read_file_part` on a truncated file, which is the io-error site
+/// in the multipart upload pipeline. This test is the integration
+/// counterpart: it asserts the visible end-state ("destination key
+/// is `NotFound` after a failed multipart") on a real backend, using
+/// a body whose multipart plan stays partly pending past the
+/// truncate window.
+///
+/// Expected outcome on S3: `put_path` errors, `head(key)` returns
+/// `NotFound` because `S3Store::finish_multipart_upload(Err)` calls
+/// `AbortMultipartUpload` (`s3.rs:1456-1473`).
+///
+/// Body size and concurrency rationale for the truncate window live
+/// on `MIDBODY_ABORT_TEST_SIZE` (`cli/tests/common/mod.rs`); 50 ms is
+/// long enough for `CreateMultipartUpload` to round-trip and the
+/// first batch of preads to begin, but short enough that queued
+/// preads have not yet fired against localhost RustFS.
+#[tokio::test]
+async fn multipart_put_path_aborts_on_midbody_truncation() {
+    use std::time::Duration;
+
+    let (store, _bucket) = fresh_bucket().await;
+    let payload = deterministic_payload(MIDBODY_ABORT_TEST_SIZE);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("midbody-src.bin");
+    tokio::fs::write(&src, &payload).await.expect("write src");
+
+    let truncator = spawn_truncator(src.clone(), Duration::from_millis(50));
+    let key = "midbody-abort";
+    let upload_result = store.put_path(key, &src, PutOpts::default()).await;
+    truncator.await.expect("truncator joins");
+
+    assert!(
+        upload_result.is_err(),
+        "expected put_path to error on mid-upload truncation, got Ok"
+    );
+    let head_err = store
+        .head(key)
+        .await
+        .expect_err("destination must not be visible after aborted multipart");
+    assert!(
+        matches!(head_err, ObjectStoreError::NotFound(_)),
+        "expected NotFound on aborted destination, got {head_err:?}"
     );
 }
