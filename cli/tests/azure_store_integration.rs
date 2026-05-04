@@ -1220,36 +1220,7 @@ async fn multipart_put_emits_per_block_progress_events() {
 #[tokio::test]
 async fn multipart_put_path_emits_per_block_progress_events() {
     let store = fresh_container().await;
-    let payload = deterministic_payload(MULTIPART_TEST_SIZE);
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let src = tmp.path().join("progress-src.bin");
-    tokio::fs::write(&src, &payload).await.expect("write src");
-
-    let events: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&events);
-    let sink = ProgressSink::new(move |bytes| {
-        recorded.lock().expect("progress lock").push(bytes);
-    });
-
-    let opts = PutOpts {
-        progress: Some(sink),
-        ..PutOpts::default()
-    };
-    store
-        .put_path("progress-path", &src, opts)
-        .await
-        .expect("multipart put_path with progress");
-
-    let observed = events.lock().expect("progress lock").clone();
-    assert!(
-        observed.len() >= 2,
-        "expected ≥ 2 progress events from put_path, got {observed:?}",
-    );
-    let total: u64 = observed.iter().sum();
-    assert_eq!(
-        total, MULTIPART_TEST_SIZE as u64,
-        "put_path progress events must sum to the body size",
-    );
+    common::assert_put_path_emits_chunked_progress(&store, "progress-path").await;
 }
 
 /// Optional regression test for the > 5 GiB body class. Skipped by
