@@ -15,14 +15,16 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use time::{Duration, OffsetDateTime};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::git::{self, GitError, RefName, RefNameError, Sha, ShaError, is_valid_ref_name};
 use crate::keys;
-use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
+use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, ProgressSink, PutOpts};
 use crate::url::StorageEngine;
 
 /// Default per-ref lock TTL, in seconds. Matches upstream
@@ -711,8 +713,22 @@ async fn perform_push_under_lock(
     }
 
     let bundle_dest = keys::bundle_key(prefix, &remote_ref, local_sha);
+    // Stat once for "X / total" formatting in progress logs. The
+    // multipart upload re-stats `bundle_path` to size the part plan;
+    // a brief race here would surface as the log showing a stale
+    // total — never as wrong bytes — so we tolerate it. On stat
+    // failure (vanishingly rare on a tempdir we just wrote) fall
+    // back to "unknown" rather than aborting the push.
+    let bundle_total = tokio::fs::metadata(&bundle_path)
+        .await
+        .map(|m| m.len())
+        .ok();
+    let bundle_opts = PutOpts {
+        progress: Some(bundle_progress_sink(&bundle_dest, bundle_total)),
+        ..PutOpts::default()
+    };
     store
-        .put_path(&bundle_dest, &bundle_path, PutOpts::default())
+        .put_path(&bundle_dest, &bundle_path, bundle_opts)
         .await?;
 
     // HEAD bootstrap: write only if absent. Single round-trip via
@@ -743,6 +759,11 @@ async fn perform_push_under_lock(
     }
 
     if let Some(artifacts) = zip_artifacts {
+        let zip_dest = archive_key(prefix, &remote_ref);
+        let zip_total = tokio::fs::metadata(&artifacts.archive_path)
+            .await
+            .map(|m| m.len())
+            .ok();
         let opts = PutOpts {
             content_disposition: Some(format!(
                 "attachment; filename=repo-{}.zip",
@@ -752,9 +773,8 @@ async fn perform_push_under_lock(
                 "codepipeline-artifact-revision-summary".to_owned(),
                 artifacts.commit_msg,
             )],
-            progress: None,
+            progress: Some(bundle_progress_sink(&zip_dest, zip_total)),
         };
-        let zip_dest = archive_key(prefix, &remote_ref);
         store
             .put_path(&zip_dest, &artifacts.archive_path, opts)
             .await?;
@@ -762,6 +782,68 @@ async fn perform_push_under_lock(
 
     Ok(PushOutcome::Ok {
         remote_ref: remote_ref_str,
+    })
+}
+
+/// Build a [`ProgressSink`] that emits one structured `tracing::info!`
+/// line per chunk transferred during a bundle / zip-archive upload.
+///
+/// Issue #55. Git's helper protocol has no upload-progress channel
+/// (the helper-protocol stdout is reserved for protocol traffic per
+/// `.claude/rules/protocol-stdout.md`), so the bundle path's only way
+/// to inform the user during a multi-GiB upload is `tracing::info!`,
+/// which routes to stderr via the tracing-subscriber initialised in
+/// `main()`. The LFS path keeps its own sink wiring (one
+/// progress-event JSON line per chunk on stdout, governed by the LFS
+/// custom-transfer protocol).
+///
+/// `total` is the bundle size at the moment we stat'd it. A short
+/// race against a writer that re-stats during multipart planning
+/// would only mis-format the log line — it cannot drive wrong-byte
+/// behaviour. `None` renders "unknown" so the call site can
+/// gracefully degrade when stat'ing the source fails.
+///
+/// The granularity of events is whatever the backend's `put_path`
+/// provides: one event per completed multipart part / staged block
+/// for bodies above [`crate::object_store::multipart::MULTIPART_PUT_THRESHOLD`],
+/// one event total for bodies below it. With the default 16 MiB
+/// part size and 8-way concurrency, a 1 GiB bundle emits ~64 lines
+/// — ample motion to spot a stall, far short of log spam.
+fn bundle_progress_sink(key: &str, total: Option<u64>) -> ProgressSink {
+    // The closure needs an owned `String` because `ProgressSink` is
+    // `'static`; cloning here keeps the call sites' borrow intact so
+    // they can pass `&bundle_dest` to `put_path` without juggling
+    // ownership.
+    let key = key.to_owned();
+    let bytes_so_far = Arc::new(AtomicU64::new(0));
+    ProgressSink::new(move |bytes_amount| {
+        // `Ordering::Relaxed` is enough: we're not synchronising with
+        // any other state, just maintaining a monotonic counter for
+        // log lines. The worst a re-ordered store could do is print
+        // an out-of-order count, which `tracing` already disclaims.
+        let so_far = bytes_so_far
+            .fetch_add(bytes_amount, Ordering::Relaxed)
+            .saturating_add(bytes_amount);
+        // Render `total` as a Display value so the field is omitted
+        // when stat'ing the source failed at the call site. Tracing's
+        // `Option<u64>` rendering would print "None" — uglier than a
+        // bare absence of the field.
+        if let Some(t) = total {
+            info!(
+                key = %key,
+                bytes_so_far = so_far,
+                total = t,
+                bytes_chunk = bytes_amount,
+                "uploading"
+            );
+        } else {
+            info!(
+                key = %key,
+                bytes_so_far = so_far,
+                bytes_chunk = bytes_amount,
+                "uploading"
+            );
+        }
     })
 }
 
@@ -1665,5 +1747,158 @@ mod tests {
             rendered, "object-store error during push: network error: dns failure",
             "PushError::Store(Network(_)) must not duplicate the inner source",
         );
+    }
+
+    // --- bundle progress sink wiring (issue #55) -----------------------
+
+    /// Decorator around `MockStore` that records, for every `put_path`
+    /// call, whether `opts.progress` was `Some`. Used to pin the
+    /// "bundle uploads attach a progress sink" contract from issue
+    /// #55: a regression that drops the sink from `perform_push_under_lock`
+    /// would silently regress the only thing `git push` users have to
+    /// watch a multi-GiB transfer.
+    ///
+    /// The decorator forwards every other method to the inner
+    /// `MockStore` unchanged. Wrapping for the assertion-of-interest
+    /// alone keeps the test tightly scoped — there is no fault
+    /// injection, no chunking knob, just a Vec of "did `put_path` get
+    /// a sink?" booleans keyed by the destination key.
+    struct RecordingPutPathStore {
+        inner: MockStore,
+        put_path_progress_seen: std::sync::Mutex<Vec<(String, bool)>>,
+    }
+
+    impl RecordingPutPathStore {
+        fn new() -> Self {
+            Self {
+                inner: MockStore::new(),
+                put_path_progress_seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn observed(&self) -> Vec<(String, bool)> {
+            self.put_path_progress_seen
+                .lock()
+                .expect("observation lock")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for RecordingPutPathStore {
+        async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, ObjectStoreError> {
+            self.inner.list(prefix).await
+        }
+        async fn get_to_file(
+            &self,
+            key: &str,
+            dest: &Path,
+            opts: crate::object_store::GetOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.get_to_file(key, dest, opts).await
+        }
+        async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+            self.inner.get_bytes(key).await
+        }
+        async fn put_bytes(
+            &self,
+            key: &str,
+            body: Bytes,
+            opts: PutOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.put_bytes(key, body, opts).await
+        }
+        async fn put_path(
+            &self,
+            key: &str,
+            src: &Path,
+            opts: PutOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.put_path_progress_seen
+                .lock()
+                .expect("observation lock")
+                .push((key.to_owned(), opts.progress.is_some()));
+            self.inner.put_path(key, src, opts).await
+        }
+        async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
+            self.inner.put_if_absent(key, body).await
+        }
+        async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
+            self.inner.head(key).await
+        }
+        async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
+            self.inner.copy(src, dst).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// `perform_push_under_lock` must attach a `ProgressSink` to the
+    /// bundle `put_path` so `git push` users see motion during a slow
+    /// upload (issue #55). Before the fix, this call passed
+    /// `PutOpts::default()` and the user saw nothing for hours on a
+    /// 20 GiB push.
+    #[tokio::test]
+    async fn perform_push_under_lock_attaches_progress_sink_to_bundle_put_path() {
+        let store = RecordingPutPathStore::new();
+        let r = rn("refs/heads/main");
+        let temp_dir = tempfile::Builder::new()
+            .prefix("test_push_progress_")
+            .tempdir()
+            .unwrap();
+        let bundle_path = temp_dir.path().join("bundle");
+        std::fs::write(&bundle_path, b"fake bundle").unwrap();
+        let state = PushReadyState {
+            remote_ref: r,
+            local_sha: Sha::from_hex(SHA).unwrap(),
+            pre_existing: None,
+            bundle_path,
+            zip_artifacts: None,
+            engine: StorageEngine::Bundle,
+            _temp_dir: temp_dir,
+        };
+        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PushOutcome::Ok { .. }),
+            "expected Ok outcome",
+        );
+        let observed = store.observed();
+        // Exactly one `put_path` call (no zip artifacts in this fixture).
+        // Pinning ≥1 rather than ==1 guards against future test
+        // refactors that legitimately add another upload — the contract
+        // we care about is that *every* bundle-class upload carries a
+        // sink.
+        assert!(
+            !observed.is_empty(),
+            "perform_push_under_lock must call put_path for the bundle",
+        );
+        for (key, has_sink) in &observed {
+            assert!(
+                has_sink,
+                "put_path for `{key}` must carry a ProgressSink (issue #55)",
+            );
+        }
+    }
+
+    /// `bundle_progress_sink` accepts an arbitrary stream of
+    /// `report(amount)` calls without panicking and tolerates `None`
+    /// for `total` (the stat-failed fallback). Pins the sink's
+    /// public-shape contract: a regression that switched the
+    /// `Option<u64>` to a non-optional `u64` would force every caller
+    /// to handle stat errors, breaking the "graceful degradation"
+    /// note in the helper's doc comment.
+    #[test]
+    fn bundle_progress_sink_accepts_reports_without_panicking() {
+        let with_total = bundle_progress_sink("repo/bundle.bundle", Some(1_024));
+        with_total.report(256);
+        with_total.report(256);
+        with_total.report(512);
+
+        let without_total = bundle_progress_sink("repo/bundle.bundle", None);
+        without_total.report(1);
+        without_total.report(u64::MAX); // saturates rather than wraps
     }
 }

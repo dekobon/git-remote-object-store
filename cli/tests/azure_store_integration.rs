@@ -1210,6 +1210,48 @@ async fn multipart_put_emits_per_block_progress_events() {
     );
 }
 
+/// `put_path` above the multipart threshold also emits per-block
+/// progress events — the streaming-from-disk path (`pread` per
+/// block) drives the same `stage_blocks_from_file` loop that the
+/// bytes path drives via `stage_blocks_with_bodies`. The bundle
+/// upload site in `protocol/push.rs` is `put_path`-only, so without
+/// this test the "bundle progress" half of issue #55's acceptance
+/// criteria has no coverage on a real backend.
+#[tokio::test]
+async fn multipart_put_path_emits_per_block_progress_events() {
+    let store = fresh_container().await;
+    let payload = deterministic_payload(MULTIPART_TEST_SIZE);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("progress-src.bin");
+    tokio::fs::write(&src, &payload).await.expect("write src");
+
+    let events: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&events);
+    let sink = ProgressSink::new(move |bytes| {
+        recorded.lock().expect("progress lock").push(bytes);
+    });
+
+    let opts = PutOpts {
+        progress: Some(sink),
+        ..PutOpts::default()
+    };
+    store
+        .put_path("progress-path", &src, opts)
+        .await
+        .expect("multipart put_path with progress");
+
+    let observed = events.lock().expect("progress lock").clone();
+    assert!(
+        observed.len() >= 2,
+        "expected ≥ 2 progress events from put_path, got {observed:?}",
+    );
+    let total: u64 = observed.iter().sum();
+    assert_eq!(
+        total, MULTIPART_TEST_SIZE as u64,
+        "put_path progress events must sum to the body size",
+    );
+}
+
 /// Optional regression test for the > 5 GiB body class. Skipped by
 /// default because a ~6 GiB body needs ~12 GiB of free disk for the
 /// round-trip check. Enable with `RUN_LARGE_BODY_TESTS=1`.
