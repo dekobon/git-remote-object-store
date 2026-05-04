@@ -604,14 +604,18 @@ impl ObjectStore for AzureStore {
     /// `request.body().len()`, which `SeekableStream` reports faithfully
     /// via `len()`.
     async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), ObjectStoreError> {
-        // Read the file length up front: feeds the size-based dispatch
-        // and drives the post-transfer progress event on the single-PUT
-        // path. Cheap.
-        let body_len = tokio::fs::metadata(src).await.map_err(other_boxed)?.len();
-        if should_use_multipart(body_len) {
-            return self.multipart_put_path(key, src, body_len, opts).await;
-        }
+        // Open the file once and read size from the open handle. This
+        // closes the metadata/upload race that would let a concurrent
+        // truncate or rename produce a body whose length disagrees
+        // with the size we used for multipart planning.
         let file = tokio::fs::File::open(src).await.map_err(other_boxed)?;
+        let body_len = file.metadata().await.map_err(other_boxed)?.len();
+        if should_use_multipart(body_len) {
+            return self.multipart_put_path(key, file, body_len, opts).await;
+        }
+        // Below the threshold: single `Put Blob`. Wrap our already-
+        // open handle in `FileStream`; the SDK does not re-open by
+        // path (which would re-introduce the race).
         let stream = FileStream::builder(file)
             .build()
             .await
@@ -787,22 +791,24 @@ impl AzureStore {
 
     /// Drive a multipart upload by streaming a local file block-by-block.
     ///
-    /// Each spawned task opens its own `tokio::fs::File`, seeks to the
-    /// block's offset, and reads the block into a `Bytes` before calling
-    /// `stage_block`. With `MULTIPART_PUT_MAX_CONCURRENCY = 8` and
-    /// `MULTIPART_PUT_PART_SIZE = 16 MiB`, peak memory is bounded at
-    /// 128 MiB regardless of file size.
+    /// All tasks share one `Arc<std::fs::File>`; per-task
+    /// `read_file_part` uses `pread` so reads are concurrent without
+    /// offset contention. Sharing one open file description closes
+    /// the metadata/upload race. With `MULTIPART_PUT_MAX_CONCURRENCY
+    /// = 8` and `MULTIPART_PUT_PART_SIZE = 16 MiB`, peak memory is
+    /// bounded at 128 MiB regardless of file size.
     async fn multipart_put_path(
         &self,
         key: &str,
-        src: &Path,
+        file: tokio::fs::File,
         size: u64,
         opts: PutOpts,
     ) -> Result<(), ObjectStoreError> {
         let parts = plan_upload_parts(size, MULTIPART_PUT_PART_SIZE, AZURE_MAX_BLOCKS);
         let progress = opts.progress.clone();
+        let file: Arc<std::fs::File> = Arc::new(file.into_std().await);
         let staged = self
-            .stage_blocks_from_path(key, src, &parts, progress)
+            .stage_blocks_from_file(key, file, &parts, progress)
             .await?;
         let blob = self.blob_client(key).block_blob_client();
         commit_block_list(&blob, key, staged, opts).await
@@ -857,30 +863,31 @@ impl AzureStore {
         join_staged_blocks(tasks, parts.len()).await
     }
 
-    /// Spawn parallel `stage_block` tasks that read each block
-    /// directly from disk (used by `multipart_put_path`).
-    async fn stage_blocks_from_path(
+    /// Spawn parallel `stage_block` tasks that each read their
+    /// block from the shared `Arc<std::fs::File>` via `pread`. The
+    /// shared open file description gives every task a stable view
+    /// of the same inode (used by `multipart_put_path`).
+    async fn stage_blocks_from_file(
         &self,
         key: &str,
-        src: &Path,
+        file: Arc<std::fs::File>,
         parts: &[UploadPart],
         progress: Option<ProgressSink>,
     ) -> Result<Vec<Vec<u8>>, ObjectStoreError> {
         let semaphore = Arc::new(Semaphore::new(MULTIPART_PUT_MAX_CONCURRENCY));
         let mut tasks: JoinSet<Result<(usize, Vec<u8>), ObjectStoreError>> = JoinSet::new();
-        let src_owned: Arc<Path> = Arc::from(src);
         for (idx, part) in parts.iter().enumerate() {
             let part = *part;
             let part_index = idx;
             let block_id = block_id_for(idx);
             let blob = self.blob_client(key).block_blob_client();
             let key = key.to_owned();
-            let src = Arc::clone(&src_owned);
+            let task_file = Arc::clone(&file);
             let semaphore = Arc::clone(&semaphore);
             let progress = progress.clone();
             tasks.spawn(async move {
                 let _permit = semaphore.acquire_owned().await.map_err(other_boxed)?;
-                let body = read_file_part(&src, part).await?;
+                let body = read_file_part(task_file, part).await?;
                 blob.stage_block(&block_id, part.length, bytes_to_request_content(body), None)
                     .await
                     .map_err(|e| classify(e, &key))?;

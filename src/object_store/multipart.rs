@@ -14,11 +14,10 @@
 //! single-call paths so small bundles, lock files, and HEAD writes do
 //! not pay the `CreateMultipartUpload` round-trip cost.
 
-use std::io::SeekFrom;
-use std::path::Path;
+use std::os::unix::fs::FileExt;
+use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::ObjectStoreError;
 use super::error::other_boxed;
@@ -116,21 +115,38 @@ pub(crate) fn plan_upload_parts(
     parts
 }
 
-/// Read `part.length` bytes starting at `part.offset` from `src` into
-/// a freshly-allocated `Bytes`. Used by both backends' streaming
-/// upload paths so each spawned task can independently source its
-/// part body.
+/// Read `part.length` bytes starting at `part.offset` from `file`
+/// into a freshly-allocated `Bytes`, using a positional read so
+/// concurrent tasks sharing the same file handle do not trample
+/// each other's offsets.
+///
+/// Per-task `try_clone` would *not* work: stdlib's `File::try_clone`
+/// (and therefore `tokio::fs::File::try_clone`) returns a new
+/// `File` that references the same kernel open file description —
+/// which holds the seek offset, so concurrent seeks via different
+/// `File` handles trample. `read_exact_at` (`pread64`) bypasses
+/// the offset entirely; it's thread-safe and kernel-defined to be
+/// a no-op on the file's seek offset.
+///
+/// Sharing one open file description across all tasks instead of
+/// re-opening by path closes the metadata/upload race: every task
+/// sees the same inode regardless of concurrent rename or unlink
+/// at the original path.
 pub(crate) async fn read_file_part(
-    src: &Path,
+    file: Arc<std::fs::File>,
     part: UploadPart,
 ) -> Result<Bytes, ObjectStoreError> {
-    let mut file = tokio::fs::File::open(src).await.map_err(other_boxed)?;
-    file.seek(SeekFrom::Start(part.offset))
-        .await
-        .map_err(other_boxed)?;
     let length = usize::try_from(part.length).map_err(other_boxed)?;
-    let mut buf = vec![0u8; length];
-    file.read_exact(&mut buf).await.map_err(other_boxed)?;
+    // `read_exact_at` is blocking; offload to the blocking pool so
+    // we don't stall the runtime for 16 MiB syscalls.
+    let buf = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; length];
+        file.read_exact_at(&mut buf, part.offset)?;
+        Ok(buf)
+    })
+    .await
+    .map_err(other_boxed)?
+    .map_err(other_boxed)?;
     Ok(Bytes::from(buf))
 }
 
