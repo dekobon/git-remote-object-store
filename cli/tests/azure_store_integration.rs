@@ -33,7 +33,9 @@ use azure_core::http::Method;
 use azure_core::http::headers::{HeaderName, Headers};
 use bytes::Bytes;
 use git_remote_object_store::object_store::azure::AzureStore;
-use git_remote_object_store::object_store::{GetOpts, ObjectStore, ObjectStoreError, PutOpts};
+use git_remote_object_store::object_store::{
+    GetOpts, ObjectStore, ObjectStoreError, ProgressSink, PutOpts,
+};
 use git_remote_object_store::protocol::backend::{self, BackendError, BackendKind};
 use git_remote_object_store::url::{ENV_ALLOW_HTTP, RemoteUrl, parse};
 use sha2::{Digest, Sha256};
@@ -1112,4 +1114,94 @@ async fn build_against_missing_container_returns_bucket_not_found() {
     };
     assert_eq!(kind, BackendKind::Azure);
     assert_eq!(name, container);
+}
+
+mod common;
+use common::{MULTIPART_TEST_SIZE, deterministic_payload, sha256_of, sha256_of_file};
+
+/// `put_bytes` above the multipart threshold drives explicit
+/// `stage_block` + `commit_block_list`. Same dispatch criterion as
+/// S3 (issue #53). 80 MiB body splits into 5 blocks at 16 MiB.
+#[tokio::test]
+async fn multipart_put_bytes_round_trips() {
+    let store = fresh_container().await;
+    let payload = deterministic_payload(MULTIPART_TEST_SIZE);
+    let expected = sha256_of(&payload);
+
+    store
+        .put_bytes("multipart-bytes", Bytes::from(payload), PutOpts::default())
+        .await
+        .expect("multipart put_bytes");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dest = tmp.path().join("downloaded");
+    store
+        .get_to_file("multipart-bytes", &dest, GetOpts::default())
+        .await
+        .expect("get_to_file");
+    assert_eq!(
+        sha256_of_file(&dest),
+        expected,
+        "multipart upload corrupted body"
+    );
+}
+
+/// `put_path` above the multipart threshold drives streaming
+/// `stage_block` (each block read from disk independently).
+#[tokio::test]
+async fn multipart_put_path_round_trips() {
+    let store = fresh_container().await;
+    let payload = deterministic_payload(MULTIPART_TEST_SIZE);
+    let expected = sha256_of(&payload);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("multipart-src.bin");
+    tokio::fs::write(&src, &payload).await.expect("write src");
+
+    store
+        .put_path("multipart-path", &src, PutOpts::default())
+        .await
+        .expect("multipart put_path");
+
+    let dest = tmp.path().join("multipart-dst.bin");
+    store
+        .get_to_file("multipart-path", &dest, GetOpts::default())
+        .await
+        .expect("get_to_file");
+    assert_eq!(sha256_of_file(&dest), expected);
+}
+
+/// Multipart uploads emit one progress event per completed block so
+/// the LFS agent can drive a live progress bar. With an 80 MiB body
+/// and 16 MiB blocks, expect at least 2 events.
+#[tokio::test]
+async fn multipart_put_emits_per_block_progress_events() {
+    let store = fresh_container().await;
+    let payload = deterministic_payload(MULTIPART_TEST_SIZE);
+
+    let events: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&events);
+    let sink = ProgressSink::new(move |bytes| {
+        recorded.lock().expect("progress lock").push(bytes);
+    });
+
+    let opts = PutOpts {
+        progress: Some(sink),
+        ..PutOpts::default()
+    };
+    store
+        .put_bytes("progress-events", Bytes::from(payload), opts)
+        .await
+        .expect("multipart put_bytes with progress");
+
+    let observed = events.lock().expect("progress lock").clone();
+    assert!(
+        observed.len() >= 2,
+        "expected ≥ 2 progress events, got {observed:?}",
+    );
+    let total: u64 = observed.iter().sum();
+    assert_eq!(
+        total, MULTIPART_TEST_SIZE as u64,
+        "progress events must sum to the body size",
+    );
 }

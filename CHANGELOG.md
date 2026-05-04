@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Hand-rolled multipart upload for S3 and explicit
+  `stage_block` + `commit_block_list` for Azure above a shared
+  `MULTIPART_PUT_THRESHOLD` (default 64 MiB). On S3 this lifts the
+  5 GiB single-`PutObject` ceiling and the 5 GiB single-`CopyObject`
+  ceiling — large LFS objects, large bundle pushes, and the
+  `manage doctor --fix` quarantine path now succeed for multi-GiB
+  objects. On Azure the dispatch criterion is the same so multi-GiB
+  transfers no longer rely on the SDK's opaque internal chunking.
+  Both backends emit one progress event per completed part / block.
+  Below the threshold the existing single-call paths are preserved
+  (no `CreateMultipartUpload` round trip for small bundles, lock
+  files, or HEAD writes). (#53)
 - `ObjectStoreError::PayloadTooLarge { limit_bytes }` variant for
   upload-body-too-big failures. The S3 classifier maps
   `EntityTooLarge` (HTTP 400) and HTTP 413 onto it (limit 5 GiB single

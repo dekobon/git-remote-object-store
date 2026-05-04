@@ -13,6 +13,7 @@
 
 pub mod azure;
 pub mod error;
+pub(crate) mod multipart;
 pub mod s3;
 
 #[cfg(any(test, feature = "test-util"))]
@@ -31,9 +32,12 @@ pub use self::error::{BoxError, ObjectStoreError};
 
 /// Progress callback invoked by streaming put/get operations.
 ///
-/// `report(bytes_just_transferred)` fires at chunk boundaries — each
-/// multipart-upload part for `put_path`, each ranged GET / chunk read
-/// for `get_to_file`. Callers accumulate `bytes_so_far` themselves.
+/// `report(bytes_just_transferred)` fires at chunk boundaries — one
+/// event per completed part / block on multipart uploads (both S3 and
+/// Azure above [`multipart::MULTIPART_PUT_THRESHOLD`]; issue #53), one
+/// event per ranged GET on multipart downloads, one event per body
+/// chunk on small-object reads, and a single end-of-transfer event on
+/// single-PUT uploads. Callers accumulate `bytes_so_far` themselves.
 /// Matches upstream `ProgressPercentage.__call__` in
 /// `../git-remote-s3/git_remote_s3/lfs.py:25-41` (one event per network
 /// chunk).
