@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-chunk upload progress for `git push`: bundle and zip-archive
+  uploads now emit one `tracing::info!` line per completed multipart
+  part / staged block (S3 and Azure), routed to stderr to stay within
+  helper-protocol stdout discipline. (#55)
+- Gated `RUN_LARGE_BODY_TESTS=1` integration tests for >5 GiB upload
+  round-trips on both S3 and Azure backends, mid-body abort tests
+  that confirm the multipart abort path leaves no destination key
+  visible, and a deterministic unit test pinning `read_file_part`'s
+  io-error propagation. (#56)
 - Hand-rolled multipart upload for S3 and explicit
   `stage_block` + `commit_block_list` for Azure above a shared
   `MULTIPART_PUT_THRESHOLD` (default 64 MiB). On S3 this lifts the
@@ -92,6 +101,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Tightened shellspec assertions
+  (`spec/integration/s3/`, `spec/live/s3/`, `spec/integration/az/`):
+  the `not ancestor` push wording is anchored to the documented
+  `NOT_ANCESTOR_TOKEN` constant in `src/protocol/push.rs`;
+  `git ls-remote` "ref absent" assertions distinguish empty-output
+  success from masked failure via the new
+  `assert_ls_remote_ref_absent` helper; the concurrent-push race
+  scenario now requires both divergent winners to be observed across
+  iterations rather than accepting `A || B`; the LFS spec is split
+  into two focused `It`s so each example has exactly one
+  load-bearing assertion that depends on the code under test. (#60)
 - `S3Store::get_to_file` no longer ends in `unreachable!()`. The
   retry-on-412 (head→GET race) loop is rewritten as an explicit
   `match … { Err(PreconditionFailed) => retry once, other => other }`
@@ -182,6 +202,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Sanitize the commit-message summary that flows from
+  `git::last_commit_message` into the
+  `codepipeline-artifact-revision-summary` user-metadata header on
+  the zip-archive upload. ASCII control bytes (CR, LF, NUL, …) are
+  collapsed to spaces so a forged commit summary cannot CRLF-inject
+  forged user-metadata headers on the upload. Both backend SDKs
+  reject CRLF at the transport layer today, but defending at the
+  call site surfaces a clean, predictable header value instead of a
+  cryptic 400.
 - Dotted S3 bucket names (e.g. `bucketname.com`) in virtual-hosted URLs
   are now parsed correctly. `detect_s3_addressing` scans for the
   rightmost `.s3.` or `.s3-` AWS service infix anywhere in the host
@@ -341,6 +370,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- Documented backend size limits (AWS / Azure SDK API ceilings),
+  lack of resume after upload failure, and the open `git push`
+  upload-progress gap (#55) in a new "Known limitations" section in
+  `README.md`, with cross-references from the s3 and azure
+  module-level docs. (#57)
 - Clarified the `ObjectStore::copy` trait contract: the body is
   preserved on every backend, but user-metadata propagation is
   best-effort. `S3Store::copy` (server-side `CopyObject`) does
