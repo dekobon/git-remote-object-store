@@ -1906,4 +1906,24 @@ mod tests {
         without_total.report(1);
         without_total.report(u64::MAX); // saturates rather than wraps
     }
+
+    /// Pin the not-ancestor wire token at the Rust level. The shellspec
+    /// suites (`spec/integration/{s3,az}/force_push_spec.sh`,
+    /// `spec/live/s3/force_push_spec.sh`) assert on the literal
+    /// substring `"not ancestor"` — but they only run via `make
+    /// shellspec-*` targets, not the default `cargo test --workspace`
+    /// gate. This test catches a Rust dev who renames the constant
+    /// without updating the spec files.
+    #[test]
+    fn not_ancestor_token_value_is_stable() {
+        assert_eq!(
+            NOT_ANCESTOR_TOKEN, "not ancestor",
+            "spec/{{integration,live}}/*/force_push_spec.sh asserts on this exact substring",
+        );
+        let formatted = format!(r#""remote ref is {NOT_ANCESTOR_TOKEN} of refs/heads/main."?"#);
+        assert!(
+            formatted.contains(NOT_ANCESTOR_TOKEN),
+            "the not-ancestor PushOutcome::Error message must embed the token literally; got {formatted:?}",
+        );
+    }
 }
