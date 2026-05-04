@@ -34,7 +34,13 @@ Describe "S3 helper: LFS round-trip via git-lfs-object-store"
 		sha256sum "$file" | awk '{print $1}'
 	}
 
-	setup_lfs_repo() {
+	# Stage the repo through the LFS-tracked commit but stop *before*
+	# the final push. Used by both Its: the upload-contract It does
+	# the push inside its `When call` so the load-bearing assertion
+	# (`assert_lfs_object_exists`) depends on the code under test, not
+	# on setup. The round-trip It calls `setup_lfs_repo_pushed` to
+	# additionally perform the push as part of its setup.
+	setup_lfs_repo_unpushed() {
 		BUCKET=$(rustfs_unique_bucket)
 		PREFIX="myrepo"
 		rustfs_make_bucket "$BUCKET"
@@ -67,16 +73,35 @@ Describe "S3 helper: LFS round-trip via git-lfs-object-store"
 		cp "$FIXTURE" "$SRC/big.bin"
 		git -C "$SRC" add .gitattributes big.bin
 		git -C "$SRC" commit -q -m "add LFS-tracked binary"
+	}
+
+	setup_lfs_repo_pushed() {
+		setup_lfs_repo_unpushed
 		push_branch "$SRC" origin refs/heads/main:refs/heads/main
 	}
 
-	Describe "push then clone"
-		BeforeEach 'setup_lfs_repo'
+	push_lfs_main() {
+		push_branch "$SRC" origin refs/heads/main:refs/heads/main
+	}
 
-		It "uploads the object to <prefix>/lfs/<oid> and round-trips on clone"
-			# Upload happened in setup; assert the object exists.
+	Describe "push uploads the LFS object"
+		# Push runs inside the `It` — `assert_lfs_object_exists` is the
+		# load-bearing assertion and depends on the code under test.
+		BeforeEach 'setup_lfs_repo_unpushed'
+
+		It "places the object at <prefix>/lfs/<oid>"
+			When call push_lfs_main
+			The status should equal 0
 			assert_lfs_object_exists rustfs_list "$BUCKET" "$PREFIX" "$OID"
+		End
+	End
 
+	Describe "clone round-trips the LFS-tracked file"
+		# Push happens in BeforeEach; the It exercises the clone + pull
+		# path so `cmp` is the load-bearing assertion.
+		BeforeEach 'setup_lfs_repo_pushed'
+
+		It "clone + lfs pull reproduces the working-tree bytes"
 			# Clone with smudge disabled, install the agent, then pull.
 			# Without the customtransfer config, the smudge filter has
 			# no transport and the working-tree file would remain a

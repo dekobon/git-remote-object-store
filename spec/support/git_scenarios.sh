@@ -175,6 +175,35 @@ ls_remote() {
 	echo "$LAST_GIT_OUTPUT"
 }
 
+# assert_ls_remote_ref_absent <url> <ref>
+# Fail unless `git ls-remote <url> <ref>` exits 0 with empty output —
+# the canonical "ref does not exist" response. A failed `git ls-remote`
+# (network blip, helper crash, malformed URL, ...) is *not* equivalent
+# to a missing ref: both produce no ref lines, but only the latter is a
+# success. Distinguishing them prevents a regression where the helper
+# crashes on `list` after a delete from masquerading as "ref absent".
+assert_ls_remote_ref_absent() {
+	local url="$1"
+	local ref="$2"
+	if [[ -z "$url" || -z "$ref" ]]; then
+		echo "assert_ls_remote_ref_absent: requires <url> <ref>" >&2
+		return 1
+	fi
+	local output exit_code
+	output=$(git ls-remote "$url" "$ref" 2>&1)
+	exit_code=$?
+	if ((exit_code != 0)); then
+		echo "assert_ls_remote_ref_absent: git ls-remote failed (exit=$exit_code)" >&2
+		echo "$output" >&2
+		return 1
+	fi
+	if [[ -n "$output" ]]; then
+		echo "assert_ls_remote_ref_absent: $ref still listed:" >&2
+		echo "$output" >&2
+		return 1
+	fi
+}
+
 # resolve_sha <dir> <rev>
 # Print the SHA of <rev> in <dir>.
 resolve_sha() {
