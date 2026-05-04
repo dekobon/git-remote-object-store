@@ -87,9 +87,12 @@ pub(crate) struct ChainManifest {
     /// SHA-1 of the tip at the time of the last full-snapshot bundle.
     /// Always set after the first push; never null.
     pub(crate) full_at: Sha40,
-    /// Pack segments newest-first. Empty after a fresh first push when
-    /// there are no incremental segments yet (the baseline bundle is
-    /// the only artifact).
+    /// Pack segments newest-first. Always non-empty after a successful
+    /// push: even the first push writes a single segment (`parent_sha
+    /// = None`) alongside the baseline bundle so the chain has a pack
+    /// to install during Phase 3 fetch. An empty Vec is still a valid
+    /// round-trip shape (Phase 5 GC may produce one transiently during
+    /// compaction) but no Phase 2 push writes one.
     pub(crate) segments: Vec<ChainSegment>,
 }
 
@@ -171,9 +174,16 @@ impl PathIndex {
     /// version before returning. See [`ChainManifest::from_json_bytes`]
     /// for the error contract.
     ///
+    /// Phase 2 push writes `path-index.json` but never reads it back —
+    /// Phase 3 fetch / Phase 4 direct file access will. The reader
+    /// landed in Phase 1 alongside the writer so the wire format is
+    /// pinned by tests; until Phase 3, the function is exercised by
+    /// the schema's own round-trip tests.
+    ///
     /// # Errors
     ///
     /// See [`ChainManifest::from_json_bytes`].
+    #[allow(dead_code)]
     pub(crate) fn from_json_bytes(bytes: &[u8]) -> Result<Self, PackchainError> {
         let parsed: Self = serde_json::from_slice(bytes)?;
         if parsed.v != Self::SCHEMA_VERSION {
@@ -304,8 +314,9 @@ mod tests {
 
     #[test]
     fn chain_manifest_handles_empty_segments() {
-        // First push: baseline bundle written, no incremental segments
-        // yet. The empty Vec must round-trip cleanly.
+        // No Phase 2 push writes an empty `segments` Vec, but Phase 5
+        // GC may produce one transiently during compaction; the wire
+        // format must still round-trip cleanly.
         let chain = ChainManifest {
             v: ChainManifest::SCHEMA_VERSION,
             tip: sha40(SHA_A),

@@ -12,40 +12,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use git_remote_object_store::object_store::mock::MockStore;
 use git_remote_object_store::object_store::{ObjectStore, PutOpts};
-use tempfile::TempDir;
 use time::Duration;
 use time::OffsetDateTime;
 
-use common::{drive_in, git, git_available, git_capture, s3_url_with_zip};
-
-/// Initialise a fresh repo with `n` linear commits on `refs/heads/main`
-/// and return the dir + Vec<sha> in commit order (oldest first).
-///
-/// `salt` differentiates blob contents so two repos seeded in the same
-/// wall-clock second still produce distinct commit SHAs.
-fn make_seed_repo(n: usize, salt: &str) -> (TempDir, Vec<String>) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    git(&["init", "--quiet", "--initial-branch=main"], dir.path());
-    git(&["config", "user.email", "test@example.com"], dir.path());
-    git(&["config", "user.name", "Test"], dir.path());
-    git(&["config", "commit.gpgsign", "false"], dir.path());
-
-    let mut shas = Vec::new();
-    for i in 0..n {
-        let body = format!("{salt}-{i}\n");
-        std::fs::write(dir.path().join(format!("f{i}.txt")), body.as_bytes()).unwrap();
-        git(&["add", "."], dir.path());
-        git(
-            &["commit", "--quiet", "-m", "step", "--no-gpg-sign"],
-            dir.path(),
-        );
-        let sha = git_capture(&["rev-parse", "HEAD"], dir.path())
-            .trim()
-            .to_owned();
-        shas.push(sha);
-    }
-    (dir, shas)
-}
+use common::{drive_in, git, git_available, make_seed_repo, s3_url_with_zip};
 
 #[tokio::test]
 async fn push_to_empty_remote_uploads_bundle_and_seeds_head() {

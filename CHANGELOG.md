@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `packchain` storage engine — Phase 2 (incremental push) of issue #52:
+  pushing to `?engine=packchain` now writes a content-SHA-keyed pack
+  under `packs/`, a sibling `.idx`, a newest-first `chain.json`
+  manifest, a nested `path-index.json` mapping repo paths to blob
+  SHAs at the tip, and (on first / force push) a baseline bundle at
+  `<tip>.bundle` so Phase 3 fetch can short-circuit a fresh clone.
+  First push is `TreeContents` from the local tip; incremental
+  pushes use `TreeAdditionsComparedToAncestor`, which yields a
+  self-contained ancestor-aware pack (the ancestor commit and tree
+  travel with the new commit; only ancestor-only blobs are omitted,
+  to be picked up from prior chain packs at fetch). `chain.json` is
+  the linearization point — pack/idx/baseline upload pre-lock to
+  keep the per-ref lock window bounded by JSON-PUT latency, and
+  under the lock the push writes path-index → FORMAT → HEAD →
+  chain.json. Concurrent pushers leave orphan packs on the loser;
+  Phase 5 GC reaps them. Fetch (Phase 3), direct file access
+  (Phase 4), and compaction / GC (Phase 5) remain out of scope; a
+  packchain bucket written by Phase 2 is still write-only until
+  Phase 3. (#63, sub-issue of #52)
+- Force push on the packchain engine collapses the chain to a fresh
+  single-segment manifest with `full_at = new tip` and replaces the
+  baseline bundle, deleting the prior baseline at the old `full_at`
+  best-effort (failure is logged at `warn` and never fails the push,
+  since chain.json has already committed).
+- Idempotent same-SHA push on the packchain engine: if the local tip
+  matches the on-bucket `chain.tip`, push is a wire-level no-op
+  (`ok <ref>` with no uploads), parity with the bundle engine's
+  same-bundle short-circuit.
+- Shallow-clone push rejection on the packchain engine: a local
+  repository with a `.git/shallow` boundary that the rev-walk crosses
+  surfaces `cannot push from a shallow clone` as a per-ref
+  `error <ref>` line rather than producing a permanently incomplete
+  remote.
 - `packchain` storage engine — Phase 1 (foundation) of issue #52: new
   `Packchain` variant of the `?engine=` URL selector and `FORMAT` key,
   `get_bytes_range(key, Range<u64>)` on `ObjectStore` (S3 + Azure +
@@ -16,11 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on-bucket schema types (`chain.json` and nested-tree
   `path-index.json`) with a validating `Sha40` newtype, and a
   `git::extract_path_index` tree walker that builds a path-index from
-  a tip commit. Selecting `?engine=packchain` (or connecting to a
-  bucket whose `FORMAT` is already `packchain`) currently aborts the
-  helper with `storage engine packchain is not yet implemented`
-  before any command runs — push, fetch, direct file access, and
-  compact/GC follow in sub-issues filed under #52. (#52)
+  a tip commit. Phase 1's blanket-abort dispatch is replaced in this
+  release by the per-engine routing introduced for Phase 2: a
+  packchain `fetch` still aborts with `EngineNotImplemented` (Phase
+  3 will fill it in) but `capabilities`, `list`, and `push` succeed.
+  (#52)
 - Per-chunk upload progress for `git push`: bundle and zip-archive
   uploads now emit one `tracing::info!` line per completed multipart
   part / staged block (S3 and Azure), routed to stderr to stay within

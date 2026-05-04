@@ -29,8 +29,28 @@ pub mod tracing_init;
 
 use self::fetch::{FetchedRefs, fetch_batch};
 use self::option::{OptionEffect, handle_option};
-use self::push::push_batch;
+use self::push::{PushOutcome, push_batch};
 use self::tracing_init::ReloadHandle;
+
+/// Write each [`PushOutcome`]'s wire line to `writer` in order.
+///
+/// Both engines' `push_batch` returns `Vec<PushOutcome>`; the rendering
+/// loop is identical, so it lives here. Pulled out so the per-engine
+/// `Mode::Push` arms in [`run`] each shrink to a single line.
+async fn write_push_outcomes<W>(
+    writer: &mut W,
+    outcomes: &[PushOutcome],
+) -> Result<(), std::io::Error>
+where
+    W: AsyncWrite + Unpin,
+{
+    for outcome in outcomes {
+        writer
+            .write_all(outcome.to_protocol_line().as_bytes())
+            .await?;
+    }
+    Ok(())
+}
 
 /// Walk `err`'s `source()` chain and append each level's `Display` to
 /// `msg`, **skipping any level whose text is already at the tail of
@@ -283,16 +303,11 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    // A Phase 1 build that lacks the resolved engine's logic must
-    // abort before running any command — silently routing a packchain
-    // bucket through the bundle engine would corrupt on-bucket state.
-    if matches!(engine, StorageEngine::Packchain) {
-        error!(
-            engine = %engine,
-            "packchain engine is not yet implemented; aborting helper",
-        );
-        return Err(ProtocolError::EngineNotImplemented(engine));
-    }
+    // Phase 2 (packchain push) routes per command/engine pair below;
+    // Phase 3 (packchain fetch) is still unimplemented, so a packchain
+    // helper that receives a `fetch` command surfaces
+    // `EngineNotImplemented` at drain time rather than letting a
+    // bundle code path run against on-bucket packchain state.
     let mut lines = reader.lines();
     let fetched_refs = FetchedRefs::new();
     let mut batch = BatchState::new();
@@ -337,21 +352,32 @@ where
             Command::Push(args) => batch.accumulate(Mode::Push, args),
             Command::Empty => {
                 if let Some((mode, cmds)) = batch.take_pending() {
-                    match mode {
-                        Mode::Fetch => {
+                    match (mode, engine) {
+                        (Mode::Fetch, StorageEngine::Bundle) => {
                             // Take depth so it applies to *this* batch only; a
                             // subsequent fetch without a fresh `option depth`
                             // line must clone fully, matching upstream git's
                             // per-operation depth contract.
                             fetch_batch(&ctx, cmds, fetched_refs.clone(), depth.take()).await?;
                         }
-                        Mode::Push => {
+                        (Mode::Fetch, StorageEngine::Packchain) => {
+                            // Phase 3 fills this in; until then a packchain
+                            // helper that sees `fetch` aborts loudly rather
+                            // than silently routing through the bundle path.
+                            error!(
+                                engine = %engine,
+                                "packchain fetch is not yet implemented; aborting helper",
+                            );
+                            return Err(ProtocolError::EngineNotImplemented(engine));
+                        }
+                        (Mode::Push, StorageEngine::Bundle) => {
                             let outcomes = push_batch(&ctx, zip, engine, cmds).await?;
-                            for outcome in &outcomes {
-                                writer
-                                    .write_all(outcome.to_protocol_line().as_bytes())
-                                    .await?;
-                            }
+                            write_push_outcomes(&mut writer, &outcomes).await?;
+                        }
+                        (Mode::Push, StorageEngine::Packchain) => {
+                            let outcomes =
+                                crate::packchain::push::push_batch(&ctx, engine, cmds).await?;
+                            write_push_outcomes(&mut writer, &outcomes).await?;
                         }
                     }
                 }
