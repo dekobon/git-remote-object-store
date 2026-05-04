@@ -782,7 +782,7 @@ async fn perform_push_under_lock(
             )),
             user_metadata: vec![(
                 "codepipeline-artifact-revision-summary".to_owned(),
-                artifacts.commit_msg,
+                sanitize_metadata_value(&artifacts.commit_msg),
             )],
             progress: Some(bundle_progress_sink(&zip_dest, zip_total)),
         };
@@ -856,6 +856,26 @@ fn bundle_progress_sink(key: &str, total: Option<u64>) -> ProgressSink {
             );
         }
     })
+}
+
+/// Replace ASCII control characters in `s` with spaces so the result
+/// is safe to use as an HTTP header value.
+///
+/// `commit_msg` flows from `git::last_commit_message` (whose summary
+/// is "everything before the first blank line" per gix) into the
+/// `codepipeline-artifact-revision-summary` user-metadata header on
+/// the zip-archive upload. A maliciously-crafted commit could embed
+/// `\r\n` in the summary, which would be a CRLF injection on
+/// transport — splitting one logical header into two and letting an
+/// attacker forge arbitrary user-metadata headers on the uploaded
+/// archive. Both backends' SDKs reject CRLF at the transport layer
+/// today, but that defense is version-dependent and the resulting
+/// error is a cryptic "invalid header" 400; sanitising here surfaces
+/// a clean, predictable value at the call site instead.
+fn sanitize_metadata_value(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// Expected key count for a non-zip ref: one bundle object.
@@ -1925,5 +1945,29 @@ mod tests {
             formatted.contains(NOT_ANCESTOR_TOKEN),
             "the not-ancestor PushOutcome::Error message must embed the token literally; got {formatted:?}",
         );
+    }
+
+    /// CRLF in a commit-message summary would split the
+    /// `x-amz-meta-codepipeline-artifact-revision-summary` (or
+    /// `x-ms-meta-…`) header on the wire, letting a forged commit
+    /// inject arbitrary user metadata onto the uploaded zip
+    /// archive. `sanitize_metadata_value` must collapse every ASCII
+    /// control byte (CR, LF, NUL, HTAB, …) to a space so the
+    /// resulting header value is single-line and free of injection
+    /// payloads.
+    #[test]
+    fn sanitize_metadata_value_strips_control_chars() {
+        assert_eq!(
+            sanitize_metadata_value("hello\r\nX-Injected: yes"),
+            "hello  X-Injected: yes",
+        );
+        assert_eq!(sanitize_metadata_value("nul\0byte"), "nul byte",);
+        assert_eq!(sanitize_metadata_value("plain text"), "plain text");
+        assert_eq!(
+            sanitize_metadata_value("café — short summary"),
+            "café — short summary",
+            "non-ASCII printable characters must pass through unchanged",
+        );
+        assert_eq!(sanitize_metadata_value(""), "");
     }
 }
