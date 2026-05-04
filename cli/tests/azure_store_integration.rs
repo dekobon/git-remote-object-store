@@ -1117,7 +1117,11 @@ async fn build_against_missing_container_returns_bucket_not_found() {
 }
 
 mod common;
-use common::{MULTIPART_TEST_SIZE, deterministic_payload, sha256_of, sha256_of_file};
+use common::{
+    LARGE_BODY_CHUNK_SIZE, LARGE_BODY_ENV_VAR, LARGE_BODY_TEST_SIZE, MIDBODY_ABORT_TEST_SIZE,
+    MULTIPART_TEST_SIZE, deterministic_payload, large_body_tests_enabled, sha256_of,
+    sha256_of_file, spawn_truncator, write_repeating_pattern_file,
+};
 
 /// `put_bytes` above the multipart threshold drives explicit
 /// `stage_block` + `commit_block_list`. Same dispatch criterion as
@@ -1203,5 +1207,98 @@ async fn multipart_put_emits_per_block_progress_events() {
     assert_eq!(
         total, MULTIPART_TEST_SIZE as u64,
         "progress events must sum to the body size",
+    );
+}
+
+/// Optional regression test for the > 5 GiB body class. Skipped by
+/// default because a ~6 GiB body needs ~12 GiB of free disk for the
+/// round-trip check. Enable with `RUN_LARGE_BODY_TESTS=1`.
+///
+/// Azure has no analogue of S3's 5 GiB single-PUT ceiling — `Put
+/// Blob` accepts up to 5 000 MiB and the SDK already chunks larger
+/// bodies — but the 50 000-block ceiling and multipart progress
+/// behavior in this size class are still worth pinning. With our 16
+/// MiB part size, a 6 GiB body splits into 384 blocks; the test
+/// asserts the body round-trips byte-identical. Issue #56.
+#[tokio::test]
+#[ignore = "requires RUN_LARGE_BODY_TESTS=1 and ~12 GiB of free disk; see .claude/rules/testing.md"]
+async fn multipart_put_path_above_5_gib_round_trips() {
+    if !large_body_tests_enabled() {
+        eprintln!("skipping: {LARGE_BODY_ENV_VAR} not set");
+        return;
+    }
+    let store = fresh_container().await;
+
+    let chunk = deterministic_payload(LARGE_BODY_CHUNK_SIZE);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("six-gib.bin");
+    let expected = write_repeating_pattern_file(&src, &chunk, LARGE_BODY_TEST_SIZE).await;
+
+    store
+        .put_path("six-gib", &src, PutOpts::default())
+        .await
+        .expect("multipart put_path > 5 GiB");
+
+    let head = store.head("six-gib").await.expect("head");
+    assert_eq!(head.size, LARGE_BODY_TEST_SIZE);
+
+    let dest = tmp.path().join("six-gib.dl");
+    store
+        .get_to_file("six-gib", &dest, GetOpts::default())
+        .await
+        .expect("get_to_file");
+    assert_eq!(
+        sha256_of_file(&dest),
+        expected,
+        "multipart > 5 GiB round-trip corrupted body",
+    );
+}
+
+/// Mid-body interruption: when a multipart `put_path` source becomes
+/// unreadable, the abort path fires and NO destination blob is
+/// visible. The deterministic part-read failure injection lives in
+/// `object_store::multipart::tests::read_file_part_propagates_eof_after_truncate`
+/// (unit test). This test is the integration counterpart asserting
+/// the visible end-state on a real backend, using a body whose
+/// multipart plan stays partly pending past the truncate window.
+///
+/// Expected outcome on Azure: `put_path` errors. Azure has no client-
+/// side abort call (uncommitted blocks Azure already staged simply
+/// expire after seven days; `commit_block_list` is never called when
+/// `stage_blocks_from_file` returns `Err`), so `head(key)` returns
+/// `NotFound` because the blob never became committed.
+///
+/// Body size and concurrency rationale for the truncate window live
+/// on `MIDBODY_ABORT_TEST_SIZE` (`cli/tests/common/mod.rs`); 50 ms is
+/// long enough for the first `stage_block` requests to leave the
+/// process and short enough that queued preads have not yet fired
+/// against localhost Azurite.
+#[tokio::test]
+async fn multipart_put_path_aborts_on_midbody_truncation() {
+    use std::time::Duration;
+
+    let store = fresh_container().await;
+    let payload = deterministic_payload(MIDBODY_ABORT_TEST_SIZE);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("midbody-src.bin");
+    tokio::fs::write(&src, &payload).await.expect("write src");
+
+    let truncator = spawn_truncator(src.clone(), Duration::from_millis(50));
+    let key = "midbody-abort";
+    let upload_result = store.put_path(key, &src, PutOpts::default()).await;
+    truncator.await.expect("truncator joins");
+
+    assert!(
+        upload_result.is_err(),
+        "expected put_path to error on mid-upload truncation, got Ok"
+    );
+    let head_err = store
+        .head(key)
+        .await
+        .expect_err("destination must not be visible after a failed multipart upload");
+    assert!(
+        matches!(head_err, ObjectStoreError::NotFound(_)),
+        "expected NotFound on aborted destination, got {head_err:?}"
     );
 }
