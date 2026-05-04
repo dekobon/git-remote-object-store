@@ -180,10 +180,6 @@ knowing about before you start:
   multipart sessions per the bucket's lifecycle policy; Azure
   uncommitted blocks expire after seven days. Neither backend
   surfaces a "resume from byte N" handle today.
-- **`git push` does not display upload progress.** A push of a
-  multi-GiB bundle prints nothing on stdout until the upload
-  finishes, so a long push can look wedged. Tracking issue:
-  [#55](https://github.com/dekobon/git-remote-object-store/issues/55).
 - **Object-size ceilings are the cloud's, not ours.** S3 caps a
   single object at 5 TiB and a multipart upload at 10 000 parts; the
   single-`PutObject` ceiling is still 5 GiB but the helper auto-
