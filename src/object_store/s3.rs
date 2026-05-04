@@ -1438,7 +1438,13 @@ async fn join_completed_parts(
         let part = joined.map_err(other_boxed)??;
         completed.push(part);
     }
-    completed.sort_by_key(|p| p.part_number().unwrap_or(0));
+    completed.sort_by_key(|p| {
+        // Each `CompletedPart` here was built via
+        // `CompletedPart::builder().part_number(...).e_tag(...).build()`
+        // in the spawn loops above, so `part_number` is always set.
+        p.part_number()
+            .expect("CompletedPart built with explicit part_number")
+    });
     Ok(completed)
 }
 
@@ -2005,19 +2011,19 @@ mod tests {
         assert_eq!(READ_TIMEOUT, Duration::from_secs(30));
     }
 
-    /// Tripwire for the multipart-upload dispatch (issue #53).
+    /// Pin the `should_use_multipart` predicate at and around the
+    /// shared threshold (issue #53).
     ///
-    /// `put_bytes`, `put_path`, and `copy` all branch on
-    /// `should_use_multipart(size)`. A regression that re-introduces a
-    /// bare `PutObject` / `CopyObject` for sizes above the threshold
-    /// would re-introduce the 5 GiB ceiling and `EntityTooLarge`
-    /// failures on large bundle pushes / LFS uploads. The
-    /// `MULTIPART_PUT_THRESHOLD` constant is the single decision point
-    /// shared with the Azure backend; pin its semantics here so a
-    /// future code-style sweep cannot move the value out from under
-    /// the dispatch sites.
+    /// `put_bytes`, `put_path`, and `copy` route through this
+    /// predicate to decide single-PUT vs multipart. The integration
+    /// tests `multipart_put_emits_per_part_progress_events` and the
+    /// env-gated `multipart_put_path_above_5_gib_round_trips` cover
+    /// the dispatch *call* (only multipart emits >= 2 progress
+    /// events; only multipart succeeds above 5 GiB); this unit test
+    /// pins the predicate's boundary semantics so the constant can't
+    /// be moved out from under those tests without something failing.
     #[test]
-    fn multipart_dispatch_threshold_matches_shared_constant() {
+    fn should_use_multipart_pins_threshold_boundary() {
         use super::super::multipart::MULTIPART_PUT_THRESHOLD;
         assert!(!should_use_multipart(MULTIPART_PUT_THRESHOLD - 1));
         assert!(should_use_multipart(MULTIPART_PUT_THRESHOLD));

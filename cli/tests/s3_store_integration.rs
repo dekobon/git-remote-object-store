@@ -1176,7 +1176,7 @@ async fn multipart_put_emits_per_part_progress_events() {
 #[tokio::test]
 #[ignore = "requires RUN_LARGE_BODY_TESTS=1 and ~12 GiB of free disk"]
 async fn multipart_put_path_above_5_gib_round_trips() {
-    use std::io::Read;
+    use sha2::{Digest, Sha256};
     use tokio::io::AsyncWriteExt;
 
     // 6 GiB — 1 GiB above the AWS single-PUT ceiling.
@@ -1188,25 +1188,30 @@ async fn multipart_put_path_above_5_gib_round_trips() {
     }
     let (store, _bucket) = fresh_bucket().await;
     let chunk = deterministic_payload(64 * 1024 * 1024);
-    let chunk_hash_byte = chunk[0];
 
+    // Build the 6 GiB source on disk and stream-hash it in the same
+    // pass. The 6 GiB body is 96 repetitions of the same 64 MiB
+    // chunk (deterministic-but-repeating), so a per-byte sentinel
+    // would not distinguish a part-swap from the original; SHA256
+    // over the whole body catches any reordering or corruption that
+    // a multipart implementation could introduce.
     let tmp = tempfile::tempdir().expect("tempdir");
     let src = tmp.path().join("six-gib.bin");
+    let mut hasher = Sha256::new();
     {
         let mut file = tokio::fs::File::create(&src).await.expect("create src");
         let mut written: u64 = 0;
         while written < SIZE {
             let remaining = SIZE - written;
-            // Both `remaining` and `chunk.len()` fit in usize on this
-            // 64-bit test target (and the chunk is well below 4 GiB),
-            // so `usize::try_from` of their min is safe.
             let chunk_len = u64::try_from(chunk.len()).expect("chunk fits in u64");
             let n = usize::try_from(remaining.min(chunk_len)).expect("min fits in usize");
+            hasher.update(&chunk[..n]);
             file.write_all(&chunk[..n]).await.expect("write chunk");
             written += u64::try_from(n).expect("usize fits in u64");
         }
         file.flush().await.expect("flush");
     }
+    let expected: [u8; 32] = hasher.finalize().into();
 
     store
         .put_path("six-gib", &src, PutOpts::default())
@@ -1215,16 +1220,18 @@ async fn multipart_put_path_above_5_gib_round_trips() {
 
     let head = store.head("six-gib").await.expect("head");
     assert_eq!(head.size, SIZE);
-    // Cheap sanity: first byte downloads correctly.
+
+    // Round-trip integrity check: every byte must match the source.
+    // `sha256_of_file` reads in 1 MiB chunks so peak memory is
+    // bounded regardless of the 6 GiB body size.
     let dest = tmp.path().join("six-gib.dl");
     store
         .get_to_file("six-gib", &dest, GetOpts::default())
         .await
         .expect("get_to_file");
-    let mut byte_buf = [0u8; 1];
-    std::fs::File::open(&dest)
-        .expect("open dl")
-        .read_exact(&mut byte_buf)
-        .expect("read first byte");
-    assert_eq!(byte_buf[0], chunk_hash_byte);
+    assert_eq!(
+        sha256_of_file(&dest),
+        expected,
+        "multipart > 5 GiB round-trip corrupted body",
+    );
 }

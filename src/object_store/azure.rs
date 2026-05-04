@@ -948,17 +948,12 @@ async fn commit_block_list(
         ..Default::default()
     };
     let body: RequestContent<_, _> = block_list.try_into().map_err(other_boxed)?;
-    let mut commit_opts = BlockBlobClientCommitBlockListOptions::default();
-    if let Some(cd) = opts.content_disposition {
-        commit_opts.blob_content_disposition = Some(cd);
-    }
-    if !opts.user_metadata.is_empty() {
-        let mut map = std::collections::HashMap::with_capacity(opts.user_metadata.len());
-        for (k, v) in opts.user_metadata {
-            map.insert(k, v);
-        }
-        commit_opts.metadata = Some(map);
-    }
+    let (cd, metadata) = put_opts_blob_fields(opts);
+    let commit_opts = BlockBlobClientCommitBlockListOptions {
+        blob_content_disposition: cd,
+        metadata,
+        ..Default::default()
+    };
     blob.commit_block_list(body, Some(commit_opts))
         .await
         .map_err(|e| classify(e, key))?;
@@ -981,20 +976,36 @@ where
     body.into()
 }
 
+/// Pull the blob-shaped `content_disposition` and `metadata` fields
+/// out of [`PutOpts`].
+///
+/// Both `BlockBlobClientUploadOptions` (single `Put Blob`) and
+/// `BlockBlobClientCommitBlockListOptions` (multipart commit) carry
+/// the same two fields by the same names. Centralising the
+/// conversion here keeps a single source of truth for "how a
+/// `PutOpts` becomes Azure blob metadata."
+fn put_opts_blob_fields(
+    opts: PutOpts,
+) -> (
+    Option<String>,
+    Option<std::collections::HashMap<String, String>>,
+) {
+    let metadata = (!opts.user_metadata.is_empty()).then(|| {
+        opts.user_metadata
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>()
+    });
+    (opts.content_disposition, metadata)
+}
+
 /// Build a [`BlockBlobClientUploadOptions`] from the trait's [`PutOpts`].
 fn upload_options_from(opts: PutOpts) -> BlockBlobClientUploadOptions<'static> {
-    let mut out = BlockBlobClientUploadOptions::default();
-    if let Some(cd) = opts.content_disposition {
-        out.blob_content_disposition = Some(cd);
+    let (cd, metadata) = put_opts_blob_fields(opts);
+    BlockBlobClientUploadOptions {
+        blob_content_disposition: cd,
+        metadata,
+        ..Default::default()
     }
-    if !opts.user_metadata.is_empty() {
-        let mut map = std::collections::HashMap::with_capacity(opts.user_metadata.len());
-        for (k, v) in opts.user_metadata {
-            map.insert(k, v);
-        }
-        out.metadata = Some(map);
-    }
-    out
 }
 
 fn header_u64(headers: &Headers, name: &HeaderName) -> Option<u64> {
@@ -1356,21 +1367,19 @@ mod tests {
         );
     }
 
-    /// Tripwire for the multipart-upload dispatch (issue #53).
+    /// Pin the `should_use_multipart` predicate at and around the
+    /// shared threshold (issue #53).
     ///
-    /// `put_bytes` and `put_path` branch on
-    /// `should_use_multipart(size)`. The Azure backend technically
-    /// works with a single-shot `BlobClient::upload` for any body the
-    /// SDK accepts (transparent block chunking up to the 5000 MiB
-    /// ceiling) — but the issue's argument is that a single transfer
-    /// at multi-GiB scale is error-prone (no per-block retry budget,
-    /// opaque progress, no client-side back-pressure). The dispatch
-    /// uses the same `MULTIPART_PUT_THRESHOLD` constant as S3 so a
-    /// future refactor cannot accidentally raise the threshold for
-    /// Azure alone and re-introduce the issue. Same shape as the
-    /// S3-side tripwire.
+    /// `put_bytes` and `put_path` route through this predicate. The
+    /// integration test `multipart_put_emits_per_block_progress_events`
+    /// covers the dispatch *call* (only multipart emits per-block
+    /// events). This unit test pins the predicate's boundary semantics
+    /// so the constant can't be moved out from under that test
+    /// without something failing. The Azure backend uses the same
+    /// shared `MULTIPART_PUT_THRESHOLD` as S3 so a future refactor
+    /// cannot accidentally raise the threshold for one backend alone.
     #[test]
-    fn multipart_dispatch_threshold_matches_shared_constant() {
+    fn should_use_multipart_pins_threshold_boundary() {
         use super::super::multipart::MULTIPART_PUT_THRESHOLD;
         assert!(!should_use_multipart(MULTIPART_PUT_THRESHOLD - 1));
         assert!(should_use_multipart(MULTIPART_PUT_THRESHOLD));
