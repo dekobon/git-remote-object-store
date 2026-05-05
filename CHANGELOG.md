@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `packchain` doctor extensions (issue #68): the management
+  `doctor` subcommand now emits a `=== Packchain ===` section
+  whenever the resolved engine is `packchain`. The section reports
+  orphan pack count and bytes, pending tombstones (run id, marked
+  timestamp, age, orphan count) sorted oldest-first, per-branch
+  segment / byte totals with a `[recommend compact]` flag when
+  either threshold is exceeded, and dangling chain references
+  (chain.json segments pointing at packs missing from the bucket)
+  surfaced as ERRORS. New public `packchain::audit` module with
+  `audit`, `AuditReport`, `OrphanReport`, `TombstoneRow`,
+  `BranchAuditRow`, `DanglingRow`, and the threshold constants
+  `COMPACT_SEGMENTS_THRESHOLD` (>20 segments) and
+  `COMPACT_BYTES_THRESHOLD` (>100 MiB). Bundle-engine remotes see
+  the existing report unchanged.
+- Operator guide for `gc` (issue #70): a "Garbage collection"
+  section in `docs/getting-started.md` covers when to run, the
+  default mark+sweep flow, a cron-friendly weekly schedule with
+  crontab and GitHub Actions samples, `--grace-hours` and
+  `GIT_REMOTE_S3_GC_GRACE_HOURS` tuning, the `--force` re-check-
+  skip semantics, and how to read the per-phase output.
 - `packchain` storage engine — Phase 5 partial (orphan-pack garbage
   collection) of issue #52: new `git-remote-object-store gc <remote>`
   subcommand and `git_remote_object_store::packchain::gc` library
