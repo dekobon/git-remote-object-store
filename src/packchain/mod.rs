@@ -46,6 +46,7 @@
 //! for the full duration of a multi-GiB upload.
 
 pub(crate) mod fetch;
+pub mod gc;
 pub(crate) mod git;
 pub(crate) mod keys;
 pub(crate) mod manifest;

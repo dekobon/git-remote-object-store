@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `packchain` storage engine — Phase 5 partial (orphan-pack garbage
+  collection) of issue #52: new `git-remote-object-store gc <remote>`
+  subcommand and `git_remote_object_store::packchain::gc` library
+  module. Two-phase mark-and-sweep design: phase 1 lists every
+  `<prefix>/refs/heads/*/chain.json`, derives the orphan pack set
+  (in `packs/` but not referenced by any chain), and writes a
+  tombstone at `<prefix>/gc/tombstones-<run_id>-<rfc3339>.json`.
+  Phase 2 walks tombstones older than `--grace-hours` (default 24,
+  env override `GIT_REMOTE_S3_GC_GRACE_HOURS`), re-derives the
+  current orphan set to skip packs re-referenced between phases,
+  deletes `.pack` + `.idx` idempotently, and removes the tombstone.
+  Mark fails closed on a corrupt `chain.json` so a parse error never
+  tombstones live packs. `--mark-only` and `--sweep-only` separate
+  the phases for cron scheduling; `--force` skips both grace and
+  re-check (operator-asserted safe). Sources of orphans handled:
+  force push, lost-race push, aborted push, branch deletion, and
+  (future) compaction. (#66, sub-issue of #52, partial — `compact`
+  subcommand and `doctor` orphan-reporting extensions deferred to
+  follow-ups.)
+- `packchain::gc` public surface: `mark`, `sweep`, `MarkOpts`,
+  `MarkOutcome`, `SweepOpts`, `SweepOutcome`, `DEFAULT_GRACE_HOURS`,
+  `ENV_GC_GRACE_HOURS`, `grace_hours_from_env` for library consumers
+  that drive GC programmatically (CI agents, scheduled lambdas).
+- `manage::gc::Gc` runner that the CLI's `gc` subcommand wraps,
+  matching the existing `Doctor` / `ManageBranch` shape so a
+  non-interactive frontend can drive the same flow.
+
+### Changed
+
+- `delete-branch` documented as not deleting pack files for the
+  packchain engine. Pack keys can be shared across branches under
+  content-hash dedup (the umbrella issue's "exclusively owned by
+  that branch" claim was incorrect); `delete-branch` removes only
+  the branch's `chain.json`, `path-index.json`, baseline bundle, and
+  `PROTECTED#` marker. Operators run `gc` afterwards to reclaim
+  orphan packs. The behaviour itself is unchanged — `delete-branch`
+  always operated under `<prefix>/refs/heads/<branch>/` only — but
+  the invariant is now explicit.
+
 - `packchain` storage engine — Phase 4 (direct file access) of issue
   #52: new public `read_blob(remote, ref_name, path, &cache)` library
   API fetches a single file at a ref's tip without cloning or running
