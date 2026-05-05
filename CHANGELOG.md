@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `packchain` storage engine — Phase 3 (fetch) of issue #52: a
+  packchain bucket written by Phase 2 is now clonable and fetchable.
+  `git fetch` against `?engine=packchain` reads `chain.json`, walks
+  segments newest → oldest until a locally-known ancestor is found,
+  downloads the needed packs (and the `<full_at>.bundle` baseline
+  when the receiver has no anchor) in parallel up to
+  `MAX_FETCH_CONCURRENCY = 8`, and installs each pack
+  oldest-first into the local `objects/pack` directory. Cross-batch
+  dedup via the existing session-wide `FetchedRefs` cache works
+  identically to the bundle engine. `chain.json` references that
+  resolve to a missing pack on the bucket surface a typed
+  `PackchainError::PackMissing` with the absent key, satisfying
+  issue #64's "fail loud, not silent zero-byte fetch" criterion.
+  (#64, sub-issue of #52)
+- Shallow fetch on the packchain engine: under `option depth N`,
+  the engine downloads segments **sequentially** newest-first,
+  installs each, and runs `shallow_boundaries` after every install,
+  stopping as soon as the boundary set is non-empty. This is a
+  deliberate divergence from the bundle engine's parallel-fetch
+  shape; the boundary calculation depends on inspecting the
+  installed objects between segments, so a future "speed up
+  packchain shallow fetch" change must NOT re-parallelise.
+- `PackchainError::ChainAbsent`, `PackchainError::PackMissing`, and
+  `PackchainError::BaselineMissing` typed variants for fetch-side
+  failure modes; surfaced through the new
+  `FetchError::Packchain(_)` wrapper. The `PackchainError` type is
+  re-exported at the crate root so consumers can match on packchain
+  failures without naming the `pub(crate)` engine module.
 - `packchain` storage engine — Phase 2 (incremental push) of issue #52:
   pushing to `?engine=packchain` now writes a content-SHA-keyed pack
   under `packs/`, a sibling `.idx`, a newest-first `chain.json`

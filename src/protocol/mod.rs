@@ -361,14 +361,18 @@ where
                             fetch_batch(&ctx, cmds, fetched_refs.clone(), depth.take()).await?;
                         }
                         (Mode::Fetch, StorageEngine::Packchain) => {
-                            // Phase 3 fills this in; until then a packchain
-                            // helper that sees `fetch` aborts loudly rather
-                            // than silently routing through the bundle path.
-                            error!(
-                                engine = %engine,
-                                "packchain fetch is not yet implemented; aborting helper",
-                            );
-                            return Err(ProtocolError::EngineNotImplemented(engine));
+                            // Take depth so it applies to *this* batch only,
+                            // matching the bundle path. Packchain's shallow
+                            // fetch is sequential newest-first with
+                            // BFS-after-each (see crate::packchain::fetch's
+                            // module doc).
+                            crate::packchain::fetch::fetch_batch(
+                                &ctx,
+                                cmds,
+                                fetched_refs.clone(),
+                                depth.take(),
+                            )
+                            .await?;
                         }
                         (Mode::Push, StorageEngine::Bundle) => {
                             let outcomes = push_batch(&ctx, zip, engine, cmds).await?;

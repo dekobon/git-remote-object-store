@@ -45,6 +45,7 @@
 //! short — an in-lock-upload alternative would block sibling pushers
 //! for the full duration of a multi-GiB upload.
 
+pub(crate) mod fetch;
 pub(crate) mod git;
 pub(crate) mod keys;
 pub(crate) mod manifest;
@@ -111,6 +112,38 @@ pub enum PackchainError {
     /// history; better to refuse loudly than to corrupt the remote.
     #[error("cannot push from a shallow clone: rev-walk crosses a shallow boundary")]
     ShallowPushRejected,
+
+    /// `chain.json` is missing for the requested ref. Either the
+    /// branch was never pushed under the packchain engine or it was
+    /// deleted server-side. Distinct from
+    /// [`Self::Store`]`(NotFound)` so the wire-line is explicit
+    /// about which artefact is missing.
+    #[error("chain.json absent for {ref_name}; the branch is unknown to the bucket")]
+    ChainAbsent {
+        /// The ref name the fetch asked about.
+        ref_name: String,
+    },
+
+    /// `chain.json` references a pack that is not present on the
+    /// bucket. Pinning this as a typed error so a Phase 5 `doctor`
+    /// can flag it specifically rather than the operator having to
+    /// disambiguate a generic `NotFound` from a transient failure.
+    /// Issue #64 calls this out as a regression case to surface
+    /// loudly rather than silently zero-byte-fetch.
+    #[error("packchain: chain.json references missing pack at {key}")]
+    PackMissing {
+        /// Bucket-relative pack key recorded in `chain.json`.
+        key: String,
+    },
+
+    /// Baseline bundle (the `<full_at>.bundle` artefact) is missing.
+    /// Surfaces during a clone where the chain walk reached the root
+    /// segment but the baseline that should be alongside it is gone.
+    #[error("packchain: baseline bundle missing at {key}")]
+    BaselineMissing {
+        /// Bucket key of the missing `<full_at>.bundle`.
+        key: String,
+    },
 
     /// Pack content SHA could not be derived (file shorter than the
     /// 32-byte minimum PACK header + trailer, or an I/O error reading
