@@ -436,12 +436,8 @@ fn render_packchain_section(report: &AuditReport) -> String {
         }
     }
 
-    if report.dangling.is_empty()
-        && report
-            .branches
-            .iter()
-            .all(|r| !r.full_at_missing_from_segments)
-    {
+    let has_corrupt = report.branches.iter().any(|r| !r.has_full_at_segment);
+    if report.dangling.is_empty() && !has_corrupt {
         let _ = writeln!(out, "ERRORS: none");
     } else {
         let _ = writeln!(out, "ERRORS:");
@@ -452,11 +448,7 @@ fn render_packchain_section(report: &AuditReport) -> String {
                 d.ref_path, d.missing_pack_key,
             );
         }
-        for b in report
-            .branches
-            .iter()
-            .filter(|r| r.full_at_missing_from_segments)
-        {
+        for b in report.branches.iter().filter(|r| !r.has_full_at_segment) {
             let _ = writeln!(
                 out,
                 "  - {}/chain.json full_at not present in segments (corrupt manifest)",
@@ -985,7 +977,7 @@ mod tests {
                 segments_total: 27,
                 bytes_total: 142 * 1024 * 1024,
                 recommend_compact: true,
-                full_at_missing_from_segments: false,
+                has_full_at_segment: true,
             }],
             dangling: Vec::new(),
         };

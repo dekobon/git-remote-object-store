@@ -49,6 +49,26 @@ pub(crate) fn optional_prefix(prefix: &str) -> Option<&str> {
     }
 }
 
+/// Strip `<prefix>/` and `/chain.json` to derive the ref path.
+///
+/// Returns `None` for keys that don't fit the shape — callers
+/// upstream filter on [`is_chain_json_key`], so a `None` here
+/// signals a deeper inconsistency (an unprefixed key listed under a
+/// prefixed bucket, or a sibling-prefix collision like `repo-other/`
+/// against `repo`). Centralised so `list::list_refs` and
+/// `audit::load_chains` can't drift apart.
+#[must_use]
+pub(crate) fn ref_path_from_chain_key(prefix: Option<&str>, key: &str) -> Option<String> {
+    let without_suffix = key.strip_suffix("/chain.json")?;
+    match prefix {
+        None | Some("") => Some(without_suffix.to_owned()),
+        Some(p) => without_suffix
+            .strip_prefix(p)
+            .and_then(|s| s.strip_prefix('/'))
+            .map(str::to_owned),
+    }
+}
+
 /// Extract the content SHA from a chain segment's `pack` field.
 ///
 /// `pack` is `[<prefix>/]packs/<sha>.pack` per the chain.json

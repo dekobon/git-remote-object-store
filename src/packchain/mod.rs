@@ -45,7 +45,7 @@
 //! short — an in-lock-upload alternative would block sibling pushers
 //! for the full duration of a multi-GiB upload.
 
-pub mod audit;
+pub(crate) mod audit;
 pub(crate) mod fetch;
 pub mod gc;
 pub(crate) mod git;

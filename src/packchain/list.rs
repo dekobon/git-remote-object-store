@@ -84,7 +84,7 @@ pub(crate) async fn list_refs(
             if !super::keys::is_chain_json_key(&m.key) {
                 return None;
             }
-            let Some(ref_path) = ref_path_from_chain_key(prefix, &m.key) else {
+            let Some(ref_path) = super::keys::ref_path_from_chain_key(prefix, &m.key) else {
                 warn!(key = %m.key, "packchain list: chain.json key has unexpected shape; skipping");
                 return None;
             };
@@ -146,24 +146,6 @@ pub(crate) async fn list_refs(
         .collect();
     out.sort_by_key(|e| std::cmp::Reverse(e.last_modified));
     Ok(out)
-}
-
-/// Strip `<prefix>/` and `/chain.json` to derive the ref path.
-///
-/// Returns `None` for keys that don't fit the expected shape — the
-/// caller filters on `ends_with("/chain.json")` upstream, so a
-/// `None` here signals a deeper inconsistency (an unprefixed key
-/// listed under a prefixed bucket) worth logging rather than
-/// silently swallowing.
-fn ref_path_from_chain_key(prefix: Option<&str>, key: &str) -> Option<String> {
-    let without_suffix = key.strip_suffix("/chain.json")?;
-    match prefix {
-        None | Some("") => Some(without_suffix.to_owned()),
-        Some(p) => without_suffix
-            .strip_prefix(p)
-            .and_then(|s| s.strip_prefix('/'))
-            .map(str::to_owned),
-    }
 }
 
 #[cfg(test)]
@@ -392,7 +374,10 @@ mod tests {
     #[test]
     fn ref_path_from_chain_key_strips_prefix_and_suffix() {
         assert_eq!(
-            ref_path_from_chain_key(Some("repo"), "repo/refs/heads/main/chain.json"),
+            super::super::keys::ref_path_from_chain_key(
+                Some("repo"),
+                "repo/refs/heads/main/chain.json"
+            ),
             Some("refs/heads/main".to_owned()),
         );
     }
@@ -400,11 +385,11 @@ mod tests {
     #[test]
     fn ref_path_from_chain_key_handles_no_prefix() {
         assert_eq!(
-            ref_path_from_chain_key(None, "refs/heads/main/chain.json"),
+            super::super::keys::ref_path_from_chain_key(None, "refs/heads/main/chain.json"),
             Some("refs/heads/main".to_owned()),
         );
         assert_eq!(
-            ref_path_from_chain_key(Some(""), "refs/heads/main/chain.json"),
+            super::super::keys::ref_path_from_chain_key(Some(""), "refs/heads/main/chain.json"),
             Some("refs/heads/main".to_owned()),
         );
     }
@@ -414,7 +399,10 @@ mod tests {
         // Sibling-prefix collision: bucket has another repo at
         // `repo-other/`. We should not match its chain.json keys.
         assert_eq!(
-            ref_path_from_chain_key(Some("repo"), "repo-other/refs/heads/main/chain.json"),
+            super::super::keys::ref_path_from_chain_key(
+                Some("repo"),
+                "repo-other/refs/heads/main/chain.json"
+            ),
             None,
         );
     }
