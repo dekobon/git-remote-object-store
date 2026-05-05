@@ -17,7 +17,7 @@ use bytes::Bytes;
 use git_remote_object_store::object_store::mock::MockStore;
 use git_remote_object_store::object_store::{ObjectStore, PutOpts};
 use git_remote_object_store::protocol::ProtocolError;
-use git_remote_object_store::url::{RemoteUrl, StorageEngine};
+use git_remote_object_store::url::RemoteUrl;
 use time::Duration;
 use time::OffsetDateTime;
 
@@ -53,12 +53,15 @@ async fn packchain_capabilities_succeeds() {
 }
 
 #[tokio::test]
-async fn packchain_fetch_aborts_with_engine_not_implemented() {
-    // Phase 3 will land packchain fetch; until then a `fetch` batch
-    // against a packchain bucket must abort with a clear error rather
-    // than silently routing through the bundle code path. Stdout
-    // discipline is asserted at the variant level — the abort should
-    // happen before any `fetch` reply is written.
+async fn packchain_fetch_against_empty_bucket_surfaces_chain_absent() {
+    // Phase 3 (issue #64) lights up packchain fetch. Fetching a ref
+    // from a packchain bucket that has no chain.json for that ref
+    // must produce a typed `ChainAbsent` error (wrapped in
+    // `FetchError::Packchain`) rather than the opaque `Store(NotFound)`
+    // a literal GET would surface.
+    use git_remote_object_store::PackchainError;
+    use git_remote_object_store::protocol::fetch::FetchError;
+
     let raw = "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=packchain";
     let remote = git_remote_object_store::url::parse(raw).expect("URL parses");
 
@@ -69,13 +72,13 @@ async fn packchain_fetch_aborts_with_engine_not_implemented() {
         "fetch 0123456789abcdef0123456789abcdef01234567 refs/heads/main\n\n",
     )
     .await;
-    let err = result.expect_err("packchain fetch must abort");
+    let err = result.expect_err("packchain fetch on empty bucket must error");
     assert!(
         matches!(
             err,
-            ProtocolError::EngineNotImplemented(StorageEngine::Packchain)
+            ProtocolError::Fetch(FetchError::Packchain(PackchainError::ChainAbsent { .. }))
         ),
-        "expected EngineNotImplemented(Packchain), got {err:?}",
+        "expected Fetch(Packchain(ChainAbsent)), got {err:?}",
     );
 }
 
@@ -87,8 +90,14 @@ async fn packchain_format_resolves_engine_even_without_url_flag() {
     // otherwise a bundle-helper would walk a packchain bucket's keys
     // and either return empty results or overwrite chain.json.
     //
-    // Capabilities is engine-agnostic; the meaningful regression is
-    // that subsequent fetch / push gets routed by FORMAT, not by URL.
+    // Pin the routing by inserting a packchain FORMAT marker without
+    // a chain.json: the fetch must produce the packchain-specific
+    // `ChainAbsent` error variant. A regression that routed through
+    // the bundle path would surface as `Store(NotFound)` for the
+    // missing `<sha>.bundle` instead.
+    use git_remote_object_store::PackchainError;
+    use git_remote_object_store::protocol::fetch::FetchError;
+
     let store = MockStore::new();
     store.insert("repo/FORMAT", Bytes::from_static(b"packchain"));
     let store: Arc<dyn ObjectStore> = Arc::new(store);
@@ -99,13 +108,13 @@ async fn packchain_format_resolves_engine_even_without_url_flag() {
         "fetch 0123456789abcdef0123456789abcdef01234567 refs/heads/main\n\n",
     )
     .await;
-    let err = result.expect_err("packchain fetch must abort even without URL flag");
+    let err = result.expect_err("packchain fetch on empty bucket must error");
     assert!(
         matches!(
             err,
-            ProtocolError::EngineNotImplemented(StorageEngine::Packchain)
+            ProtocolError::Fetch(FetchError::Packchain(PackchainError::ChainAbsent { .. }))
         ),
-        "FORMAT must drive engine resolution; got {err:?}",
+        "FORMAT must drive engine resolution to packchain fetch; got {err:?}",
     );
 }
 

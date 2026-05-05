@@ -71,6 +71,13 @@ pub enum FetchError {
     /// A spawned fetch task panicked or was cancelled.
     #[error("fetch task join failed: {0}")]
     Join(#[from] JoinError),
+
+    /// Packchain-engine-specific failure surfaced by
+    /// [`crate::packchain::fetch::fetch_batch`]. Wrapped here so the
+    /// protocol REPL can render fetch failures uniformly regardless
+    /// of which engine produced them.
+    #[error("packchain engine error during fetch: {0}")]
+    Packchain(#[from] crate::packchain::PackchainError),
 }
 
 /// Session-wide set of SHAs already fetched in this REPL run.
@@ -89,7 +96,7 @@ impl FetchedRefs {
         Self::default()
     }
 
-    fn contains(&self, sha: &Sha) -> bool {
+    pub(crate) fn contains(&self, sha: &Sha) -> bool {
         // We hold the lock only across `HashSet::contains` / `insert`,
         // both of which cannot leave the set in a half-modified state.
         // If a previous holder panicked, the set is still safe to read,
@@ -101,7 +108,7 @@ impl FetchedRefs {
             .contains(sha)
     }
 
-    fn insert(&self, sha: Sha) {
+    pub(crate) fn insert(&self, sha: Sha) {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -125,16 +132,16 @@ impl FetchedRefs {
 /// merged write to `.git/shallow` after all tasks finish. Cloning is
 /// cheap (`Arc` bump).
 #[derive(Clone, Default)]
-struct ShallowBoundaries {
+pub(crate) struct ShallowBoundaries {
     inner: Arc<Mutex<HashSet<ObjectId>>>,
 }
 
 impl ShallowBoundaries {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    fn extend(&self, ids: impl IntoIterator<Item = ObjectId>) {
+    pub(crate) fn extend(&self, ids: impl IntoIterator<Item = ObjectId>) {
         let mut guard = self
             .inner
             .lock()
@@ -142,7 +149,7 @@ impl ShallowBoundaries {
         guard.extend(ids);
     }
 
-    fn drain(&self) -> Vec<ObjectId> {
+    pub(crate) fn drain(&self) -> Vec<ObjectId> {
         let mut guard = self
             .inner
             .lock()
@@ -213,17 +220,22 @@ pub(crate) async fn fetch_batch(
     }
 
     // Drain every task before returning, so a single failure cannot
-    // leave the rest running into a closing helper. First error wins.
+    // leave the rest running into a closing helper. First error wins;
+    // subsequent errors are logged at debug! so multi-task failures
+    // remain visible to operators (the wire-line only carries the
+    // first).
     let mut first_err: Option<FetchError> = None;
     while let Some(joined) = tasks.join_next().await {
         // `joined` is `Result<Result<(), FetchError>, JoinError>` — flatten
         // by promoting a join error (panic / cancellation) into a
         // `FetchError::Join` and keeping the inner result otherwise.
         let res: Result<(), FetchError> = joined.unwrap_or_else(|je| Err(je.into()));
-        if let Err(err) = res
-            && first_err.is_none()
-        {
-            first_err = Some(err);
+        if let Err(err) = res {
+            if first_err.is_none() {
+                first_err = Some(err);
+            } else {
+                debug!(error = %err, "additional bundle fetch task error (first error already captured)");
+            }
         }
     }
 
@@ -253,7 +265,7 @@ pub(crate) async fn fetch_batch(
 /// 2. `.git` is a file → linked worktree or `--separate-git-dir`; the
 ///    file contains `gitdir: <path>` pointing to the real git dir.
 /// 3. No `.git` entry → bare repository; `repo_dir` is the git dir.
-fn git_dir_for(repo_dir: &Path) -> PathBuf {
+pub(crate) fn git_dir_for(repo_dir: &Path) -> PathBuf {
     let candidate = repo_dir.join(".git");
     if candidate.is_dir() {
         return candidate;
@@ -343,7 +355,7 @@ async fn fetch_one(ctx: FetchOneCtx<'_>) -> Result<(), FetchError> {
 
 /// Parse the payload of a `fetch <sha> <ref>` line (the bytes after the
 /// `fetch ` prefix have already been stripped by the REPL).
-fn parse_fetch_args(args: &str) -> Result<(Sha, RefName), FetchError> {
+pub(crate) fn parse_fetch_args(args: &str) -> Result<(Sha, RefName), FetchError> {
     let parse_err = || FetchError::Parse {
         line: args.to_owned(),
     };
