@@ -51,7 +51,10 @@ pub(crate) mod keys;
 pub(crate) mod manifest;
 pub(crate) mod pack;
 pub(crate) mod push;
+pub(crate) mod read;
 pub(crate) mod schema;
+
+pub use read::{PackIndexCache, read_blob};
 
 /// Errors surfaced by the packchain engine. `pub` because the
 /// [`crate::protocol::push::PushError::Packchain`] variant — which is
@@ -168,6 +171,114 @@ pub enum PackchainError {
     /// Local I/O failure (tempdir, file read, file persist).
     #[error("packchain I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// [`read::read_blob`] was called against a remote whose resolved
+    /// engine is not [`crate::url::StorageEngine::Packchain`]. Surfaces
+    /// before any artefact lookup so callers see a typed mismatch
+    /// instead of a misleading `chain.json` not-found.
+    #[error(
+        "read_blob requires the packchain engine; this remote uses `{found}` — \
+         check the URL's `?engine=` parameter or the bucket's `FORMAT` key"
+    )]
+    WrongEngine {
+        /// Engine the remote actually resolved to.
+        found: crate::url::StorageEngine,
+    },
+
+    /// `path-index.json` is missing for the requested ref. Distinct
+    /// from [`Self::ChainAbsent`] so an operator sees which artefact is
+    /// gone — chain.json being present without path-index indicates a
+    /// crashed-mid-push state Phase 5 GC will reconcile.
+    #[error("path-index.json absent for {ref_name}; the branch's path map is unavailable")]
+    PathIndexAbsent {
+        /// The ref name [`read::read_blob`] was asked about.
+        ref_name: String,
+    },
+
+    /// Caller passed a `path` that does not exist in this commit's tree.
+    #[error("path `{path}` not found in {ref_name}")]
+    PathNotFound {
+        /// Ref the lookup ran against.
+        ref_name: String,
+        /// The path the caller asked for, returned verbatim.
+        path: String,
+    },
+
+    /// Caller passed a malformed path: empty, absolute (`/`-prefixed),
+    /// containing a `..` segment, or containing empty segments
+    /// (consecutive slashes). These shapes don't map to git tree
+    /// semantics; reject before walking.
+    #[error("malformed path `{path}`: {reason}")]
+    MalformedPath {
+        /// The rejected path, returned verbatim.
+        path: String,
+        /// Human-readable reason (`"empty"`, `"absolute"`, `"contains ..\""`, etc.).
+        reason: &'static str,
+    },
+
+    /// Path resolved to a tree node, not a blob — the caller asked for
+    /// a directory, not a file. Distinct from [`Self::PathNotFound`] so
+    /// the caller can distinguish "wrong shape" from "missing".
+    #[error("path `{path}` resolves to a directory, not a file")]
+    PathNotABlob {
+        /// The path the caller asked for.
+        path: String,
+    },
+
+    /// Blob SHA recorded in `path-index.json` was not present in any
+    /// pack referenced by `chain.json`. Indicates a corrupted bucket
+    /// (path-index points at a blob the chain doesn't carry); typed
+    /// distinctly so a Phase 5 `doctor` can flag it specifically.
+    #[error("blob {sha} for path `{path}` not present in any chain pack")]
+    BlobNotInChain {
+        /// The blob SHA the path-index named.
+        sha: String,
+        /// The path the caller asked for.
+        path: String,
+    },
+
+    /// Pack entry header could not be decoded (truncated bytes, unknown
+    /// type id, non-canonical size encoding, etc.).
+    #[error("malformed pack entry at offset {offset}: {reason}")]
+    MalformedPackEntry {
+        /// Pack-relative offset of the entry that failed to decode.
+        offset: u64,
+        /// Human-readable reason from the underlying decoder.
+        reason: String,
+    },
+
+    /// Zlib stream embedded in a pack entry could not be inflated.
+    #[error("zlib decompression failure for entry at offset {offset}")]
+    Decompress {
+        /// Pack-relative offset of the entry whose payload failed.
+        offset: u64,
+    },
+
+    /// Delta resolution exceeded [`read::MAX_DELTA_DEPTH`]. Mirrors
+    /// git's own depth cap — most legitimate chains stay well under it,
+    /// so a deep chain is almost certainly a corrupted pack with a
+    /// delta cycle.
+    #[error("pack delta chain exceeds maximum depth ({max})")]
+    DeltaTooDeep {
+        /// The depth limit (always [`read::MAX_DELTA_DEPTH`]).
+        max: u32,
+    },
+
+    /// Delta payload could not be applied (truncated instructions,
+    /// out-of-range copy span, source size mismatch).
+    #[error("malformed delta payload: {reason}")]
+    MalformedDelta {
+        /// Human-readable reason from the delta decoder.
+        reason: &'static str,
+    },
+
+    /// `read_blob` was given a ref name that fails `gix-validate`'s
+    /// reference-name rules (empty, control characters, `..`, etc.).
+    #[error("invalid ref name `{name}`")]
+    InvalidRefName {
+        /// The ref name the caller passed.
+        name: String,
+    },
 }
 
 impl From<gix_pack::bundle::write::Error> for PackchainError {

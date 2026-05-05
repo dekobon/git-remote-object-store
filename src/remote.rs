@@ -54,7 +54,7 @@ use bytes::Bytes;
 
 use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
 use crate::protocol::backend::{self, BackendError};
-use crate::url::{ParseError, RemoteUrl};
+use crate::url::{ParseError, RemoteUrl, StorageEngine};
 
 /// A handle to a git-remote-object-store repository in a cloud backend.
 ///
@@ -63,6 +63,7 @@ use crate::url::{ParseError, RemoteUrl};
 pub struct Remote {
     store: Arc<dyn ObjectStore>,
     prefix: String,
+    engine: StorageEngine,
 }
 
 impl Remote {
@@ -92,12 +93,13 @@ impl Remote {
     ///
     /// Returns [`BackendError`] when the backend is unreachable.
     pub async fn open(url: &RemoteUrl) -> Result<Self, BackendError> {
-        // The library entry point doesn't dispatch on engine yet; drop
-        // it for now. Phase 2+ may expose it on `Remote` when packchain
-        // gains a public `read_blob` API.
-        let (store, _engine) = backend::build(url).await?;
+        let (store, engine) = backend::build(url).await?;
         let prefix = url.prefix().unwrap_or_default().to_owned();
-        Ok(Self { store, prefix })
+        Ok(Self {
+            store,
+            prefix,
+            engine,
+        })
     }
 
     /// Compute the storage key for `suffix` within this repository's prefix.
@@ -132,10 +134,41 @@ impl Remote {
         &*self.store
     }
 
+    /// Test-only constructor that lets integration tests build a
+    /// [`Remote`] against an in-memory [`crate::object_store::mock::MockStore`]
+    /// without going through `backend::build` (which would attempt a
+    /// live probe). Production callers must use [`Self::connect`] /
+    /// [`Self::open`].
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn new_for_test(
+        store: Arc<dyn ObjectStore>,
+        prefix: impl Into<String>,
+        engine: StorageEngine,
+    ) -> Self {
+        Self {
+            store,
+            prefix: prefix.into(),
+            engine,
+        }
+    }
+
     /// The repository prefix (empty string for bucket-root repositories).
     #[must_use]
     pub fn prefix(&self) -> &str {
         &self.prefix
+    }
+
+    /// The storage engine resolved at [`open`](Self::open) time from the
+    /// `FORMAT` key combined with any `?engine=` URL parameter.
+    ///
+    /// Callers that target engine-specific APIs (notably
+    /// [`crate::packchain::read_blob`]) inspect this to fail fast against
+    /// a remote of the wrong shape rather than blindly fetching the
+    /// engine-specific manifest keys.
+    #[must_use]
+    pub fn engine(&self) -> StorageEngine {
+        self.engine
     }
 
     /// Read the repository's `HEAD` ref.
@@ -180,6 +213,7 @@ mod tests {
         Remote {
             store: Arc::new(crate::object_store::mock::MockStore::new()),
             prefix: prefix.to_owned(),
+            engine: StorageEngine::Bundle,
         }
     }
 

@@ -54,6 +54,26 @@ pub(crate) async fn write_chain(
     Ok(())
 }
 
+/// Read `<prefix>/<ref_name>/path-index.json` and parse it.
+///
+/// Returns `Ok(None)` when the key does not exist (the bucket has a
+/// chain.json but no path-index, e.g. a partially crashed first push
+/// that committed before path-index was rewritten — see the engine's
+/// crash-recovery analysis). Every other failure surfaces as
+/// [`PackchainError`].
+pub(crate) async fn load_path_index(
+    store: &dyn ObjectStore,
+    prefix: Option<&str>,
+    remote_ref: &RefName,
+) -> Result<Option<PathIndex>, PackchainError> {
+    let key = path_index_key(prefix, remote_ref);
+    match store.get_bytes(&key).await {
+        Ok(bytes) => Ok(Some(PathIndex::from_json_bytes(&bytes)?)),
+        Err(ObjectStoreError::NotFound(_)) => Ok(None),
+        Err(e) => Err(PackchainError::Store(e)),
+    }
+}
+
 /// Overwrite `<prefix>/<ref_name>/path-index.json` with `index`.
 pub(crate) async fn write_path_index(
     store: &dyn ObjectStore,

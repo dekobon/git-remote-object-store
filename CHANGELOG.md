@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `packchain` storage engine — Phase 4 (direct file access) of issue
+  #52: new public `read_blob(remote, ref_name, path, &cache)` library
+  API fetches a single file at a ref's tip without cloning or running
+  git. The lookup walks `chain.json` + `path-index.json` to resolve
+  the path to a blob SHA, scans each segment's `.idx` newest-first
+  for the entry, and ranged-GETs the blob's pack bytes via
+  `ObjectStore::get_bytes_range`, zlib-decompressing and applying
+  `OFS_DELTA` / `REF_DELTA` chains up to a fixed depth (`MAX_DELTA_DEPTH
+  = 50`, matching git's own cap). Total: 4–5 API calls for a warm
+  lookup against a single-segment chain. (#65, sub-issue of #52)
+- `PackIndexCache` — byte-bounded LRU keyed by `(prefix, content-sha)`
+  that amortises pack-index parses across `read_blob` calls. Default
+  capacity is 64 MiB; long-running consumers (CI agents, build
+  systems) keep one cache for the lifetime of the process so the
+  per-call cost drops to one `chain.json` GET, one `path-index.json`
+  GET, and the ranged pack read. Single-shot callers can pass
+  `&PackIndexCache::default()` and let it GC at drop.
+- Engine guardrail on `Remote`: `Remote::open` now stores the resolved
+  `StorageEngine`, exposed via `Remote::engine()`. `read_blob` rejects
+  bundle remotes up front with `PackchainError::WrongEngine` rather
+  than blindly fetching a non-existent `chain.json`.
+- New `PackchainError` variants for Phase 4 failure modes:
+  `WrongEngine`, `PathIndexAbsent`, `PathNotFound`, `MalformedPath`,
+  `PathNotABlob`, `BlobNotInChain`, `MalformedPackEntry`, `Decompress`,
+  `DeltaTooDeep`, `MalformedDelta`, and `InvalidRefName`. Each
+  identifies the specific corruption / misuse class so a Phase 5
+  `doctor` can flag them individually.
 - `packchain` storage engine — Phase 3 (fetch) of issue #52: a
   packchain bucket written by Phase 2 is now clonable and fetchable.
   `git fetch` against `?engine=packchain` reads `chain.json`, walks
