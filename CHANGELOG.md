@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `packchain::list::list_refs` now fetches `chain.json` bodies in
+  bounded parallel (`MAX_FETCH_CONCURRENCY = 8`, matching Phase 3
+  fetch). Earlier sequential N round trips became a single bounded
+  batch — meaningful for buckets with many branches; negligible
+  for typical single-digit-branch repos.
+
+- `packchain::list::list_refs` filters extracted ref paths through
+  `gix-validate`'s `RefName::new` check before emitting them to
+  git. A maliciously-planted key like
+  `<prefix>/refs/heads/../etc/passwd/chain.json` would otherwise
+  yield ref path `refs/heads/../etc/passwd` in the list response;
+  the filter rejects such names with `tracing::warn!` and skips
+  the entry. Defense-in-depth against bucket-write attackers.
+
+### Fixed
+
+- `list` command on packchain remotes now returns `chain.tip`
+  rather than the baseline `<full_at>` SHA. The bundle-engine
+  `list` handler parsed `<sha>.bundle` filenames; for packchain
+  the bundle is the (fixed) baseline, not the moving tip, so
+  after any incremental push `git ls-remote` / `git fetch` /
+  `git pull` saw stale tips. Fix: engine-aware dispatch in
+  `protocol::list::handle_list` — bundle keeps its bundle-key
+  parser, packchain reads each ref's `chain.json` and reports
+  `chain.tip`. Per-entry `chain.json` parse failures skip with
+  a `tracing::warn!` so a single corrupt branch does not
+  blackhole the whole listing. (#72)
+
 ### Added
 
 - `packchain` storage engine — Phase 5 partial (orphan-pack garbage

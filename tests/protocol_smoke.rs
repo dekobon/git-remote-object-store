@@ -119,6 +119,59 @@ async fn packchain_format_resolves_engine_even_without_url_flag() {
 }
 
 #[tokio::test]
+async fn packchain_list_returns_chain_tip_not_full_at() {
+    // Regression test for issue #72: `list` against a packchain
+    // remote returned the baseline `<full_at>` SHA from the bundle
+    // filename, not the current `chain.tip` from chain.json. After
+    // any incremental push, `chain.tip != full_at` and the bundle
+    // path produces stale tips, breaking `git ls-remote` /
+    // `git fetch` / `git pull`.
+    //
+    // The fix routes `Command::List` through engine-aware dispatch:
+    // packchain reads chain.json directly. Pin both the right SHA
+    // (chain.tip) AND the absence of the wrong SHA (full_at).
+    //
+    // Construct the chain.json via raw bytes (the schema types are
+    // `pub(crate)`); the integration boundary is the on-bucket JSON
+    // shape, which this string pins directly.
+    let store = MockStore::new();
+    let chain_json = format!(
+        r#"{{"v":1,"tip":"{SHA_B}","full_at":"{SHA_A}","segments":[{{"sha":"{SHA_B}","parent_sha":"{SHA_A}","pack":"packs/{SHA_C}.pack","bytes":1024}}]}}"#
+    );
+    store.insert(
+        "repo/refs/heads/main/chain.json",
+        Bytes::from(chain_json.into_bytes()),
+    );
+    // Also drop a stale baseline bundle on disk to make the bug
+    // observable: a regression that fell back to the bundle path
+    // would pick up SHA_A from the filename.
+    store.insert(
+        format!("repo/refs/heads/main/{SHA_A}.bundle"),
+        Bytes::from_static(b"baseline"),
+    );
+    store.insert("repo/FORMAT", Bytes::from_static(b"packchain"));
+    store.insert("repo/HEAD", Bytes::from_static(b"refs/heads/main"));
+
+    let url_str = "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=packchain";
+    let remote = git_remote_object_store::url::parse(url_str).expect("URL parses");
+    let (out, result) = drive(remote, Arc::new(store), "list\n").await;
+    result.expect("packchain list should succeed");
+    let text = std::str::from_utf8(&out).unwrap();
+    assert_eq!(
+        text,
+        format!("@refs/heads/main HEAD\n{SHA_B} refs/heads/main\n\n"),
+        "packchain list must report chain.tip ({SHA_B}), not full_at ({SHA_A})",
+    );
+    // Belt-and-suspenders: explicitly assert the wrong SHA never
+    // appears, so a future regression that emits BOTH lines (an
+    // engine-mux bug) would still fail the test.
+    assert!(
+        !text.contains(SHA_A),
+        "list output must not include the baseline `full_at` sha; got {text:?}",
+    );
+}
+
+#[tokio::test]
 async fn capabilities_emits_exact_block() {
     let (out, result) = drive(
         s3_url(Some("repo")),

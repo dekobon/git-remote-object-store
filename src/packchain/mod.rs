@@ -49,6 +49,7 @@ pub(crate) mod fetch;
 pub mod gc;
 pub(crate) mod git;
 pub(crate) mod keys;
+pub(crate) mod list;
 pub(crate) mod manifest;
 pub(crate) mod pack;
 pub(crate) mod push;
