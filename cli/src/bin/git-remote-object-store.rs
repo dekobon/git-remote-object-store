@@ -26,8 +26,10 @@ use git_remote_object_store::manage::{
     DEFAULT_LOCK_TTL_SECONDS, DialoguerPrompter,
     branch::ManageBranch,
     doctor::{Doctor, DoctorOpts},
+    gc::{Gc, GcOpts},
 };
 use git_remote_object_store::object_store::ObjectStore;
+use git_remote_object_store::packchain::gc as packchain_gc;
 use git_remote_object_store::protocol::backend::{self, BackendError};
 use git_remote_object_store::url::{self as remote_url, RemoteUrl};
 
@@ -85,6 +87,32 @@ enum Command {
         target: Target,
         /// Branch name, without the `refs/heads/` prefix.
         branch: String,
+    },
+    /// Two-phase mark-and-sweep garbage collection of orphan packs on a
+    /// packchain bucket. Default flow is mark + sweep; `--mark-only` and
+    /// `--sweep-only` separate the phases for cron-style scheduling.
+    Gc {
+        #[command(flatten)]
+        target: Target,
+
+        /// Run the mark phase only (write a tombstone, do not delete).
+        #[arg(long, conflicts_with = "sweep_only")]
+        mark_only: bool,
+
+        /// Run the sweep phase only (process pre-existing tombstones).
+        #[arg(long, conflicts_with = "mark_only")]
+        sweep_only: bool,
+
+        /// Bypass the grace window and the orphan re-check.
+        /// Operator-asserted safe (no concurrent reads).
+        #[arg(long)]
+        force: bool,
+
+        /// Hours a tombstone must age before its packs are eligible
+        /// for sweep. Default reads the `GIT_REMOTE_S3_GC_GRACE_HOURS`
+        /// environment variable (falling back to 24).
+        #[arg(long, value_name = "HOURS")]
+        grace_hours: Option<u64>,
     },
 }
 
@@ -161,6 +189,22 @@ async fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Unprotect { target, branch } => {
             run_branch(&target, &branch, BranchAction::Unprotect).await
+        }
+        Command::Gc {
+            target,
+            mark_only,
+            sweep_only,
+            force,
+            grace_hours,
+        } => {
+            let (store, prefix) = open_target(&target).await?;
+            let opts = GcOpts {
+                mark_only,
+                sweep_only,
+                force,
+                grace_hours: grace_hours.unwrap_or_else(packchain_gc::grace_hours_from_env),
+            };
+            Ok(Gc::new(store, prefix, opts).run().await?)
         }
     }
 }

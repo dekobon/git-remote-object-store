@@ -14,6 +14,7 @@
 
 pub mod branch;
 pub mod doctor;
+pub mod gc;
 pub mod snapshot;
 
 use std::io;
