@@ -483,7 +483,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_tombstone_is_skipped_with_warning() {
+    async fn corrupt_tombstone_is_skipped() {
         let store = MockStore::new();
         store.insert(
             "repo/gc/tombstones-bad-2025-01-01T00:00:00Z.json",
