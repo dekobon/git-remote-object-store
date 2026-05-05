@@ -467,18 +467,16 @@ fn format_bytes(bytes: u64) -> String {
     const KIB: u64 = 1_024;
     const MIB: u64 = 1_024 * KIB;
     const GIB: u64 = 1_024 * MIB;
+    // f64 precision loss is acceptable here: the result is rendered
+    // to one decimal place for human consumption only.
+    #[allow(clippy::cast_precision_loss)]
+    let scaled = |unit: u64| bytes as f64 / unit as f64;
     if bytes >= GIB {
-        #[allow(clippy::cast_precision_loss)]
-        let g = bytes as f64 / GIB as f64;
-        format!("{g:.1} GiB")
+        format!("{:.1} GiB", scaled(GIB))
     } else if bytes >= MIB {
-        #[allow(clippy::cast_precision_loss)]
-        let m = bytes as f64 / MIB as f64;
-        format!("{m:.1} MiB")
+        format!("{:.1} MiB", scaled(MIB))
     } else if bytes >= KIB {
-        #[allow(clippy::cast_precision_loss)]
-        let k = bytes as f64 / KIB as f64;
-        format!("{k:.1} KiB")
+        format!("{:.1} KiB", scaled(KIB))
     } else {
         format!("{bytes} B")
     }
