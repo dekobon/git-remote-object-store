@@ -16,6 +16,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tracing::warn;
 
+use crate::git::RefName;
 use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore};
 
@@ -234,7 +235,33 @@ async fn load_chains(
             warn!(key = %meta.key, "audit: chain.json key has unexpected shape; skipping");
             continue;
         };
-        let body = store.get_bytes(&meta.key).await?;
+        // Mirror `list_refs`'s defense-in-depth: a maliciously-planted
+        // key like `<prefix>/refs/heads/../etc/passwd/chain.json`
+        // would otherwise render its derived path verbatim into
+        // doctor's stdout.
+        if RefName::new(&ref_path).is_err() {
+            warn!(
+                key = %meta.key,
+                ref_path = %ref_path,
+                "audit: derived ref path is not a valid ref name; skipping",
+            );
+            continue;
+        }
+        // Per-entry transport failures warn-and-skip rather than
+        // aborting: doctor is a read-only diagnostic surface and a
+        // single transient 503 on one branch should not blackhole the
+        // rest of the report.
+        let body = match store.get_bytes(&meta.key).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    key = %meta.key,
+                    error = %e,
+                    "audit: chain.json fetch failed; skipping ref",
+                );
+                continue;
+            }
+        };
         match ChainManifest::from_json_bytes(&body) {
             Ok(chain) => out.push((ref_path, chain)),
             Err(e) => warn!(
@@ -286,7 +313,18 @@ async fn load_tombstones(
         if !is_tombstone_key(&meta.key, prefix) {
             continue;
         }
-        let body = store.get_bytes(&meta.key).await?;
+        // Per-entry transport failures warn-and-skip; see `load_chains`.
+        let body = match store.get_bytes(&meta.key).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    key = %meta.key,
+                    error = %e,
+                    "audit: tombstone fetch failed; skipping",
+                );
+                continue;
+            }
+        };
         let tombstone = match Tombstone::from_json_bytes(&body) {
             Ok(t) => t,
             Err(e) => {
@@ -312,9 +350,10 @@ async fn load_tombstones(
     Ok(out)
 }
 
-/// Mirror of `gc::is_tombstone_key`. Inlined here so audit doesn't
-/// depend on a `gc`-private helper; both reduce to the same prefix
-/// check (`<prefix>/gc/tombstones-`).
+/// Stricter sibling of `gc::is_tombstone_key`: requires the
+/// `<prefix>/gc/tombstones-` prefix AND a `.json` suffix. The gc
+/// caller separately filters on `.json` before invoking the prefix
+/// check, so the two callers reach the same effective acceptance set.
 fn is_tombstone_key(key: &str, prefix: &str) -> bool {
     let expected = keys::join(prefix, "gc/tombstones-");
     key.starts_with(&expected) && key.as_bytes().ends_with(b".json")
@@ -569,6 +608,66 @@ mod tests {
         let report = audit(&store, "repo").await.unwrap();
         let row = &report.branches[0];
         assert!(row.recommend_compact);
+    }
+
+    #[tokio::test]
+    async fn branch_at_byte_boundary_is_not_recommended() {
+        // Mirror of the segments boundary test: exactly the byte
+        // threshold must NOT recommend; recommendation fires only on
+        // strictly greater. Catches a regression that swapped `>` for
+        // `>=` on the bytes clause.
+        let store = MockStore::new();
+        write_chain_segment(
+            &store,
+            "repo",
+            "refs/heads/main",
+            SHA_TIP,
+            SHA_TIP,
+            vec![(
+                format!("packs/{SHA_PACK_LIVE}.pack"),
+                COMPACT_BYTES_THRESHOLD,
+                SHA_TIP,
+                None,
+            )],
+        )
+        .await;
+        let report = audit(&store, "repo").await.unwrap();
+        let row = &report.branches[0];
+        assert_eq!(row.bytes_total, COMPACT_BYTES_THRESHOLD);
+        assert!(!row.recommend_compact);
+    }
+
+    #[tokio::test]
+    async fn audit_skips_chain_json_with_path_traversal_in_ref_name() {
+        // Defense-in-depth (mirrors `list::list_refs`): a maliciously-
+        // planted key like `<prefix>/refs/heads/../etc/passwd/chain.json`
+        // would otherwise yield ref path `refs/heads/../etc/passwd` and
+        // emit it verbatim into the doctor's stdout.
+        let store = MockStore::new();
+        write_chain_segment(
+            &store,
+            "repo",
+            "refs/heads/main",
+            SHA_TIP,
+            SHA_TIP,
+            vec![(format!("packs/{SHA_PACK_LIVE}.pack"), 1, SHA_TIP, None)],
+        )
+        .await;
+        write_pack(&store, "repo", SHA_PACK_LIVE, b"x");
+        store.insert(
+            "repo/refs/heads/../etc/passwd/chain.json",
+            Bytes::from(
+                format!(r#"{{"v":1,"tip":"{SHA_TIP}","full_at":"{SHA_TIP}","segments":[]}}"#)
+                    .into_bytes(),
+            ),
+        );
+        let report = audit(&store, "repo").await.unwrap();
+        assert_eq!(report.branches.len(), 1);
+        assert_eq!(report.branches[0].ref_path, "refs/heads/main");
+        assert!(
+            !report.branches.iter().any(|r| r.ref_path.contains("..")),
+            "no entry with `..` in ref_path may reach the report",
+        );
     }
 
     #[tokio::test]

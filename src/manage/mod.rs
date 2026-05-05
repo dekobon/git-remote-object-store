@@ -75,6 +75,13 @@ pub enum ManageError {
     /// error keeps the helper from aborting the process.
     #[error("internal management error: {0}")]
     Internal(String),
+
+    /// Packchain engine surface error. Surfaced by the `doctor`'s
+    /// engine-aware audit path. Carries the typed source so the
+    /// `main`-level downcast can recognise transport failures and
+    /// emit the upstream-compatible `fatal:` line.
+    #[error(transparent)]
+    Packchain(#[from] crate::packchain::PackchainError),
 }
 
 /// Interactive UI surface used by [`doctor`] and [`branch`].

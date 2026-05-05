@@ -122,9 +122,7 @@ impl<'a> Doctor<'a> {
         // the fixers below to keep the report ordering stable
         // regardless of what fixers do later.
         if matches!(self.opts.engine, StorageEngine::Packchain) {
-            let report = audit::audit(&*self.store, &self.prefix)
-                .await
-                .map_err(|e| ManageError::Internal(format!("packchain audit failed: {e}")))?;
+            let report = audit::audit(&*self.store, &self.prefix).await?;
             print!("{}", render_packchain_section(&report));
         }
 
@@ -951,6 +949,30 @@ mod tests {
         assert!(rendered.contains("Tombstones (pending sweep): none"));
         assert!(rendered.contains("Branches needing compaction: none"));
         assert!(rendered.contains("ERRORS: none"));
+    }
+
+    #[test]
+    fn format_bytes_unit_boundaries() {
+        assert_eq!(super::format_bytes(0), "0 B");
+        assert_eq!(super::format_bytes(1023), "1023 B");
+        assert_eq!(super::format_bytes(1024), "1.0 KiB");
+        assert_eq!(super::format_bytes(1024 * 1024 - 1), "1024.0 KiB");
+        assert_eq!(super::format_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(super::format_bytes(1024 * 1024 * 1024), "1.0 GiB");
+    }
+
+    #[test]
+    fn format_age_handles_clock_skew_and_rollover() {
+        // Negative (future timestamp / clock skew) renders as "<1h".
+        assert_eq!(super::format_age(-1), "<1h");
+        // Zero hours likewise.
+        assert_eq!(super::format_age(0), "<1h");
+        // Just under the day rollover stays in hours.
+        assert_eq!(super::format_age(1), "1h ago");
+        assert_eq!(super::format_age(47), "47h ago");
+        // Day rollover (>= 48h reports days).
+        assert_eq!(super::format_age(48), "2d ago");
+        assert_eq!(super::format_age(72), "3d ago");
     }
 
     #[test]
