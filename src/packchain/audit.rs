@@ -114,24 +114,35 @@ pub(crate) struct DanglingRow {
     pub(crate) missing_pack_key: String,
 }
 
-/// Walk the bucket once and produce an [`AuditReport`].
+/// Walk the supplied object listing and produce an [`AuditReport`].
 ///
-/// Performs three list calls (one each for `<prefix>/refs/heads/`,
-/// `<prefix>/packs/`, and `<prefix>/gc/`) plus one `get_bytes` per
-/// chain.json and per tombstone. Per-entry parse failures are logged
-/// at `warn` and the entry is skipped rather than aborting the audit
-/// — `doctor` is read-only and a corrupt artefact on one branch
+/// `objects` must be a listing that covers everything under
+/// `<prefix>/` — typically the same bucket-wide list the doctor
+/// already performs for snapshot analysis. Audit filters this
+/// listing for the three subsets it cares about (chain.json,
+/// `packs/*.pack`, tombstones) so a single network list serves
+/// both the bundle-shape report and the packchain audit.
+///
+/// `store` is used only for `get_bytes` calls on chain.json and
+/// tombstone bodies. Per-entry parse failures are logged at `warn`
+/// and the entry is skipped rather than aborting the audit —
+/// `doctor` is read-only and a corrupt artefact on one branch
 /// shouldn't blackhole the rest of the report.
 ///
 /// # Errors
 ///
-/// Returns [`PackchainError::Store`] for transport failures on any
-/// list or get call. JSON-parse failures on per-entry artefacts do
-/// not surface as errors — they are logged and the entry is skipped.
-pub async fn audit(store: &dyn ObjectStore, prefix: &str) -> Result<AuditReport, PackchainError> {
-    let chains = load_chains(store, prefix).await?;
-    let pack_metas = list_pack_metas(store, prefix).await?;
-    let tombstones = load_tombstones(store, prefix).await?;
+/// Returns [`PackchainError::Store`] only for fatal transport
+/// errors during artefact body fetches that survive the per-entry
+/// warn-and-skip filter (currently none — every body fetch warns
+/// and skips on its own).
+pub(crate) async fn audit(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    objects: &[ObjectMeta],
+) -> Result<AuditReport, PackchainError> {
+    let chains = load_chains(store, prefix, objects).await?;
+    let pack_metas = pack_metas_from_objects(prefix, objects);
+    let tombstones = load_tombstones(store, prefix, objects).await?;
 
     let referenced: HashSet<Sha40> = chains
         .iter()
@@ -209,21 +220,16 @@ fn pack_present(pack_field: &str, pack_metas: &HashMap<Sha40, ObjectMeta>) -> bo
     parse_pack_key_sha(pack_field).is_some_and(|sha| pack_metas.contains_key(&sha))
 }
 
-/// List `<prefix>/refs/heads/`, fetch every chain.json, and parse.
-/// Per-entry parse failures warn and skip; transport failures on the
-/// initial list call abort.
+/// Filter the supplied listing for chain.json keys, fetch each
+/// body, parse, and return per-branch chain manifests. Per-entry
+/// parse failures warn and skip.
 async fn load_chains(
     store: &dyn ObjectStore,
     prefix: &str,
+    objects: &[ObjectMeta],
 ) -> Result<Vec<(String, ChainManifest)>, PackchainError> {
-    let refs_prefix = keys::join(prefix, "refs/heads/");
-    let metas = store.list(&refs_prefix).await?;
-
     let mut out: Vec<(String, ChainManifest)> = Vec::new();
-    for meta in metas {
-        if !is_chain_json_key(&meta.key) {
-            continue;
-        }
+    for meta in objects.iter().filter(|m| is_chain_json_key(&m.key)) {
         let Some(ref_path) =
             ref_path_from_chain_key(super::keys::optional_prefix(prefix), &meta.key)
         else {
@@ -269,18 +275,17 @@ async fn load_chains(
     Ok(out)
 }
 
-/// List `<prefix>/packs/` and pair each `.pack` key with its parsed
-/// content sha. Sibling `.idx` files and any malformed names are
-/// dropped silently. Returns a [`HashMap`] for cheap orphan-set
-/// derivation downstream.
-async fn list_pack_metas(
-    store: &dyn ObjectStore,
-    prefix: &str,
-) -> Result<HashMap<Sha40, ObjectMeta>, PackchainError> {
+/// Filter the supplied listing for `<prefix>/packs/<sha>.pack` keys
+/// and pair each with its parsed content sha. Sibling `.idx` files
+/// and malformed names are dropped silently. Returns a [`HashMap`]
+/// for cheap orphan-set derivation downstream.
+fn pack_metas_from_objects(prefix: &str, objects: &[ObjectMeta]) -> HashMap<Sha40, ObjectMeta> {
     let packs_prefix = keys::join(prefix, "packs/");
-    let metas = store.list(&packs_prefix).await?;
     let mut out: HashMap<Sha40, ObjectMeta> = HashMap::new();
-    for meta in metas {
+    for meta in objects {
+        if !meta.key.starts_with(&packs_prefix) {
+            continue;
+        }
         // `rsplit('/').next()` always yields one element for any
         // non-empty input — and `meta.key` cannot be empty in a
         // packs/ listing — so the `expect` documents the invariant
@@ -296,23 +301,22 @@ async fn list_pack_metas(
         let Ok(sha) = Sha40::try_new(sha_str) else {
             continue;
         };
-        out.insert(sha, meta);
+        out.insert(sha, meta.clone());
     }
-    Ok(out)
+    out
 }
 
-/// List `<prefix>/gc/` and parse every tombstone JSON. Per-entry parse
-/// failures warn-and-skip. Returns the tombstones sorted oldest-first
-/// so the doctor's report is easy to read.
+/// Filter the supplied listing for tombstone keys, fetch and parse
+/// each body, and return rows sorted oldest-first. Per-entry parse
+/// or transport failures warn-and-skip.
 async fn load_tombstones(
     store: &dyn ObjectStore,
     prefix: &str,
+    objects: &[ObjectMeta],
 ) -> Result<Vec<TombstoneRow>, PackchainError> {
-    let gc_prefix = keys::join(prefix, "gc/");
-    let metas = store.list(&gc_prefix).await?;
     let now = OffsetDateTime::now_utc();
     let mut out: Vec<TombstoneRow> = Vec::new();
-    for meta in metas {
+    for meta in objects {
         if !is_tombstone_key(&meta.key, prefix) {
             continue;
         }
@@ -417,10 +421,19 @@ mod tests {
         write_chain(store, Some(prefix), &rn, &chain).await.unwrap();
     }
 
+    /// List the bucket-wide object set for a test prefix and run
+    /// `audit` against it. Mirrors the doctor's "list once, audit
+    /// from listing" flow so tests exercise the same code path.
+    async fn audit_test(store: &MockStore, prefix: &str) -> AuditReport {
+        let list_prefix = crate::keys::join(prefix, "");
+        let objects = store.list(&list_prefix).await.unwrap();
+        audit(store, prefix, &objects).await.unwrap()
+    }
+
     #[tokio::test]
     async fn empty_bucket_returns_empty_report() {
         let store = MockStore::new();
-        let report = audit(&store, "repo").await.unwrap();
+        let report = audit_test(&store, "repo").await;
         assert_eq!(report.orphans.pack_count, 0);
         assert_eq!(report.orphans.bytes, 0);
         assert!(report.tombstones.is_empty());
@@ -445,7 +458,7 @@ mod tests {
         )
         .await;
 
-        let report = audit(&store, "repo").await.unwrap();
+        let report = audit_test(&store, "repo").await;
         assert_eq!(report.orphans.pack_count, 1);
         // Body length is 24; idx file is excluded.
         assert_eq!(
@@ -470,7 +483,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = audit(&store, "repo").await.unwrap();
+        let report = audit_test(&store, "repo").await;
         assert_eq!(report.tombstones.len(), 1);
         let row = &report.tombstones[0];
         assert_eq!(row.run_id, "abc-1");
@@ -489,7 +502,7 @@ mod tests {
             "repo/gc/tombstones-bad-2025-01-01T00:00:00Z.json",
             Bytes::from_static(b"{not-json"),
         );
-        let report = audit(&store, "repo").await.unwrap();
+        let report = audit_test(&store, "repo").await;
         assert!(report.tombstones.is_empty());
     }
 
@@ -522,7 +535,7 @@ mod tests {
         .await;
         write_pack(&store, "repo", SHA_PACK_LIVE_2, b"y");
 
-        let report = audit(&store, "repo").await.unwrap();
+        let report = audit_test(&store, "repo").await;
         assert_eq!(report.branches.len(), 1);
         let row = &report.branches[0];
         assert_eq!(row.ref_path, "refs/heads/main");
@@ -545,7 +558,7 @@ mod tests {
             })
             .collect();
         write_chain_segment(&store, "repo", "refs/heads/main", SHA_TIP, SHA_TIP, segs).await;
-        let report = audit(&store, "repo").await.unwrap();
+        let report = audit_test(&store, "repo").await;
         let row = report
             .branches
             .iter()
@@ -565,7 +578,7 @@ mod tests {
             })
             .collect();
         write_chain_segment(&store, "repo", "refs/heads/main", SHA_TIP, SHA_TIP, segs).await;
-        let report = audit(&store, "repo").await.unwrap();
+        let report = audit_test(&store, "repo").await;
         let row = report
             .branches
             .iter()
@@ -592,7 +605,7 @@ mod tests {
             )],
         )
         .await;
-        let report = audit(&store, "repo").await.unwrap();
+        let report = audit_test(&store, "repo").await;
         let row = &report.branches[0];
         assert!(row.recommend_compact);
     }
@@ -618,10 +631,49 @@ mod tests {
             )],
         )
         .await;
-        let report = audit(&store, "repo").await.unwrap();
+        let report = audit_test(&store, "repo").await;
         let row = &report.branches[0];
         assert_eq!(row.bytes_total, COMPACT_BYTES_THRESHOLD);
         assert!(!row.recommend_compact);
+    }
+
+    #[tokio::test]
+    async fn branch_with_full_at_missing_from_segments_is_flagged() {
+        // A corrupted manifest whose `full_at` doesn't match any
+        // segment's `sha`. The audit still computes totals but flags
+        // `has_full_at_segment = false` so the doctor surfaces an
+        // ERROR row.
+        let store = MockStore::new();
+        // tip + full_at differ; segments contain only a segment whose
+        // sha matches `tip`, NOT `full_at`. This is the canary the
+        // doctor's ERRORS section watches for.
+        let chain = ChainManifest {
+            v: 1,
+            tip: sha40(SHA_TIP),
+            full_at: sha40(SHA_FULL),
+            segments: vec![ChainSegment {
+                sha: sha40(SHA_TIP),
+                parent_sha: None,
+                pack: format!("packs/{SHA_PACK_LIVE}.pack"),
+                bytes: 1,
+            }],
+        };
+        let rn = crate::git::RefName::new("refs/heads/main").unwrap();
+        write_chain(&store, Some("repo"), &rn, &chain)
+            .await
+            .unwrap();
+        write_pack(&store, "repo", SHA_PACK_LIVE, b"x");
+
+        let report = audit_test(&store, "repo").await;
+        let row = report
+            .branches
+            .iter()
+            .find(|r| r.ref_path == "refs/heads/main")
+            .expect("branch present");
+        assert!(
+            !row.has_full_at_segment,
+            "full_at not in segments must flag the branch row",
+        );
     }
 
     #[tokio::test]
@@ -648,7 +700,7 @@ mod tests {
                     .into_bytes(),
             ),
         );
-        let report = audit(&store, "repo").await.unwrap();
+        let report = audit_test(&store, "repo").await;
         assert_eq!(report.branches.len(), 1);
         assert_eq!(report.branches[0].ref_path, "refs/heads/main");
         assert!(
@@ -675,7 +727,7 @@ mod tests {
             )],
         )
         .await;
-        let report = audit(&store, "repo").await.unwrap();
+        let report = audit_test(&store, "repo").await;
         assert_eq!(report.dangling.len(), 1);
         let row = &report.dangling[0];
         assert_eq!(row.ref_path, "refs/heads/main");
@@ -701,7 +753,7 @@ mod tests {
         .await;
         write_pack(&store, "repo", SHA_PACK_LIVE, b"x");
 
-        let report = audit(&store, "repo").await.unwrap();
+        let report = audit_test(&store, "repo").await;
         assert_eq!(report.branches.len(), 1, "broken chain must skip");
         assert_eq!(report.branches[0].ref_path, "refs/heads/main");
     }
@@ -728,7 +780,7 @@ mod tests {
             Bytes::from_static(b"x"),
         );
 
-        let report = audit(&store, "").await.unwrap();
+        let report = audit_test(&store, "").await;
         assert_eq!(report.branches.len(), 1);
         assert_eq!(report.branches[0].ref_path, "refs/heads/main");
         assert_eq!(report.dangling.len(), 0);

@@ -108,10 +108,10 @@ impl<'a> Doctor<'a> {
     /// index, [`ManageError::Cancelled`] if the user cancels an interactive
     /// prompt, or [`ManageError::Io`] for prompt I/O failures.
     pub async fn run(&self) -> Result<(), ManageError> {
-        // Share one LIST between snapshot analysis and stale-lock
-        // scanning so a doctor run is a single bucket walk regardless
-        // of repo size. Empty `prefix` (root-of-bucket repo) collapses
-        // to a bucket-wide list.
+        // Share one LIST between snapshot analysis, the packchain
+        // audit, and stale-lock scanning so a doctor run is a single
+        // bucket walk regardless of repo size. Empty `prefix`
+        // (root-of-bucket repo) collapses to a bucket-wide list.
         let list_prefix = keys::join(&self.prefix, "");
         let objects = self.store.list(&list_prefix).await?;
         let mut snapshot = analyze_objects(&objects, &list_prefix, &self.store).await?;
@@ -121,9 +121,8 @@ impl<'a> Doctor<'a> {
         // read-only — no bucket mutations — so it runs before any of
         // the fixers below to keep the report ordering stable
         // regardless of what fixers do later.
-        if matches!(self.opts.engine, StorageEngine::Packchain) {
-            let report = audit::audit(&*self.store, &self.prefix).await?;
-            print!("{}", render_packchain_section(&report));
+        if let Some(section) = self.maybe_render_packchain_section(&objects).await? {
+            print!("{section}");
         }
 
         // Fix duplicates ref-by-ref. We need owned ref-names because
@@ -144,6 +143,28 @@ impl<'a> Doctor<'a> {
 
         self.list_and_handle_stale_locks(&objects).await?;
         Ok(())
+    }
+
+    /// Run the packchain audit and render its section, but only when
+    /// the configured engine is [`StorageEngine::Packchain`]. Returns
+    /// `Ok(None)` for bundle remotes (cheap — no I/O).
+    ///
+    /// Exposed at `pub(crate)` so the tests can pin the engine gate
+    /// without going through `run`'s `print!` side effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManageError::Packchain`] for engine-level failures
+    /// during the audit.
+    pub(crate) async fn maybe_render_packchain_section(
+        &self,
+        objects: &[ObjectMeta],
+    ) -> Result<Option<String>, ManageError> {
+        if !matches!(self.opts.engine, StorageEngine::Packchain) {
+            return Ok(None);
+        }
+        let report = audit::audit(&*self.store, &self.prefix, objects).await?;
+        Ok(Some(render_packchain_section(&report)))
     }
 
     /// Render the snapshot to a human-readable report. Returns the
@@ -858,13 +879,12 @@ mod tests {
         assert_eq!(mock.keys(), initial_keys);
     }
 
-    #[tokio::test]
-    async fn packchain_engine_renders_section_with_orphan_and_tombstone() {
-        // Build a packchain shape: one chain.json + one orphan pack +
-        // one tombstone. Verify the rendered section against the
-        // audit output directly — this catches a regression where
-        // either `audit` mis-classifies the packs / tombstones OR
-        // `render_packchain_section` drops them on the floor.
+    /// Build a small packchain-shape mock used by the engine-gate
+    /// tests below: chain.json + live pack + orphan pack + tombstone.
+    /// Returns the bucket-wide listing the doctor would compute, so
+    /// tests can drive `maybe_render_packchain_section` with the
+    /// same `objects` slice the production code receives.
+    async fn packchain_mock_with_listing() -> (MockStore, Vec<ObjectMeta>) {
         let mock = MockStore::new();
         mock.insert(
             "repo/refs/heads/main/chain.json",
@@ -889,32 +909,58 @@ mod tests {
         let tombstone_key = format!("repo/gc/tombstones-abc-1-{marked_at}.json");
         mock.insert(tombstone_key, Bytes::from(tombstone_body));
 
-        let store: Arc<dyn ObjectStore> = Arc::new(mock);
-        let report = super::audit::audit(&*store, "repo")
-            .await
-            .expect("audit succeeds");
-        let rendered = super::render_packchain_section(&report);
+        let objects = mock.list("repo/").await.expect("list");
+        (mock, objects)
+    }
 
-        // Pin the actual content of the rendered section: header,
-        // orphan count + bytes, the tombstone's run id + orphan
-        // count. A regression in either audit OR render breaks
-        // these.
+    #[tokio::test]
+    async fn packchain_engine_renders_section_with_orphan_and_tombstone() {
+        // Mutation-tested: stubbing `render_packchain_section` to
+        // return an empty string makes this test fail.
+        let (mock, objects) = packchain_mock_with_listing().await;
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(
+            store_arc(&mock),
+            "repo",
+            DoctorOpts {
+                engine: StorageEngine::Packchain,
+                ..DoctorOpts::default()
+            },
+            &prompter,
+        );
+        let rendered = doctor
+            .maybe_render_packchain_section(&objects)
+            .await
+            .expect("packchain audit succeeds")
+            .expect("packchain engine produces a section");
+
+        // Pin actual content. A regression in either audit
+        // classification OR renderer fails one of these.
         assert!(rendered.contains("=== Packchain ==="), "{rendered}");
         assert!(rendered.contains("Orphans: 1 pack(s)"), "{rendered}");
-        // The orphan body is 21 bytes — assert the bytes-formatted line.
         assert!(rendered.contains("21 B"), "{rendered}");
         assert!(rendered.contains("run id abc-1"), "{rendered}");
         assert!(rendered.contains("1 pack(s)"), "{rendered}");
     }
 
-    // NOTE: There is no unit test that pins `Doctor::run`'s engine
-    // gate directly — the gate guards a `print!` call, and the
-    // current Doctor doesn't expose a writer parameter for tests to
-    // capture. The existing `render_packchain_section_*` tests pin
-    // the renderer's behaviour, and `packchain_engine_renders_section_with_orphan_and_tombstone`
-    // pins the audit-then-render integration. Refactoring `run` to
-    // take a writer would close that gap; deliberately out of scope
-    // here.
+    #[tokio::test]
+    async fn bundle_engine_returns_no_packchain_section() {
+        // Mutation-tested: inverting `maybe_render_packchain_section`'s
+        // engine gate (`Packchain` → `Bundle`) makes this test fail.
+        // The same packchain-shape bucket that fills `packchain_engine_renders_section_with_orphan_and_tombstone`
+        // produces None here because the engine is Bundle.
+        let (mock, objects) = packchain_mock_with_listing().await;
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "repo", DoctorOpts::default(), &prompter);
+        let rendered = doctor
+            .maybe_render_packchain_section(&objects)
+            .await
+            .expect("audit gate skips cleanly under bundle");
+        assert!(
+            rendered.is_none(),
+            "bundle engine must not render a packchain section, got: {rendered:?}",
+        );
+    }
 
     #[test]
     fn render_packchain_section_lists_dangling_references_as_errors() {
