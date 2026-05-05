@@ -31,7 +31,7 @@ use git_remote_object_store::manage::{
 use git_remote_object_store::object_store::ObjectStore;
 use git_remote_object_store::packchain::gc as packchain_gc;
 use git_remote_object_store::protocol::backend::{self, BackendError};
-use git_remote_object_store::url::{self as remote_url, RemoteUrl};
+use git_remote_object_store::url::{self as remote_url, RemoteUrl, StorageEngine};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -246,11 +246,7 @@ async fn open_target(target: &Target) -> Result<(Arc<dyn ObjectStore>, String)> 
 /// or packchain-shaped (e.g. `doctor`'s engine-aware report).
 async fn open_target_with_engine(
     target: &Target,
-) -> Result<(
-    Arc<dyn ObjectStore>,
-    String,
-    git_remote_object_store::url::StorageEngine,
-)> {
+) -> Result<(Arc<dyn ObjectStore>, String, StorageEngine)> {
     let url = resolve_remote(&target.remote)?;
     let prefix = url.prefix().unwrap_or_default().to_owned();
     let (store, engine) = backend::build(&url).await?;
