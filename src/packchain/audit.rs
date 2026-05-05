@@ -22,33 +22,33 @@ use crate::object_store::{ObjectMeta, ObjectStore};
 
 use super::PackchainError;
 use super::gc::Tombstone;
-use super::keys::{is_chain_json_key, parse_pack_key_sha};
+use super::keys::{is_chain_json_key, parse_pack_key_sha, ref_path_from_chain_key};
 use super::schema::{ChainManifest, Sha40};
 
 /// Segment-count threshold above which a branch is flagged as a
 /// compaction candidate. Mirrors the heuristic specified in #67 / #68.
-pub const COMPACT_SEGMENTS_THRESHOLD: usize = 20;
+pub(crate) const COMPACT_SEGMENTS_THRESHOLD: usize = 20;
 
 /// Bytes-since-`full_at` threshold above which a branch is flagged as
 /// a compaction candidate. Default: 100 MiB.
-pub const COMPACT_BYTES_THRESHOLD: u64 = 100 * 1_024 * 1_024;
+pub(crate) const COMPACT_BYTES_THRESHOLD: u64 = 100 * 1_024 * 1_024;
 
 /// Aggregate output of [`audit`]. Each field is independently reportable
 /// — an empty `Vec` (or zero count) means "nothing to report" rather
 /// than "audit failed".
 #[derive(Debug, Clone, Default)]
-pub struct AuditReport {
+pub(crate) struct AuditReport {
     /// Pack files in `<prefix>/packs/` that no live chain.json
     /// references.
-    pub orphans: OrphanReport,
+    pub(crate) orphans: OrphanReport,
     /// Tombstones currently sitting in `<prefix>/gc/`, sorted oldest
     /// first.
-    pub tombstones: Vec<TombstoneRow>,
+    pub(crate) tombstones: Vec<TombstoneRow>,
     /// Per-branch row, sorted by ref path.
-    pub branches: Vec<BranchAuditRow>,
+    pub(crate) branches: Vec<BranchAuditRow>,
     /// chain.json segment-pack references that point at pack keys
     /// missing from the bucket. Sorted by ref path.
-    pub dangling: Vec<DanglingRow>,
+    pub(crate) dangling: Vec<DanglingRow>,
 }
 
 /// Orphan-pack summary. `pack_count` counts unique content-shas;
@@ -56,27 +56,25 @@ pub struct AuditReport {
 /// (the matching `.idx` is excluded so the total reflects
 /// recoverable storage rather than raw key count).
 #[derive(Debug, Clone, Copy, Default)]
-pub struct OrphanReport {
+pub(crate) struct OrphanReport {
     /// Number of distinct orphan content-shas.
-    pub pack_count: usize,
+    pub(crate) pack_count: usize,
     /// Total bytes occupied by orphan `.pack` files.
-    pub bytes: u64,
+    pub(crate) bytes: u64,
 }
 
 /// One pending tombstone awaiting sweep.
 #[derive(Debug, Clone)]
-pub struct TombstoneRow {
-    /// Bucket key of the tombstone JSON file.
-    pub key: String,
+pub(crate) struct TombstoneRow {
     /// `UUIDv4` run id from the tombstone body.
-    pub run_id: String,
+    pub(crate) run_id: String,
     /// RFC 3339 timestamp from the tombstone body.
-    pub marked_at: String,
+    pub(crate) marked_at: String,
     /// Whole hours since `marked_at` (negative when the tombstone's
     /// timestamp is in the future, e.g. operator clock skew).
-    pub age_hours: i64,
+    pub(crate) age_hours: i64,
     /// Number of orphan packs the tombstone names.
-    pub orphan_count: usize,
+    pub(crate) orphan_count: usize,
 }
 
 /// Per-branch chain summary used to recommend (or not) a compact run.
@@ -88,19 +86,20 @@ pub struct TombstoneRow {
 /// distinction only matters in a corrupted chain whose `full_at` does
 /// not match any segment's `sha`.
 #[derive(Debug, Clone)]
-pub struct BranchAuditRow {
+pub(crate) struct BranchAuditRow {
     /// Full ref path (e.g. `refs/heads/main`).
-    pub ref_path: String,
+    pub(crate) ref_path: String,
     /// `chain.segments.len()`.
-    pub segments_total: usize,
+    pub(crate) segments_total: usize,
     /// Sum of `segment.bytes` over `chain.segments`.
-    pub bytes_total: u64,
+    pub(crate) bytes_total: u64,
     /// `true` when either threshold is exceeded.
-    pub recommend_compact: bool,
-    /// `true` when `chain.full_at` is not present as a segment's
-    /// `sha`. A corrupted manifest is reported but does not change
-    /// the totals above.
-    pub full_at_missing_from_segments: bool,
+    pub(crate) recommend_compact: bool,
+    /// `true` when `chain.full_at` is present as a segment's `sha`
+    /// (the healthy state). `false` flags a corrupted manifest; the
+    /// totals above are still computed but the doctor surfaces an
+    /// ERROR row.
+    pub(crate) has_full_at_segment: bool,
 }
 
 /// One chain.json segment that points at a pack key missing from the
@@ -108,11 +107,11 @@ pub struct BranchAuditRow {
 /// without a chain reference; a dangling reference is a chain
 /// pointing at a pack that has been deleted.
 #[derive(Debug, Clone)]
-pub struct DanglingRow {
+pub(crate) struct DanglingRow {
     /// Ref whose chain.json references the missing pack.
-    pub ref_path: String,
+    pub(crate) ref_path: String,
     /// Pack key the chain.json segment names.
-    pub missing_pack_key: String,
+    pub(crate) missing_pack_key: String,
 }
 
 /// Walk the bucket once and produce an [`AuditReport`].
@@ -149,8 +148,6 @@ pub async fn audit(store: &dyn ObjectStore, prefix: &str) -> Result<AuditReport,
             acc
         });
 
-    let pack_keys: HashSet<&str> = pack_metas.values().map(|meta| meta.key.as_str()).collect();
-
     let mut branches: Vec<BranchAuditRow> = chains
         .iter()
         .map(|(ref_path, chain)| audit_branch(ref_path, chain))
@@ -163,7 +160,7 @@ pub async fn audit(store: &dyn ObjectStore, prefix: &str) -> Result<AuditReport,
             chain
                 .segments
                 .iter()
-                .filter(|s| !pack_present(prefix, &s.pack, &pack_keys))
+                .filter(|s| !pack_present(&s.pack, &pack_metas))
                 .map(move |s| DanglingRow {
                     ref_path: ref_path.clone(),
                     missing_pack_key: s.pack.clone(),
@@ -194,26 +191,22 @@ fn audit_branch(ref_path: &str, chain: &ChainManifest) -> BranchAuditRow {
         .fold(0u64, u64::saturating_add);
     let recommend_compact =
         segments_total > COMPACT_SEGMENTS_THRESHOLD || bytes_total > COMPACT_BYTES_THRESHOLD;
-    let full_at_missing_from_segments = !chain.segments.iter().any(|s| s.sha == chain.full_at);
+    let has_full_at_segment = chain.segments.iter().any(|s| s.sha == chain.full_at);
     BranchAuditRow {
         ref_path: ref_path.to_owned(),
         segments_total,
         bytes_total,
         recommend_compact,
-        full_at_missing_from_segments,
+        has_full_at_segment,
     }
 }
 
-/// Resolve a chain segment's `pack` field to an absolute key and check
-/// presence against the listed pack keys. The schema stores the pack
-/// field with or without the bucket prefix; collapse to the shape the
-/// listing returns by re-deriving the canonical absolute key.
-fn pack_present(prefix: &str, pack_field: &str, pack_keys: &HashSet<&str>) -> bool {
-    let Some(sha) = parse_pack_key_sha(pack_field) else {
-        return false;
-    };
-    let key = super::keys::pack_key(super::keys::optional_prefix(prefix), &sha);
-    pack_keys.contains(key.as_str())
+/// Resolve a chain segment's `pack` field to its content sha and
+/// check presence against the on-bucket pack set. Membership is
+/// keyed by the parsed [`Sha40`], not by the full bucket key, so
+/// each segment lookup is a single hash probe with no allocation.
+fn pack_present(pack_field: &str, pack_metas: &HashMap<Sha40, ObjectMeta>) -> bool {
+    parse_pack_key_sha(pack_field).is_some_and(|sha| pack_metas.contains_key(&sha))
 }
 
 /// List `<prefix>/refs/heads/`, fetch every chain.json, and parse.
@@ -231,7 +224,9 @@ async fn load_chains(
         if !is_chain_json_key(&meta.key) {
             continue;
         }
-        let Some(ref_path) = ref_path_from_chain_key(prefix, &meta.key) else {
+        let Some(ref_path) =
+            ref_path_from_chain_key(super::keys::optional_prefix(prefix), &meta.key)
+        else {
             warn!(key = %meta.key, "audit: chain.json key has unexpected shape; skipping");
             continue;
         };
@@ -286,7 +281,15 @@ async fn list_pack_metas(
     let metas = store.list(&packs_prefix).await?;
     let mut out: HashMap<Sha40, ObjectMeta> = HashMap::new();
     for meta in metas {
-        let basename = meta.key.rsplit('/').next().unwrap_or(meta.key.as_str());
+        // `rsplit('/').next()` always yields one element for any
+        // non-empty input — and `meta.key` cannot be empty in a
+        // packs/ listing — so the `expect` documents the invariant
+        // rather than papering over an unreachable code path.
+        let basename = meta
+            .key
+            .rsplit('/')
+            .next()
+            .expect("rsplit yields at least one element");
         let Some(sha_str) = basename.strip_suffix(".pack") else {
             continue;
         };
@@ -339,7 +342,6 @@ async fn load_tombstones(
         let age_hours = OffsetDateTime::parse(&tombstone.marked_at, &Rfc3339)
             .map_or(0, |m| (now - m).whole_hours());
         out.push(TombstoneRow {
-            key: meta.key,
             run_id: tombstone.run_id,
             marked_at: tombstone.marked_at,
             age_hours,
@@ -357,21 +359,6 @@ async fn load_tombstones(
 fn is_tombstone_key(key: &str, prefix: &str) -> bool {
     let expected = keys::join(prefix, "gc/tombstones-");
     key.starts_with(&expected) && key.as_bytes().ends_with(b".json")
-}
-
-/// Strip `<prefix>/` and `/chain.json` to derive the ref path. Mirror
-/// of the same helper in [`super::list`]; kept private here so the
-/// audit is self-contained even if the list helper's signature
-/// evolves.
-fn ref_path_from_chain_key(prefix: &str, key: &str) -> Option<String> {
-    let without_suffix = key.strip_suffix("/chain.json")?;
-    if prefix.is_empty() {
-        return Some(without_suffix.to_owned());
-    }
-    without_suffix
-        .strip_prefix(prefix)
-        .and_then(|s| s.strip_prefix('/'))
-        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -542,7 +529,7 @@ mod tests {
         assert_eq!(row.segments_total, 2);
         assert_eq!(row.bytes_total, 1_024 + 2_048);
         assert!(!row.recommend_compact);
-        assert!(!row.full_at_missing_from_segments);
+        assert!(row.has_full_at_segment);
     }
 
     #[tokio::test]
