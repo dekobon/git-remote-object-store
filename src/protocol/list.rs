@@ -18,6 +18,8 @@ use tracing::warn;
 
 use crate::keys;
 use crate::object_store::{ObjectStore, ObjectStoreError};
+use crate::packchain::list as packchain_list;
+use crate::url::StorageEngine;
 
 /// Errors specific to the list path that the dispatcher converts into
 /// fatal exits.
@@ -30,6 +32,13 @@ pub enum ListError {
     /// Writing to the protocol stream failed (typically `BrokenPipe`).
     #[error("write to protocol stream failed: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Packchain-engine list failed (transport or schema-version
+    /// mismatch). Per-entry parse failures are skipped with a warn
+    /// and never reach this variant — only fatal transport errors
+    /// from the listing call propagate here.
+    #[error("packchain list error: {0}")]
+    Packchain(#[from] crate::packchain::PackchainError),
 }
 
 /// Drive a single `list` (or `list for-push`) command end-to-end.
@@ -40,16 +49,33 @@ pub enum ListError {
 pub(crate) async fn handle_list<W>(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
+    engine: StorageEngine,
     for_push: bool,
     writer: &mut W,
 ) -> Result<(), ListError>
 where
     W: AsyncWrite + Unpin,
 {
-    let entries = collect_bundles(store, prefix).await?;
+    // Engine-aware dispatch: bundle parses `<sha>.bundle` filenames,
+    // packchain reads each ref's `chain.json` and reports `chain.tip`.
+    // Both produce engine-neutral [`ListedRef`] values that the wire
+    // loop below renders identically. Without this split, packchain
+    // remotes return stale `<full_at>` SHAs after any incremental
+    // push (issue #72).
+    let entries: Vec<ListedRef> = match engine {
+        StorageEngine::Bundle => collect_bundles(store, prefix).await?,
+        StorageEngine::Packchain => packchain_list::list_refs(store, prefix)
+            .await?
+            .into_iter()
+            .map(|r| ListedRef {
+                sha: r.sha,
+                ref_path: r.ref_path,
+            })
+            .collect(),
+    };
 
     // Print `@<ref> HEAD` only when not for-push, HEAD is present, and the
-    // listed bundles include the head ref. Mirrors upstream's
+    // listed entries include the head ref. Mirrors upstream's
     // loop-and-match behaviour in `cmd_list`.
     if !for_push
         && let Some(head_ref) = read_remote_head(store, prefix).await?
@@ -71,8 +97,11 @@ where
     Ok(())
 }
 
-/// One listed bundle's parsed parts. Internal — never serialised directly.
-struct ListedBundle {
+/// One listed ref's parsed parts. Engine-neutral — both bundle and
+/// packchain handlers produce these, and the wire loop in
+/// [`handle_list`] formats them identically. Internal — never
+/// serialised directly.
+struct ListedRef {
     sha: String,
     ref_path: String,
 }
@@ -80,21 +109,21 @@ struct ListedBundle {
 async fn collect_bundles(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
-) -> Result<Vec<ListedBundle>, ObjectStoreError> {
+) -> Result<Vec<ListedRef>, ObjectStoreError> {
     // Match upstream: `list_objects_v2(Prefix=prefix)` with no trailing
     // slash. The strip step below disambiguates sibling-prefix collisions.
     let listed = store.list(prefix.unwrap_or("")).await?;
 
     // Parse every match exactly once, carrying the timestamp alongside
     // the parsed entry so the sort below doesn't force a re-parse.
-    let mut parsed: Vec<(time::OffsetDateTime, ListedBundle)> = listed
+    let mut parsed: Vec<(time::OffsetDateTime, ListedRef)> = listed
         .into_iter()
         .filter_map(|m| {
             let rel = relative_key(prefix, &m.key)?;
             let (ref_path, sha) = parse_bundle_key(rel)?;
             Some((
                 m.last_modified,
-                ListedBundle {
+                ListedRef {
                     sha: sha.to_owned(),
                     ref_path: ref_path.to_owned(),
                 },
