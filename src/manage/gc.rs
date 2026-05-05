@@ -79,17 +79,14 @@ impl Gc {
     ///
     /// # Errors
     ///
-    /// Returns [`ManageError::Store`] for transport failures. Mark
-    /// failure (corrupt `chain.json`, schema-version mismatch) surfaces
-    /// as [`ManageError::Internal`] carrying the underlying
-    /// [`crate::PackchainError`]'s display.
+    /// Returns [`ManageError::Store`] for transport failures and
+    /// [`ManageError::Packchain`] for engine-level failures (corrupt
+    /// `chain.json`, schema-version mismatch).
     pub async fn run(&self) -> Result<(), ManageError> {
         let store_ref = self.store.as_ref();
 
         if !self.opts.sweep_only {
-            let mark_outcome = gc::mark(store_ref, &self.prefix, gc::MarkOpts::default())
-                .await
-                .map_err(|e| ManageError::Internal(format!("gc mark failed: {e}")))?;
+            let mark_outcome = gc::mark(store_ref, &self.prefix, gc::MarkOpts::default()).await?;
             if mark_outcome.orphan_count == 0 {
                 println!("gc mark: no orphan packs.");
             } else {
@@ -114,8 +111,7 @@ impl Gc {
                     force: self.opts.force,
                 },
             )
-            .await
-            .map_err(|e| ManageError::Internal(format!("gc sweep failed: {e}")))?;
+            .await?;
             if sweep_outcome.swept_tombstones == 0 && sweep_outcome.deferred_tombstones == 0 {
                 println!("gc sweep: no tombstones present.");
             } else {
