@@ -21,6 +21,26 @@
 //!
 //! See [`remote`] for the full key layout and API documentation.
 //!
+//! ## Direct file access (packchain remotes only)
+//!
+//! [`read_blob`] returns the bytes of a single file at a ref's tip
+//! without cloning the repo. The companion [`PackIndexCache`]
+//! amortises pack-index parses across calls — long-running consumers
+//! (CI agents, build systems) keep one cache for the lifetime of the
+//! process.
+//!
+//! ```no_run
+//! # #[tokio::main] async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use git_remote_object_store::{PackIndexCache, Remote, read_blob};
+//!
+//! let remote = Remote::connect("s3+https://bucket/repo?engine=packchain").await?;
+//! let cache = PackIndexCache::default();
+//! let bytes = read_blob(&remote, "refs/heads/main", "src/main.rs", &cache).await?;
+//! println!("{}", String::from_utf8_lossy(&bytes));
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # CLI
 //!
 //! The binaries (`git-remote-s3-https`, `git-remote-az-https`, etc.) are

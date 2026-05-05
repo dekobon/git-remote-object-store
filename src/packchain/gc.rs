@@ -233,6 +233,23 @@ pub fn grace_hours_from_env() -> u64 {
 ///   before re-running.
 /// - [`PackchainError::Store`] / [`PackchainError::Io`] for transport
 ///   or local-I/O failures.
+///
+/// # Example
+///
+/// ```no_run
+/// # #[tokio::main] async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use git_remote_object_store::Remote;
+/// use git_remote_object_store::packchain::gc::{MarkOpts, mark};
+///
+/// let remote = Remote::connect("s3+https://bucket/repo?engine=packchain").await?;
+/// let outcome = mark(remote.store(), remote.prefix(), MarkOpts::default()).await?;
+/// println!(
+///     "{} orphan pack(s) tombstoned (run id {})",
+///     outcome.orphan_count, outcome.run_id,
+/// );
+/// # Ok(())
+/// # }
+/// ```
 pub async fn mark(
     store: &dyn ObjectStore,
     prefix: &str,
@@ -301,6 +318,30 @@ pub async fn mark(
 /// the run (errors are logged and the next tombstone is tried).
 /// Returns [`PackchainError::Store`] only when the initial
 /// tombstone-list call fails.
+///
+/// # Example
+///
+/// ```no_run
+/// # #[tokio::main] async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use git_remote_object_store::Remote;
+/// use git_remote_object_store::packchain::gc::{SweepOpts, sweep};
+///
+/// let remote = Remote::connect("s3+https://bucket/repo?engine=packchain").await?;
+/// let outcome = sweep(
+///     remote.store(),
+///     remote.prefix(),
+///     SweepOpts::default(),
+/// )
+/// .await?;
+/// println!(
+///     "swept {} tombstone(s), deleted {} object(s), deferred {}",
+///     outcome.swept_tombstones,
+///     outcome.deleted_objects,
+///     outcome.deferred_tombstones,
+/// );
+/// # Ok(())
+/// # }
+/// ```
 pub async fn sweep(
     store: &dyn ObjectStore,
     prefix: &str,
@@ -411,8 +452,8 @@ async fn sweep_one_tombstone(
             );
             continue;
         }
-        let pack_key = super::keys::pack_key(optional_prefix(prefix), sha);
-        let idx_key = super::keys::pack_idx_key(optional_prefix(prefix), sha);
+        let pack_key = super::keys::pack_key(super::keys::optional_prefix(prefix), sha);
+        let idx_key = super::keys::pack_idx_key(super::keys::optional_prefix(prefix), sha);
         if delete_idempotent(store, &pack_key).await? {
             deleted_objects += 1;
         }
@@ -455,14 +496,6 @@ fn is_tombstone_key(key: &str, prefix: &str) -> bool {
     key.starts_with(&expected_prefix)
 }
 
-fn optional_prefix(prefix: &str) -> Option<&str> {
-    if prefix.is_empty() {
-        None
-    } else {
-        Some(prefix)
-    }
-}
-
 /// List every `<prefix>/refs/heads/*/chain.json` and union the pack
 /// content-shas they reference. Fail closed on parse error.
 async fn list_referenced_packs(
@@ -473,28 +506,25 @@ async fn list_referenced_packs(
     let metas = store.list(&refs_prefix).await?;
     let mut referenced: HashSet<Sha40> = HashSet::new();
     for meta in metas {
-        if !meta.key.as_bytes().ends_with(b"/chain.json") {
+        if !super::keys::is_chain_json_key(&meta.key) {
             continue;
         }
         let body = store.get_bytes(&meta.key).await?;
         let chain = ChainManifest::from_json_bytes(&body)?;
         for segment in chain.segments {
-            referenced.insert(content_sha_from_segment_pack(&segment.pack)?);
+            // gc fails closed on a malformed pack key (vs read.rs's
+            // MalformedPackEntry path) — the chain is corrupt and
+            // tombstoning live packs based on it would be unsafe.
+            let sha = super::keys::parse_pack_key_sha(&segment.pack).ok_or_else(|| {
+                PackchainError::ParseJson(serde_json::Error::custom(format!(
+                    "chain segment pack key `{}` lacks `.pack` suffix",
+                    segment.pack,
+                )))
+            })?;
+            referenced.insert(sha);
         }
     }
     Ok(referenced)
-}
-
-/// `segment.pack` is `[<prefix>/]packs/<sha>.pack`. Extract the
-/// content-sha.
-fn content_sha_from_segment_pack(pack: &str) -> Result<Sha40, PackchainError> {
-    let basename = pack.rsplit('/').next().unwrap_or(pack);
-    let sha = basename.strip_suffix(".pack").ok_or_else(|| {
-        PackchainError::ParseJson(serde_json::Error::custom(format!(
-            "chain segment pack key `{pack}` lacks `.pack` suffix"
-        )))
-    })?;
-    Sha40::try_new(sha)
 }
 
 /// List every `<prefix>/packs/*.pack` and `*.idx` and return the union
