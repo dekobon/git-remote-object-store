@@ -7,36 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- `packchain::list::list_refs` now fetches `chain.json` bodies in
-  bounded parallel (`MAX_FETCH_CONCURRENCY = 8`, matching Phase 3
-  fetch). Earlier sequential N round trips became a single bounded
-  batch — meaningful for buckets with many branches; negligible
-  for typical single-digit-branch repos.
-
-- `packchain::list::list_refs` filters extracted ref paths through
-  `gix-validate`'s `RefName::new` check before emitting them to
-  git. A maliciously-planted key like
-  `<prefix>/refs/heads/../etc/passwd/chain.json` would otherwise
-  yield ref path `refs/heads/../etc/passwd` in the list response;
-  the filter rejects such names with `tracing::warn!` and skips
-  the entry. Defense-in-depth against bucket-write attackers.
-
-### Fixed
-
-- `list` command on packchain remotes now returns `chain.tip`
-  rather than the baseline `<full_at>` SHA. The bundle-engine
-  `list` handler parsed `<sha>.bundle` filenames; for packchain
-  the bundle is the (fixed) baseline, not the moving tip, so
-  after any incremental push `git ls-remote` / `git fetch` /
-  `git pull` saw stale tips. Fix: engine-aware dispatch in
-  `protocol::list::handle_list` — bundle keeps its bundle-key
-  parser, packchain reads each ref's `chain.json` and reports
-  `chain.tip`. Per-entry `chain.json` parse failures skip with
-  a `tracing::warn!` so a single corrupt branch does not
-  blackhole the whole listing. (#72)
-
 ### Added
 
 - `packchain` storage engine — Phase 5 partial (orphan-pack garbage
@@ -65,19 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `manage::gc::Gc` runner that the CLI's `gc` subcommand wraps,
   matching the existing `Doctor` / `ManageBranch` shape so a
   non-interactive frontend can drive the same flow.
-
-### Changed
-
-- `delete-branch` documented as not deleting pack files for the
-  packchain engine. Pack keys can be shared across branches under
-  content-hash dedup (the umbrella issue's "exclusively owned by
-  that branch" claim was incorrect); `delete-branch` removes only
-  the branch's `chain.json`, `path-index.json`, baseline bundle, and
-  `PROTECTED#` marker. Operators run `gc` afterwards to reclaim
-  orphan packs. The behaviour itself is unchanged — `delete-branch`
-  always operated under `<prefix>/refs/heads/<branch>/` only — but
-  the invariant is now explicit.
-
 - `packchain` storage engine — Phase 4 (direct file access) of issue
   #52: new public `read_blob(remote, ref_name, path, &cache)` library
   API fetches a single file at a ref's tip without cloning or running
@@ -148,10 +105,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keep the per-ref lock window bounded by JSON-PUT latency, and
   under the lock the push writes path-index → FORMAT → HEAD →
   chain.json. Concurrent pushers leave orphan packs on the loser;
-  Phase 5 GC reaps them. Fetch (Phase 3), direct file access
-  (Phase 4), and compaction / GC (Phase 5) remain out of scope; a
-  packchain bucket written by Phase 2 is still write-only until
-  Phase 3. (#63, sub-issue of #52)
+  Phase 5 GC reaps them. (#63, sub-issue of #52)
 - Force push on the packchain engine collapses the chain to a fresh
   single-segment manifest with `full_at = new tip` and replaces the
   baseline bundle, deleting the prior baseline at the old `full_at`
@@ -267,9 +221,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binaries can emit single-line `fatal:` diagnostics that match
   upstream `git_remote_s3/remote.py:574-593`. The probe runs once per
   helper invocation and is off the per-command hot path. (#45)
+- The LFS custom-transfer agent now emits `progress` events at each
+  network-chunk boundary, mirroring upstream
+  `git_remote_s3/lfs.py`'s `ProgressPercentage.__call__` callback.
+  Previously the agent emitted a single end-of-transfer event with
+  `bytesSoFar == size`, which left long uploads / downloads
+  appearing frozen and stripped `git-lfs` of any signal to detect
+  stalled transfers. Backends report bytes through a `ProgressSink`;
+  the agent forwards them through an `mpsc` channel into live
+  `progress` events on stdout. (#44)
+- `Remote` struct as the primary library entry point for external
+  consumers. `Remote::connect(url)` parses a URL and opens a verified
+  backend connection in one call; `Remote::key(suffix)` computes correct
+  prefixed storage keys; `Remote::get_head()`, `Remote::put_head()`, and
+  `Remote::list()` cover the most common on-bucket operations; and
+  `Remote::store()` exposes the underlying `ObjectStore` (as `&dyn
+  ObjectStore`) for advanced use.
+- Top-level re-exports for `ObjectStore`, `ObjectMeta`,
+  `ObjectStoreError`, `RemoteUrl`, `Remote`, `RemoteError`,
+  `BackendError`, and `BackendKind`; consumers no longer need
+  three-level module-path imports.
+- `ProtocolError::is_broken_pipe()` method; the private
+  `is_broken_pipe(err: &io::Error)` helper is removed.
 
 ### Changed
 
+- `packchain::list::list_refs` now fetches `chain.json` bodies in
+  bounded parallel (`MAX_FETCH_CONCURRENCY = 8`, matching Phase 3
+  fetch). Earlier sequential N round trips became a single bounded
+  batch — meaningful for buckets with many branches; negligible
+  for typical single-digit-branch repos.
+- `packchain::list::list_refs` filters extracted ref paths through
+  `gix-validate`'s `RefName::new` check before emitting them to
+  git. A maliciously-planted key like
+  `<prefix>/refs/heads/../etc/passwd/chain.json` would otherwise
+  yield ref path `refs/heads/../etc/passwd` in the list response;
+  the filter rejects such names with `tracing::warn!` and skips
+  the entry. Defense-in-depth against bucket-write attackers.
+- `delete-branch` documented as not deleting pack files for the
+  packchain engine. Pack keys can be shared across branches under
+  content-hash dedup (the umbrella issue's "exclusively owned by
+  that branch" claim was incorrect); `delete-branch` removes only
+  the branch's `chain.json`, `path-index.json`, baseline bundle, and
+  `PROTECTED#` marker. Operators run `gc` afterwards to reclaim
+  orphan packs. The behaviour itself is unchanged — `delete-branch`
+  always operated under `<prefix>/refs/heads/<branch>/` only — but
+  the invariant is now explicit.
+- Cross-cutting packchain polish: `is_chain_json_key`,
+  `optional_prefix`, and `parse_pack_key_sha` consolidated into
+  `src/packchain/keys.rs` so `gc`, `list`, and `read` no longer
+  duplicate the same string-shape inspectors. `pub mod read;`
+  matches `pub mod gc;` so both submodules are reachable through
+  the public rustdoc tree at
+  `git_remote_object_store::packchain::{gc, read}`. New crate-level
+  doc-test in `src/lib.rs` walks `Remote::connect` →
+  `PackIndexCache::default` → `read_blob` using the crate-root
+  re-exports. New `# Example` sections on `gc::mark` and `gc::sweep`
+  show the canonical `Remote::connect` → `mark|sweep(remote.store(),
+  remote.prefix(), Opts::default())` shape for library consumers
+  driving GC programmatically.
 - Tightened shellspec assertions
   (`spec/integration/s3/`, `spec/live/s3/`, `spec/integration/az/`):
   the `not ancestor` push wording is anchored to the documented
@@ -300,19 +310,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`git-remote-object-store-cli`). Install from source with
   `cargo install --path cli`; `cargo build --workspace` is unchanged
   for development builds.
-- Added `Remote` struct as the primary library entry point for external
-  consumers. `Remote::connect(url)` parses a URL and opens a verified
-  backend connection in one call; `Remote::key(suffix)` computes correct
-  prefixed storage keys; `Remote::get_head()`, `Remote::put_head()`, and
-  `Remote::list()` cover the most common on-bucket operations; and
-  `Remote::store()` exposes the underlying `ObjectStore` (as `&dyn
-  ObjectStore`) for advanced use.
-- Top-level re-exports added for `ObjectStore`, `ObjectMeta`,
-  `ObjectStoreError`, `RemoteUrl`, `Remote`, `RemoteError`,
-  `BackendError`, and `BackendKind`; consumers no longer need
-  three-level module-path imports.
-- `ProtocolError::is_broken_pipe()` method added; the private
-  `is_broken_pipe(err: &io::Error)` helper is removed.
 - `protocol::run_main` is no longer part of the library API; it lives
   in the CLI crate. `protocol::capabilities` and `protocol::option` are
   now `pub(crate)`.
@@ -359,6 +356,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   call sites pass `GetOpts::default()` and `progress: None`; the LFS
   agent populates the sink. This is a public-API break for callers of
   `ObjectStore::get_to_file`. (#44)
+- Renamed `crate::object_store::Error` to `ObjectStoreError`. Every
+  importer previously aliased it via `use ... as ObjectStoreError`;
+  the rename pushes the action prefix into the type so pattern
+  matches read `ObjectStoreError::NotFound(_)` natively. Breaking
+  for external library consumers (none in-tree besides the helper /
+  management binaries). (#37)
+- Renamed `PushOutcome::as_protocol_line` to `to_protocol_line`
+  (allocates `String` via `format!`, so `to_*` matches Rust API
+  Guidelines C-CONV). Replaced the free helper
+  `into_dialoguer_error` with `impl From<dialoguer::Error> for
+  ManageError`, dropping the `map_err(...)` boilerplate at both
+  call sites in favour of `?`. (#38)
+- Renamed `ManageBranch::delete_branch`/`protect_branch`/
+  `unprotect_branch` to `delete`/`protect`/`unprotect` — the
+  receiver type already names the subject; the method-side
+  `_branch` was redundant noise. The CLI subcommand names
+  (`delete-branch`, `protect`, `unprotect`) are unchanged. (#39)
+- Renamed `AzureBlobStore` to `AzureStore` (symmetric with
+  `S3Store`); renamed `AzureAddressing::Subdomain` to
+  `AzureAddressing::VirtualHosted` (symmetric with
+  `S3Addressing::VirtualHosted` and matches AWS-canonical
+  terminology); renamed the private `protocol::list::BundleEntry`
+  to `ListedBundle` so it no longer collides with the public
+  `manage::snapshot::BundleEntry`. (#40)
+- Renamed `git::validate_ref_name` to `is_valid_ref_name` so the
+  `bool`-returning predicate carries the `is_*` prefix per the
+  project naming rules. (#41)
+- Hoisted the empty-prefix key builder out of `manage` into a new
+  `crate::keys` module so the protocol, LFS, and management layers
+  all share one source of truth for `<prefix>/<suffix>` joining.
+  Five sites (`push.rs`, `fetch.rs`, `list.rs`, `lfs/agent.rs`, plus
+  three management call sites) previously open-coded the same
+  empty-prefix `match`. Added `network_boxed` next to `other_boxed`
+  in `object_store::error` so the seven open-coded
+  `|e| ObjectStoreError::Network(Box::new(e))` closures collapse to
+  function pointers.
+- Tightened protocol-test coverage: dropped the stale
+  `bucket = "0.a"` proptest seed (no longer reachable from
+  `arb_bucket()`), replaced placeholder `aaaa.bundle` /
+  `bbbb.bundle` fixtures with realistic 40-hex SHAs, added a
+  regression test for the previously-untested
+  `parse_remote_sha_from_key` failure arm in `protocol::push`,
+  added end-to-end S3 helper-binary coverage modeled on the
+  existing Azure pattern (push / clone / fetch / LFS), and pinned
+  `option verbosity` behaviour for `n >= 2`. (#35)
+- Strengthened three tests surfaced by the audit-tests pass:
+  `pre_lock_multi_bundle_rejection_surfaces_unchanged` now pins the
+  byte-exact wire bytes (the loose `contains("multiple bundles")`
+  would not have caught the missing `?` that #34 fixed); added
+  `fix_head_out_of_range_select_returns_internal_error` to cover
+  the HEAD-candidate `ManageError::Internal` branch that was
+  structurally identical to the bundle-index branch but lacked
+  coverage; and the Azure `put_path_with_opts_uploads_body` test
+  now verifies `content_disposition` and `x-ms-meta-*` propagate on
+  the wire via a signed HEAD, mirroring its S3 sibling.
+- Documented backend size limits (AWS / Azure SDK API ceilings),
+  lack of resume after upload failure, and the open `git push`
+  upload-progress gap (#55) in a new "Known limitations" section in
+  `README.md`, with cross-references from the s3 and azure
+  module-level docs. (#57)
+- Clarified the `ObjectStore::copy` trait contract: the body is
+  preserved on every backend, but user-metadata propagation is
+  best-effort. `S3Store::copy` (server-side `CopyObject`) does
+  propagate it; `AzureStore::copy` (download-then-upload, since
+  `azure_storage_blob` 0.12 does not ergonomically expose `Copy
+  Blob` with shared-key auth) currently drops it. Callers must not
+  depend on metadata round-tripping through `copy`.
+- Removed the stale "Azure backend wired in Phase 11 — until then
+  the REPL exits early with a 'not yet implemented' error" note
+  from both Azure helper shim binaries; the wrappers now describe
+  the current shape symmetrically with the S3 shims. (#31)
+- ls-remote / `cmd_list` wire output documentation now matches the
+  actual behaviour: one line per bundle (not per ref), sorted by
+  `LastModified` descending, with the `@<head> HEAD` line prepended
+  only when not `list for-push` and the head ref appears in the
+  listed bundles. (#36)
+- `README.md` "Status" section now describes the gitoxide /
+  subprocess split honestly: gitoxide is used for rev-parse,
+  is-ancestor, ref-name validation, remote-URL inspection, archive,
+  last-commit-message, ref discovery, and object resolution; bundle
+  `create` and `unbundle` still shell out via the single `run_git`
+  helper because `gix` 0.82 has no public bundle API. (#36)
 
 ### Removed
 
@@ -371,6 +450,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `list` command on packchain remotes now returns `chain.tip`
+  rather than the baseline `<full_at>` SHA. The bundle-engine
+  `list` handler parsed `<sha>.bundle` filenames; for packchain
+  the bundle is the (fixed) baseline, not the moving tip, so
+  after any incremental push `git ls-remote` / `git fetch` /
+  `git pull` saw stale tips. Fix: engine-aware dispatch in
+  `protocol::list::handle_list` — bundle keeps its bundle-key
+  parser, packchain reads each ref's `chain.json` and reports
+  `chain.tip`. Per-entry `chain.json` parse failures skip with
+  a `tracing::warn!` so a single corrupt branch does not
+  blackhole the whole listing. (#72)
 - Sanitize the commit-message summary that flows from
   `git::last_commit_message` into the
   `codepipeline-artifact-revision-summary` user-metadata header on
@@ -407,15 +497,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is healthy by definition, so forcing a fresh socket there does not
   help — the timeout-then-SDK-retry path covers the actual stuck-
   connection case. (#26)
-- The LFS custom-transfer agent now emits `progress` events at each
-  network-chunk boundary, mirroring upstream
-  `git_remote_s3/lfs.py`'s `ProgressPercentage.__call__` callback.
-  Previously the agent emitted a single end-of-transfer event with
-  `bytesSoFar == size`, which left long uploads / downloads
-  appearing frozen and stripped `git-lfs` of any signal to detect
-  stalled transfers. Backends report bytes through a `ProgressSink`;
-  the agent forwards them through an `mpsc` channel into live
-  `progress` events on stdout. (#44)
 - `S3Store::from_remote_url` now installs a custom
   `aws-smithy-http-client` with `pool_idle_timeout(30s)` so DNS
   rotation no longer wedges a long-running LFS session until the
@@ -475,97 +556,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inline `match` produced a `/HEAD` key for root-of-bucket remotes
   whose prefix parsed as the empty string, which never resolved
   on the wire.
-
-### Changed
-
-- Renamed `crate::object_store::Error` to `ObjectStoreError`. Every
-  importer previously aliased it via `use ... as ObjectStoreError`;
-  the rename pushes the action prefix into the type so pattern
-  matches read `ObjectStoreError::NotFound(_)` natively. Breaking
-  for external library consumers (none in-tree besides the helper /
-  management binaries). (#37)
-- Renamed `PushOutcome::as_protocol_line` to `to_protocol_line`
-  (allocates `String` via `format!`, so `to_*` matches Rust API
-  Guidelines C-CONV). Replaced the free helper
-  `into_dialoguer_error` with `impl From<dialoguer::Error> for
-  ManageError`, dropping the `map_err(...)` boilerplate at both
-  call sites in favour of `?`. (#38)
-- Renamed `ManageBranch::delete_branch`/`protect_branch`/
-  `unprotect_branch` to `delete`/`protect`/`unprotect` — the
-  receiver type already names the subject; the method-side
-  `_branch` was redundant noise. The CLI subcommand names
-  (`delete-branch`, `protect`, `unprotect`) are unchanged. (#39)
-- Renamed `AzureBlobStore` to `AzureStore` (symmetric with
-  `S3Store`); renamed `AzureAddressing::Subdomain` to
-  `AzureAddressing::VirtualHosted` (symmetric with
-  `S3Addressing::VirtualHosted` and matches AWS-canonical
-  terminology); renamed the private `protocol::list::BundleEntry`
-  to `ListedBundle` so it no longer collides with the public
-  `manage::snapshot::BundleEntry`. (#40)
-- Renamed `git::validate_ref_name` to `is_valid_ref_name` so the
-  `bool`-returning predicate carries the `is_*` prefix per the
-  project naming rules. (#41)
-- Hoisted the empty-prefix key builder out of `manage` into a new
-  `crate::keys` module so the protocol, LFS, and management layers
-  all share one source of truth for `<prefix>/<suffix>` joining.
-  Five sites (`push.rs`, `fetch.rs`, `list.rs`, `lfs/agent.rs`, plus
-  three management call sites) previously open-coded the same
-  empty-prefix `match`. Added `network_boxed` next to `other_boxed`
-  in `object_store::error` so the seven open-coded
-  `|e| ObjectStoreError::Network(Box::new(e))` closures collapse to
-  function pointers.
-
-### Tests
-
-- Tightened protocol-test coverage: dropped the stale
-  `bucket = "0.a"` proptest seed (no longer reachable from
-  `arb_bucket()`), replaced placeholder `aaaa.bundle` /
-  `bbbb.bundle` fixtures with realistic 40-hex SHAs, added a
-  regression test for the previously-untested
-  `parse_remote_sha_from_key` failure arm in `protocol::push`,
-  added end-to-end S3 helper-binary coverage modeled on the
-  existing Azure pattern (push / clone / fetch / LFS), and pinned
-  `option verbosity` behaviour for `n >= 2`. (#35)
-- Strengthened three tests surfaced by the audit-tests pass:
-  `pre_lock_multi_bundle_rejection_surfaces_unchanged` now pins the
-  byte-exact wire bytes (the loose `contains("multiple bundles")`
-  would not have caught the missing `?` that #34 fixed); added
-  `fix_head_out_of_range_select_returns_internal_error` to cover
-  the HEAD-candidate `ManageError::Internal` branch that was
-  structurally identical to the bundle-index branch but lacked
-  coverage; and the Azure `put_path_with_opts_uploads_body` test
-  now verifies `content_disposition` and `x-ms-meta-*` propagate on
-  the wire via a signed HEAD, mirroring its S3 sibling.
-
-### Documentation
-
-- Documented backend size limits (AWS / Azure SDK API ceilings),
-  lack of resume after upload failure, and the open `git push`
-  upload-progress gap (#55) in a new "Known limitations" section in
-  `README.md`, with cross-references from the s3 and azure
-  module-level docs. (#57)
-- Clarified the `ObjectStore::copy` trait contract: the body is
-  preserved on every backend, but user-metadata propagation is
-  best-effort. `S3Store::copy` (server-side `CopyObject`) does
-  propagate it; `AzureStore::copy` (download-then-upload, since
-  `azure_storage_blob` 0.12 does not ergonomically expose `Copy
-  Blob` with shared-key auth) currently drops it. Callers must not
-  depend on metadata round-tripping through `copy`.
-- Removed the stale "Azure backend wired in Phase 11 — until then
-  the REPL exits early with a 'not yet implemented' error" note
-  from both Azure helper shim binaries; the wrappers now describe
-  the current shape symmetrically with the S3 shims. (#31)
-- ls-remote / `cmd_list` wire output documentation now matches the
-  actual behaviour: one line per bundle (not per ref), sorted by
-  `LastModified` descending, with the `@<head> HEAD` line prepended
-  only when not `list for-push` and the head ref appears in the
-  listed bundles. (#36)
-- `README.md` "Status" section now describes the gitoxide /
-  subprocess split honestly: gitoxide is used for rev-parse,
-  is-ancestor, ref-name validation, remote-URL inspection, archive,
-  last-commit-message, ref discovery, and object resolution; bundle
-  `create` and `unbundle` still shell out via the single `run_git`
-  helper because `gix` 0.82 has no public bundle API. (#36)
+- `release_lock` now propagates non-`NotFound` delete failures instead of
+  silently swallowing them. When the push itself succeeds but the lock
+  cannot be released, the outcome is replaced with
+  `error <ref> "failed to release lock. ..."` matching upstream
+  `cmd_push`'s `finally` block. A genuine push error is never masked by
+  a release failure. (#18)
+- `S3Store::get_to_file` now guards against concurrent object mutation:
+  every GET carries `If-Match: <etag>` from the preceding `HeadObject`.
+  If the object is overwritten mid-download, S3 returns 412 and the
+  operation retries once before propagating `Error::PreconditionFailed`.
+  (#20)
+- Push batches no longer abort on the first per-push transport, git, or
+  local-I/O failure. `push_batch` now catches `PushError::Store`, `Git`,
+  `Io`, and `Sha` per-push and converts them to `error <ref> "..."` outcome
+  lines so the batch continues, mirroring upstream `cmd_push`'s
+  try/except shape (`../git-remote-s3/git_remote_s3/remote.py:286-296`).
+  Without this, a single 5xx blip mid-batch would silently drop the
+  outcome lines for already-completed pushes and leave git's local
+  ref-tracking inconsistent with the remote. `PushError::Parse`,
+  `InvalidLocalSpec`, and `RemoteRef` still abort the batch — those mean
+  subsequent commands cannot be trusted.
+- `url::is_valid_bucket` now rejects the AWS-reserved bucket prefixes
+  (`xn--`, `sthree-`, `amzn-s3-demo-`) and suffixes (`-s3alias`,
+  `--ol-s3`, `.mrap`, `--x-s3`, `--table-s3`), enforces the
+  begin-and-end-with-alphanumeric rule, rejects consecutive periods, and
+  rejects names formatted as IPv4 dotted-quads. `url::is_valid_container`
+  now enforces the matching Azure rules: alphanumeric bookends and no
+  consecutive hyphens. Closes #17.
 
 ## [0.1.0] - 2026-04-26
 

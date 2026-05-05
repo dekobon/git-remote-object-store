@@ -81,7 +81,7 @@ pub(crate) async fn list_refs(
     let candidates: Vec<(String, String, OffsetDateTime)> = metas
         .into_iter()
         .filter_map(|m| {
-            if !m.key.as_bytes().ends_with(b"/chain.json") {
+            if !super::keys::is_chain_json_key(&m.key) {
                 return None;
             }
             let Some(ref_path) = ref_path_from_chain_key(prefix, &m.key) else {

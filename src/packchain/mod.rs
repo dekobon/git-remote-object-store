@@ -53,7 +53,11 @@ pub(crate) mod list;
 pub(crate) mod manifest;
 pub(crate) mod pack;
 pub(crate) mod push;
-pub(crate) mod read;
+// `pub` (parity with `gc`) so `git_remote_object_store::packchain::read`
+// is reachable for rustdoc discovery. The convenience re-exports
+// below (`packchain::PackIndexCache`, `packchain::read_blob`) remain
+// the canonical short paths.
+pub mod read;
 pub(crate) mod schema;
 
 pub use read::{PackIndexCache, read_blob};

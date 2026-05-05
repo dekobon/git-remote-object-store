@@ -47,7 +47,7 @@ use crate::remote::Remote;
 use crate::url::StorageEngine;
 
 use super::PackchainError;
-use super::keys::{pack_idx_key, pack_key};
+use super::keys::{optional_prefix, pack_idx_key, pack_key, parse_pack_key_sha};
 use super::manifest::{load_chain, load_path_index};
 use super::schema::{ChainSegment, PathNode, Sha40};
 
@@ -401,14 +401,6 @@ enum ObjectKind {
     Tag,
 }
 
-fn optional_prefix(prefix: &str) -> Option<&str> {
-    if prefix.is_empty() {
-        None
-    } else {
-        Some(prefix)
-    }
-}
-
 /// Validate `path` and split it on `/`.
 ///
 /// Rejects shapes that don't map to git tree semantics: empty paths,
@@ -542,25 +534,18 @@ async fn read_object_from_chain(
     })
 }
 
+/// Extract the content SHA from a chain segment, wrapping the
+/// shared [`parse_pack_key_sha`] result into the
+/// [`PackchainError::MalformedPackEntry`] variant `read_blob`'s
+/// error contract uses for pack-decode failures.
 fn pack_content_sha(segment: &ChainSegment) -> Result<Sha40, PackchainError> {
-    // segment.pack is `[<prefix>/]packs/<sha>.pack`. Strip the
-    // basename and the .pack suffix.
-    let basename = segment
-        .pack
-        .rsplit('/')
-        .next()
-        .unwrap_or(segment.pack.as_str());
-    let sha_str =
-        basename
-            .strip_suffix(".pack")
-            .ok_or_else(|| PackchainError::MalformedPackEntry {
-                offset: 0,
-                reason: format!(
-                    "chain segment pack key `{}` lacks `.pack` suffix",
-                    segment.pack
-                ),
-            })?;
-    Sha40::try_new(sha_str)
+    parse_pack_key_sha(&segment.pack).ok_or_else(|| PackchainError::MalformedPackEntry {
+        offset: 0,
+        reason: format!(
+            "chain segment pack key `{}` lacks `.pack` suffix",
+            segment.pack,
+        ),
+    })
 }
 
 async fn load_index(
