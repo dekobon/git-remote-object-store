@@ -171,11 +171,12 @@ async fn dispatch(cli: Cli) -> Result<()> {
             lock_ttl,
             delete_stale_locks,
         } => {
-            let (store, prefix) = open_target(&target).await?;
+            let (store, prefix, engine) = open_target_with_engine(&target).await?;
             let opts = DoctorOpts {
                 delete_bundle,
                 lock_ttl_seconds: lock_ttl,
                 delete_stale_locks,
+                engine,
             };
             let prompter = DialoguerPrompter;
             let doctor = Doctor::new(store, prefix, opts, &prompter);
@@ -236,16 +237,24 @@ async fn run_branch(target: &Target, branch: &str, action: BranchAction) -> Resu
 /// `analyze`) all build keys without a leading slash for empty
 /// prefixes, matching the protocol REPL's on-bucket layout.
 async fn open_target(target: &Target) -> Result<(Arc<dyn ObjectStore>, String)> {
+    let (store, prefix, _engine) = open_target_with_engine(target).await?;
+    Ok((store, prefix))
+}
+
+/// Like [`open_target`] but also returns the resolved engine, for
+/// subcommands whose output depends on whether the bucket is bundle-
+/// or packchain-shaped (e.g. `doctor`'s engine-aware report).
+async fn open_target_with_engine(
+    target: &Target,
+) -> Result<(
+    Arc<dyn ObjectStore>,
+    String,
+    git_remote_object_store::url::StorageEngine,
+)> {
     let url = resolve_remote(&target.remote)?;
     let prefix = url.prefix().unwrap_or_default().to_owned();
-    // No `.context()` wrap: surface the typed `BackendError` so the
-    // catch-all in `main` can downcast and emit a single-line `fatal:`
-    // matching upstream `git-remote-s3`.
-    // Management CLI is engine-independent for Phase 1 (every
-    // subcommand reads/writes engine-shared keys: HEAD, FORMAT,
-    // PROTECTED#, lock files). Drop the resolved engine for now.
-    let (store, _engine) = backend::build(&url).await?;
-    Ok((store, prefix))
+    let (store, engine) = backend::build(&url).await?;
+    Ok((store, prefix, engine))
 }
 
 /// Try to interpret `input` as a URL first; if that fails, look it up as

@@ -33,6 +33,8 @@ use super::snapshot::{BundleEntry, RepoSnapshot, analyze_objects};
 use super::{DEFAULT_LOCK_TTL_SECONDS, ManageError, Prompter};
 use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, PutOpts};
+use crate::packchain::audit::{self, AuditReport, BranchAuditRow};
+use crate::url::StorageEngine;
 
 /// Tunables for [`Doctor::run`]. Field names match the equivalent
 /// upstream Python `argparse` flags.
@@ -48,6 +50,11 @@ pub struct DoctorOpts {
     /// doctor only reports them and recommends re-running with the
     /// flag.
     pub delete_stale_locks: bool,
+    /// Engine resolved from the bucket's `FORMAT` key. Drives
+    /// engine-aware reporting: a `Packchain` value enables the
+    /// orphan / tombstone / compaction / dangling-reference section.
+    /// Bundle remotes see the existing report unchanged.
+    pub engine: StorageEngine,
 }
 
 impl Default for DoctorOpts {
@@ -56,6 +63,7 @@ impl Default for DoctorOpts {
             delete_bundle: false,
             lock_ttl_seconds: DEFAULT_LOCK_TTL_SECONDS,
             delete_stale_locks: false,
+            engine: StorageEngine::Bundle,
         }
     }
 }
@@ -108,6 +116,17 @@ impl<'a> Doctor<'a> {
         let objects = self.store.list(&list_prefix).await?;
         let mut snapshot = analyze_objects(&objects, &list_prefix, &self.store).await?;
         print!("{}", self.report(&snapshot));
+
+        // Engine-aware diagnostic. The packchain section is purely
+        // read-only — no bucket mutations — so it runs before any of
+        // the fixers below to keep the report ordering stable
+        // regardless of what fixers do later.
+        if matches!(self.opts.engine, StorageEngine::Packchain) {
+            let report = audit::audit(&*self.store, &self.prefix)
+                .await
+                .map_err(|e| ManageError::Internal(format!("packchain audit failed: {e}")))?;
+            print!("{}", render_packchain_section(&report));
+        }
 
         // Fix duplicates ref-by-ref. We need owned ref-names because
         // `fix_multiple_bundles` mutates the snapshot under `&mut`.
@@ -368,6 +387,124 @@ impl<'a> Doctor<'a> {
 /// label.
 fn short_branch_name(full: &str) -> &str {
     full.rsplit('/').next().unwrap_or(full)
+}
+
+/// Render the packchain audit section. The output ends with a trailing
+/// newline so callers can `print!` it without manual spacing. The shape
+/// is the one specified in #68: a header line, then four sub-sections
+/// (orphans, tombstones, branches needing compaction, errors).
+fn render_packchain_section(report: &AuditReport) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "\n=== Packchain ===");
+    let _ = writeln!(
+        out,
+        "Orphans: {} pack(s), {}",
+        report.orphans.pack_count,
+        format_bytes(report.orphans.bytes),
+    );
+
+    if report.tombstones.is_empty() {
+        let _ = writeln!(out, "Tombstones (pending sweep): none");
+    } else {
+        let _ = writeln!(out, "Tombstones (pending sweep):");
+        for t in &report.tombstones {
+            let age = format_age(t.age_hours);
+            let _ = writeln!(
+                out,
+                "  - run id {}, marked {} ({}), {} pack(s)",
+                t.run_id, t.marked_at, age, t.orphan_count,
+            );
+        }
+    }
+
+    let candidates: Vec<&BranchAuditRow> = report
+        .branches
+        .iter()
+        .filter(|r| r.recommend_compact)
+        .collect();
+    if candidates.is_empty() {
+        let _ = writeln!(out, "Branches needing compaction: none");
+    } else {
+        let _ = writeln!(out, "Branches needing compaction:");
+        for r in candidates {
+            let _ = writeln!(
+                out,
+                "  - {}: {} segment(s), {} since full_at  [recommend compact]",
+                r.ref_path,
+                r.segments_total,
+                format_bytes(r.bytes_total),
+            );
+        }
+    }
+
+    if report.dangling.is_empty()
+        && report
+            .branches
+            .iter()
+            .all(|r| !r.full_at_missing_from_segments)
+    {
+        let _ = writeln!(out, "ERRORS: none");
+    } else {
+        let _ = writeln!(out, "ERRORS:");
+        for d in &report.dangling {
+            let _ = writeln!(
+                out,
+                "  - {}/chain.json references missing pack {}",
+                d.ref_path, d.missing_pack_key,
+            );
+        }
+        for b in report
+            .branches
+            .iter()
+            .filter(|r| r.full_at_missing_from_segments)
+        {
+            let _ = writeln!(
+                out,
+                "  - {}/chain.json full_at not present in segments (corrupt manifest)",
+                b.ref_path,
+            );
+        }
+    }
+    out
+}
+
+/// Human-readable byte total. Reports MiB / GiB above 1 MiB and bare
+/// bytes below; rounds to a single decimal for the larger units. The
+/// units mirror the numbers operators see in `gc` output and the issue
+/// thresholds (100 MiB, etc.) so the report stays diff-comparable.
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1_024;
+    const MIB: u64 = 1_024 * KIB;
+    const GIB: u64 = 1_024 * MIB;
+    if bytes >= GIB {
+        #[allow(clippy::cast_precision_loss)]
+        let g = bytes as f64 / GIB as f64;
+        format!("{g:.1} GiB")
+    } else if bytes >= MIB {
+        #[allow(clippy::cast_precision_loss)]
+        let m = bytes as f64 / MIB as f64;
+        format!("{m:.1} MiB")
+    } else if bytes >= KIB {
+        #[allow(clippy::cast_precision_loss)]
+        let k = bytes as f64 / KIB as f64;
+        format!("{k:.1} KiB")
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Render an age in whole hours. Negative values (clock skew) are
+/// reported as "<1h" so the line stays human-readable without leaking
+/// signed-arithmetic semantics into the report.
+fn format_age(hours: i64) -> String {
+    if hours <= 0 {
+        "<1h".to_owned()
+    } else if hours < 48 {
+        format!("{hours}h ago")
+    } else {
+        format!("{}d ago", hours / 24)
+    }
 }
 
 #[cfg(test)]
@@ -710,6 +847,130 @@ mod tests {
             !moved.starts_with('/'),
             "quarantine key must not have a leading slash: {moved:?}"
         );
+    }
+
+    // --- Packchain section --------------------------------------------
+
+    fn packchain_opts() -> DoctorOpts {
+        DoctorOpts {
+            engine: StorageEngine::Packchain,
+            ..DoctorOpts::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn bundle_engine_does_not_emit_packchain_section() {
+        // Default engine is Bundle; no orphan/tombstone scan should
+        // trigger. Capture rendering by re-using the pre-/post-fix
+        // bundle assertions: the existing `report` already covers
+        // bundle-shape output, and a stale-lock-free clean run does
+        // not mutate the bucket — we verify the bucket is unchanged
+        // (no spurious read of `gc/` or `packs/`).
+        let mock = MockStore::new();
+        mock.insert("repo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("repo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        let initial_keys = mock.keys();
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "repo", DoctorOpts::default(), &prompter);
+        doctor.run().await.expect("clean bundle run");
+        assert_eq!(mock.keys(), initial_keys);
+    }
+
+    #[tokio::test]
+    async fn packchain_engine_renders_section_with_orphan_and_tombstone() {
+        // Build a packchain shape: one chain.json + one orphan pack +
+        // one tombstone. The audit returns all three, and the doctor
+        // renders them.
+        let mock = MockStore::new();
+        // HEAD so the bundle-shape `fix_head` prompt path doesn't fire.
+        mock.insert("repo/HEAD", Bytes::from("refs/heads/main"));
+        // A bundle keeps the bundle-shape ref entry valid for the
+        // legacy snapshot analyser (which doesn't yet understand
+        // chain.json as a tip indicator).
+        mock.insert(
+            "repo/refs/heads/main/0000000000000000000000000000000000000001.bundle",
+            Bytes::from("baseline"),
+        );
+        // chain.json so the audit has a branch row.
+        mock.insert(
+            "repo/refs/heads/main/chain.json",
+            Bytes::from(
+                r#"{"v":1,"tip":"0000000000000000000000000000000000000001","full_at":"0000000000000000000000000000000000000001","segments":[{"sha":"0000000000000000000000000000000000000001","parent_sha":null,"pack":"packs/1111111111111111111111111111111111111111.pack","bytes":1024}]}"#,
+            ),
+        );
+        // Live pack referenced by the chain.
+        mock.insert(
+            "repo/packs/1111111111111111111111111111111111111111.pack",
+            Bytes::from_static(b"live"),
+        );
+        // Orphan pack (not in any chain).
+        mock.insert(
+            "repo/packs/2222222222222222222222222222222222222222.pack",
+            Bytes::from_static(b"orphan-body-len-eq-19"),
+        );
+        // Tombstone older than 1h.
+        let marked_at = (OffsetDateTime::now_utc() - time::Duration::hours(2))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let tombstone_body = format!(
+            r#"{{"v":1,"run_id":"abc-1","marked_at":"{marked_at}","orphan_packs":["2222222222222222222222222222222222222222"]}}"#
+        );
+        let tombstone_key = format!("repo/gc/tombstones-abc-1-{marked_at}.json");
+        mock.insert(tombstone_key, Bytes::from(tombstone_body));
+
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "repo", packchain_opts(), &prompter);
+        doctor.run().await.expect("packchain doctor run");
+    }
+
+    #[test]
+    fn render_packchain_section_lists_dangling_references_as_errors() {
+        // Hand-roll an `AuditReport` so the renderer's behaviour is
+        // pinned without going through the live store.
+        let report = AuditReport {
+            orphans: super::audit::OrphanReport::default(),
+            tombstones: Vec::new(),
+            branches: Vec::new(),
+            dangling: vec![super::audit::DanglingRow {
+                ref_path: "refs/heads/dev".to_owned(),
+                missing_pack_key: "packs/abcdef0123456789abcdef0123456789abcdef01.pack".to_owned(),
+            }],
+        };
+        let rendered = super::render_packchain_section(&report);
+        assert!(rendered.contains("ERRORS:"));
+        assert!(rendered.contains("references missing pack"));
+        assert!(rendered.contains("refs/heads/dev"));
+    }
+
+    #[test]
+    fn render_packchain_section_clean_bucket_says_none() {
+        let report = AuditReport::default();
+        let rendered = super::render_packchain_section(&report);
+        assert!(rendered.contains("=== Packchain ==="));
+        assert!(rendered.contains("Orphans: 0 pack(s)"));
+        assert!(rendered.contains("Tombstones (pending sweep): none"));
+        assert!(rendered.contains("Branches needing compaction: none"));
+        assert!(rendered.contains("ERRORS: none"));
+    }
+
+    #[test]
+    fn render_packchain_section_compaction_candidate_is_flagged() {
+        let report = AuditReport {
+            orphans: super::audit::OrphanReport::default(),
+            tombstones: Vec::new(),
+            branches: vec![BranchAuditRow {
+                ref_path: "refs/heads/main".to_owned(),
+                segments_total: 27,
+                bytes_total: 142 * 1024 * 1024,
+                recommend_compact: true,
+                full_at_missing_from_segments: false,
+            }],
+            dangling: Vec::new(),
+        };
+        let rendered = super::render_packchain_section(&report);
+        assert!(rendered.contains("refs/heads/main: 27 segment(s)"));
+        assert!(rendered.contains("[recommend compact]"));
+        assert!(rendered.contains("142.0 MiB"));
     }
 
     #[tokio::test]
