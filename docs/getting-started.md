@@ -506,9 +506,12 @@ Recommended values:
 - **7d** — buckets where multi-day clones are realistic (very
   large repos, slow links, scheduled mirroring jobs).
 
-Setting the grace window to `0` is allowed but only meaningful in
-combination with `--force` (see below) — sweep otherwise still
-requires the tombstone to have a non-zero age.
+`--grace-hours 0` and `--force` are independent knobs. The former
+removes only the age check; the latter also skips the orphan-set
+re-check that protects against a concurrent push reusing the
+tombstoned pack via content-hash dedup. For routine maintenance
+keep both at their defaults; reach for them only during operator-
+asserted-quiet windows.
 
 ### `--force`: skip the grace window and re-check
 
