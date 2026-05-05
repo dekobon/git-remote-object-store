@@ -16,7 +16,8 @@ that skip cloud accounts entirely.
 - [6. Submodules](#6-submodules)
 - [7. Git LFS](#7-git-lfs)
 - [8. Management CLI](#8-management-cli)
-- [9. Troubleshooting](#9-troubleshooting)
+- [9. Garbage collection](#9-garbage-collection)
+- [10. Troubleshooting](#10-troubleshooting)
 
 ## 1. Install
 
@@ -382,7 +383,186 @@ git-remote-object-store unprotect origin main
   is non-destructive — you can `git checkout` the quarantine ref and
   decide what to do).
 
-## 9. Troubleshooting
+## 9. Garbage collection
+
+The `gc` subcommand only applies to **packchain** remotes
+(`?engine=packchain`). Bundle-engine remotes have no garbage to
+collect — every push writes a fresh, self-contained bundle.
+
+```text
+git-remote-object-store gc <remote> [--mark-only] [--sweep-only] [--force] [--grace-hours <HOURS>]
+```
+
+### When to run
+
+Run `gc` after any operation that detaches packs from the chain:
+
+- **Force pushes** — the previous baseline and any segments that
+  were rewritten become orphans.
+- **Branch deletions** — packs unique to the deleted branch are no
+  longer referenced.
+- **Compactions** — `compact` rewrites a chain to a single segment;
+  every pre-compact segment pack becomes an orphan.
+- **On a regular schedule** — for active buckets, a weekly cron is
+  the simplest way to keep the bucket tidy without thinking about
+  it.
+
+`gc` is read-mostly during the mark phase and only deletes during
+sweep. It is safe to run against a live bucket; concurrent pushes
+take the per-ref lock and sweep re-checks the orphan set before
+deletion.
+
+### Default flow: mark + sweep in one command
+
+```bash
+git-remote-object-store gc origin
+```
+
+This invokes both phases:
+
+1. **Mark** — list every pack key, intersect against every
+   `chain.json`'s segment set, and write a tombstone at
+   `<prefix>/gc/tombstones-<run-id>-<rfc3339>.json` listing the
+   orphan packs.
+2. **Sweep** — re-list pack keys, re-check each tombstoned pack
+   against the latest chains (a concurrent push may have re-pointed
+   to a previously-orphan pack via content-hash dedup), and delete
+   the packs that are still orphan AND whose tombstone is older
+   than the grace window.
+
+Fresh tombstones from this same invocation will not sweep — they
+have not yet aged past the grace window. Re-running `gc` after the
+grace window applies them.
+
+### Cron-friendly split
+
+The grace window protects in-flight readers: a clone that started
+before the mark phase is allowed to finish even if `gc` decided
+the pack was orphan. For that to work, mark and sweep need to run
+**at least one grace window apart**.
+
+The simplest schedule is a single weekly job. Each invocation
+sweeps last week's tombstones and writes this week's. You do not
+need to split mark and sweep into separate jobs to get the grace
+behaviour — the grace check inside sweep handles it.
+
+Sample crontab (Sunday 03:00 local time):
+
+```cron
+0 3 * * 0  /usr/local/bin/git-remote-object-store gc s3+https://my-bucket.s3.us-west-2.amazonaws.com/my-repo?profile=ops >> /var/log/grobs-gc.log 2>&1
+```
+
+Sample GitHub Actions workflow (weekly, manual trigger also
+allowed):
+
+```yaml
+name: Bucket GC
+on:
+  schedule:
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+jobs:
+  gc:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # for OIDC -> AWS
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gc-runner
+          aws-region: us-west-2
+      - run: cargo install --git https://github.com/dekobon/git-remote-object-store git-remote-object-store-cli
+      - run: |
+          git-remote-object-store gc \
+            's3+https://my-bucket.s3.us-west-2.amazonaws.com/my-repo'
+```
+
+Operators who want the phases on different schedules — e.g. mark
+nightly, sweep weekly — can pass `--mark-only` and `--sweep-only`.
+Each `--mark-only` invocation writes a fresh tombstone; each
+`--sweep-only` invocation sweeps tombstones that have aged past
+the grace window.
+
+### Tuning the grace window
+
+The grace window is the minimum age a tombstone must reach before
+its packs are eligible for sweep. Default is 24 hours.
+
+```bash
+# Override per invocation:
+git-remote-object-store gc origin --grace-hours 168    # 7 days
+
+# Or via env var (also picks up upstream-compat name):
+export GIT_REMOTE_S3_GC_GRACE_HOURS=168
+git-remote-object-store gc origin
+```
+
+Recommended values:
+
+- **24h** — typical setup. Long enough that any normal `git clone`
+  or `git fetch` finishes within the window.
+- **7d** — buckets where multi-day clones are realistic (very
+  large repos, slow links, scheduled mirroring jobs).
+
+Setting the grace window to `0` is allowed but only meaningful in
+combination with `--force` (see below) — sweep otherwise still
+requires the tombstone to have a non-zero age.
+
+### `--force`: skip the grace window and re-check
+
+```bash
+git-remote-object-store gc origin --force
+```
+
+`--force` tells `gc`:
+
+1. The operator asserts that no concurrent reads against this
+   bucket are in flight.
+2. Sweep should not require a grace window — apply tombstones
+   immediately.
+3. Sweep should not re-check orphan packs against the chains —
+   delete what the tombstone said.
+
+Use it for one-off cleanup after a known-quiet maintenance window
+(release freeze, off-hours sweep). Do **not** wire it into a
+recurring schedule — the protections it bypasses exist precisely
+to keep clones from breaking under concurrent traffic.
+
+### Reading `gc` output
+
+The mark phase reports the orphan count or that the bucket is
+already clean:
+
+```text
+gc mark: N orphan pack(s) tombstoned (run id <uuid>).
+gc mark: no orphan packs.
+```
+
+The sweep phase reports per-tombstone disposition:
+
+```text
+gc sweep: A tombstone(s) applied, B object(s) deleted, C repointed pack(s) skipped, D tombstone(s) deferred.
+gc sweep: no tombstones present.
+```
+
+Field meanings:
+
+- **applied** (`A`) — tombstones whose grace window has expired
+  and whose orphan packs were processed this invocation.
+- **deleted** (`B`) — pack keys actually removed from the bucket.
+  Each pack contributes both its `.pack` and `.idx` to this count.
+- **repointed pack(s) skipped** (`C`) — packs the tombstone listed
+  as orphan but that the post-mark re-check found referenced by a
+  current chain. A concurrent push reused the content-hashed pack;
+  the tombstone correctly defers to the live reference and the
+  pack is not deleted.
+- **deferred** (`D`) — tombstones whose grace window has not yet
+  expired. They remain on the bucket and will be considered on
+  the next sweep.
+
+## 10. Troubleshooting
 
 ### Verbose helper output
 
