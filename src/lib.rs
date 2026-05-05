@@ -43,7 +43,7 @@ pub(crate) mod keys;
 pub mod lfs;
 pub mod manage;
 pub mod object_store;
-pub(crate) mod packchain;
+pub mod packchain;
 pub mod protocol;
 pub mod remote;
 pub mod url;
@@ -54,13 +54,13 @@ pub mod url;
 pub use object_store::{
     BoxError, GetOpts, ObjectMeta, ObjectStore, ObjectStoreError, ProgressSink, PutOpts,
 };
-/// Re-export of the packchain engine's error type. The packchain
-/// module itself is `pub(crate)`, but [`PackchainError`] is part of
-/// the public API surface via [`protocol::push::PushError::Packchain`]
-/// and [`protocol::fetch::FetchError::Packchain`], so consumers and
-/// integration tests must be able to match on it.
+/// Re-export of the packchain engine's public API: the error enum
+/// surfaced through [`protocol::push::PushError::Packchain`] /
+/// [`protocol::fetch::FetchError::Packchain`], plus the Phase 4
+/// direct-file-access entry points [`packchain::read_blob`] and
+/// [`packchain::PackIndexCache`].
 #[doc(no_inline)]
-pub use packchain::PackchainError;
+pub use packchain::{PackIndexCache, PackchainError, read_blob};
 #[doc(no_inline)]
 pub use protocol::backend::{BackendError, BackendKind};
 #[doc(no_inline)]
