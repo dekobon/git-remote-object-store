@@ -350,6 +350,17 @@ mod tests {
         crate::packchain::manifest::write_chain(&mock, Some("repo"), &rn, &chain)
             .await
             .unwrap();
+        // Add a stand-alone pack with NO chain reference. This is a
+        // real orphan: gc::mark would observe it and write a
+        // tombstone if it ran. The original test had no orphans on
+        // the bucket, so the "no `gc/` keys" assertion was
+        // vacuously true regardless of whether the with_gc gate
+        // fired — mutation-verified during /audit-tests
+        // (#67-followup).
+        mock.insert(
+            "repo/packs/9999999999999999999999999999999999999999.pack",
+            bytes::Bytes::from_static(b"orphan"),
+        );
 
         let prompter = ScriptedPrompter::new([]);
         let runner = Compact::new(
@@ -362,9 +373,11 @@ mod tests {
             },
             &prompter,
         );
-        // No tombstones exist, no orphan tracking — the runner
-        // should observe SkippedUnderThreshold and skip the gc
-        // pass. We verify by checking no `gc/` keys were written.
+        // Compact under-threshold short-circuits to
+        // `SkippedUnderThreshold`; with_gc must observe
+        // `any_compacted == false` and skip gc. If gc ran, it
+        // would tombstone the orphan above and we would see a
+        // `repo/gc/tombstones-*.json` key.
         runner.run().await.expect("skip-under-threshold run is Ok");
         let keys = mock.keys();
         assert!(
