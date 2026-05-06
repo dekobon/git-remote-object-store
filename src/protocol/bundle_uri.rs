@@ -23,16 +23,17 @@
 //! rotate per push, so a stable URL would race the next push; the
 //! issue explicitly puts the bundle engine out of scope.
 //!
-//! ## URL generation (MVP)
+//! ## URL generation
 //!
-//! For the MVP this module emits **canonical bucket URLs** suitable
-//! for public-read S3 buckets, S3-compatible CDNs, and Azure blob
-//! containers with anonymous-read access. Operator-controlled
-//! presigning (S3 `SigV4`) and SAS-token generation (Azure) are
-//! deliberate follow-ups — see [`BundleUriOpts::presign_ttl_seconds`]
-//! — because the cross-backend signing logic is invasive enough to
-//! warrant its own focused review (credential leakage if implemented
-//! incorrectly is the failure mode).
+//! This module emits either **canonical bucket URLs** (default,
+//! works for public-read S3 buckets, S3-compatible CDNs, and Azure
+//! blob containers with anonymous-read access) or **presigned
+//! URLs** (S3 `SigV4` / Azure service-blob SAS) when the operator
+//! sets [`BundleUriOpts::presign_ttl_seconds`] via the
+//! `?bundle_uri_presign_ttl=<seconds>` URL flag. Presigning runs
+//! through [`crate::object_store::ObjectStore::presigned_get_url`]
+//! so the credential material lives in the per-backend store
+//! impl, not here. (Issue #76.)
 //!
 //! ## Wire format
 //!
@@ -57,19 +58,17 @@ use crate::url::{AzureAddressing, RemoteUrl, S3Addressing};
 /// other manage-style opts (Doctor, Gc, Compact).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct BundleUriOpts {
-    /// When `Some(N)`, presign emitted URLs with an `N`-second TTL.
-    /// `None` (default) emits canonical bucket URLs that only work
-    /// against public-read buckets / CDN-fronted endpoints.
+    /// When `Some(N)`, presign emitted URLs with an `N`-second TTL
+    /// using the backend's
+    /// [`ObjectStore::presigned_get_url`](crate::object_store::ObjectStore::presigned_get_url)
+    /// impl. `None` (default) emits canonical bucket URLs that
+    /// only work against public-read buckets / CDN-fronted
+    /// endpoints.
     ///
     /// `NonZeroU64` because a zero-second TTL is meaningless (the
     /// URL would expire before any client could observe it); the
     /// type-system check rejects the bad value at the boundary
-    /// rather than letting it flow into the (eventually) presigning
-    /// code path.
-    ///
-    /// **Currently unimplemented**: setting this to `Some(_)` causes
-    /// the handler to return [`BundleUriError::PresigningUnsupported`]
-    /// rather than silently emit a canonical (insecure) URL.
+    /// rather than letting it flow into the presigning code path.
     pub(crate) presign_ttl_seconds: Option<NonZeroU64>,
 }
 
@@ -86,15 +85,6 @@ pub enum BundleUriError {
     /// I/O failure writing the response to the protocol writer.
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    /// Operator passed `presign_ttl_seconds: Some(_)` but the
-    /// presigning code path is not yet implemented. Today the handler
-    /// only emits canonical bucket URLs (sufficient for public-read
-    /// buckets and CDN-fronted endpoints).
-    #[error(
-        "bundle-uri presigned URLs are not yet implemented; \
-         drop the presign TTL or use a public-read bucket"
-    )]
-    PresigningUnsupported,
 }
 
 /// Run the `bundle-uri` command.
@@ -127,9 +117,6 @@ where
         writer.flush().await?;
         return Ok(());
     }
-    if opts.presign_ttl_seconds.is_some() {
-        return Err(BundleUriError::PresigningUnsupported);
-    }
 
     let prefix = remote.prefix().unwrap_or_default();
     // Bundle-uri is best-effort hinting per gitprotocol-v2: on a
@@ -151,7 +138,26 @@ where
     };
 
     for entry in &entries {
-        let url = canonical_bundle_url(remote, &entry.ref_path, &entry.full_at);
+        let url =
+            match bundle_url_for_emission(store, remote, &entry.ref_path, &entry.full_at, &opts)
+                .await
+            {
+                Ok(u) => u,
+                Err(e) => {
+                    // Per-entry warn-and-skip — an operator
+                    // misconfiguration on one ref (e.g. SDK rejects
+                    // a 7-day-plus TTL) must not blackhole the
+                    // bundle-uri response for the rest of the refs.
+                    // The terminator is still emitted at end of
+                    // loop.
+                    warn!(
+                        ref_path = %entry.ref_path,
+                        error = %e,
+                        "bundle-uri: URL build failed; skipping entry",
+                    );
+                    continue;
+                }
+            };
         let ref_path = &entry.ref_path;
         let token = &entry.full_at;
         let line =
@@ -261,10 +267,39 @@ async fn collect_entries(
     Ok(out)
 }
 
+/// Build the bundle URL to emit for `entry`. Dispatches on
+/// [`BundleUriOpts::presign_ttl_seconds`]:
+///
+/// - `None` → [`canonical_bundle_url`] (unsigned, works for
+///   public-read buckets and CDN-fronted endpoints).
+/// - `Some(ttl)` → [`ObjectStore::presigned_get_url`] (signed,
+///   required for private buckets — issue #76).
+///
+/// Per-entry errors propagate; the caller (`handle_bundle_uri`'s
+/// emission loop) warn-and-skips rather than aborting the whole
+/// helper.
+async fn bundle_url_for_emission(
+    store: &dyn ObjectStore,
+    remote: &RemoteUrl,
+    ref_path: &str,
+    full_at: &str,
+    opts: &BundleUriOpts,
+) -> Result<String, BundleUriError> {
+    let Some(ttl_seconds) = opts.presign_ttl_seconds else {
+        return Ok(canonical_bundle_url(remote, ref_path, full_at));
+    };
+    let bundle_key = keys::bundle_key(remote.prefix(), ref_path, full_at);
+    let ttl = std::time::Duration::from_secs(ttl_seconds.get());
+    store
+        .presigned_get_url(&bundle_key, ttl)
+        .await
+        .map_err(|e| BundleUriError::Packchain(PackchainError::Store(e)))
+}
+
 /// Build a canonical (unsigned) bucket URL for the baseline bundle
 /// at `<prefix>/<ref_path>/<full_at>.bundle`. Works for public-read
-/// buckets and CDN-fronted endpoints. Private buckets need
-/// presigning, which is a documented follow-up.
+/// buckets and CDN-fronted endpoints. Private buckets use
+/// [`bundle_url_for_emission`]'s presigning branch instead.
 fn canonical_bundle_url(remote: &RemoteUrl, ref_path: &str, full_at: &str) -> String {
     let bundle_key = keys::bundle_key(remote.prefix(), ref_path, full_at);
     match remote {
@@ -460,16 +495,106 @@ mod tests {
         );
     }
 
+    /// Decorator over [`MockStore`] that returns a deterministic
+    /// "presigned" URL so the dispatch path in
+    /// [`bundle_url_for_emission`] can be exercised without a real
+    /// backend. The URL shape mirrors what S3 presigning emits
+    /// (`X-Amz-Signature=` + `X-Amz-Expires=`) so assertions can
+    /// look for the same query parameters that a live test would.
+    struct StubPresignStore {
+        inner: MockStore,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for StubPresignStore {
+        async fn list(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<crate::object_store::ObjectMeta>, crate::object_store::ObjectStoreError>
+        {
+            self.inner.list(prefix).await
+        }
+        async fn get_to_file(
+            &self,
+            key: &str,
+            dest: &std::path::Path,
+            opts: crate::object_store::GetOpts,
+        ) -> Result<(), crate::object_store::ObjectStoreError> {
+            self.inner.get_to_file(key, dest, opts).await
+        }
+        async fn get_bytes(
+            &self,
+            key: &str,
+        ) -> Result<bytes::Bytes, crate::object_store::ObjectStoreError> {
+            self.inner.get_bytes(key).await
+        }
+        async fn get_bytes_range(
+            &self,
+            key: &str,
+            range: std::ops::Range<u64>,
+        ) -> Result<bytes::Bytes, crate::object_store::ObjectStoreError> {
+            self.inner.get_bytes_range(key, range).await
+        }
+        async fn put_bytes(
+            &self,
+            key: &str,
+            body: bytes::Bytes,
+            opts: crate::object_store::PutOpts,
+        ) -> Result<(), crate::object_store::ObjectStoreError> {
+            self.inner.put_bytes(key, body, opts).await
+        }
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            body: bytes::Bytes,
+        ) -> Result<bool, crate::object_store::ObjectStoreError> {
+            self.inner.put_if_absent(key, body).await
+        }
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<crate::object_store::ObjectMeta, crate::object_store::ObjectStoreError>
+        {
+            self.inner.head(key).await
+        }
+        async fn copy(
+            &self,
+            src: &str,
+            dst: &str,
+        ) -> Result<(), crate::object_store::ObjectStoreError> {
+            self.inner.copy(src, dst).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), crate::object_store::ObjectStoreError> {
+            self.inner.delete(key).await
+        }
+        async fn presigned_get_url(
+            &self,
+            key: &str,
+            ttl: std::time::Duration,
+        ) -> Result<String, crate::object_store::ObjectStoreError> {
+            Ok(format!(
+                "https://stub.example/{key}?X-Amz-Expires={}&X-Amz-Signature=DEADBEEF",
+                ttl.as_secs(),
+            ))
+        }
+    }
+
     #[tokio::test]
-    async fn presign_ttl_returns_unsupported_error() {
-        // Until the presigning implementation lands (see follow-up),
-        // setting `presign_ttl_seconds: Some(_)` must error rather
-        // than silently emit a canonical (insecure) URL.
-        let store = MockStore::new();
-        let remote =
-            parse("s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?bundle_uri=1").unwrap();
+    async fn presign_ttl_emits_presigned_url_via_dispatch() {
+        // With a backend that supports presigning, `bundle_url_for_emission`
+        // routes through `ObjectStore::presigned_get_url` instead of
+        // building a canonical URL. Verifies the dispatch path end-to-end.
+        let store = StubPresignStore {
+            inner: MockStore::new(),
+        };
+        write_test_chain(&store.inner, Some("repo"), &ref_main(), SHA_TIP, SHA_FULL).await;
+        let remote = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo\
+             ?engine=packchain&bundle_uri=1&bundle_uri_presign_ttl=3600",
+        )
+        .unwrap();
         let mut buf: Vec<u8> = Vec::new();
-        let err = handle_bundle_uri(
+        handle_bundle_uri(
             &store,
             &remote,
             BundleUriOpts {
@@ -479,9 +604,53 @@ mod tests {
             &mut buf,
         )
         .await
-        .unwrap_err();
-        assert!(matches!(err, BundleUriError::PresigningUnsupported));
-        assert!(buf.is_empty(), "no bytes written on error path");
+        .expect("handler succeeds against a presign-capable backend");
+        let text = std::str::from_utf8(&buf).unwrap();
+        assert!(
+            text.contains("uri=https://stub.example/"),
+            "presigned URL must reach the wire output: {text}",
+        );
+        assert!(
+            text.contains("X-Amz-Expires=3600"),
+            "TTL must be honoured (3600s): {text}",
+        );
+        assert!(
+            text.contains("X-Amz-Signature=DEADBEEF"),
+            "signature query param must be present: {text}",
+        );
+    }
+
+    #[tokio::test]
+    async fn presign_ttl_against_unsupporting_backend_warn_skips_entries() {
+        // `MockStore` inherits the `presigned_get_url` default impl
+        // (returns `ObjectStoreError::Unsupported`). Per-entry errors
+        // warn-and-skip — the bundle-uri response degrades to the
+        // terminator-only shape rather than aborting the whole
+        // helper invocation. (#76)
+        let store = MockStore::new();
+        write_test_chain(&store, Some("repo"), &ref_main(), SHA_TIP, SHA_FULL).await;
+        let remote = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo\
+             ?engine=packchain&bundle_uri=1&bundle_uri_presign_ttl=3600",
+        )
+        .unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        handle_bundle_uri(
+            &store,
+            &remote,
+            BundleUriOpts {
+                presign_ttl_seconds: Some(NonZeroU64::new(3_600).unwrap()),
+            },
+            true,
+            &mut buf,
+        )
+        .await
+        .expect("warn-and-skip never aborts the helper");
+        assert_eq!(
+            std::str::from_utf8(&buf).unwrap(),
+            "\n",
+            "presigning unsupported by backend → only the terminator reaches the wire",
+        );
     }
 
     #[tokio::test]

@@ -285,6 +285,36 @@ pub trait ObjectStore: Send + Sync {
     /// Delete `key`. Returns `Err(ObjectStoreError::NotFound)` if the key was
     /// not present.
     async fn delete(&self, key: &str) -> Result<(), ObjectStoreError>;
+
+    /// Build a presigned (short-lived, signed) URL granting GET access
+    /// to `key` for `ttl`. Used by the `bundle-uri` capability
+    /// ([`crate::protocol::bundle_uri`]) to advertise time-limited
+    /// download URLs against private buckets.
+    ///
+    /// The default impl returns
+    /// [`ObjectStoreError::Unsupported`] so backends that have no
+    /// presigning model (e.g. `MockStore` in tests, or
+    /// `AzureStore` configured with a `TokenCredential` rather than
+    /// a shared account key) inherit a clean "not supported" error
+    /// without needing a stub.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObjectStoreError::Unsupported`] when the backend
+    /// cannot produce signed URLs (default).
+    /// Returns [`ObjectStoreError::Other`] when the backend supports
+    /// presigning but the SDK rejects the TTL (e.g. AWS's 7-day
+    /// ceiling).
+    async fn presigned_get_url(
+        &self,
+        key: &str,
+        ttl: std::time::Duration,
+    ) -> Result<String, ObjectStoreError> {
+        let _ = (key, ttl);
+        Err(ObjectStoreError::Unsupported(
+            "presigned URLs are not supported by this backend".to_owned(),
+        ))
+    }
 }
 
 /// Blanket impl so `&Arc<T>` coerces to `&dyn ObjectStore` and so
@@ -354,5 +384,13 @@ impl<T: ObjectStore + ?Sized> ObjectStore for Arc<T> {
 
     async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
         (**self).delete(key).await
+    }
+
+    async fn presigned_get_url(
+        &self,
+        key: &str,
+        ttl: std::time::Duration,
+    ) -> Result<String, ObjectStoreError> {
+        (**self).presigned_get_url(key, ttl).await
     }
 }

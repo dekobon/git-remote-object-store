@@ -1376,3 +1376,58 @@ async fn multipart_put_path_aborts_on_midbody_truncation() {
         "expected NotFound on aborted destination, got {head_err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// S3 presigned-URL round-trip (issue #76)
+// ---------------------------------------------------------------------------
+
+/// `S3Store::presigned_get_url` produces a SigV4-signed URL whose
+/// `X-Amz-Expires` matches the requested TTL and whose
+/// `X-Amz-Signature` is non-empty. The URL fetches the same bytes a
+/// signed SDK call would, exercising the `SigV4` wire format end-to-end
+/// against `RustFS` (which supports `SigV4`). Issue #76.
+#[tokio::test]
+async fn presigned_get_url_round_trips_against_rustfs() {
+    use std::time::Duration;
+
+    let (store, _bucket) = fresh_bucket().await;
+    let key = "presign-target";
+    let body = Bytes::from_static(b"presigned body content");
+    store
+        .put_bytes(key, body.clone(), PutOpts::default())
+        .await
+        .expect("seed body");
+
+    let url_str = store
+        .presigned_get_url(key, Duration::from_hours(1))
+        .await
+        .expect("presigned_get_url");
+
+    let parsed = ::url::Url::parse(&url_str).expect("presigned URL parses");
+    let pairs: std::collections::BTreeMap<String, String> = parsed
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    assert_eq!(
+        pairs.get("X-Amz-Expires").map(String::as_str),
+        Some("3600"),
+        "X-Amz-Expires must echo the requested TTL: {pairs:?}",
+    );
+    let sig = pairs
+        .get("X-Amz-Signature")
+        .expect("X-Amz-Signature query param present");
+    assert!(!sig.is_empty(), "signature must be non-empty");
+    assert!(
+        pairs.contains_key("X-Amz-Date"),
+        "X-Amz-Date present (SigV4 requirement): {pairs:?}",
+    );
+
+    // Round-trip via plain reqwest — proves the URL is actually
+    // honoured by the bucket without any further auth.
+    let resp = reqwest::get(url_str)
+        .await
+        .expect("HTTP GET against presigned URL");
+    assert_eq!(resp.status().as_u16(), 200, "status: {}", resp.status());
+    let downloaded = resp.bytes().await.expect("body").to_vec();
+    assert_eq!(downloaded, body.as_ref(), "body mismatch via presigned URL");
+}

@@ -1345,3 +1345,76 @@ async fn multipart_put_path_aborts_on_midbody_truncation() {
         "expected NotFound on aborted destination, got {head_err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Azure presigned-URL (service SAS) round-trip (issue #76)
+// ---------------------------------------------------------------------------
+
+/// `AzureStore::presigned_get_url` produces a service-blob SAS URL
+/// whose query carries `sv=` (signed version), `sr=b` (blob),
+/// `sp=r` (read), `se=` (expiry, ISO-8601 UTC), and a non-empty
+/// `sig=` (HMAC-SHA256 signature). The URL fetches the same bytes a
+/// signed SDK call would, exercising the SAS wire format end-to-end
+/// against Azurite. Issue #76.
+#[tokio::test]
+async fn presigned_get_url_round_trips_against_azurite() {
+    use std::time::Duration;
+
+    let store = fresh_container().await;
+    let key = "presign-target";
+    let body = Bytes::from_static(b"presigned body content");
+    store
+        .put_bytes(key, body.clone(), PutOpts::default())
+        .await
+        .expect("seed body");
+
+    let url_str = store
+        .presigned_get_url(key, Duration::from_hours(1))
+        .await
+        .expect("presigned_get_url");
+
+    let parsed = ::url::Url::parse(&url_str).expect("presigned URL parses");
+    let pairs: std::collections::BTreeMap<String, String> = parsed
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    assert_eq!(
+        pairs.get("sr").map(String::as_str),
+        Some("b"),
+        "sr (signed resource) must be 'b': {pairs:?}",
+    );
+    assert_eq!(
+        pairs.get("sp").map(String::as_str),
+        Some("r"),
+        "sp (signed permissions) must be 'r': {pairs:?}",
+    );
+    assert!(
+        pairs.get("sv").is_some_and(|s| !s.is_empty()),
+        "sv (signed version) must be present: {pairs:?}",
+    );
+    let se = pairs
+        .get("se")
+        .expect("se (signed expiry) query param present");
+    assert!(
+        se.ends_with('Z'),
+        "se must be ISO-8601 UTC with Z suffix, got `{se}`",
+    );
+    let sig = pairs.get("sig").expect("sig query param present");
+    assert!(!sig.is_empty(), "signature must be non-empty");
+
+    // Round-trip via plain reqwest — proves Azurite honours the
+    // SAS without any further auth (no x-ms-version, no
+    // Authorization header, just the URL).
+    let resp = reqwest::get(url_str.clone())
+        .await
+        .expect("HTTP GET against SAS URL");
+    let status = resp.status();
+    let body_resp = resp.bytes().await.expect("body downloads").to_vec();
+    assert_eq!(
+        status.as_u16(),
+        200,
+        "status: {status} url={url_str} body={}",
+        String::from_utf8_lossy(&body_resp),
+    );
+    assert_eq!(body_resp, body.as_ref(), "body mismatch via SAS URL");
+}

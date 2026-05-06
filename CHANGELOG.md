@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `packchain` `bundle-uri` presigned URLs (issue #76, completes
+  the deferred follow-up from #71): a new
+  `?bundle_uri_presign_ttl=<seconds>` URL flag asks the helper to
+  emit per-ref signed URLs (S3 SigV4 / Azure service-blob SAS)
+  instead of canonical bucket URLs, so private-bucket users can
+  also benefit from `bundle-uri`-accelerated clones. The TTL
+  parses to `Option<NonZeroU64>` so `=0` is rejected at the URL
+  boundary. New `ObjectStore::presigned_get_url(key, ttl)` trait
+  method drives the presigning per backend; the default impl
+  returns `ObjectStoreError::Unsupported` so backends without a
+  presigning model (`MockStore` in tests, Azure `TokenCredential`
+  / SAS-env-var paths) inherit a clean error without a stub.
+  S3 presigning uses `aws-sdk-s3::presigning::PresigningConfig`;
+  Azure SAS is a hand-built `sv=2022-11-02` service-blob signature
+  in `src/object_store/azure/sas.rs` (storage-key-signed; user-
+  delegation SAS is out of scope per #76). Live round-trip tests
+  exercise SigV4 against RustFS and SAS against Azurite — both
+  emit the expected `X-Amz-Signature` / `sig` query parameters
+  and the URL fetches the body via plain `reqwest::get` with no
+  further auth. The `BundleUriError::PresigningUnsupported`
+  variant is removed.
 - `packchain` live integration tests against RustFS and Azurite
   (issue #69, completes the live-coverage gap for Phases 2–5 of
   #52): two new test binaries
@@ -40,14 +61,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bundle.<ref>.creationToken=<full_at>`), letting clients cache
   the bundle across clones until `full_at` advances (force push or
   compact). Per-ref parse failures warn-and-skip; a corrupt chain
-  on one branch does not blackhole the others. **MVP scope**: emits
-  canonical bucket URLs (works against public-read buckets,
+  on one branch does not blackhole the others. Default emission
+  is canonical bucket URLs (works against public-read buckets,
   S3-compatible CDNs, and Azure containers with anonymous-read
-  access). Operator-controlled presigning (S3 SigV4 + Azure SAS)
-  is a documented follow-up — `BundleUriOpts.presign_ttl_seconds`
-  is reserved for it; setting it today returns
-  `BundleUriError::PresigningUnsupported` rather than silently
-  emitting an unsigned URL against a private bucket.
+  access); private buckets opt in to per-ref presigned URLs via
+  the `?bundle_uri_presign_ttl=<seconds>` flag (issue #76).
 - `packchain` `compact` subcommand (issue #67, completes Phase 5
   of #52): new `git-remote-object-store compact <remote>` rewrites
   a packchain ref's `chain.json` to a single-segment chain at the
