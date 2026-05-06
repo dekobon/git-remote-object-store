@@ -288,9 +288,10 @@ async fn compact_under_lock(
     // SHA. The spec must resolve to that commit in the temp repo —
     // and the temp repo only has objects, not refs (unbundle and
     // install_pack do not create refs), so pass the SHA directly
-    // rather than the ref name.
-    let tip_spec = chain.tip.as_str().to_owned();
-    let bundle_path = git::bundle_at(&repo_dir, &output_dir, tip_sha, &tip_spec)
+    // rather than the ref name. `bundle_at` clones the spec into a
+    // `'static` String internally for `spawn_blocking`, so passing
+    // a borrowed `&str` here is sufficient.
+    let bundle_path = git::bundle_at(&repo_dir, &output_dir, tip_sha, chain.tip.as_str())
         .await
         .map_err(PackchainError::Git)?;
 
