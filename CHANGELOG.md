@@ -661,6 +661,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now enforces the matching Azure rules: alphanumeric bookends and no
   consecutive hyphens. Closes #17.
 
+### Security
+
+- `packchain` `bundle-uri` (issue #71) now rejects derived
+  ref-paths containing `=` before emission. Defense-in-depth
+  hardening flagged by /security-review: `gix_validate::reference::name`
+  bans `:`, `\n`, `\r`, ` `, control chars, and other framing-
+  relevant bytes — but it permits `=`, which git's `bundle-uri`
+  parser uses as the id/value split. The pre-existing `:` ban
+  forecloses scheme injection (no host-relocation SSRF), but a
+  ref-path with `=` could still produce a malformed wire entry on
+  shared-prefix deployments where another tenant has bucket-write
+  access. The new `is_safe_for_bundle_uri_emission` check warns
+  and skips such entries. Mutation-verified
+  (`skips_chain_json_with_equals_in_ref_name`).
+
 ## [0.1.0] - 2026-04-26
 
 Initial release. The full feature surface is in place: URL parser,
