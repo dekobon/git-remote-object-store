@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `packchain` `bundle-uri` capability (issue #71): packchain remotes
+  can now advertise the git remote-helper `bundle-uri` capability,
+  letting `git clone` fetch the baseline bundle from a public bucket
+  or CDN-fronted endpoint in parallel before the helper protocol
+  negotiates only the incremental tail. Opt in with `?bundle_uri=1`
+  on a `?engine=packchain` URL; bundle-engine remotes ignore the
+  flag (their bundle filenames rotate per push, so a stable URL
+  would race the next push). The `bundle-uri` command response
+  emits one entry per ref (`bundle.<ref>.uri=<url>` +
+  `bundle.<ref>.creationToken=<full_at>`), letting clients cache
+  the bundle across clones until `full_at` advances (force push or
+  compact). Per-ref parse failures warn-and-skip; a corrupt chain
+  on one branch does not blackhole the others. **MVP scope**: emits
+  canonical bucket URLs (works against public-read buckets,
+  S3-compatible CDNs, and Azure containers with anonymous-read
+  access). Operator-controlled presigning (S3 SigV4 + Azure SAS)
+  is a documented follow-up — `BundleUriOpts.presign_ttl_seconds`
+  is reserved for it; setting it today returns
+  `BundleUriError::PresigningUnsupported` rather than silently
+  emitting an unsigned URL against a private bucket.
 - `packchain` `compact` subcommand (issue #67, completes Phase 5
   of #52): new `git-remote-object-store compact <remote>` rewrites
   a packchain ref's `chain.json` to a single-segment chain at the
