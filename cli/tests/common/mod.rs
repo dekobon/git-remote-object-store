@@ -10,6 +10,14 @@
 //! but it special-cases `tests/<name>/mod.rs` as a shared module
 //! that does not become an integration-test crate of its own.
 
+// Each integration-test crate compiles this module independently, so
+// helpers used by one test file but not another would trigger warnings.
+#![allow(dead_code)]
+
+/// Backend-agnostic packchain end-to-end scenarios driven by both
+/// `packchain_live_s3.rs` and `packchain_live_azure.rs`. Issue #69.
+pub mod packchain_live;
+
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
