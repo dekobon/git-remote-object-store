@@ -17,7 +17,8 @@ that skip cloud accounts entirely.
 - [7. Git LFS](#7-git-lfs)
 - [8. Management CLI](#8-management-cli)
 - [9. Garbage collection](#9-garbage-collection)
-- [10. Troubleshooting](#10-troubleshooting)
+- [10. Bundle URI (accelerated clones)](#10-bundle-uri-accelerated-clones)
+- [11. Troubleshooting](#11-troubleshooting)
 
 ## 1. Install
 
@@ -565,7 +566,80 @@ Field meanings:
   expired. They remain on the bucket and will be considered on
   the next sweep.
 
-## 10. Troubleshooting
+## 10. Bundle URI (accelerated clones)
+
+Packchain remotes can advertise the git remote-helper
+`bundle-uri` capability so `git clone` fetches the baseline
+bundle directly from the bucket (or a CDN in front of it) in
+parallel with the helper protocol negotiating the incremental
+tail. The clone path takes one round trip per ref instead of
+walking the full chain. Issues #71 / #76.
+
+Opt in with `?bundle_uri=1`:
+
+```bash
+git clone 's3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=packchain&bundle_uri=1'
+```
+
+The helper emits one entry per ref:
+
+```text
+bundle.<ref>.uri=<url>
+bundle.<ref>.creationToken=<full_at>
+```
+
+`creationToken` is the chain's `full_at` SHA. Clients cache the
+fetched bundle and skip the network round trip on a subsequent
+clone whenever the token still matches; force-push or `compact`
+advances `full_at`, invalidating any cached bundle.
+
+### Public-read vs private buckets
+
+| Bucket layout | URL flag | Notes |
+|---|---|---|
+| Public-read S3 / CDN-fronted / anonymous-read Azure container | `?bundle_uri=1` | Default; helper emits the canonical bucket URL — no signing. |
+| Private S3 / private Azure container | `?bundle_uri=1&bundle_uri_presign_ttl=<seconds>` | Helper emits a per-ref presigned URL (S3 SigV4 / Azure service-blob SAS) that expires after `<seconds>`. |
+
+`bundle_uri_presign_ttl` is parsed as a positive integer of
+seconds (`Option<NonZeroU64>` internally — `=0` is rejected at
+the URL boundary). Choose it to balance accelerated-clone
+window vs URL-leakage risk: longer TTLs let one clone reuse the
+URL across retries, but the URL grants time-limited GET access
+to the bundle key to anyone who reads it.
+
+```bash
+# Private S3 bucket, 1-hour TTL.
+git clone 's3+https://acme-private.s3.us-west-2.amazonaws.com/repo?engine=packchain&bundle_uri=1&bundle_uri_presign_ttl=3600'
+
+# Private Azure container with a shared-key credential alias.
+AZSTORE_PROD_KEY=<base64-key> \
+  git clone 'az+https://acme.blob.core.windows.net/repo?engine=packchain&bundle_uri=1&bundle_uri_presign_ttl=3600&credential=PROD'
+```
+
+### Trade-offs and operator security notes
+
+- **URL leakage**: anyone who reads the helper's stdout (e.g.
+  `git -c transfer.verbosity=2`, CI log captures, `git remote
+  -v` after the clone if the URL is persisted) sees the
+  presigned URL. Choose `presign_ttl` shorter than your log
+  retention if that matters.
+- **Server-side signing only**: the helper signs the URL itself;
+  no credential material is emitted on stdout. The signed URL is
+  derived from the credentials but does not contain them.
+- **Azure credentials**: presigning requires a shared account
+  key (the `AZSTORE_<ALIAS>_KEY` or `AZSTORE_<ALIAS>_CONNECTION_STRING`
+  env var). Entra-ID `TokenCredential` and the SAS-env-var path
+  cannot derive per-blob SAS — both fall back to
+  `ObjectStoreError::Unsupported` at the wire line, the entry is
+  warn-and-skipped, and the client falls back to the helper
+  protocol fetch path. User-delegation SAS (Entra-ID-backed) is
+  filed as a future enhancement.
+- **AWS TTL ceiling**: AWS enforces a 7-day maximum on
+  presigned URLs. Asking for `bundle_uri_presign_ttl=604801`
+  surfaces an SDK error at emission time, the entry is warn-and-
+  skipped, and again the client falls back gracefully.
+
+## 11. Troubleshooting
 
 ### Verbose helper output
 

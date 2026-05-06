@@ -351,10 +351,13 @@ where
                 capabilities::handle_capabilities(&mut writer, advertise_bundle_uri).await?;
             }
             Command::BundleUri => {
+                let opts = bundle_uri::BundleUriOpts {
+                    presign_ttl_seconds: remote.flags().bundle_uri_presign_ttl,
+                };
                 bundle_uri::handle_bundle_uri(
                     ctx.store.as_ref(),
                     &remote,
-                    bundle_uri::BundleUriOpts::default(),
+                    opts,
                     advertise_bundle_uri,
                     &mut writer,
                 )

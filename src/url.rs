@@ -9,6 +9,7 @@
 
 use std::env;
 use std::fmt;
+use std::num::NonZeroU64;
 use std::str::FromStr;
 
 use thiserror::Error;
@@ -186,6 +187,19 @@ pub struct RemoteFlags {
     /// the flag because their bundle filenames rotate per push and a
     /// stable URL would race the next push.
     pub bundle_uri: bool,
+    /// `?bundle_uri_presign_ttl=<seconds>` — when set on a packchain
+    /// remote with `?bundle_uri=1`, the helper presigns each emitted
+    /// `bundle.<ref>.uri=<url>` line with an `<seconds>`-TTL signed
+    /// URL (S3 `SigV4` or Azure service-SAS). Operators with private
+    /// buckets need this; public-read buckets and CDN-fronted
+    /// endpoints can leave it unset (the canonical URL works
+    /// directly).
+    ///
+    /// `NonZeroU64` because a zero-second TTL is meaningless (the URL
+    /// would expire before any client could observe it). The URL
+    /// parser rejects `=0` at the boundary with [`ParseError::InvalidFlagValue`].
+    /// Issue #76.
+    pub bundle_uri_presign_ttl: Option<NonZeroU64>,
 }
 
 /// Errors produced by [`parse`].
@@ -411,6 +425,12 @@ fn extract_flags(u: &Url) -> Result<(RemoteFlags, Option<AddressingOverride>), P
                 );
             }
             "bundle_uri" => flags.bundle_uri = parse_bool_flag("bundle_uri", value.as_ref())?,
+            "bundle_uri_presign_ttl" => {
+                flags.bundle_uri_presign_ttl = Some(parse_nonzero_u64_flag(
+                    "bundle_uri_presign_ttl",
+                    value.as_ref(),
+                )?);
+            }
             other => return Err(ParseError::UnknownFlag(other.to_owned())),
         }
     }
@@ -426,6 +446,20 @@ fn parse_bool_flag(name: &str, value: &str) -> Result<bool, ParseError> {
             value: other.to_owned(),
         }),
     }
+}
+
+/// Parse a positive integer flag value into [`NonZeroU64`]. Rejects
+/// `0`, negative values, non-numeric junk. Used for `bundle_uri_presign_ttl`
+/// (issue #76).
+fn parse_nonzero_u64_flag(name: &str, value: &str) -> Result<NonZeroU64, ParseError> {
+    let n: u64 = value.parse().map_err(|_| ParseError::InvalidFlagValue {
+        name: name.to_owned(),
+        value: value.to_owned(),
+    })?;
+    NonZeroU64::new(n).ok_or_else(|| ParseError::InvalidFlagValue {
+        name: name.to_owned(),
+        value: value.to_owned(),
+    })
 }
 
 /// Non-empty path segments. Segments are returned verbatim; bucket /
@@ -1091,6 +1125,96 @@ mod tests {
         )
         .unwrap();
         assert!(!url.flags().bundle_uri);
+    }
+
+    // --- bundle_uri_presign_ttl flag (issue #76) -------------------------
+
+    #[test]
+    fn bundle_uri_presign_ttl_absent_defaults_to_none() {
+        let url = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=packchain&bundle_uri=1",
+        )
+        .unwrap();
+        assert_eq!(url.flags().bundle_uri_presign_ttl, None);
+    }
+
+    #[test]
+    fn bundle_uri_presign_ttl_positive_int_parses() {
+        let url = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo\
+             ?engine=packchain&bundle_uri=1&bundle_uri_presign_ttl=3600",
+        )
+        .unwrap();
+        assert_eq!(
+            url.flags().bundle_uri_presign_ttl,
+            Some(NonZeroU64::new(3600).expect("3600 is non-zero")),
+        );
+    }
+
+    #[test]
+    fn bundle_uri_presign_ttl_one_second_accepted() {
+        // Useless in practice but the type-system contract is "any
+        // positive value"; operator's prerogative to choose.
+        let url = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo\
+             ?engine=packchain&bundle_uri=1&bundle_uri_presign_ttl=1",
+        )
+        .unwrap();
+        assert_eq!(
+            url.flags().bundle_uri_presign_ttl,
+            Some(NonZeroU64::new(1).expect("1 is non-zero")),
+        );
+    }
+
+    #[test]
+    fn bundle_uri_presign_ttl_zero_rejected() {
+        // Zero-second TTL is meaningless; reject at the boundary
+        // rather than letting the bad value flow into the
+        // (presigning) backend.
+        let err = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo\
+             ?engine=packchain&bundle_uri=1&bundle_uri_presign_ttl=0",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidFlagValue { ref name, ref value }
+                    if name == "bundle_uri_presign_ttl" && value == "0"
+            ),
+            "expected InvalidFlagValue {{ name: bundle_uri_presign_ttl, value: 0 }}, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn bundle_uri_presign_ttl_non_numeric_rejected() {
+        let err = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo\
+             ?engine=packchain&bundle_uri=1&bundle_uri_presign_ttl=abc",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidFlagValue { ref name, ref value }
+                    if name == "bundle_uri_presign_ttl" && value == "abc"
+            ),
+            "expected InvalidFlagValue, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn bundle_uri_presign_ttl_negative_rejected() {
+        // u64 parser rejects negative input; surface as InvalidFlagValue.
+        let err = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo\
+             ?engine=packchain&bundle_uri=1&bundle_uri_presign_ttl=-1",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidFlagValue { ref name, .. } if name == "bundle_uri_presign_ttl"),
+            "expected InvalidFlagValue, got {err:?}",
+        );
     }
 
     #[test]

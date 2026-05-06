@@ -85,6 +85,15 @@ pub enum ObjectStoreError {
     #[error("network error: {0}")]
     Network(#[source] BoxError),
 
+    /// Operation is not implemented for the backend in use. Used by
+    /// optional [`ObjectStore`](crate::object_store::ObjectStore)
+    /// methods such as `presigned_get_url` that not every backend
+    /// can satisfy (e.g. `MockStore` in tests, or `AzureStore`
+    /// configured with a `TokenCredential` rather than a shared
+    /// account key — the latter cannot generate a service-SAS).
+    #[error("backend does not support operation: {0}")]
+    Unsupported(String),
+
     /// Any backend failure that does not fit the variants above.
     #[error(transparent)]
     Other(BoxError),

@@ -49,13 +49,44 @@ use crate::object_store::ObjectStoreError;
 use crate::object_store::error::other_boxed;
 use crate::url::RemoteFlags;
 
-/// Outcome of [`resolve`]: at most one of these is populated.
+/// Outcome of [`resolve`]: at most one of (`token_credential`,
+/// `per_try_policy`) is populated. `sas_signing_key` is populated
+/// only for the shared-key / connection-string paths so that the
+/// `bundle-uri` capability (issue #76) can derive per-blob service
+/// SAS tokens; the SAS env-var path and the Entra-ID path leave it
+/// `None`, in which case `presigned_get_url` returns
+/// [`crate::object_store::ObjectStoreError::Unsupported`].
 pub(crate) struct ResolvedCredentials {
     /// Entra ID credential, used when no `?credential=` alias is set.
     pub token_credential: Option<Arc<dyn TokenCredential>>,
     /// Per-try signing policy (shared-key or SAS), used when a
     /// `?credential=` alias resolves to an env-var-provided key.
     pub per_try_policy: Option<Arc<dyn Policy>>,
+    /// Account name + base64 storage key, when the credential alias
+    /// resolves to a shared key (KEY env var or connection string).
+    /// Held alongside the per-try policy so callers that need to
+    /// sign things outside the request pipeline (service-SAS for
+    /// `bundle-uri` presigned URLs) don't have to re-walk the env
+    /// vars. `None` for SAS / Entra-ID paths.
+    pub sas_signing_key: Option<SasSigningKey>,
+}
+
+/// Material required to sign a service-blob SAS token (issue #76).
+/// Carries the storage key as an [`azure_core::credentials::Secret`]
+/// so accidental `Debug` / log emission redacts the key.
+#[derive(Clone)]
+pub(crate) struct SasSigningKey {
+    pub account: String,
+    pub key: Secret,
+}
+
+impl std::fmt::Debug for SasSigningKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SasSigningKey")
+            .field("account", &self.account)
+            .field("key", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Resolve credentials for a parsed Azure URL.
@@ -70,6 +101,7 @@ pub(crate) fn resolve(
     Ok(ResolvedCredentials {
         token_credential: Some(cred),
         per_try_policy: None,
+        sas_signing_key: None,
     })
 }
 
@@ -90,15 +122,30 @@ fn resolve_alias(account: &str, alias: &str) -> Result<ResolvedCredentials, Obje
 
     if let Ok(key_b64) = env::var(&key_var) {
         let policy = SharedKeySigningPolicy::new(account, &key_b64)?;
-        return Ok(policy_only(Arc::new(policy)));
+        return Ok(policy_with_sas_key(
+            Arc::new(policy),
+            SasSigningKey {
+                account: account.to_owned(),
+                key: Secret::new(key_b64),
+            },
+        ));
     }
     if let Ok(conn) = env::var(&conn_var) {
         let parsed = parse_connection_string(&conn)?;
         let policy = SharedKeySigningPolicy::new(&parsed.account, &parsed.key_b64)?;
-        return Ok(policy_only(Arc::new(policy)));
+        return Ok(policy_with_sas_key(
+            Arc::new(policy),
+            SasSigningKey {
+                account: parsed.account,
+                key: Secret::new(parsed.key_b64),
+            },
+        ));
     }
     if let Ok(sas) = env::var(&sas_var) {
         let policy = SasSigningPolicy::new(&sas)?;
+        // SAS-env-var path has no storage key, so we cannot derive
+        // a fresh per-blob SAS for `bundle-uri` presigning. Leave
+        // `sas_signing_key` as `None`.
         return Ok(policy_only(Arc::new(policy)));
     }
 
@@ -115,6 +162,15 @@ fn policy_only(policy: Arc<dyn Policy>) -> ResolvedCredentials {
     ResolvedCredentials {
         token_credential: None,
         per_try_policy: Some(policy),
+        sas_signing_key: None,
+    }
+}
+
+fn policy_with_sas_key(policy: Arc<dyn Policy>, sas_key: SasSigningKey) -> ResolvedCredentials {
+    ResolvedCredentials {
+        token_credential: None,
+        per_try_policy: Some(policy),
+        sas_signing_key: Some(sas_key),
     }
 }
 

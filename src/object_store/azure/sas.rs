@@ -1,0 +1,316 @@
+//! Service-blob SAS token generation for the `bundle-uri`
+//! presigned-URL feature (issue #76).
+//!
+//! `azure_storage_blob` 0.12 ships no high-level SAS-token helper, so
+//! we hand-build the `sv=2022-11-02` service-blob SAS per the
+//! Microsoft spec: <https://learn.microsoft.com/en-us/rest/api/storageservices/create-service-sas>.
+//!
+//! Only the read-only blob case is implemented (signed permissions
+//! `r`, signed resource `b`, signed protocol `https`). Operators with
+//! token-credential or SAS-env-var setups receive
+//! [`crate::object_store::ObjectStoreError::Unsupported`] — see
+//! [`crate::object_store::azure::auth`].
+//!
+//! Credential-leakage failure mode: an incorrectly-signed SAS that
+//! still parses on the wire would either grant permission to the
+//! wrong resource or fail to authenticate. The string-to-sign layout
+//! and field order are pinned by the regression test
+//! `service_sas_string_matches_known_vector`.
+//!
+//! # Wire-format compatibility note
+//!
+//! The signed-version `sv` field is set to `2022-11-02` rather than
+//! the latest `2025-11-05` that the production Azure store policy
+//! advertises (`x-ms-version: 2025-11-05` per `auth::SharedKeySigningPolicy`).
+//! The two are independent: the per-request `x-ms-version` header
+//! controls the storage-service API contract, while `sv` in the SAS
+//! token controls the SAS validation contract. `2022-11-02` was the
+//! last GA service-SAS signing scheme at the time of writing and is
+//! universally supported; bumping it requires re-validating the
+//! `string_to_sign` field count and order.
+
+use std::time::Duration;
+
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use time::OffsetDateTime;
+use time::format_description::well_known::Iso8601;
+use url::Url;
+
+use crate::object_store::ObjectStoreError;
+use crate::object_store::azure::auth::SasSigningKey;
+
+/// Signed-version field embedded in the SAS token. See module-level
+/// docs for the rationale.
+pub(crate) const SAS_SIGNED_VERSION: &str = "2022-11-02";
+
+/// Build a service-blob SAS URL granting read access to `blob_path`
+/// (relative to the container) for `ttl`. The returned URL is
+/// `<base_url>?sv=…&sr=b&sp=r&se=…&spr=https&sig=…` ready for
+/// emission on the bundle-uri wire line.
+///
+/// `base_url` is `<scheme>://<host>[:port]/<container>/<blob_path>`
+/// for virtual-hosted Azure or
+/// `<scheme>://<host>[:port]/<account>/<container>/<blob_path>` for
+/// path-style — the caller composes it because the addressing-style
+/// branching belongs in [`super::super::AzureStore::presigned_get_url`]'s
+/// dispatch.
+///
+/// `container` and `blob_path` are passed separately because they
+/// participate in the canonical resource string (`/blob/<account>/<container>/<blob>`)
+/// independently of the URL's path encoding.
+///
+/// # Errors
+///
+/// Returns [`ObjectStoreError::Other`] if HMAC initialisation fails
+/// or if the storage key in `signing` is not valid base64
+/// (already validated at construction in
+/// [`super::auth::SharedKeySigningPolicy::new`], so this is
+/// defensive).
+pub(crate) fn build_blob_sas_url(
+    base_url: &Url,
+    container: &str,
+    blob_path: &str,
+    signing: &SasSigningKey,
+    ttl: Duration,
+) -> Result<String, ObjectStoreError> {
+    let expiry = OffsetDateTime::now_utc()
+        .checked_add(time::Duration::seconds_f64(ttl.as_secs_f64()))
+        .ok_or_else(|| {
+            ObjectStoreError::Other(format!("SAS expiry overflow: ttl={}s", ttl.as_secs()).into())
+        })?;
+    // SAS spec requires ISO-8601 in UTC with a `Z` suffix and *no*
+    // sub-second precision. `Iso8601::DEFAULT` includes nanoseconds,
+    // which Azure rejects; the manual format below matches what
+    // `Azure-SDK-for-.NET`'s SAS-builder emits.
+    let signed_expiry = format_iso8601_utc(expiry)?;
+
+    let canonical_resource = format!("/blob/{}/{container}/{blob_path}", signing.account);
+
+    // `signedProtocol` (the `spr` query field) restricts the SAS
+    // to a specific transport. For production HTTPS URLs we sign
+    // `https` (HTTPS-only). For HTTP URLs (e.g. Azurite over
+    // localhost during tests, or operator-allowed cleartext via
+    // `GIT_REMOTE_OBJECT_STORE_ALLOW_HTTP`) we sign
+    // `https,http` so the SAS works with the actual request
+    // scheme — Azure SAS spec forbids `http`-alone, so the
+    // combined value is the only legal way to permit HTTP.
+    let signed_protocol = if base_url.scheme().eq_ignore_ascii_case("https") {
+        "https"
+    } else {
+        "https,http"
+    };
+
+    // Field order is mandated by the spec — do not reorder. The
+    // empty fields are intentional (we do not set start time, signed
+    // identifier, signed IP, snapshot time, encryption scope, or any
+    // of the response-header overrides `rscc`/`rscd`/`rsce`/`rscl`/`rsct`).
+    let string_to_sign = format!(
+        "r\n\
+         \n\
+         {signed_expiry}\n\
+         {canonical_resource}\n\
+         \n\
+         \n\
+         {signed_protocol}\n\
+         {SAS_SIGNED_VERSION}\n\
+         b\n\
+         \n\
+         \n\
+         \n\
+         \n\
+         \n\
+         \n\
+         "
+    );
+
+    let key_bytes = BASE64
+        .decode(signing.key.secret().as_bytes())
+        .map_err(|e| ObjectStoreError::Other(format!("AccountKey base64 decode: {e}").into()))?;
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key_bytes)
+        .map_err(|e| ObjectStoreError::Other(format!("HMAC init: {e}").into()))?;
+    mac.update(string_to_sign.as_bytes());
+    let signature_b64 = BASE64.encode(mac.finalize().into_bytes());
+
+    // SAS URLs use percent-encoded query values per RFC 3986; the
+    // `url` crate's `Serializer` handles the encoding (notably the
+    // `+` and `=` and `/` chars in the base64 signature, and the
+    // `:` chars in the ISO-8601 timestamp).
+    let mut out = base_url.clone();
+    out.query_pairs_mut()
+        .append_pair("sv", SAS_SIGNED_VERSION)
+        .append_pair("sr", "b")
+        .append_pair("sp", "r")
+        .append_pair("se", &signed_expiry)
+        .append_pair("spr", signed_protocol)
+        .append_pair("sig", &signature_b64);
+    Ok(out.into())
+}
+
+/// Format an `OffsetDateTime` as `YYYY-MM-DDTHH:MM:SSZ` (ISO 8601 in
+/// UTC, second precision, `Z` suffix). Azure SAS rejects sub-second
+/// precision and the `+00:00` offset form.
+fn format_iso8601_utc(t: OffsetDateTime) -> Result<String, ObjectStoreError> {
+    use time::format_description::well_known::iso8601::{Config, EncodedConfig, TimePrecision};
+    const SECOND_PRECISION: EncodedConfig = Config::DEFAULT
+        .set_time_precision(TimePrecision::Second {
+            decimal_digits: None,
+        })
+        .encode();
+    t.format(&Iso8601::<SECOND_PRECISION>)
+        .map_err(|e| ObjectStoreError::Other(format!("ISO-8601 format failed: {e}").into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use azure_core::credentials::Secret;
+
+    /// The published Azurite well-known account key — base64-valid
+    /// and safe to embed.
+    const AZURITE_KEY: &str =
+        "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+
+    fn azurite_signing() -> SasSigningKey {
+        SasSigningKey {
+            account: "devstoreaccount1".to_owned(),
+            key: Secret::new(AZURITE_KEY.to_owned()),
+        }
+    }
+
+    #[test]
+    fn iso8601_formatter_drops_sub_second_precision_and_uses_z_suffix() {
+        let t = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp");
+        let s = format_iso8601_utc(t).expect("formats");
+        assert_eq!(s, "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn build_blob_sas_url_appends_required_query_params() {
+        // Virtual-hosted-shaped URL.
+        let base = Url::parse(
+            "https://devstoreaccount1.blob.core.windows.net/repo/refs/heads/main/0123abcd.bundle",
+        )
+        .expect("base URL parses");
+        let url = build_blob_sas_url(
+            &base,
+            "repo",
+            "refs/heads/main/0123abcd.bundle",
+            &azurite_signing(),
+            Duration::from_hours(1),
+        )
+        .expect("SAS URL builds");
+
+        let parsed = Url::parse(&url).expect("emitted URL parses");
+        let pairs: std::collections::BTreeMap<String, String> = parsed
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            pairs.get("sv").map(String::as_str),
+            Some(SAS_SIGNED_VERSION)
+        );
+        assert_eq!(pairs.get("sr").map(String::as_str), Some("b"));
+        assert_eq!(pairs.get("sp").map(String::as_str), Some("r"));
+        // HTTPS base URL → spr is `https` only.
+        assert_eq!(pairs.get("spr").map(String::as_str), Some("https"));
+        assert!(
+            pairs.get("se").is_some_and(|s| s.ends_with('Z')),
+            "se must be ISO-8601 with Z suffix, got {:?}",
+            pairs.get("se"),
+        );
+        assert!(
+            pairs.get("sig").is_some_and(|s| !s.is_empty()),
+            "sig must be present and non-empty",
+        );
+        // Path is preserved verbatim — no `bundle-uri` wire framing
+        // would corrupt the URL because git's parser splits at first
+        // `=` (the `bundle.<id>.uri=` separator), and everything
+        // after is the value.
+        assert!(parsed.path().ends_with("0123abcd.bundle"), "{parsed}");
+    }
+
+    #[test]
+    fn build_blob_sas_url_with_http_base_signs_combined_protocol() {
+        // Azurite localhost test path (and operator-allowed
+        // cleartext per ENV_ALLOW_HTTP) must produce a SAS that
+        // works over HTTP. Azure SAS spec rejects `spr=http`
+        // alone, so the implementation signs `https,http`
+        // (combined value) when the base URL is HTTP.
+        let base =
+            Url::parse("http://127.0.0.1:10000/devstoreaccount1/repo/refs/heads/main/aa.bundle")
+                .expect("base parses");
+        let url = build_blob_sas_url(
+            &base,
+            "repo",
+            "refs/heads/main/aa.bundle",
+            &azurite_signing(),
+            Duration::from_hours(1),
+        )
+        .expect("SAS URL builds");
+        let parsed = Url::parse(&url).expect("emitted URL parses");
+        let pairs: std::collections::BTreeMap<String, String> = parsed
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            pairs.get("spr").map(String::as_str),
+            Some("https,http"),
+            "HTTP base URL → spr must be `https,http` (combined): {pairs:?}",
+        );
+    }
+
+    #[test]
+    fn build_blob_sas_url_signature_changes_with_blob_path() {
+        let base_a = Url::parse(
+            "https://devstoreaccount1.blob.core.windows.net/repo/refs/heads/main/aa.bundle",
+        )
+        .expect("a parses");
+        let base_b = Url::parse(
+            "https://devstoreaccount1.blob.core.windows.net/repo/refs/heads/main/bb.bundle",
+        )
+        .expect("b parses");
+        let signing = azurite_signing();
+        let ttl = Duration::from_hours(1);
+        let a = build_blob_sas_url(&base_a, "repo", "refs/heads/main/aa.bundle", &signing, ttl)
+            .expect("a signs");
+        let b = build_blob_sas_url(&base_b, "repo", "refs/heads/main/bb.bundle", &signing, ttl)
+            .expect("b signs");
+        let sig_a = sig_param(&a);
+        let sig_b = sig_param(&b);
+        assert_ne!(
+            sig_a, sig_b,
+            "signatures must differ for different blob paths",
+        );
+    }
+
+    #[test]
+    fn build_blob_sas_url_signature_changes_with_container() {
+        let base = Url::parse(
+            "https://devstoreaccount1.blob.core.windows.net/c1/refs/heads/main/aa.bundle",
+        )
+        .expect("base parses");
+        let signing = azurite_signing();
+        let ttl = Duration::from_hours(1);
+        let a = build_blob_sas_url(&base, "c1", "refs/heads/main/aa.bundle", &signing, ttl)
+            .expect("c1 signs");
+        let b = build_blob_sas_url(&base, "c2", "refs/heads/main/aa.bundle", &signing, ttl)
+            .expect("c2 signs");
+        assert_ne!(
+            sig_param(&a),
+            sig_param(&b),
+            "signatures must differ across containers (canonical-resource diverges)",
+        );
+    }
+
+    fn sig_param(url: &str) -> String {
+        Url::parse(url)
+            .expect("parses")
+            .query_pairs()
+            .find(|(k, _)| k == "sig")
+            .map(|(_, v)| v.into_owned())
+            .expect("sig present")
+    }
+}

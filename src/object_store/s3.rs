@@ -896,6 +896,39 @@ impl ObjectStore for S3Store {
             .map_err(|e| classify(e, key))?;
         Ok(())
     }
+
+    /// Presign a `GetObject` request for `key` valid for `ttl`. Used
+    /// by the `bundle-uri` capability (issue #76) to advertise
+    /// time-limited download URLs against private buckets. The
+    /// returned URL carries an `X-Amz-Signature` query parameter
+    /// derived from the SDK's resolved `SigV4` credentials and an
+    /// `X-Amz-Expires=<ttl-seconds>` parameter that the operator
+    /// can use to verify the requested TTL was honoured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObjectStoreError::Other`] when the SDK rejects the
+    /// TTL (AWS caps presigned URLs at 7 days) or when the
+    /// presigning step fails (e.g. credential provider returned no
+    /// credentials).
+    async fn presigned_get_url(
+        &self,
+        key: &str,
+        ttl: std::time::Duration,
+    ) -> Result<String, ObjectStoreError> {
+        let config = aws_sdk_s3::presigning::PresigningConfig::expires_in(ttl).map_err(|e| {
+            ObjectStoreError::Other(format!("PresigningConfig::expires_in({ttl:?}): {e}").into())
+        })?;
+        let presigned = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .presigned(config)
+            .await
+            .map_err(|e| classify(e, key))?;
+        Ok(presigned.uri().to_owned())
+    }
 }
 
 impl S3Store {

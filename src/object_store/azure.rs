@@ -131,6 +131,7 @@
 //! configure to write to stderr).
 
 pub mod auth;
+pub(crate) mod sas;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -207,6 +208,19 @@ pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Production [`ObjectStore`] backed by `azure_storage_blob`.
 pub struct AzureStore {
     container: BlobContainerClient,
+    /// Container name as parsed from the URL — needed by SAS-token
+    /// construction (issue #76) because the SDK's
+    /// `BlobContainerClient::container_name()` is private. Held
+    /// regardless of credential type so the field shape doesn't
+    /// branch on whether SAS is reachable.
+    container_name: String,
+    /// Storage-key material for service-blob SAS generation
+    /// ([`presigned_get_url`](ObjectStore::presigned_get_url)).
+    /// `Some` when the credential alias resolves to a shared
+    /// account key (KEY env var or connection string); `None` for
+    /// SAS-env-var or Entra-ID paths, which return
+    /// [`ObjectStoreError::Unsupported`] for presigning.
+    sas_signing: Option<auth::SasSigningKey>,
 }
 
 impl std::fmt::Debug for AzureStore {
@@ -216,6 +230,8 @@ impl std::fmt::Debug for AzureStore {
         // useful.
         f.debug_struct("AzureStore")
             .field("endpoint", &self.container.endpoint().as_str())
+            .field("container", &self.container_name)
+            .field("sas_signing", &self.sas_signing)
             .finish()
     }
 }
@@ -255,6 +271,7 @@ impl AzureStore {
 
         let account_url = build_account_url(endpoint, account, *addressing);
         let resolved = auth::resolve(account, flags)?;
+        let sas_signing = resolved.sas_signing_key.clone();
 
         let client_options = build_client_options(&resolved)?;
 
@@ -263,7 +280,7 @@ impl AzureStore {
             ..Default::default()
         };
 
-        let container = BlobContainerClient::new(
+        let container_client = BlobContainerClient::new(
             &account_url,
             container,
             resolved.token_credential,
@@ -271,7 +288,11 @@ impl AzureStore {
         )
         .map_err(other_boxed)?;
 
-        Ok(Self { container })
+        Ok(Self {
+            container: container_client,
+            container_name: container.clone(),
+            sas_signing,
+        })
     }
 
     /// Construct a [`BlobClient`] for an individual blob.
@@ -759,6 +780,44 @@ impl ObjectStore for AzureStore {
             .await
             .map_err(|e| classify(e, key))?;
         Ok(())
+    }
+
+    /// Build a service-blob SAS URL for `key` valid for `ttl`.
+    /// Used by the `bundle-uri` capability (issue #76) to advertise
+    /// time-limited download URLs against private containers.
+    ///
+    /// Only the shared-key / connection-string credential paths can
+    /// produce a SAS — the SAS env-var path has no key to re-sign
+    /// with, and the Entra-ID `TokenCredential` path requires
+    /// user-delegation SAS (out of scope per the issue). Both
+    /// fall through to [`ObjectStoreError::Unsupported`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ObjectStoreError::Unsupported`] when the credential is
+    ///   not a shared key.
+    /// - [`ObjectStoreError::Other`] when SAS construction fails
+    ///   (HMAC init / base64 decode / time overflow).
+    async fn presigned_get_url(
+        &self,
+        key: &str,
+        ttl: std::time::Duration,
+    ) -> Result<String, ObjectStoreError> {
+        let signing = self.sas_signing.as_ref().ok_or_else(|| {
+            ObjectStoreError::Unsupported(
+                "Azure presigned URLs require a shared account key (KEY env var or \
+                 connection string); SAS-env-var and Entra-ID credentials cannot \
+                 derive per-blob SAS"
+                    .to_owned(),
+            )
+        })?;
+        // The SDK's `BlobClient::url()` returns the fully-qualified
+        // blob URL including the container path segment. Reuse it
+        // rather than re-deriving the URL shape per addressing
+        // mode here.
+        let blob = self.blob_client(key);
+        let base = blob.url();
+        sas::build_blob_sas_url(base, &self.container_name, key, signing, ttl)
     }
 }
 
@@ -1385,6 +1444,7 @@ mod tests {
         let resolved = auth::ResolvedCredentials {
             token_credential: None,
             per_try_policy: None,
+            sas_signing_key: None,
         };
         let opts = build_client_options(&resolved).expect("client options build");
         assert!(
@@ -1419,6 +1479,7 @@ mod tests {
         let resolved = auth::ResolvedCredentials {
             token_credential: None,
             per_try_policy: Some(Arc::clone(&policy)),
+            sas_signing_key: None,
         };
         let opts = build_client_options(&resolved).expect("client options build");
         assert!(opts.transport.is_some(), "transport still wired");
