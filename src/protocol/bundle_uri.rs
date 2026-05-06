@@ -209,6 +209,25 @@ async fn collect_entries(
             );
             continue;
         }
+        // Belt-and-suspenders against bundle-uri wire-format
+        // injection. The line shape is
+        // `bundle.<id>.<key>=<value>\n`; git's parser splits each
+        // line at the first `=`. `RefName::new` (via
+        // `gix_validate::reference::name`) already bans `\n`, `\r`,
+        // ` `, `:`, and the rest of `\0-\x1F`, but it permits `=`.
+        // A ref-path containing `=` cannot relocate the URL host —
+        // the `:` ban forecloses scheme injection — but it would
+        // produce a malformed entry that breaks a clone with
+        // `?bundle_uri=1` against a shared-prefix bucket where
+        // another tenant has write access. Reject defensively.
+        if !is_safe_for_bundle_uri_emission(&ref_path) {
+            warn!(
+                key = %meta.key,
+                ref_path = %ref_path,
+                "bundle-uri: derived ref path contains framing-unsafe bytes; skipping",
+            );
+            continue;
+        }
         // Fetch and parse chain.json. Per-ref transport failures
         // warn-and-skip rather than aborting — bundle-uri is
         // best-effort hinting; a missing entry just means the
@@ -289,6 +308,17 @@ fn canonical_bundle_url(remote: &RemoteUrl, ref_path: &str, full_at: &str) -> St
             host_authority(endpoint),
         ),
     }
+}
+
+/// `true` if `ref_path` is safe to interpolate into the
+/// `bundle.<id>.<key>=<value>\n` wire shape after `RefName::new`
+/// has already accepted it. Specifically, reject `=`: gix-validate
+/// permits it in ref names, but git's `bundle-uri` parser splits at
+/// the first `=` so its presence in the id position breaks framing.
+/// All other framing-relevant bytes (`\n`, `\r`, ` `, `:`,
+/// `\0`-`\x1F`, `\x7F`) are already rejected by gix-validate.
+fn is_safe_for_bundle_uri_emission(ref_path: &str) -> bool {
+    !ref_path.as_bytes().contains(&b'=')
 }
 
 /// Render `<scheme>://<host>[:port]` from a parsed [`url::Url`].
@@ -452,6 +482,86 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, BundleUriError::PresigningUnsupported));
         assert!(buf.is_empty(), "no bytes written on error path");
+    }
+
+    #[tokio::test]
+    async fn skips_chain_json_with_equals_in_ref_name() {
+        // Defense-in-depth against bundle-uri wire-format injection:
+        // gix-validate permits `=` in ref names, but git's
+        // `bundle-uri` parser splits each line at the first `=`. A
+        // ref-path containing `=` would produce a malformed entry on
+        // the wire. The host-relocation SSRF chain is foreclosed by
+        // gix-validate's `:` ban (no scheme injection possible), but
+        // we still skip rather than emit a corrupted line.
+        //
+        // Mutation-verified during /security-review: removing the
+        // `is_safe_for_bundle_uri_emission` check at the call site
+        // makes this test fail because `bundle.refs/heads/x=evil...`
+        // reaches the wire output.
+        let store = MockStore::new();
+        write_test_chain(&store, Some("repo"), &ref_main(), SHA_TIP, SHA_FULL).await;
+        // Plant a chain.json under a ref name that gix-validate
+        // accepts (`=` is not in its banned-bytes set) but that
+        // would corrupt the bundle-uri wire framing.
+        store.insert(
+            "repo/refs/heads/x=evil/chain.json",
+            Bytes::from(
+                format!(r#"{{"v":1,"tip":"{SHA_TIP}","full_at":"{SHA_TIP}","segments":[]}}"#)
+                    .into_bytes(),
+            ),
+        );
+        let remote = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=packchain&bundle_uri=1",
+        )
+        .unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        handle_bundle_uri(&store, &remote, BundleUriOpts::default(), true, &mut buf)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&buf).unwrap();
+        // The malicious entry must not reach the wire output. We
+        // anchor on the ref-name fragment `x=evil` rather than `=`
+        // alone because legitimate `bundle.<ref>.uri=<url>` lines
+        // also contain `=` as the id/value separator.
+        assert!(
+            !text.contains("x=evil"),
+            "no entry containing `=` in the ref-name segment may reach the wire output: {text}",
+        );
+        // The good ref is still present.
+        assert!(text.contains("bundle.refs/heads/main.uri="), "{text}");
+    }
+
+    #[test]
+    fn is_safe_for_bundle_uri_emission_accepts_typical_ref_paths() {
+        for path in &[
+            "refs/heads/main",
+            "refs/heads/feature/foo-bar.baz",
+            "refs/heads/release-1.0.0",
+            "refs/tags/v1",
+        ] {
+            assert!(
+                is_safe_for_bundle_uri_emission(path),
+                "expected `{path}` to be accepted",
+            );
+        }
+    }
+
+    #[test]
+    fn is_safe_for_bundle_uri_emission_rejects_equals() {
+        // `=` is the only framing-relevant byte gix-validate
+        // permits. Reject it everywhere it appears in the ref-path.
+        for path in &[
+            "refs/heads/x=y",
+            "refs/heads/=",
+            "=refs/heads/main",
+            "refs/heads/main=",
+            "refs/heads/main=evil.attacker",
+        ] {
+            assert!(
+                !is_safe_for_bundle_uri_emission(path),
+                "expected `{path}` to be rejected",
+            );
+        }
     }
 
     #[tokio::test]
