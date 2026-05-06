@@ -178,6 +178,14 @@ pub struct RemoteFlags {
     /// `FORMAT` key. On subsequent connects the stored `FORMAT` value is
     /// authoritative; a conflicting `?engine=` aborts with an error.
     pub engine: Option<StorageEngine>,
+    /// `?bundle_uri=1` — opt in to advertising the `bundle-uri` helper
+    /// capability so a `git clone` can fetch the packchain baseline
+    /// bundle directly (e.g. via a public bucket or CDN) before the
+    /// helper protocol negotiates the incremental tail. Only meaningful
+    /// for `?engine=packchain` remotes; bundle-engine remotes ignore
+    /// the flag because their bundle filenames rotate per push and a
+    /// stable URL would race the next push.
+    pub bundle_uri: bool,
 }
 
 /// Errors produced by [`parse`].
@@ -402,6 +410,7 @@ fn extract_flags(u: &Url) -> Result<(RemoteFlags, Option<AddressingOverride>), P
                         .ok_or_else(|| ParseError::UnknownEngine(value.into_owned()))?,
                 );
             }
+            "bundle_uri" => flags.bundle_uri = parse_bool_flag("bundle_uri", value.as_ref())?,
             other => return Err(ParseError::UnknownFlag(other.to_owned())),
         }
     }
@@ -1056,6 +1065,32 @@ mod tests {
         let url =
             parse("s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=packchain").unwrap();
         assert_eq!(url.flags().engine, Some(StorageEngine::Packchain));
+    }
+
+    // --- bundle_uri flag (issue #71) -------------------------------------
+
+    #[test]
+    fn bundle_uri_flag_absent_defaults_to_false() {
+        let url = parse("s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo").unwrap();
+        assert!(!url.flags().bundle_uri);
+    }
+
+    #[test]
+    fn bundle_uri_flag_one_sets_true() {
+        let url = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=packchain&bundle_uri=1",
+        )
+        .unwrap();
+        assert!(url.flags().bundle_uri);
+    }
+
+    #[test]
+    fn bundle_uri_flag_zero_sets_false() {
+        let url = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=packchain&bundle_uri=0",
+        )
+        .unwrap();
+        assert!(!url.flags().bundle_uri);
     }
 
     #[test]

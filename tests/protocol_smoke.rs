@@ -53,6 +53,95 @@ async fn packchain_capabilities_succeeds() {
 }
 
 #[tokio::test]
+async fn packchain_capabilities_advertises_bundle_uri_when_opted_in() {
+    // Issue #71: `?bundle_uri=1` on a packchain remote opts the
+    // helper into advertising the `bundle-uri` capability. Without
+    // the flag the line is absent (verified by
+    // `packchain_capabilities_succeeds`).
+    let raw = "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=packchain&bundle_uri=1";
+    let remote = git_remote_object_store::url::parse(raw).expect("URL parses");
+    let store: Arc<dyn ObjectStore> = Arc::new(MockStore::new());
+    let (out, result) = drive(remote, store, "capabilities\n").await;
+    result.expect("capabilities must succeed");
+    assert_eq!(
+        &out, b"*push\n*fetch\noption\nbundle-uri\n\n",
+        "bundle-uri line must precede the trailing terminator",
+    );
+}
+
+#[tokio::test]
+async fn bundle_engine_with_bundle_uri_flag_does_not_advertise() {
+    // The bundle engine ignores `?bundle_uri=1`: bundle filenames
+    // rotate per push so a stable URL would race the next push.
+    // Pin that the capability line is absent regardless of the URL
+    // flag.
+    let raw = "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?bundle_uri=1";
+    let remote = git_remote_object_store::url::parse(raw).expect("URL parses");
+    let store: Arc<dyn ObjectStore> = Arc::new(MockStore::new());
+    let (out, result) = drive(remote, store, "capabilities\n").await;
+    result.expect("capabilities must succeed");
+    assert_eq!(
+        &out, b"*push\n*fetch\noption\n\n",
+        "bundle-engine remote must not advertise bundle-uri",
+    );
+}
+
+#[tokio::test]
+async fn bundle_uri_command_emits_per_ref_entries_with_creation_token() {
+    // End-to-end: push + bundle-uri command. We seed a packchain
+    // chain.json so the handler has something to emit, then drive
+    // the REPL through a `capabilities` + `bundle-uri` exchange.
+    let store = MockStore::new();
+    store.insert("repo/FORMAT", Bytes::from_static(b"packchain"));
+    store.insert(
+        "repo/refs/heads/main/chain.json",
+        Bytes::from(
+            format!(
+                r#"{{"v":1,"tip":"{SHA_A}","full_at":"{SHA_B}","segments":[{{"sha":"{SHA_A}","parent_sha":null,"pack":"packs/{SHA_C}.pack","bytes":1024}}]}}"#,
+            )
+            .into_bytes(),
+        ),
+    );
+    let store: Arc<dyn ObjectStore> = Arc::new(store);
+
+    let raw = "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=packchain&bundle_uri=1";
+    let remote = git_remote_object_store::url::parse(raw).expect("URL parses");
+    let (out, result) = drive(remote, store, "capabilities\nbundle-uri\n").await;
+    result.expect("capabilities + bundle-uri must succeed");
+    let text = std::str::from_utf8(&out).unwrap();
+    // capabilities response, then bundle-uri response.
+    assert!(
+        text.starts_with("*push\n*fetch\noption\nbundle-uri\n\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "bundle.refs/heads/main.uri=https://my-bucket.s3.us-west-2.amazonaws.com/repo/refs/heads/main/{SHA_B}.bundle\n"
+        )),
+        "{text}",
+    );
+    assert!(
+        text.contains(&format!("bundle.refs/heads/main.creationToken={SHA_B}\n")),
+        "{text}",
+    );
+    // creationToken is `full_at` (SHA_B), not `tip` (SHA_A).
+    assert!(!text.contains(&format!("creationToken={SHA_A}")), "{text}");
+}
+
+#[tokio::test]
+async fn bundle_uri_command_when_capability_not_advertised_emits_terminator_only() {
+    // If a misconfigured client sends `bundle-uri\n` without us
+    // having advertised the capability, the helper still must
+    // respond gracefully — emit just the trailing blank line.
+    let raw = "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=packchain";
+    let remote = git_remote_object_store::url::parse(raw).expect("URL parses");
+    let store: Arc<dyn ObjectStore> = Arc::new(MockStore::new());
+    let (out, result) = drive(remote, store, "bundle-uri\n").await;
+    result.expect("bundle-uri command must succeed");
+    assert_eq!(&out, b"\n");
+}
+
+#[tokio::test]
 async fn packchain_fetch_against_empty_bucket_surfaces_chain_absent() {
     // Phase 3 (issue #64) lights up packchain fetch. Fetching a ref
     // from a packchain bucket that has no chain.json for that ref

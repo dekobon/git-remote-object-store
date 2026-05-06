@@ -1,22 +1,40 @@
 //! `capabilities` command handler.
 //!
-//! Mirrors `cmd_capabilities` in `../git-remote-s3/git_remote_s3/remote.py`.
-//! Output is exactly four lines: `*push`, `*fetch`, `option`, blank — see
-//! the git remote-helper protocol docs (`git help gitremote-helpers`).
+//! Mirrors `cmd_capabilities` in `../git-remote-s3/git_remote_s3/remote.py`,
+//! plus a packchain-only `bundle-uri` extension (issue #71) that opts an
+//! operator into advertising baseline-bundle URLs the client can fetch
+//! before the helper protocol negotiates the incremental tail.
+//!
+//! Output is the same line-by-line block the upstream Python emits —
+//! `*push`, `*fetch`, `option`, optionally `bundle-uri`, then a blank
+//! terminator. See the git remote-helper protocol docs
+//! (`git help gitremote-helpers`) for the format.
 
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-/// Capability list announced to git: parallel push, parallel fetch, and
-/// the `option` setting protocol. Includes the trailing blank-line
-/// terminator.
-const CAPABILITIES: &[u8] = b"*push\n*fetch\noption\n\n";
+const BASE_CAPABILITIES: &[u8] = b"*push\n*fetch\noption\n";
+const BUNDLE_URI_LINE: &[u8] = b"bundle-uri\n";
+const TERMINATOR: &[u8] = b"\n";
 
 /// Write the capability list to `writer` and flush.
-pub(crate) async fn handle_capabilities<W>(writer: &mut W) -> std::io::Result<()>
+///
+/// `advertise_bundle_uri` is set by the caller when the resolved engine
+/// is [`crate::url::StorageEngine::Packchain`] and the URL has
+/// `?bundle_uri=1`. Per `.claude/rules/protocol-stdout.md`, every byte
+/// emitted here is part of the wire-line; the function performs no
+/// other writes.
+pub(crate) async fn handle_capabilities<W>(
+    writer: &mut W,
+    advertise_bundle_uri: bool,
+) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    writer.write_all(CAPABILITIES).await?;
+    writer.write_all(BASE_CAPABILITIES).await?;
+    if advertise_bundle_uri {
+        writer.write_all(BUNDLE_URI_LINE).await?;
+    }
+    writer.write_all(TERMINATOR).await?;
     writer.flush().await
 }
 
@@ -25,9 +43,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn writes_exact_capabilities_block() {
+    async fn writes_base_capabilities_block_when_bundle_uri_disabled() {
         let mut buf: Vec<u8> = Vec::new();
-        handle_capabilities(&mut buf).await.unwrap();
+        handle_capabilities(&mut buf, false).await.unwrap();
         assert_eq!(&buf, b"*push\n*fetch\noption\n\n");
+    }
+
+    #[tokio::test]
+    async fn appends_bundle_uri_line_when_enabled() {
+        // The bundle-uri line lands BEFORE the trailing blank
+        // terminator so git's capability parser still sees the
+        // canonical termination.
+        let mut buf: Vec<u8> = Vec::new();
+        handle_capabilities(&mut buf, true).await.unwrap();
+        assert_eq!(&buf, b"*push\n*fetch\noption\nbundle-uri\n\n");
     }
 }

@@ -20,6 +20,7 @@ use crate::object_store::ObjectStore;
 use crate::url::{RemoteUrl, StorageEngine};
 
 pub mod backend;
+pub(crate) mod bundle_uri;
 pub(crate) mod capabilities;
 pub mod fetch;
 pub(crate) mod list;
@@ -123,6 +124,10 @@ pub enum ProtocolError {
     /// `FORMAT` validation / engine resolution failed during connect.
     #[error("backend resolution failed: {0}")]
     Backend(#[from] backend::BackendError),
+
+    /// `bundle-uri` command handler failed.
+    #[error("bundle-uri failed: {0}")]
+    BundleUri(#[from] bundle_uri::BundleUriError),
 }
 
 impl ProtocolError {
@@ -140,6 +145,7 @@ impl ProtocolError {
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Capabilities,
+    BundleUri,
     List { for_push: bool },
     Option(String),
     Fetch(String),
@@ -252,6 +258,9 @@ fn parse_command(line: &str) -> Option<Command> {
     if trimmed == "capabilities" {
         return Some(Command::Capabilities);
     }
+    if trimmed == "bundle-uri" {
+        return Some(Command::BundleUri);
+    }
     // Order matters: "list for-push" must match before "list".
     if trimmed == "list for-push" {
         return Some(Command::List { for_push: true });
@@ -317,6 +326,14 @@ where
     // shallow operation.
     let mut depth: Option<NonZeroU32> = None;
     let zip = remote.flags().zip;
+    // bundle-uri (issue #71) is gated on engine == Packchain AND the
+    // operator opting in via `?bundle_uri=1`. The gate is computed
+    // once at session start so a `?bundle_uri=1` flag on a bundle
+    // remote is silently inert (the issue puts the bundle engine
+    // explicitly out of scope: bundle filenames rotate per push, so
+    // a stable URL would race the next push).
+    let advertise_bundle_uri =
+        matches!(engine, StorageEngine::Packchain) && remote.flags().bundle_uri;
     let ctx = BatchCtx {
         store,
         prefix: remote.prefix().map(Arc::from),
@@ -331,7 +348,17 @@ where
         };
         match cmd {
             Command::Capabilities => {
-                capabilities::handle_capabilities(&mut writer).await?;
+                capabilities::handle_capabilities(&mut writer, advertise_bundle_uri).await?;
+            }
+            Command::BundleUri => {
+                bundle_uri::handle_bundle_uri(
+                    ctx.store.as_ref(),
+                    &remote,
+                    bundle_uri::BundleUriOpts::default(),
+                    advertise_bundle_uri,
+                    &mut writer,
+                )
+                .await?;
             }
             Command::List { for_push } => {
                 list::handle_list(
