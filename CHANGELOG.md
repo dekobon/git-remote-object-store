@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `packchain` live integration tests against RustFS and Azurite
+  (issue #69, completes the live-coverage gap for Phases 2–5 of
+  #52): two new test binaries
+  (`cli/tests/packchain_live_s3.rs`,
+  `cli/tests/packchain_live_azure.rs`) drive a backend-agnostic
+  scenario module (`cli/tests/common/packchain_live.rs`) against
+  fresh-per-test buckets / containers. Scenarios cover Phase 2
+  (first push lays down `chain.json` + `path-index.json` +
+  `<tip>.bundle` + `packs/<sha>.{pack,idx}` + `FORMAT` + `HEAD`;
+  incremental push appends a chain segment newest-first; force
+  push collapses to a single segment); Phase 3 (fetch into an
+  empty repo lands the tip; chain-walk fetch installs every
+  segment in dependency order); Phase 4 (`read_blob` returns
+  byte-equal content, and the cache survives an `.idx` deletion
+  between calls — pinning `PackIndexCache` reuse without
+  instrumenting the store); Phase 5 (`mark` writes a tombstone
+  for orphan packs, `sweep` with `grace_hours = 0` deletes them
+  through the production grace-comparison path). CI runs both
+  suites in the existing integration-test jobs.
 - `packchain` `bundle-uri` capability (issue #71): packchain remotes
   can now advertise the git remote-helper `bundle-uri` capability,
   letting `git clone` fetch the baseline bundle from a public bucket

@@ -1890,6 +1890,7 @@ dependencies = [
  "git-remote-object-store",
  "gix",
  "reqwest",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "testcontainers",

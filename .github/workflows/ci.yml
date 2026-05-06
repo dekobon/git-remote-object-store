@@ -267,6 +267,9 @@ jobs:
       - name: Run S3 integration tests
         run: cargo test --workspace --features integration-s3 --test s3_store_integration
 
+      - name: Run packchain live S3 tests
+        run: cargo test --workspace --features integration-s3 --test packchain_live_s3
+
   # -------------------------------------------------------------------
   # Job 4: Azure Blob backend integration tests
   #
@@ -287,3 +290,6 @@ jobs:
 
       - name: Run Azure integration tests
         run: cargo test --workspace --features integration-azure --test azure_store_integration
+
+      - name: Run packchain live Azure tests
+        run: cargo test --workspace --features integration-azure --test packchain_live_azure

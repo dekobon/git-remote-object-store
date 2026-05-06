@@ -113,6 +113,10 @@ tempfile = "3"
 # SHA-256 — used in both integration test files for content-hash assertions.
 sha2 = "0.10"
 
+# JSON parsing — `tests/packchain_live_*.rs` parse `chain.json` /
+# `path-index.json` to assert the packchain on-bucket layout (#69).
+serde_json = "1"
+
 # AWS SDK S3 — `tests/s3_store_integration.rs` imports `ByteStream` directly.
 # Versions and features must match the library's `[dependencies]` entry so
 # cargo unifies to a single copy.
