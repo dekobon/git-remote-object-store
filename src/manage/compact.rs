@@ -23,7 +23,7 @@ use crate::object_store::ObjectStore;
 use crate::packchain::audit::{self, AuditReport, BranchAuditRow};
 use crate::packchain::compact::{self, CompactAction, CompactOpts, CompactOutcome};
 use crate::packchain::gc;
-use crate::protocol::push::{DEFAULT_LOCK_TTL_SECONDS, lock_ttl_from_env};
+use crate::protocol::push::lock_ttl_from_env;
 
 /// Tunables for [`Compact::run`]. Field semantics mirror the CLI flags.
 #[derive(Debug, Clone)]
@@ -181,7 +181,9 @@ impl<'a> Compact<'a> {
     async fn audit_for_compaction_candidates(&self) -> Result<AuditReport, ManageError> {
         let list_prefix = keys::join(&self.prefix, "");
         let objects = self.store.list(&list_prefix).await?;
-        Ok(audit::audit(self.store.as_ref(), &self.prefix, &objects).await?)
+        audit::audit(self.store.as_ref(), &self.prefix, &objects)
+            .await
+            .map_err(ManageError::from)
     }
 
     async fn run_gc(&self) -> Result<(), ManageError> {
@@ -265,11 +267,6 @@ fn print_outcome(outcome: &CompactOutcome) {
         }
     }
 }
-
-// `DEFAULT_LOCK_TTL_SECONDS` is re-exported here so the CLI can use
-// it as the default value for `--lock-ttl`. Imported but unused
-// signals an intentional re-export contract; reference it explicitly.
-const _: u64 = DEFAULT_LOCK_TTL_SECONDS;
 
 #[cfg(test)]
 mod tests {

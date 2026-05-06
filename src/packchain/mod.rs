@@ -295,6 +295,15 @@ impl From<gix_pack::bundle::write::Error> for PackchainError {
     }
 }
 
+impl From<tokio::task::JoinError> for PackchainError {
+    fn from(value: tokio::task::JoinError) -> Self {
+        // `JoinError` carries either a panic payload or a cancellation
+        // signal; flatten both through the Io variant since neither
+        // matches a more specific PackchainError category.
+        Self::Io(std::io::Error::other(value.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

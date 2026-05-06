@@ -37,17 +37,17 @@ use tracing::{debug, info, warn};
 
 use crate::git::{self, RefName, Sha};
 use crate::keys;
-use crate::object_store::{ObjectStore, PutOpts};
+use crate::object_store::{GetOpts, ObjectStore, PutOpts};
 use crate::protocol::fetch::MAX_FETCH_CONCURRENCY;
 use crate::protocol::push::{acquire_lock, lock_key, release_lock};
 
 use super::PackchainError;
 use super::audit::{COMPACT_BYTES_THRESHOLD, COMPACT_SEGMENTS_THRESHOLD};
 use super::fetch::install_pack;
-use super::keys::{pack_idx_key, pack_key};
+use super::keys::{pack_idx_key, pack_key, packs_key_with_prefix};
 use super::manifest::{load_chain, write_chain, write_path_index};
 use super::pack::build_baseline_pack;
-use super::schema::{ChainManifest, ChainSegment, Sha40};
+use super::schema::{ChainManifest, ChainSegment};
 
 /// Knobs for [`compact`]. Mirrors the shape used by `gc::SweepOpts`.
 #[derive(Debug, Clone, Copy)]
@@ -225,12 +225,11 @@ async fn compact_under_lock(
             .ok_or_else(|| PackchainError::ChainAbsent {
                 ref_name: ref_name.as_str().to_owned(),
             })?;
-    let tip_sha = Sha::from_hex(chain.tip.as_str()).map_err(|e| {
-        PackchainError::Io(std::io::Error::other(format!(
-            "chain.tip `{}` is not a valid 40-hex sha: {e}",
-            chain.tip.as_str(),
-        )))
-    })?;
+    // `Sha40::try_new` already validated 40-hex on deserialise of
+    // `chain.tip`, so the `Sha::from_hex` round-trip is provably-OK
+    // by construction. Use `expect` per the project's
+    // unreachable-defensive-code rule.
+    let tip_sha = Sha::from_hex(chain.tip.as_str()).expect("Sha40 always parses as a gix Sha");
 
     let scratch = TempDir::new().map_err(PackchainError::Io)?;
     let repo_dir = scratch.path().join("repo");
@@ -244,15 +243,16 @@ async fn compact_under_lock(
     // working tree the install step would need to ignore.
     // `gix::init::Error` is a large variant — box it on the way out
     // so the closure return type stays small (avoids
-    // `clippy::result_large_err`).
+    // `clippy::result_large_err`); the `?` chain then collapses
+    // through `From<JoinError> for PackchainError` and the explicit
+    // map for the boxed init error.
     {
         let repo_dir = repo_dir.clone();
         tokio::task::spawn_blocking(move || {
             gix::init_bare(&repo_dir)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
         })
-        .await
-        .map_err(|e| PackchainError::Io(std::io::Error::other(e.to_string())))?
+        .await?
         .map_err(|e| PackchainError::Io(std::io::Error::other(e.to_string())))?;
     }
 
@@ -271,8 +271,7 @@ async fn compact_under_lock(
         let repo_dir = repo_dir.clone();
         let output_dir = output_dir.clone();
         tokio::task::spawn_blocking(move || build_baseline_pack(&repo_dir, tip_sha, &output_dir))
-            .await
-            .map_err(|e| PackchainError::Io(std::io::Error::other(e.to_string())))??
+            .await??
     };
 
     // Compute fresh path-index.
@@ -282,8 +281,7 @@ async fn compact_under_lock(
             let repo = gix::open(&repo_dir).map_err(crate::git::GitError::from)?;
             super::git::extract_path_index(&repo, tip_sha)
         })
-        .await
-        .map_err(|e| PackchainError::Io(std::io::Error::other(e.to_string())))??
+        .await??
     };
 
     // Build fresh baseline bundle. The bundle filename uses the tip
@@ -319,10 +317,10 @@ async fn compact_under_lock(
     let new_segment = ChainSegment {
         sha: chain.tip.clone(),
         parent_sha: None,
-        // Schema stores the pack key relative to the bucket; for
-        // bucket-root deployments that's `packs/<sha>.pack`. Mirror
-        // the push path's representation.
-        pack: relative_pack_path(&new_pack.content_sha),
+        // Schema stores the pack key relative to the bucket; reuse
+        // the canonical key builder with `None` as the prefix to
+        // produce `packs/<sha>.pack`.
+        pack: pack_key(None, &new_pack.content_sha),
         bytes: new_pack.pack_bytes,
     };
     let new_chain = ChainManifest {
@@ -352,13 +350,6 @@ async fn compact_under_lock(
         new_pack_sha: Some(new_pack.content_sha.as_str().to_owned()),
         new_pack_bytes: new_pack.pack_bytes,
     })
-}
-
-/// Pack-relative key as stored in the `ChainSegment.pack` field. The
-/// schema uses `packs/<sha>.pack` (no bucket prefix); the prefix is
-/// re-applied when constructing absolute keys.
-fn relative_pack_path(content_sha: &Sha40) -> String {
-    format!("packs/{}.pack", content_sha.as_str())
 }
 
 /// Download every chain pack + the baseline bundle into
@@ -396,16 +387,6 @@ async fn download_chain_artefacts(
     Ok(())
 }
 
-/// Build the absolute pack key for a `ChainSegment.pack` value. The
-/// schema stores the relative form `packs/<sha>.pack`; for prefixed
-/// buckets we prepend `<prefix>/`.
-fn packs_key_with_prefix(prefix: Option<&str>, relative: &str) -> String {
-    match prefix {
-        Some(p) if !p.is_empty() => format!("{p}/{relative}"),
-        _ => relative.to_owned(),
-    }
-}
-
 /// One artefact to download. `kind` is a static label for the
 /// `tracing::debug!` line so an operator can see what failed.
 #[derive(Debug, Clone)]
@@ -417,14 +398,16 @@ struct DownloadTask {
 
 impl DownloadTask {
     async fn run(self, store: &dyn ObjectStore) -> Result<(), PackchainError> {
-        let bytes = store
-            .get_bytes(&self.key)
+        // Stream the body straight to disk so a chain with many
+        // large packs doesn't hold every body in memory under
+        // `buffer_unordered`. Peak RSS becomes
+        // `MAX_FETCH_CONCURRENCY × per-chunk-buffer` instead of
+        // `MAX_FETCH_CONCURRENCY × largest-pack`.
+        store
+            .get_to_file(&self.key, &self.dest, GetOpts::default())
             .await
             .map_err(PackchainError::Store)?;
-        tokio::fs::write(&self.dest, &bytes)
-            .await
-            .map_err(PackchainError::Io)?;
-        debug!(key = %self.key, kind = self.kind, len = bytes.len(), "compact: downloaded");
+        debug!(key = %self.key, kind = self.kind, "compact: downloaded");
         Ok(())
     }
 }
@@ -438,12 +421,10 @@ async fn install_chain_into_repo(
     chain: &ChainManifest,
     ref_name: &RefName,
 ) -> Result<(), PackchainError> {
-    let baseline_sha = Sha::from_hex(chain.full_at.as_str()).map_err(|e| {
-        PackchainError::Io(std::io::Error::other(format!(
-            "chain.full_at `{}` is not a valid 40-hex sha: {e}",
-            chain.full_at.as_str(),
-        )))
-    })?;
+    // `chain.full_at` has the same Sha40-validated provenance as
+    // `chain.tip`; see the matching comment in `compact_under_lock`.
+    let baseline_sha =
+        Sha::from_hex(chain.full_at.as_str()).expect("Sha40 always parses as a gix Sha");
     // `unbundle_at` resolves the bundle file via `<folder>/<sha>.bundle`.
     git::unbundle_at(repo_dir, download_dir, baseline_sha, ref_name)
         .await
@@ -453,8 +434,7 @@ async fn install_chain_into_repo(
         let pack_path = download_dir.join(format!("{}.pack", segment.sha.as_str()));
         let repo_dir = repo_dir.to_path_buf();
         tokio::task::spawn_blocking(move || install_pack(&repo_dir, &pack_path))
-            .await
-            .map_err(|e| PackchainError::Io(std::io::Error::other(e.to_string())))?
+            .await?
             .map_err(|e| match e {
                 crate::protocol::fetch::FetchError::Packchain(p) => p,
                 crate::protocol::fetch::FetchError::Git(g) => PackchainError::Git(g),
@@ -466,9 +446,9 @@ async fn install_chain_into_repo(
 }
 
 /// Upload `<pack_path>` and `<idx_path>` to their respective bucket
-/// keys. Sequential because the two artefacts share a content sha
-/// and collapsing them into one parallel batch saves one round trip
-/// per compact at most — not worth the orchestration complexity.
+/// keys in parallel. Pack and idx are independent and share no
+/// resource, so `try_join!` saves one full round-trip per compact
+/// without orchestration complexity worth flagging.
 async fn upload_pack_and_idx(
     store: &dyn ObjectStore,
     pack_key: &str,
@@ -476,14 +456,11 @@ async fn upload_pack_and_idx(
     pack_path: &Path,
     idx_path: &Path,
 ) -> Result<(), PackchainError> {
-    store
-        .put_path(pack_key, pack_path, PutOpts::default())
-        .await
-        .map_err(PackchainError::Store)?;
-    store
-        .put_path(idx_key, idx_path, PutOpts::default())
-        .await
-        .map_err(PackchainError::Store)?;
+    tokio::try_join!(
+        store.put_path(pack_key, pack_path, PutOpts::default()),
+        store.put_path(idx_key, idx_path, PutOpts::default()),
+    )
+    .map_err(PackchainError::Store)?;
     Ok(())
 }
 
@@ -505,7 +482,7 @@ mod tests {
     use crate::object_store::mock::MockStore;
     use crate::packchain::manifest::write_chain;
     use crate::packchain::pack::{build_baseline_pack, build_incremental_pack};
-    use crate::packchain::schema::ChainSegment;
+    use crate::packchain::schema::{ChainSegment, Sha40};
     use bytes::Bytes;
     use gix::actor::SignatureRef;
     use gix::bstr::BStr;
@@ -727,8 +704,7 @@ mod tests {
         // observe a non-stale lock and return LockContended without
         // doing any work.
         let store = MockStore::new();
-        let (_repo, chain, _c1, _c2, _c3) = lay_down_three_segment_chain(&store, "repo").await;
-        let _ = chain;
+        let (_repo, _chain, _c1, _c2, _c3) = lay_down_three_segment_chain(&store, "repo").await;
 
         let lock_key = lock_key(Some("repo"), &ref_main());
         store.insert(&lock_key, Bytes::new());

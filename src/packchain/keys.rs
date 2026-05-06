@@ -49,6 +49,16 @@ pub(crate) fn optional_prefix(prefix: &str) -> Option<&str> {
     }
 }
 
+/// Compose the full bucket key for a chain segment's pack from the
+/// prefix and the bucket-relative `pack` field stored in `chain.json`.
+/// `chain.json` records pack keys as `packs/<sha>.pack` (no leading
+/// prefix) so a chain authored with one prefix can be read with
+/// another after a `mv`-style rename.
+#[must_use]
+pub(crate) fn packs_key_with_prefix(prefix: Option<&str>, bucket_relative_pack: &str) -> String {
+    crate::keys::join(prefix.unwrap_or(""), bucket_relative_pack)
+}
+
 /// Strip `<prefix>/` and `/chain.json` to derive the ref path.
 ///
 /// Returns `None` for keys that don't fit the shape — callers
