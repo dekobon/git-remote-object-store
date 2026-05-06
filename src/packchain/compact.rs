@@ -195,14 +195,31 @@ pub(crate) async fn compact(
     // the lock unconditionally, then surface either error.
     let result = compact_under_lock(store, prefix, ref_name).await;
     let release_result = release_lock(store, &lock).await;
-    let mut outcome = result?;
-    if let Err(e) = release_result {
-        // Compact succeeded; log the release failure rather than
-        // failing the operator-visible result. The lock will age out
-        // by `opts.lock_ttl`; subsequent pushes will recover it as
-        // stale.
-        warn!(key = %lock, error = %e, "compact: failed to release per-ref lock");
+
+    // Match push.rs:667-687: a genuine work error takes priority,
+    // but a release failure on the (Err, Err) path is logged at
+    // `warn` so an operator investigating a compact failure also
+    // sees the dangling-lock signal. Without this, the (Err, Err)
+    // case silently drops the release error.
+    match (&result, release_result) {
+        (Ok(_), Err(e)) => {
+            // Work succeeded but release failed; surface the
+            // dangling-lock detail at warn rather than failing the
+            // operator-visible result. The lock will age out by
+            // `opts.lock_ttl`; subsequent pushes will recover it
+            // as stale.
+            warn!(key = %lock, error = %e, "compact: failed to release per-ref lock");
+        }
+        (Err(_), Err(e)) => {
+            warn!(
+                key = %lock,
+                error = %e,
+                "compact: lock release failed (compact already errored)",
+            );
+        }
+        _ => {}
     }
+    let mut outcome = result?;
     // Fill in pre-lock fields that compact_under_lock didn't have
     // visibility into.
     outcome.prior_segments = prior_segments;
@@ -737,6 +754,15 @@ mod tests {
         let store = MockStore::new();
         let (_repo, prior, _c1, _c2, c3) = lay_down_three_segment_chain(&store, "repo").await;
 
+        // Delete the fixture's path-index so the post-compact
+        // assertion below is observable: compact writing the
+        // path-index is the only way for the key to reappear.
+        // (Without this delete the assertion would be tautological —
+        // the fixture writes the same path-index compact would
+        // produce.)
+        let path_index_key = "repo/refs/heads/main/path-index.json";
+        store.delete(path_index_key).await.unwrap();
+
         let outcome = compact(&store, Some("repo"), &ref_main(), opts(true))
             .await
             .unwrap();
@@ -775,6 +801,15 @@ mod tests {
         assert!(
             store.contains(&bundle_key),
             "fresh baseline bundle at the new tip must be uploaded",
+        );
+
+        // The fresh path-index.json at the ref must exist. We
+        // explicitly deleted the fixture's pre-existing one above
+        // so this assertion catches a regression where compact
+        // drops the `write_path_index` call.
+        assert!(
+            store.contains(path_index_key),
+            "compact must write a fresh path-index.json at the ref",
         );
 
         // Lock must be released.
