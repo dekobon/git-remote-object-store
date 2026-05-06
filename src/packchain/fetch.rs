@@ -549,7 +549,11 @@ async fn download_baseline(
 /// [`crate::bundle::unbundle`] but operates on a raw PACK file (no
 /// bundle v2 header) — packchain packs are bare per the on-bucket
 /// schema.
-fn install_pack(repo_dir: &Path, pack_path: &Path) -> Result<(), FetchError> {
+///
+/// `pub(crate)` so [`super::compact`] can drive the same install
+/// pipeline against its temp repo without going through the
+/// helper-protocol fetch path.
+pub(crate) fn install_pack(repo_dir: &Path, pack_path: &Path) -> Result<(), FetchError> {
     use std::fs;
     use std::io::BufReader;
 

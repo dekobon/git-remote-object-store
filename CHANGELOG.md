@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `packchain` `compact` subcommand (issue #67, completes Phase 5
+  of #52): new `git-remote-object-store compact <remote>` rewrites
+  a packchain ref's `chain.json` to a single-segment chain at the
+  current tip, with a fresh baseline pack and bundle. Old segment
+  packs become orphans for `gc` to reap on the next mark/sweep
+  cycle. Flags: `--ref <name>` to target a single branch (default
+  scans every ref via the audit and prompts for confirmation),
+  `--force` to bypass the segments-/bytes-since-`full_at`
+  heuristic, `--with-gc` to chain mark+sweep after a successful
+  compact, `--lock-ttl-seconds <N>` to extend the per-ref lock TTL
+  for large repos (resolves Open Q4 from #52). Implementation uses
+  the local-clone-then-repack approach: downloads the entire chain
+  into a tempdir-backed bare repo, runs `build_baseline_pack` at
+  the current tip, regenerates `path-index.json`, builds a fresh
+  baseline bundle, uploads, and atomically commits the new
+  `chain.json`. New `packchain::compact` library API and
+  `manage::compact::Compact` runner.
 - `packchain` doctor extensions (issue #68): the management
   `doctor` subcommand now emits a `=== Packchain ===` section
   whenever the resolved engine is `packchain`. The section reports

@@ -25,6 +25,7 @@ use git_remote_object_store::git as git_helpers;
 use git_remote_object_store::manage::{
     DEFAULT_LOCK_TTL_SECONDS, DialoguerPrompter,
     branch::ManageBranch,
+    compact::{Compact, ManageCompactOpts},
     doctor::{Doctor, DoctorOpts},
     gc::{Gc, GcOpts},
 };
@@ -113,6 +114,45 @@ enum Command {
         /// environment variable (falling back to 24).
         #[arg(long, value_name = "HOURS")]
         grace_hours: Option<u64>,
+    },
+    /// Compact a packchain ref's chain.json down to a single segment
+    /// at the current tip. The default scans every ref and prompts
+    /// for confirmation; `--ref` targets a single branch. Old segment
+    /// packs become orphans for `gc` to reap.
+    Compact {
+        #[command(flatten)]
+        target: Target,
+
+        /// Compact only this ref. Accepts a fully-qualified path
+        /// (`refs/heads/main`).
+        #[arg(long, value_name = "REF")]
+        ref_name: Option<String>,
+
+        /// Bypass the segments-/bytes-since-`full_at` heuristic and
+        /// compact unconditionally. Useful after a force push when
+        /// segments are below threshold but the operator still
+        /// wants a baseline rewrite.
+        #[arg(long)]
+        force: bool,
+
+        /// Run `gc` mark+sweep against the same bucket after a
+        /// successful compact. Convenience for one-command cleanup.
+        #[arg(long)]
+        with_gc: bool,
+
+        /// Lock TTL for compact's per-ref lock, in seconds. Compact
+        /// holds the lock from chain read through chain.json commit;
+        /// large repos may need a TTL well above the push default.
+        /// Default reads `GIT_REMOTE_S3_LOCK_TTL_SECONDS` (falling
+        /// back to the upstream 60s).
+        #[arg(long, value_name = "SECONDS")]
+        lock_ttl_seconds: Option<u64>,
+
+        /// Grace hours for the optional `--with-gc` sweep; ignored
+        /// without `--with-gc`. Default reads
+        /// `GIT_REMOTE_S3_GC_GRACE_HOURS` (falling back to 24).
+        #[arg(long, value_name = "HOURS")]
+        gc_grace_hours: Option<u64>,
     },
 }
 
@@ -206,6 +246,25 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 grace_hours: grace_hours.unwrap_or_else(packchain_gc::grace_hours_from_env),
             };
             Ok(Gc::new(store, prefix, opts).run().await?)
+        }
+        Command::Compact {
+            target,
+            ref_name,
+            force,
+            with_gc,
+            lock_ttl_seconds,
+            gc_grace_hours,
+        } => {
+            let (store, prefix) = open_target(&target).await?;
+            let opts = ManageCompactOpts {
+                ref_name,
+                force,
+                with_gc,
+                lock_ttl_seconds,
+                gc_grace_hours: gc_grace_hours.unwrap_or_else(packchain_gc::grace_hours_from_env),
+            };
+            let prompter = DialoguerPrompter;
+            Ok(Compact::new(store, prefix, opts, &prompter).run().await?)
         }
     }
 }
