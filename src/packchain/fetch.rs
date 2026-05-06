@@ -346,7 +346,7 @@ async fn fetch_full(
     for segment in needed {
         let store = Arc::clone(store);
         let permit_pool = Arc::clone(semaphore);
-        let key = packs_key_with_prefix(prefix, &segment.pack);
+        let key = super::keys::packs_key_with_prefix(prefix, &segment.pack);
         let dest = temp_path.join(format!("{}.pack", segment.sha.as_str()));
         let segment_clone = segment.clone();
         downloads.spawn(async move {
@@ -449,7 +449,7 @@ async fn fetch_shallow(
     depth: NonZeroU32,
 ) -> Result<(), FetchError> {
     for segment in needed {
-        let key = packs_key_with_prefix(prefix, &segment.pack);
+        let key = super::keys::packs_key_with_prefix(prefix, &segment.pack);
         let dest = temp_path.join(format!("{}.pack", segment.sha.as_str()));
         download_pack(store, &key, &dest).await?;
         let repo_dir_clone = repo_dir.to_path_buf();
@@ -487,15 +487,6 @@ async fn fetch_shallow(
         git::unbundle_at(repo_dir, temp_path, baseline_sha, ref_name).await?;
     }
     Ok(())
-}
-
-/// Compose the full bucket key for a chain segment's pack from the
-/// prefix and the bucket-relative `pack` field stored in `chain.json`.
-/// `chain.json` records pack keys as `packs/<sha>.pack` (no leading
-/// prefix) so a chain authored with one prefix can be read with
-/// another after a `mv`-style rename.
-fn packs_key_with_prefix(prefix: Option<&str>, bucket_relative_pack: &str) -> String {
-    keys::join(prefix.unwrap_or(""), bucket_relative_pack)
 }
 
 /// One downloaded artefact ready for installation. Ordered installs
