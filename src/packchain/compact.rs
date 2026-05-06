@@ -1,0 +1,846 @@
+//! Chain compaction (issue #67).
+//!
+//! `compact` rewrites a packchain ref's `chain.json` to a single-segment
+//! chain at the current tip. After a successful compact the ref's
+//! on-bucket state mirrors a fresh first push:
+//!
+//! - `chain.json.segments.len() == 1` with `parent_sha = None`.
+//! - `chain.tip == chain.full_at`.
+//! - A fresh baseline bundle lives at `<prefix>/<ref>/<full_at>.bundle`.
+//! - A fresh `path-index.json` reflects the tip's tree.
+//! - Old segment packs are left in `<prefix>/packs/` and become orphans
+//!   for [`super::gc`] to reap on the next mark/sweep cycle.
+//!
+//! ## Concurrency
+//!
+//! Compact holds the per-ref lock for the full duration so a concurrent
+//! push cannot land a chain.json that compact then silently overwrites.
+//! The lock TTL is configured by the caller; for large repos it must
+//! be set well above the push default (typically 60s).
+//!
+//! ## Implementation choice
+//!
+//! Issue #67 enumerates two approaches: local-clone-then-repack vs
+//! server-side re-pack. We take **local-clone-then-repack** because it
+//! reuses [`super::pack::build_baseline_pack`] and the existing
+//! [`super::fetch::install_pack`] pipeline; the alternative would
+//! duplicate gix-pack iteration logic that already lives behind the
+//! local-repo abstraction. The cost is one full chain install per
+//! compact — paid only by an operator who explicitly opts in.
+
+use std::path::Path;
+
+use futures::stream::{StreamExt, TryStreamExt};
+use tempfile::TempDir;
+use time::{Duration, OffsetDateTime};
+use tracing::{debug, info, warn};
+
+use crate::git::{self, RefName, Sha};
+use crate::keys;
+use crate::object_store::{ObjectStore, PutOpts};
+use crate::protocol::fetch::MAX_FETCH_CONCURRENCY;
+use crate::protocol::push::{acquire_lock, lock_key, release_lock};
+
+use super::PackchainError;
+use super::audit::{COMPACT_BYTES_THRESHOLD, COMPACT_SEGMENTS_THRESHOLD};
+use super::fetch::install_pack;
+use super::keys::{pack_idx_key, pack_key};
+use super::manifest::{load_chain, write_chain, write_path_index};
+use super::pack::build_baseline_pack;
+use super::schema::{ChainManifest, ChainSegment, Sha40};
+
+/// Knobs for [`compact`]. Mirrors the shape used by `gc::SweepOpts`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompactOpts {
+    /// When `true`, bypass the "≥ 20 segments OR > 100 MiB" heuristic
+    /// and compact unconditionally. Operator-asserted: small chains
+    /// don't benefit from the work.
+    pub(crate) force: bool,
+    /// Lock TTL for the compact's per-ref lock. Compact holds the lock
+    /// from chain read through chain.json commit; large repos may
+    /// need TTL well above the push default.
+    pub(crate) lock_ttl: Duration,
+}
+
+/// Per-ref compact result. The `action` field discriminates the four
+/// terminal states the compact runner reports to operators.
+#[derive(Debug, Clone)]
+pub(crate) struct CompactOutcome {
+    /// Outcome category — see [`CompactAction`].
+    pub(crate) action: CompactAction,
+    /// Ref whose chain was (or was not) compacted.
+    pub(crate) ref_path: String,
+    /// Pre-compact segment count. Reported regardless of action so
+    /// operators can see why the heuristic did/didn't trigger.
+    pub(crate) prior_segments: usize,
+    /// Pre-compact `sum(segment.bytes)`.
+    pub(crate) prior_bytes: u64,
+    /// Content-SHA of the new baseline pack (only set on
+    /// [`CompactAction::Compacted`]).
+    pub(crate) new_pack_sha: Option<String>,
+    /// Size of the new baseline pack in bytes (only set on
+    /// [`CompactAction::Compacted`]).
+    pub(crate) new_pack_bytes: u64,
+}
+
+/// Terminal state of a [`compact`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactAction {
+    /// Chain was rewritten to a single-segment chain at the current tip.
+    Compacted,
+    /// Heuristic did not trigger and `force` was not set; chain
+    /// untouched.
+    SkippedUnderThreshold,
+    /// Chain was already a single-segment chain at the current tip;
+    /// idempotent no-op (no lock acquisition, no I/O beyond the
+    /// initial `chain.json` read).
+    AlreadyMinimal,
+    /// Per-ref lock was held by another client; no work performed.
+    LockContended,
+}
+
+/// Run compact against `<prefix>/<ref_name>/`.
+///
+/// Acquires the per-ref lock with `opts.lock_ttl`, downloads every
+/// chain pack and the existing baseline bundle into a tempdir-rooted
+/// bare git repo, builds a fresh baseline pack via
+/// [`build_baseline_pack`], regenerates `path-index.json`, builds a
+/// fresh baseline bundle, uploads the new artefacts, and atomically
+/// commits the new single-segment `chain.json`. Old segment packs
+/// stay on the bucket as orphans for [`super::gc`].
+///
+/// # Errors
+///
+/// - [`PackchainError::ChainAbsent`] — the ref has no `chain.json`.
+/// - [`PackchainError::Store`] — transport failures during artefact
+///   download or upload.
+/// - [`PackchainError::PackBuild`] / [`PackchainError::PackIndexWrite`]
+///   — gix-pack failures during the fresh baseline construction.
+/// - [`PackchainError::Git`] — gix failures during chain install or
+///   path-index extraction.
+/// - [`PackchainError::Io`] — local I/O failures (tempdir, file
+///   read/write).
+pub(crate) async fn compact(
+    store: &dyn ObjectStore,
+    prefix: Option<&str>,
+    ref_name: &RefName,
+    opts: CompactOpts,
+) -> Result<CompactOutcome, PackchainError> {
+    let prior =
+        load_chain(store, prefix, ref_name)
+            .await?
+            .ok_or_else(|| PackchainError::ChainAbsent {
+                ref_name: ref_name.as_str().to_owned(),
+            })?;
+
+    let prior_segments = prior.segments.len();
+    let prior_bytes = prior
+        .segments
+        .iter()
+        .map(|s| s.bytes)
+        .fold(0u64, u64::saturating_add);
+
+    // Idempotent short-circuit: a chain that's already a single
+    // segment at the tip needs nothing done and we avoid taking the
+    // lock entirely. Concurrent compact-against-the-same-ref runs
+    // both observe this state once any one of them completes.
+    if prior_segments == 1 && prior.tip == prior.full_at {
+        return Ok(CompactOutcome {
+            action: CompactAction::AlreadyMinimal,
+            ref_path: ref_name.as_str().to_owned(),
+            prior_segments,
+            prior_bytes,
+            new_pack_sha: None,
+            new_pack_bytes: 0,
+        });
+    }
+
+    if !opts.force
+        && prior_segments <= COMPACT_SEGMENTS_THRESHOLD
+        && prior_bytes <= COMPACT_BYTES_THRESHOLD
+    {
+        debug!(
+            ref_path = %ref_name.as_str(),
+            segments = prior_segments,
+            bytes = prior_bytes,
+            "compact: heuristic did not trigger; skipping",
+        );
+        return Ok(CompactOutcome {
+            action: CompactAction::SkippedUnderThreshold,
+            ref_path: ref_name.as_str().to_owned(),
+            prior_segments,
+            prior_bytes,
+            new_pack_sha: None,
+            new_pack_bytes: 0,
+        });
+    }
+
+    let lock = lock_key(prefix, ref_name);
+    let now = OffsetDateTime::now_utc();
+    if !acquire_lock(store, &lock, opts.lock_ttl, now)
+        .await
+        .map_err(PackchainError::Store)?
+    {
+        return Ok(CompactOutcome {
+            action: CompactAction::LockContended,
+            ref_path: ref_name.as_str().to_owned(),
+            prior_segments,
+            prior_bytes,
+            new_pack_sha: None,
+            new_pack_bytes: 0,
+        });
+    }
+
+    // Mirror push.rs's "try / always release" pattern: run work, drop
+    // the lock unconditionally, then surface either error.
+    let result = compact_under_lock(store, prefix, ref_name).await;
+    let release_result = release_lock(store, &lock).await;
+    let mut outcome = result?;
+    if let Err(e) = release_result {
+        // Compact succeeded; log the release failure rather than
+        // failing the operator-visible result. The lock will age out
+        // by `opts.lock_ttl`; subsequent pushes will recover it as
+        // stale.
+        warn!(key = %lock, error = %e, "compact: failed to release per-ref lock");
+    }
+    // Fill in pre-lock fields that compact_under_lock didn't have
+    // visibility into.
+    outcome.prior_segments = prior_segments;
+    outcome.prior_bytes = prior_bytes;
+    Ok(outcome)
+}
+
+/// Lock-protected body of [`compact`]: re-read chain, install
+/// locally, build fresh artefacts, upload, commit chain.json.
+async fn compact_under_lock(
+    store: &dyn ObjectStore,
+    prefix: Option<&str>,
+    ref_name: &RefName,
+) -> Result<CompactOutcome, PackchainError> {
+    // Re-read chain under lock. A pre-lock observation could be
+    // stale (concurrent push between heuristic check and lock).
+    let chain =
+        load_chain(store, prefix, ref_name)
+            .await?
+            .ok_or_else(|| PackchainError::ChainAbsent {
+                ref_name: ref_name.as_str().to_owned(),
+            })?;
+    let tip_sha = Sha::from_hex(chain.tip.as_str()).map_err(|e| {
+        PackchainError::Io(std::io::Error::other(format!(
+            "chain.tip `{}` is not a valid 40-hex sha: {e}",
+            chain.tip.as_str(),
+        )))
+    })?;
+
+    let scratch = TempDir::new().map_err(PackchainError::Io)?;
+    let repo_dir = scratch.path().join("repo");
+    let download_dir = scratch.path().join("downloads");
+    let output_dir = scratch.path().join("output");
+    std::fs::create_dir(&repo_dir).map_err(PackchainError::Io)?;
+    std::fs::create_dir(&download_dir).map_err(PackchainError::Io)?;
+    std::fs::create_dir(&output_dir).map_err(PackchainError::Io)?;
+
+    // Init a bare git repo in `repo_dir`. Bare avoids creating a
+    // working tree the install step would need to ignore.
+    // `gix::init::Error` is a large variant — box it on the way out
+    // so the closure return type stays small (avoids
+    // `clippy::result_large_err`).
+    {
+        let repo_dir = repo_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            gix::init_bare(&repo_dir)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        })
+        .await
+        .map_err(|e| PackchainError::Io(std::io::Error::other(e.to_string())))?
+        .map_err(|e| PackchainError::Io(std::io::Error::other(e.to_string())))?;
+    }
+
+    // Download every chain pack + the baseline bundle in parallel.
+    download_chain_artefacts(store, prefix, ref_name, &chain, &download_dir).await?;
+
+    // Install oldest-first: baseline bundle first, then segments
+    // from oldest (last in newest-first list) to newest. Mirrors
+    // `fetch::fetch_full`'s install order so deltas resolve against
+    // already-installed bases.
+    install_chain_into_repo(&repo_dir, &download_dir, &chain, ref_name).await?;
+
+    // Build the fresh baseline pack at the current tip. After this
+    // returns, `<output_dir>/<content_sha>.{pack,idx}` exist.
+    let new_pack = {
+        let repo_dir = repo_dir.clone();
+        let output_dir = output_dir.clone();
+        tokio::task::spawn_blocking(move || build_baseline_pack(&repo_dir, tip_sha, &output_dir))
+            .await
+            .map_err(|e| PackchainError::Io(std::io::Error::other(e.to_string())))??
+    };
+
+    // Compute fresh path-index.
+    let path_index = {
+        let repo_dir = repo_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let repo = gix::open(&repo_dir).map_err(crate::git::GitError::from)?;
+            super::git::extract_path_index(&repo, tip_sha)
+        })
+        .await
+        .map_err(|e| PackchainError::Io(std::io::Error::other(e.to_string())))??
+    };
+
+    // Build fresh baseline bundle. The bundle filename uses the tip
+    // SHA. The spec must resolve to that commit in the temp repo —
+    // and the temp repo only has objects, not refs (unbundle and
+    // install_pack do not create refs), so pass the SHA directly
+    // rather than the ref name.
+    let tip_spec = chain.tip.as_str().to_owned();
+    let bundle_path = git::bundle_at(&repo_dir, &output_dir, tip_sha, &tip_spec)
+        .await
+        .map_err(PackchainError::Git)?;
+
+    // Upload artefacts. Order matters here for crash safety: pack
+    // and bundle FIRST (orphan-safe — they become reapable orphans
+    // if the chain commit fails), then path-index, then chain.json.
+    // The chain.json PUT is the linearisation point — anything
+    // before it is best-effort and reapable; anything after is
+    // already committed.
+    let new_pack_key = pack_key(prefix, &new_pack.content_sha);
+    let new_idx_key = pack_idx_key(prefix, &new_pack.content_sha);
+    let new_bundle_key = keys::bundle_key(prefix, ref_name, chain.tip.as_str());
+    upload_pack_and_idx(
+        store,
+        &new_pack_key,
+        &new_idx_key,
+        &new_pack.pack_path,
+        &new_pack.idx_path,
+    )
+    .await?;
+    upload_bundle(store, &new_bundle_key, &bundle_path).await?;
+    write_path_index(store, prefix, ref_name, &path_index).await?;
+
+    let new_segment = ChainSegment {
+        sha: chain.tip.clone(),
+        parent_sha: None,
+        // Schema stores the pack key relative to the bucket; for
+        // bucket-root deployments that's `packs/<sha>.pack`. Mirror
+        // the push path's representation.
+        pack: relative_pack_path(&new_pack.content_sha),
+        bytes: new_pack.pack_bytes,
+    };
+    let new_chain = ChainManifest {
+        v: ChainManifest::SCHEMA_VERSION,
+        tip: chain.tip.clone(),
+        full_at: chain.tip.clone(),
+        segments: vec![new_segment],
+    };
+    write_chain(store, prefix, ref_name, &new_chain).await?;
+
+    info!(
+        ref_path = %ref_name.as_str(),
+        prior_segments = chain.segments.len(),
+        new_pack_sha = %new_pack.content_sha.as_str(),
+        new_pack_bytes = new_pack.pack_bytes,
+        "compact: chain rewritten to single segment",
+    );
+
+    Ok(CompactOutcome {
+        action: CompactAction::Compacted,
+        ref_path: ref_name.as_str().to_owned(),
+        // prior_* are filled in by the public `compact` after this
+        // function returns (it has the snapshot from before the
+        // lock was taken).
+        prior_segments: 0,
+        prior_bytes: 0,
+        new_pack_sha: Some(new_pack.content_sha.as_str().to_owned()),
+        new_pack_bytes: new_pack.pack_bytes,
+    })
+}
+
+/// Pack-relative key as stored in the `ChainSegment.pack` field. The
+/// schema uses `packs/<sha>.pack` (no bucket prefix); the prefix is
+/// re-applied when constructing absolute keys.
+fn relative_pack_path(content_sha: &Sha40) -> String {
+    format!("packs/{}.pack", content_sha.as_str())
+}
+
+/// Download every chain pack + the baseline bundle into
+/// `download_dir`. Pack files land at
+/// `<download_dir>/<segment.sha>.pack`; the baseline bundle lands at
+/// `<download_dir>/<full_at>.bundle`. Per-artefact downloads run in
+/// parallel up to [`MAX_FETCH_CONCURRENCY`].
+async fn download_chain_artefacts(
+    store: &dyn ObjectStore,
+    prefix: Option<&str>,
+    ref_name: &RefName,
+    chain: &ChainManifest,
+    download_dir: &Path,
+) -> Result<(), PackchainError> {
+    let mut tasks: Vec<DownloadTask> = chain
+        .segments
+        .iter()
+        .map(|seg| DownloadTask {
+            key: packs_key_with_prefix(prefix, &seg.pack),
+            dest: download_dir.join(format!("{}.pack", seg.sha.as_str())),
+            kind: "pack",
+        })
+        .collect();
+    tasks.push(DownloadTask {
+        key: keys::bundle_key(prefix, ref_name, chain.full_at.as_str()),
+        dest: download_dir.join(format!("{}.bundle", chain.full_at.as_str())),
+        kind: "bundle",
+    });
+
+    futures::stream::iter(tasks)
+        .map(|task| async move { task.run(store).await })
+        .buffer_unordered(MAX_FETCH_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(())
+}
+
+/// Build the absolute pack key for a `ChainSegment.pack` value. The
+/// schema stores the relative form `packs/<sha>.pack`; for prefixed
+/// buckets we prepend `<prefix>/`.
+fn packs_key_with_prefix(prefix: Option<&str>, relative: &str) -> String {
+    match prefix {
+        Some(p) if !p.is_empty() => format!("{p}/{relative}"),
+        _ => relative.to_owned(),
+    }
+}
+
+/// One artefact to download. `kind` is a static label for the
+/// `tracing::debug!` line so an operator can see what failed.
+#[derive(Debug, Clone)]
+struct DownloadTask {
+    key: String,
+    dest: std::path::PathBuf,
+    kind: &'static str,
+}
+
+impl DownloadTask {
+    async fn run(self, store: &dyn ObjectStore) -> Result<(), PackchainError> {
+        let bytes = store
+            .get_bytes(&self.key)
+            .await
+            .map_err(PackchainError::Store)?;
+        tokio::fs::write(&self.dest, &bytes)
+            .await
+            .map_err(PackchainError::Io)?;
+        debug!(key = %self.key, kind = self.kind, len = bytes.len(), "compact: downloaded");
+        Ok(())
+    }
+}
+
+/// Install every chain pack + the baseline bundle into `repo_dir`,
+/// in oldest-first order so each install resolves its deltas against
+/// already-installed bases.
+async fn install_chain_into_repo(
+    repo_dir: &Path,
+    download_dir: &Path,
+    chain: &ChainManifest,
+    ref_name: &RefName,
+) -> Result<(), PackchainError> {
+    let baseline_sha = Sha::from_hex(chain.full_at.as_str()).map_err(|e| {
+        PackchainError::Io(std::io::Error::other(format!(
+            "chain.full_at `{}` is not a valid 40-hex sha: {e}",
+            chain.full_at.as_str(),
+        )))
+    })?;
+    // `unbundle_at` resolves the bundle file via `<folder>/<sha>.bundle`.
+    git::unbundle_at(repo_dir, download_dir, baseline_sha, ref_name)
+        .await
+        .map_err(PackchainError::Git)?;
+
+    for segment in chain.segments.iter().rev() {
+        let pack_path = download_dir.join(format!("{}.pack", segment.sha.as_str()));
+        let repo_dir = repo_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || install_pack(&repo_dir, &pack_path))
+            .await
+            .map_err(|e| PackchainError::Io(std::io::Error::other(e.to_string())))?
+            .map_err(|e| match e {
+                crate::protocol::fetch::FetchError::Packchain(p) => p,
+                crate::protocol::fetch::FetchError::Git(g) => PackchainError::Git(g),
+                crate::protocol::fetch::FetchError::Io(io) => PackchainError::Io(io),
+                other => PackchainError::Io(std::io::Error::other(other.to_string())),
+            })?;
+    }
+    Ok(())
+}
+
+/// Upload `<pack_path>` and `<idx_path>` to their respective bucket
+/// keys. Sequential because the two artefacts share a content sha
+/// and collapsing them into one parallel batch saves one round trip
+/// per compact at most — not worth the orchestration complexity.
+async fn upload_pack_and_idx(
+    store: &dyn ObjectStore,
+    pack_key: &str,
+    idx_key: &str,
+    pack_path: &Path,
+    idx_path: &Path,
+) -> Result<(), PackchainError> {
+    store
+        .put_path(pack_key, pack_path, PutOpts::default())
+        .await
+        .map_err(PackchainError::Store)?;
+    store
+        .put_path(idx_key, idx_path, PutOpts::default())
+        .await
+        .map_err(PackchainError::Store)?;
+    Ok(())
+}
+
+async fn upload_bundle(
+    store: &dyn ObjectStore,
+    key: &str,
+    bundle_path: &Path,
+) -> Result<(), PackchainError> {
+    store
+        .put_path(key, bundle_path, PutOpts::default())
+        .await
+        .map_err(PackchainError::Store)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object_store::mock::MockStore;
+    use crate::packchain::manifest::write_chain;
+    use crate::packchain::pack::{build_baseline_pack, build_incremental_pack};
+    use crate::packchain::schema::ChainSegment;
+    use bytes::Bytes;
+    use gix::actor::SignatureRef;
+    use gix::bstr::BStr;
+    use gix_hash::ObjectId;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn signature() -> SignatureRef<'static> {
+        SignatureRef {
+            name: BStr::new("Tester"),
+            email: BStr::new("t@example.com"),
+            time: "0 +0000",
+        }
+    }
+
+    fn ref_main() -> RefName {
+        RefName::new("refs/heads/main").unwrap()
+    }
+
+    fn sha40(s: &str) -> Sha40 {
+        Sha40::try_new(s).unwrap()
+    }
+
+    fn opts(force: bool) -> CompactOpts {
+        CompactOpts {
+            force,
+            lock_ttl: Duration::seconds(60),
+        }
+    }
+
+    /// Build a small repo with three commits c1 -> c2 -> c3, each
+    /// touching one file. Returns the repo dir and tip sha for c3.
+    fn fixture_three_commits() -> (TempDir, Sha, Sha, Sha) {
+        let tmp = TempDir::new().unwrap();
+        let repo = gix::init(tmp.path()).unwrap();
+        let mut prev: Option<ObjectId> = None;
+        let mut shas: Vec<ObjectId> = Vec::new();
+        for (i, content) in [b"hello-1".as_slice(), b"hello-2", b"hello-3"]
+            .iter()
+            .enumerate()
+        {
+            let blob = repo.write_blob(content).unwrap().detach();
+            let tree = repo
+                .write_object(&gix::objs::Tree {
+                    entries: vec![gix::objs::tree::Entry {
+                        mode: gix::objs::tree::EntryKind::Blob.into(),
+                        filename: format!("f{i}").into(),
+                        oid: blob,
+                    }],
+                })
+                .unwrap()
+                .detach();
+            let parents: Vec<ObjectId> = prev.into_iter().collect();
+            let c = repo
+                .commit_as(
+                    signature(),
+                    signature(),
+                    "refs/heads/main",
+                    format!("commit {i}"),
+                    tree,
+                    parents,
+                )
+                .unwrap()
+                .detach();
+            shas.push(c);
+            prev = Some(c);
+        }
+        (
+            tmp,
+            Sha::from_object_id(shas[0]),
+            Sha::from_object_id(shas[1]),
+            Sha::from_object_id(shas[2]),
+        )
+    }
+
+    /// Lay down a real three-segment packchain in `store` using the
+    /// repo from [`fixture_three_commits`]. Returns the chain and
+    /// the path to the source repo (for read-back verification).
+    async fn lay_down_three_segment_chain(
+        store: &MockStore,
+        prefix: &str,
+    ) -> (TempDir, ChainManifest, Sha, Sha, Sha) {
+        let (repo_dir, c1, c2, c3) = fixture_three_commits();
+
+        // Baseline pack at c1, plus incremental packs for c2 and c3.
+        let out_dir = TempDir::new().unwrap();
+        let baseline = build_baseline_pack(repo_dir.path(), c1, out_dir.path()).unwrap();
+        let inc2 = build_incremental_pack(repo_dir.path(), c1, c2, out_dir.path()).unwrap();
+        let inc3 = build_incremental_pack(repo_dir.path(), c2, c3, out_dir.path()).unwrap();
+
+        // Upload packs + idx files.
+        for built in [&baseline, &inc2, &inc3] {
+            let pack_key = format!("{}/packs/{}.pack", prefix, built.content_sha.as_str());
+            let idx_key = format!("{}/packs/{}.idx", prefix, built.content_sha.as_str());
+            let pack_bytes = std::fs::read(&built.pack_path).unwrap();
+            let idx_bytes = std::fs::read(&built.idx_path).unwrap();
+            store.insert(pack_key, Bytes::from(pack_bytes));
+            store.insert(idx_key, Bytes::from(idx_bytes));
+        }
+
+        // Baseline bundle at c1. Pass the commit SHA as the spec so
+        // `bundle::create` resolves to c1 specifically (the repo's
+        // `refs/heads/main` points at c3 after the third commit).
+        let c1_spec = c1.to_string();
+        let bundle_path = crate::git::bundle_at(repo_dir.path(), out_dir.path(), c1, &c1_spec)
+            .await
+            .unwrap();
+        let bundle_bytes = std::fs::read(&bundle_path).unwrap();
+        let bundle_key = format!("{prefix}/refs/heads/main/{c1}.bundle");
+        store.insert(bundle_key, Bytes::from(bundle_bytes));
+
+        // chain.json: newest-first [c3, c2, c1], full_at = c1.
+        let chain = ChainManifest {
+            v: ChainManifest::SCHEMA_VERSION,
+            tip: sha40(&c3.to_string()),
+            full_at: sha40(&c1.to_string()),
+            segments: vec![
+                ChainSegment {
+                    sha: sha40(&c3.to_string()),
+                    parent_sha: Some(sha40(&c2.to_string())),
+                    pack: format!("packs/{}.pack", inc3.content_sha.as_str()),
+                    bytes: inc3.pack_bytes,
+                },
+                ChainSegment {
+                    sha: sha40(&c2.to_string()),
+                    parent_sha: Some(sha40(&c1.to_string())),
+                    pack: format!("packs/{}.pack", inc2.content_sha.as_str()),
+                    bytes: inc2.pack_bytes,
+                },
+                ChainSegment {
+                    sha: sha40(&c1.to_string()),
+                    parent_sha: None,
+                    pack: format!("packs/{}.pack", baseline.content_sha.as_str()),
+                    bytes: baseline.pack_bytes,
+                },
+            ],
+        };
+        write_chain(store, Some(prefix), &ref_main(), &chain)
+            .await
+            .unwrap();
+
+        // Path-index at the current tip — the read_blob path requires
+        // it. Build it from the source repo before we drop the handle.
+        let path_index = {
+            let repo = gix::open(repo_dir.path()).unwrap();
+            crate::packchain::git::extract_path_index(&repo, c3).unwrap()
+        };
+        crate::packchain::manifest::write_path_index(store, Some(prefix), &ref_main(), &path_index)
+            .await
+            .unwrap();
+
+        (repo_dir, chain, c1, c2, c3)
+    }
+
+    #[tokio::test]
+    async fn compact_short_circuits_for_single_segment_at_tip() {
+        // A chain that is already a single-segment chain at the tip is
+        // the post-compact state; running compact again must be a
+        // no-op (no lock taken, no I/O beyond the chain.json read).
+        let store = MockStore::new();
+        let chain = ChainManifest {
+            v: 1,
+            tip: sha40("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            full_at: sha40("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            segments: vec![ChainSegment {
+                sha: sha40("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                parent_sha: None,
+                pack: "packs/1111111111111111111111111111111111111111.pack".into(),
+                bytes: 100,
+            }],
+        };
+        write_chain(&store, Some("repo"), &ref_main(), &chain)
+            .await
+            .unwrap();
+
+        let outcome = compact(&store, Some("repo"), &ref_main(), opts(true))
+            .await
+            .unwrap();
+        assert_eq!(outcome.action, CompactAction::AlreadyMinimal);
+    }
+
+    #[tokio::test]
+    async fn compact_skips_when_under_threshold_without_force() {
+        let store = MockStore::new();
+        // 2 segments, 1 KiB each — well under both thresholds.
+        let chain = ChainManifest {
+            v: 1,
+            tip: sha40("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            full_at: sha40("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            segments: vec![
+                ChainSegment {
+                    sha: sha40("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    parent_sha: Some(sha40("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
+                    pack: "packs/1111111111111111111111111111111111111111.pack".into(),
+                    bytes: 1024,
+                },
+                ChainSegment {
+                    sha: sha40("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                    parent_sha: None,
+                    pack: "packs/2222222222222222222222222222222222222222.pack".into(),
+                    bytes: 1024,
+                },
+            ],
+        };
+        write_chain(&store, Some("repo"), &ref_main(), &chain)
+            .await
+            .unwrap();
+
+        let outcome = compact(&store, Some("repo"), &ref_main(), opts(false))
+            .await
+            .unwrap();
+        assert_eq!(outcome.action, CompactAction::SkippedUnderThreshold);
+        assert_eq!(outcome.prior_segments, 2);
+    }
+
+    #[tokio::test]
+    async fn compact_returns_lock_contended_when_lock_held_recently() {
+        // Pre-place a fresh lock; compact's `acquire_lock` should
+        // observe a non-stale lock and return LockContended without
+        // doing any work.
+        let store = MockStore::new();
+        let (_repo, chain, _c1, _c2, _c3) = lay_down_three_segment_chain(&store, "repo").await;
+        let _ = chain;
+
+        let lock_key = lock_key(Some("repo"), &ref_main());
+        store.insert(&lock_key, Bytes::new());
+
+        let outcome = compact(&store, Some("repo"), &ref_main(), opts(true))
+            .await
+            .unwrap();
+        assert_eq!(outcome.action, CompactAction::LockContended);
+        // Lock object still present.
+        assert!(store.contains(&lock_key));
+    }
+
+    #[tokio::test]
+    async fn compact_chain_absent_returns_chain_absent_error() {
+        let store = MockStore::new();
+        let err = compact(&store, Some("repo"), &ref_main(), opts(true))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PackchainError::ChainAbsent { .. }));
+    }
+
+    #[tokio::test]
+    async fn compact_force_collapses_three_segment_chain_to_one() {
+        // The substantive end-to-end test: build a real 3-commit
+        // repo, lay down a 3-segment packchain in MockStore, run
+        // compact, verify the resulting chain.json is a single
+        // segment at tip with full_at = tip and the new pack
+        // content-sha is uploaded.
+        let store = MockStore::new();
+        let (_repo, prior, _c1, _c2, c3) = lay_down_three_segment_chain(&store, "repo").await;
+
+        let outcome = compact(&store, Some("repo"), &ref_main(), opts(true))
+            .await
+            .unwrap();
+        assert_eq!(outcome.action, CompactAction::Compacted);
+        assert_eq!(outcome.prior_segments, 3);
+
+        // Read the new chain.json and verify shape.
+        let new_chain = crate::packchain::manifest::load_chain(&store, Some("repo"), &ref_main())
+            .await
+            .unwrap()
+            .expect("chain present");
+        assert_eq!(new_chain.tip, prior.tip);
+        assert_eq!(
+            new_chain.full_at, new_chain.tip,
+            "full_at must equal tip after compact",
+        );
+        assert_eq!(new_chain.segments.len(), 1);
+        assert_eq!(new_chain.segments[0].sha, prior.tip);
+        assert_eq!(
+            new_chain.segments[0].parent_sha, None,
+            "post-compact chain root segment has no parent",
+        );
+
+        // The single segment's pack key must exist on the bucket.
+        let new_pack_sha = outcome
+            .new_pack_sha
+            .as_ref()
+            .expect("Compacted action carries new pack sha");
+        let pack_key = format!("repo/packs/{new_pack_sha}.pack");
+        let idx_key = format!("repo/packs/{new_pack_sha}.idx");
+        assert!(store.contains(&pack_key), "new pack must be uploaded");
+        assert!(store.contains(&idx_key), "new idx must be uploaded");
+
+        // The fresh baseline bundle at the new tip must exist.
+        let bundle_key = format!("repo/refs/heads/main/{c3}.bundle");
+        assert!(
+            store.contains(&bundle_key),
+            "fresh baseline bundle at the new tip must be uploaded",
+        );
+
+        // Lock must be released.
+        let lock = lock_key(Some("repo"), &ref_main());
+        assert!(
+            !store.contains(&lock),
+            "compact must release the per-ref lock on success",
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_round_trips_blobs_via_read_blob() {
+        // Bytes-equivalence: every blob reachable from the new tip
+        // must be byte-identical pre- and post-compact when read
+        // through the public `read_blob` API.
+        let store = MockStore::new();
+        let (_repo, _prior, _c1, _c2, _c3) = lay_down_three_segment_chain(&store, "repo").await;
+        let store_arc: Arc<dyn ObjectStore> = Arc::new(store.clone());
+
+        // Capture pre-compact bytes for path "f2" (the file added at c3).
+        let remote = crate::Remote::new_for_test(
+            store_arc.clone(),
+            "repo",
+            crate::url::StorageEngine::Packchain,
+        );
+        // 1 MiB cache is plenty — test packs are tiny.
+        let cache = crate::packchain::PackIndexCache::new(1024 * 1024);
+        let pre = crate::packchain::read_blob(&remote, ref_main().as_str(), "f2", &cache)
+            .await
+            .expect("read_blob pre-compact");
+
+        // Run compact.
+        let outcome = compact(&store, Some("repo"), &ref_main(), opts(true))
+            .await
+            .unwrap();
+        assert_eq!(outcome.action, CompactAction::Compacted);
+
+        // Read post-compact through a fresh cache (the old idx is
+        // orphan; a stale cached entry would mask a bug).
+        let cache2 = crate::packchain::PackIndexCache::new(1024 * 1024);
+        let post = crate::packchain::read_blob(&remote, ref_main().as_str(), "f2", &cache2)
+            .await
+            .expect("read_blob post-compact");
+        assert_eq!(pre, post, "blob bytes must round-trip through compact");
+    }
+}

@@ -13,6 +13,7 @@
 //! non-interactive frontend share the same code path.
 
 pub mod branch;
+pub mod compact;
 pub mod doctor;
 pub mod gc;
 pub mod snapshot;

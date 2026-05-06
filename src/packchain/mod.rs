@@ -46,6 +46,7 @@
 //! for the full duration of a multi-GiB upload.
 
 pub(crate) mod audit;
+pub(crate) mod compact;
 pub(crate) mod fetch;
 pub mod gc;
 pub(crate) mod git;
