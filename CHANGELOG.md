@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `parse_bundle_key` now rejects bundle keys whose extracted ref
+  path fails `gix-validate`'s ref-name check (`..` traversal,
+  control characters, `.lock` suffixes). Mirrors the packchain-side
+  hardening from #72 — both engines now validate ref paths before
+  emitting them in the `list` response (#73).
+
 ### Added
 
 - `packchain` `bundle-uri` presigned URLs (issue #76, completes

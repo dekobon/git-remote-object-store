@@ -240,7 +240,7 @@ async fn load_chains(
         // key like `<prefix>/refs/heads/../etc/passwd/chain.json`
         // would otherwise render its derived path verbatim into
         // doctor's stdout.
-        if RefName::new(&ref_path).is_err() {
+        if !RefName::is_valid(&ref_path) {
             warn!(
                 key = %meta.key,
                 ref_path = %ref_path,
