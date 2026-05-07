@@ -7,7 +7,7 @@
 //! (`../git-remote-s3/git_remote_s3/manage.py`), which remains a
 //! useful reference but is not authoritative.
 //!
-//! The library entry points (`Doctor`, `ManageBranch`, `analyze`) take an
+//! The library entry points (`Doctor`, `ManageBranch`) take an
 //! [`ObjectStore`][crate::object_store::ObjectStore] and a
 //! [`Prompter`], so the binary, mock-backed unit tests, and any future
 //! non-interactive frontend share the same code path.
@@ -16,7 +16,7 @@ pub mod branch;
 pub mod compact;
 pub mod doctor;
 pub mod gc;
-pub mod snapshot;
+pub(crate) mod snapshot;
 
 use std::io;
 

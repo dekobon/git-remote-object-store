@@ -10,45 +10,55 @@ use time::OffsetDateTime;
 use tracing::warn;
 
 use super::ManageError;
-use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore};
 
 /// One bundle object listed under a ref.
 #[derive(Debug, Clone)]
-pub struct BundleEntry {
+pub(crate) struct BundleEntry {
     /// Hex-encoded commit OID extracted from the bundle filename.
     /// Stored as `String` (not `Sha`) because the doctor must report
     /// even malformed entries — `<sha>.bundle` keys with non-hex names
     /// still need to be displayed and offered for deletion.
-    pub sha: String,
+    pub(crate) sha: String,
     /// Full object key, used directly for `delete` / `copy` calls so the
     /// caller never has to reconstruct it.
-    pub key: String,
+    pub(crate) key: String,
     /// Server-side last-modified timestamp.
-    pub last_modified: OffsetDateTime,
+    pub(crate) last_modified: OffsetDateTime,
 }
 
 /// Per-ref snapshot — protection state plus every bundle object.
+///
+/// Constructed by [`analyze_objects`] and consumed only by the doctor.
+/// The whole snapshot module is `pub(crate)` because no code outside
+/// this crate reads these fields — the `RepoSnapshot` value is built
+/// inside `Doctor::run` and the doctor itself owns all rendering.
 #[derive(Debug, Clone, Default)]
-pub struct RefSnapshot {
+pub(crate) struct RefSnapshot {
     /// `true` iff at least one `<ref>/PROTECTED#…` marker is present.
     /// The marker is matched by **prefix**, so any key under `<ref>/`
     /// whose final segment starts with `PROTECTED#` counts.
-    pub is_protected: bool,
+    pub(crate) is_protected: bool,
     /// Bundle objects under this ref, in listing order. The doctor's
     /// "multiple bundles" check fires when this is longer than one.
-    pub bundles: Vec<BundleEntry>,
+    pub(crate) bundles: Vec<BundleEntry>,
+    /// `true` iff a `chain.json` manifest is present under this ref.
+    /// Indicates a packchain branch; the doctor treats such a ref as
+    /// structurally healthy ("Ok") even when no `.bundle` file exists,
+    /// because the pack segments are stored under `packs/` rather than
+    /// inlined as a bundle.
+    pub(crate) has_chain: bool,
 }
 
 /// Whole-repository snapshot.
 #[derive(Debug, Clone, Default)]
-pub struct RepoSnapshot {
+pub(crate) struct RepoSnapshot {
     /// Body of `<prefix>/HEAD`, decoded as UTF-8 and trimmed of
     /// surrounding whitespace. `None` when the object is absent or its
     /// body is not valid UTF-8.
-    pub head: Option<String>,
+    pub(crate) head: Option<String>,
     /// Refs keyed by their full ref-path (e.g. `refs/heads/main`).
-    pub refs: BTreeMap<String, RefSnapshot>,
+    pub(crate) refs: BTreeMap<String, RefSnapshot>,
 }
 
 impl RepoSnapshot {
@@ -56,7 +66,7 @@ impl RepoSnapshot {
     /// [`refs`](Self::refs). A `None` HEAD or a HEAD pointing at a ref
     /// with no listed keys is "invalid" and triggers `fix_head`.
     #[must_use]
-    pub fn is_head_valid(&self) -> bool {
+    pub(crate) fn is_head_valid(&self) -> bool {
         self.head
             .as_ref()
             .is_some_and(|h| self.refs.contains_key(h))
@@ -73,16 +83,21 @@ impl RepoSnapshot {
 /// repository) and skips the trailing `/` to avoid emitting a
 /// leading-slash list prefix.
 ///
-/// Performs one `list` call. Callers that already have a listing of
-/// `<prefix>/` should call [`analyze_objects`] instead to avoid a
-/// second LIST round-trip.
+/// Performs one `list` call. Production callers always already have a
+/// listing in hand and use [`analyze_objects`] directly to share the
+/// LIST across analysis and stale-lock scanning; this convenience form
+/// exists for unit-test ergonomics only.
 ///
 /// # Errors
 ///
 /// Returns [`ManageError::Store`] if the list or HEAD-object get calls
 /// fail.
-pub async fn analyze(store: &dyn ObjectStore, prefix: &str) -> Result<RepoSnapshot, ManageError> {
-    let list_prefix = keys::join(prefix, "");
+#[cfg(test)]
+pub(crate) async fn analyze(
+    store: &dyn ObjectStore,
+    prefix: &str,
+) -> Result<RepoSnapshot, ManageError> {
+    let list_prefix = crate::keys::join(prefix, "");
     let objects = store.list(&list_prefix).await?;
     analyze_objects(&objects, &list_prefix, store).await
 }
@@ -95,7 +110,7 @@ pub async fn analyze(store: &dyn ObjectStore, prefix: &str) -> Result<RepoSnapsh
 ///
 /// Returns [`ManageError::Store`] if fetching the `HEAD` object body
 /// fails.
-pub async fn analyze_objects(
+pub(crate) async fn analyze_objects(
     objects: &[ObjectMeta],
     list_prefix: &str,
     store: &dyn ObjectStore,
@@ -139,6 +154,14 @@ async fn classify_into(
         return Ok(());
     }
 
+    // Skip known bookkeeping top-level directories that are never ref
+    // directories. `packs/` and `gc/` are packchain-internal; `lfs/`
+    // holds LFS objects. Including them in `refs` pollutes the doctor
+    // report with spurious "No bundles" lines (#75).
+    if is_bookkeeping_dir(relative) {
+        return Ok(());
+    }
+
     // Every other key is `<ref-path>/<last>`. Anything without a slash
     // (e.g. a sidecar dropped at the prefix root) is unknown and
     // skipped — the doctor never rewrites keys it does not recognise.
@@ -162,8 +185,30 @@ async fn classify_into(
             key: object.key.clone(),
             last_modified: object.last_modified,
         });
+    } else if last == "chain.json" {
+        entry.has_chain = true;
     }
     Ok(())
+}
+
+/// `true` iff `relative` falls under a known bookkeeping top-level
+/// directory that is never a ref directory. These are filtered out
+/// before ref-grouping so they don't pollute the doctor report.
+///
+/// Current set: `packs/` and `gc/` (packchain-internal), `lfs/` (LFS
+/// object storage).
+///
+/// **Maintenance**: if the on-bucket layout adds a new reserved
+/// top-level directory, add its `"name/"` prefix here and extend
+/// `is_bookkeeping_dir_matches_known_prefixes` in the test suite.
+/// The trailing slash is required — `"packs"` (no slash) must NOT
+/// match, because a root-level sidecar with that exact name is not
+/// a directory.
+fn is_bookkeeping_dir(relative: &str) -> bool {
+    // Top-level directory prefixes that are never ref directories.
+    // Keep sorted alphabetically for scan readability.
+    const BOOKKEEPING_PREFIXES: &[&str] = &["gc/", "lfs/", "packs/"];
+    BOOKKEEPING_PREFIXES.iter().any(|p| relative.starts_with(p))
 }
 
 #[cfg(test)]
@@ -332,5 +377,84 @@ mod tests {
         let s: Arc<dyn ObjectStore> = Arc::new(mock);
         let snap = analyze(&s, "myrepo").await.expect("analyze");
         assert!(snap.head.is_none());
+    }
+
+    // --- Bookkeeping directory filtering (#75) ---------------------------
+
+    #[tokio::test]
+    async fn packchain_bookkeeping_dirs_excluded_from_refs() {
+        // packs/, gc/, and lfs/ are internal directories that must not
+        // appear as ref entries in the snapshot (#75).
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert(
+            "myrepo/packs/1111111111111111111111111111111111111111.pack",
+            Bytes::from("pack-body"),
+        );
+        mock.insert(
+            "myrepo/gc/tombstones-abc-1-2025-01-01T00:00:00Z.json",
+            Bytes::from("{}"),
+        );
+        mock.insert("myrepo/lfs/abcdef0123456789", Bytes::from("lfs-body"));
+        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+
+        // Only the actual ref should be present.
+        assert_eq!(
+            snap.refs.keys().collect::<Vec<_>>(),
+            vec!["refs/heads/main"],
+        );
+        assert!(!snap.refs.contains_key("packs"));
+        assert!(!snap.refs.contains_key("gc"));
+        assert!(!snap.refs.contains_key("lfs"));
+    }
+
+    #[tokio::test]
+    async fn chain_json_sets_has_chain_flag() {
+        // A packchain branch has chain.json instead of (or alongside) a
+        // .bundle file. The snapshot must record this so the doctor can
+        // treat the ref as healthy.
+        let mock = MockStore::new();
+        mock.insert(
+            "myrepo/refs/heads/main/chain.json",
+            Bytes::from(r#"{"v":1}"#),
+        );
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+        let main = snap.refs.get("refs/heads/main").expect("main present");
+        assert!(main.has_chain, "chain.json must set has_chain");
+        assert!(main.bundles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chain_json_coexists_with_bundle() {
+        // Edge case: a packchain branch that also has a baseline .bundle
+        // must record both has_chain and the bundle entry.
+        let mock = MockStore::new();
+        mock.insert(
+            "myrepo/refs/heads/main/chain.json",
+            Bytes::from(r#"{"v":1}"#),
+        );
+        mock.insert("myrepo/refs/heads/main/abc123.bundle", Bytes::from("body"));
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+        let main = snap.refs.get("refs/heads/main").expect("main present");
+        assert!(main.has_chain);
+        assert_eq!(main.bundles.len(), 1);
+        assert_eq!(main.bundles[0].sha, "abc123");
+    }
+
+    #[test]
+    fn is_bookkeeping_dir_matches_known_prefixes() {
+        assert!(super::is_bookkeeping_dir("packs/something.pack"));
+        assert!(super::is_bookkeeping_dir("gc/tombstones.json"));
+        assert!(super::is_bookkeeping_dir("lfs/abcdef"));
+        // Actual ref paths must NOT match.
+        assert!(!super::is_bookkeeping_dir("refs/heads/main/abc.bundle"));
+        assert!(!super::is_bookkeeping_dir("HEAD"));
+        // Prefix-only match: "packs" without trailing slash is not a
+        // bookkeeping directory (would be a root-level sidecar).
+        assert!(!super::is_bookkeeping_dir("packs"));
     }
 }
