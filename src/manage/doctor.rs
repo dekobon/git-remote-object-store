@@ -2,7 +2,7 @@
 //!
 //! Mirrors `Doctor` in upstream
 //! `../git-remote-s3/git_remote_s3/manage.py`. The flow is:
-//! analyze → print report → fix duplicate bundles per ref → fix invalid
+//! analyze → write report → fix duplicate bundles per ref → fix invalid
 //! HEAD → list and (optionally) delete stale locks.
 //!
 //! The `Doctor` value is constructed once per CLI invocation; all
@@ -10,17 +10,16 @@
 //! path drives both the binary (via [`DialoguerPrompter`]) and unit
 //! tests (via [`ScriptedPrompter`]).
 //!
+//! All human-readable output flows through [`Doctor::run_into`]'s
+//! `impl Write` parameter so tests can capture exact bytes without
+//! spawning the management binary. [`Doctor::run`] is the thin
+//! public wrapper that passes [`std::io::stdout()`] (per-write
+//! locking, keeping the future `Send`).
+//!
 //! [`DialoguerPrompter`]: super::DialoguerPrompter
 //! [`ScriptedPrompter`]: super::ScriptedPrompter
 
-// The doctor's report is the management CLI's user-facing output and is
-// only reachable from the `git-remote-object-store` binary, which speaks
-// no protocol on stdout. Per `.claude/rules/protocol-stdout.md` the
-// management binary "may write to stdout normally"; the global
-// `disallowed_macros` lint is opted out here so the report can use
-// `println!` without per-line escapes.
-#![allow(clippy::disallowed_macros)]
-
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -95,7 +94,27 @@ impl<'a> Doctor<'a> {
         }
     }
 
-    /// Analyze, report, and fix.
+    /// Analyze, report, and fix — writing human-readable output to
+    /// stdout.
+    ///
+    /// Thin wrapper around [`run_into`](Self::run_into) that passes
+    /// [`std::io::stdout()`]. Each write acquires the stdout lock
+    /// individually, keeping the returned future `Send`. Use
+    /// `run_into` directly when you need to capture output (e.g. in
+    /// tests).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManageError::Store`] if an object-store call fails,
+    /// [`ManageError::Internal`] if a prompter returns an out-of-range
+    /// index, [`ManageError::Cancelled`] if the user cancels an interactive
+    /// prompt, or [`ManageError::Io`] for prompt or write I/O failures.
+    pub async fn run(&self) -> Result<(), ManageError> {
+        self.run_into(&mut std::io::stdout()).await
+    }
+
+    /// Analyze, report, and fix — writing human-readable output to
+    /// `out`.
     ///
     /// Errors short-circuit the run — partial fixes are committed
     /// immediately (each `delete` / `copy` / `put` is its own request),
@@ -106,8 +125,8 @@ impl<'a> Doctor<'a> {
     /// Returns [`ManageError::Store`] if an object-store call fails,
     /// [`ManageError::Internal`] if a prompter returns an out-of-range
     /// index, [`ManageError::Cancelled`] if the user cancels an interactive
-    /// prompt, or [`ManageError::Io`] for prompt I/O failures.
-    pub async fn run(&self) -> Result<(), ManageError> {
+    /// prompt, or [`ManageError::Io`] for prompt or write I/O failures.
+    pub(crate) async fn run_into<W: Write>(&self, out: &mut W) -> Result<(), ManageError> {
         // Share one LIST between snapshot analysis, the packchain
         // audit, and stale-lock scanning so a doctor run is a single
         // bucket walk regardless of repo size. Empty `prefix`
@@ -115,14 +134,14 @@ impl<'a> Doctor<'a> {
         let list_prefix = keys::join(&self.prefix, "");
         let objects = self.store.list(&list_prefix).await?;
         let mut snapshot = analyze_objects(&objects, &list_prefix, &self.store).await?;
-        print!("{}", self.report(&snapshot));
+        write!(out, "{}", self.report(&snapshot))?;
 
         // Engine-aware diagnostic. The packchain section is purely
         // read-only — no bucket mutations — so it runs before any of
         // the fixers below to keep the report ordering stable
         // regardless of what fixers do later.
         if let Some(section) = self.maybe_render_packchain_section(&objects).await? {
-            print!("{section}");
+            write!(out, "{section}")?;
         }
 
         // Fix duplicates ref-by-ref. We need owned ref-names because
@@ -134,14 +153,15 @@ impl<'a> Doctor<'a> {
             .map(|(name, _)| name.clone())
             .collect();
         for ref_path in dup_refs {
-            self.fix_multiple_bundles(&mut snapshot, &ref_path).await?;
+            self.fix_multiple_bundles(out, &mut snapshot, &ref_path)
+                .await?;
         }
 
         if !snapshot.is_head_valid() {
-            self.fix_head(&mut snapshot).await?;
+            self.fix_head(out, &mut snapshot).await?;
         }
 
-        self.list_and_handle_stale_locks(&objects).await?;
+        self.list_and_handle_stale_locks(out, &objects).await?;
         Ok(())
     }
 
@@ -204,15 +224,17 @@ impl<'a> Doctor<'a> {
         }
     }
 
-    async fn fix_multiple_bundles(
+    async fn fix_multiple_bundles<W: Write>(
         &self,
+        out: &mut W,
         snapshot: &mut RepoSnapshot,
         ref_path: &str,
     ) -> Result<(), ManageError> {
-        println!(
+        writeln!(
+            out,
             "\nFix multiple bundles for repo {} and ref {ref_path}",
             self.report_label()
-        );
+        )?;
 
         // The caller filtered for refs with `bundles.len() > 1`; if the
         // map shape changed in between, surface a structured internal
@@ -250,11 +272,11 @@ impl<'a> Doctor<'a> {
             // Match `ManageBranch::delete`: an interactive "no" is the user
             // declining this fix, not an abort of the whole run. Doctor
             // continues to the next ref / stale-lock scan with exit 0.
-            println!("Aborted");
+            writeln!(out, "Aborted")?;
             return Ok(());
         }
 
-        println!("Keeping {keeper_sha}");
+        writeln!(out, "Keeping {keeper_sha}")?;
         // Partition into (keep, evict). The snapshot is updated in place
         // so subsequent steps (HEAD validation in particular) see the
         // resolved layout.
@@ -264,13 +286,14 @@ impl<'a> Doctor<'a> {
         ref_entry.bundles = keepers;
 
         for losing in &losers {
-            self.evict_losing_bundle(ref_path, losing).await?;
+            self.evict_losing_bundle(out, ref_path, losing).await?;
         }
         Ok(())
     }
 
-    async fn evict_losing_bundle(
+    async fn evict_losing_bundle<W: Write>(
         &self,
+        out: &mut W,
         ref_path: &str,
         losing: &BundleEntry,
     ) -> Result<(), ManageError> {
@@ -282,7 +305,7 @@ impl<'a> Doctor<'a> {
         // unconditional delete below — keep the delete inside the
         // appropriate branch when adding new modes.
         if self.opts.delete_bundle {
-            println!("Removing {}", losing.sha);
+            writeln!(out, "Removing {}", losing.sha)?;
         } else {
             // `Uuid::Simple`'s `Display` impl does NOT honor the
             // precision specifier (`{:.8}`), so encode into a stack
@@ -297,15 +320,19 @@ impl<'a> Doctor<'a> {
             // `Some(&self.prefix)` therefore handles both the prefixed
             // and root-of-bucket cases without an explicit branch.
             let dst_key = keys::bundle_key(Some(&self.prefix), &new_ref, &losing.sha);
-            println!("Moving {} to new branch {new_ref}", losing.sha);
+            writeln!(out, "Moving {} to new branch {new_ref}", losing.sha)?;
             self.store.copy(&losing.key, &dst_key).await?;
         }
         self.store.delete(&losing.key).await?;
         Ok(())
     }
 
-    async fn fix_head(&self, snapshot: &mut RepoSnapshot) -> Result<(), ManageError> {
-        println!("\nFix invalid HEAD for repo {}", self.report_label());
+    async fn fix_head<W: Write>(
+        &self,
+        out: &mut W,
+        snapshot: &mut RepoSnapshot,
+    ) -> Result<(), ManageError> {
+        writeln!(out, "\nFix invalid HEAD for repo {}", self.report_label())?;
 
         let candidates: Vec<&str> = snapshot
             .refs
@@ -314,7 +341,10 @@ impl<'a> Doctor<'a> {
             .map(String::as_str)
             .collect();
         if candidates.is_empty() {
-            println!("No `refs/heads/*` available to assign as HEAD; skipping.");
+            writeln!(
+                out,
+                "No `refs/heads/*` available to assign as HEAD; skipping."
+            )?;
             return Ok(());
         }
 
@@ -341,7 +371,7 @@ impl<'a> Doctor<'a> {
             .to_owned();
 
         let head_key = keys::join(&self.prefix, "HEAD");
-        println!("Setting {new_head} as HEAD");
+        writeln!(out, "Setting {new_head} as HEAD")?;
         self.store
             .put_bytes(&head_key, Bytes::from(new_head.clone()), PutOpts::default())
             .await?;
@@ -349,8 +379,12 @@ impl<'a> Doctor<'a> {
         Ok(())
     }
 
-    async fn list_and_handle_stale_locks(&self, objects: &[ObjectMeta]) -> Result<(), ManageError> {
-        println!("\nScanning for stale locks...");
+    async fn list_and_handle_stale_locks<W: Write>(
+        &self,
+        out: &mut W,
+        objects: &[ObjectMeta],
+    ) -> Result<(), ManageError> {
+        writeln!(out, "\nScanning for stale locks...")?;
         let now = OffsetDateTime::now_utc();
         let ttl = Duration::from_secs(self.opts.lock_ttl_seconds);
 
@@ -364,31 +398,34 @@ impl<'a> Doctor<'a> {
             .collect();
 
         if stale.is_empty() {
-            println!("No stale locks found.");
+            writeln!(out, "No stale locks found.")?;
             return Ok(());
         }
 
-        println!("Found stale locks:");
+        writeln!(out, "Found stale locks:")?;
         for (key, age) in &stale {
-            println!(" - {key} (age: {}s)", age.as_secs());
+            writeln!(out, " - {key} (age: {}s)", age.as_secs())?;
         }
 
         if self.opts.delete_stale_locks {
-            println!("\nDeleting stale locks...");
+            writeln!(out, "\nDeleting stale locks...")?;
             for (key, _) in &stale {
                 match self.store.delete(key).await {
                     Ok(()) => {
-                        println!("Deleted {key}");
+                        writeln!(out, "Deleted {key}")?;
                         info!(key, "deleted stale lock");
                     }
                     Err(e) => {
                         // Match upstream: report each failure but keep going.
-                        println!("Failed to delete {key}: {e}");
+                        writeln!(out, "Failed to delete {key}: {e}")?;
                     }
                 }
             }
         } else {
-            println!("\nRun with --delete-stale-locks to remove them automatically.");
+            writeln!(
+                out,
+                "\nRun with --delete-stale-locks to remove them automatically."
+            )?;
         }
         Ok(())
     }
@@ -536,7 +573,10 @@ mod tests {
         let initial_keys = mock.keys();
         let prompter = ScriptedPrompter::new([]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
-        doctor.run().await.expect("doctor.run");
+        doctor
+            .run_into(&mut std::io::sink())
+            .await
+            .expect("doctor.run");
         // A clean run must not mutate the bucket — no objects added,
         // moved, or removed. This catches a `Doctor::run` regressed to
         // a no-op as well as one that over-eagerly fixes a non-issue.
@@ -558,7 +598,10 @@ mod tests {
         );
         let prompter = ScriptedPrompter::new([Answer::Select(0), Answer::Confirm(true)]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
-        doctor.run().await.expect("doctor.run");
+        doctor
+            .run_into(&mut std::io::sink())
+            .await
+            .expect("doctor.run");
 
         // Original bundle for the keeper is still present.
         assert!(mock.contains("myrepo/refs/heads/main/aaaaaaaa.bundle"));
@@ -597,7 +640,10 @@ mod tests {
             ..DoctorOpts::default()
         };
         let doctor = Doctor::new(store_arc(&mock), "myrepo", opts, &prompter);
-        doctor.run().await.expect("doctor.run");
+        doctor
+            .run_into(&mut std::io::sink())
+            .await
+            .expect("doctor.run");
         assert!(!mock.contains("myrepo/refs/heads/main/aaa.bundle"));
         assert!(mock.contains("myrepo/refs/heads/main/bbb.bundle"));
     }
@@ -613,7 +659,10 @@ mod tests {
         // User-no on the confirmation declines this fix but is not an
         // abort of the whole run — the doctor continues to scan stale
         // locks and exits 0. Both bundles must remain untouched.
-        doctor.run().await.expect("user-no should not error");
+        doctor
+            .run_into(&mut std::io::sink())
+            .await
+            .expect("user-no should not error");
         assert!(mock.contains("myrepo/refs/heads/main/aaa.bundle"));
         assert!(mock.contains("myrepo/refs/heads/main/bbb.bundle"));
     }
@@ -632,7 +681,7 @@ mod tests {
         let prompter = ScriptedPrompter::new([Answer::Select(99)]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
         let err = doctor
-            .run()
+            .run_into(&mut std::io::sink())
             .await
             .expect_err("out-of-range index propagates");
         assert!(
@@ -659,7 +708,7 @@ mod tests {
         let prompter = ScriptedPrompter::new([Answer::Select(42)]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
         let err = doctor
-            .run()
+            .run_into(&mut std::io::sink())
             .await
             .expect_err("out-of-range HEAD index propagates");
         assert!(
@@ -678,7 +727,10 @@ mod tests {
         // index 1 is `main`.
         let prompter = ScriptedPrompter::new([Answer::Select(1)]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
-        doctor.run().await.expect("doctor.run");
+        doctor
+            .run_into(&mut std::io::sink())
+            .await
+            .expect("doctor.run");
 
         let head_bytes = mock.get_bytes("myrepo/HEAD").await.expect("HEAD written");
         assert_eq!(&head_bytes[..], b"refs/heads/main");
@@ -698,7 +750,10 @@ mod tests {
         );
         let prompter = ScriptedPrompter::new([]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
-        doctor.run().await.expect("doctor.run");
+        doctor
+            .run_into(&mut std::io::sink())
+            .await
+            .expect("doctor.run");
         assert!(
             mock.contains("myrepo/refs/heads/main/LOCK#.lock"),
             "lock retained without --delete-stale-locks"
@@ -723,7 +778,10 @@ mod tests {
         };
         let prompter = ScriptedPrompter::new([]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", opts, &prompter);
-        doctor.run().await.expect("doctor.run");
+        doctor
+            .run_into(&mut std::io::sink())
+            .await
+            .expect("doctor.run");
         assert!(!mock.contains("myrepo/refs/heads/main/LOCK#.lock"));
     }
 
@@ -740,7 +798,10 @@ mod tests {
         };
         let prompter = ScriptedPrompter::new([]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", opts, &prompter);
-        doctor.run().await.expect("doctor.run");
+        doctor
+            .run_into(&mut std::io::sink())
+            .await
+            .expect("doctor.run");
         assert!(mock.contains("myrepo/refs/heads/main/LOCK#.lock"));
     }
 
@@ -816,7 +877,10 @@ mod tests {
         let initial_keys = mock.keys();
         let prompter = ScriptedPrompter::new([]);
         let doctor = Doctor::new(store_arc(&mock), "", DoctorOpts::default(), &prompter);
-        doctor.run().await.expect("doctor.run at root");
+        doctor
+            .run_into(&mut std::io::sink())
+            .await
+            .expect("doctor.run at root");
         assert_eq!(mock.keys(), initial_keys);
     }
 
@@ -828,7 +892,10 @@ mod tests {
         mock.insert("refs/heads/main/abc.bundle", Bytes::from("b"));
         let prompter = ScriptedPrompter::new([Answer::Select(0)]);
         let doctor = Doctor::new(store_arc(&mock), "", DoctorOpts::default(), &prompter);
-        doctor.run().await.expect("doctor.run at root");
+        doctor
+            .run_into(&mut std::io::sink())
+            .await
+            .expect("doctor.run at root");
 
         let head_bytes = mock.get_bytes("HEAD").await.expect("HEAD at root");
         assert_eq!(&head_bytes[..], b"refs/heads/main");
@@ -843,7 +910,10 @@ mod tests {
         mock.insert("refs/heads/main/bbb.bundle", Bytes::from("b"));
         let prompter = ScriptedPrompter::new([Answer::Select(0), Answer::Confirm(true)]);
         let doctor = Doctor::new(store_arc(&mock), "", DoctorOpts::default(), &prompter);
-        doctor.run().await.expect("doctor.run at root");
+        doctor
+            .run_into(&mut std::io::sink())
+            .await
+            .expect("doctor.run at root");
 
         // Loser was moved to a quarantine ref `refs/heads/main_<uuid8>`,
         // and the destination key has no leading slash.
@@ -875,7 +945,10 @@ mod tests {
         let initial_keys = mock.keys();
         let prompter = ScriptedPrompter::new([]);
         let doctor = Doctor::new(store_arc(&mock), "repo", DoctorOpts::default(), &prompter);
-        doctor.run().await.expect("clean bundle run");
+        doctor
+            .run_into(&mut std::io::sink())
+            .await
+            .expect("clean bundle run");
         assert_eq!(mock.keys(), initial_keys);
     }
 
@@ -1057,6 +1130,235 @@ mod tests {
         assert_eq!(
             report,
             "(root):\n  refs/heads/main: Ok\n  HEAD: refs/heads/main\n",
+        );
+    }
+
+    // --- run_into output-capture tests -----------------------------------
+
+    /// Helper: run `doctor.run_into` into a `Vec<u8>` and return the
+    /// captured output as a `String`.
+    async fn capture_run(doctor: &Doctor<'_>) -> (Result<(), ManageError>, String) {
+        let mut buf = Vec::new();
+        let result = doctor.run_into(&mut buf).await;
+        let output = String::from_utf8(buf).expect("doctor output is valid UTF-8");
+        (result, output)
+    }
+
+    #[tokio::test]
+    async fn run_into_bundle_engine_section_order() {
+        // A clean bundle-engine run: snapshot report followed by the
+        // stale-lock scan. The packchain section must NOT appear.
+        // Expected output derives from `report()` (already pinned) plus
+        // the stale-lock trailer.
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let (result, output) = capture_run(&doctor).await;
+        result.expect("clean bundle run");
+
+        // Section 1: snapshot report
+        assert!(
+            output.starts_with("myrepo:\n"),
+            "output must start with snapshot report header, got: {output:?}",
+        );
+        // Section 2: stale-lock scan (no packchain section in between)
+        assert!(
+            output.contains("\nScanning for stale locks...\n"),
+            "stale-lock scan missing from output: {output:?}",
+        );
+        assert!(
+            output.contains("No stale locks found.\n"),
+            "no-stale-locks trailer missing: {output:?}",
+        );
+        // Packchain section must NOT appear under bundle engine.
+        assert!(
+            !output.contains("=== Packchain ==="),
+            "packchain section must not appear under bundle engine: {output:?}",
+        );
+
+        // Assert ordering: snapshot header appears before stale-lock scan.
+        let report_pos = output.find("myrepo:").expect("report header");
+        let locks_pos = output
+            .find("Scanning for stale locks")
+            .expect("stale-lock scan");
+        assert!(
+            report_pos < locks_pos,
+            "snapshot report must precede stale-lock scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_into_packchain_engine_section_order() {
+        // A packchain-engine run: snapshot report, then packchain
+        // section, then stale-lock scan. This test pins the three-part
+        // section ordering that is only observable via captured output.
+        let mock = MockStore::new();
+        mock.insert("repo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("repo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        // A minimal packchain shape: chain.json + live pack.
+        mock.insert(
+            "repo/refs/heads/main/chain.json",
+            Bytes::from(
+                r#"{"v":1,"tip":"0000000000000000000000000000000000000001","full_at":"0000000000000000000000000000000000000001","segments":[{"sha":"0000000000000000000000000000000000000001","parent_sha":null,"pack":"packs/1111111111111111111111111111111111111111.pack","bytes":1024}]}"#,
+            ),
+        );
+        mock.insert(
+            "repo/packs/1111111111111111111111111111111111111111.pack",
+            Bytes::from_static(b"live"),
+        );
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(
+            store_arc(&mock),
+            "repo",
+            DoctorOpts {
+                engine: StorageEngine::Packchain,
+                ..DoctorOpts::default()
+            },
+            &prompter,
+        );
+        let (result, output) = capture_run(&doctor).await;
+        result.expect("clean packchain run");
+
+        // All three sections must appear, in order.
+        let report_pos = output.find("repo:").expect("snapshot report header");
+        let packchain_pos = output.find("=== Packchain ===").expect("packchain section");
+        let locks_pos = output
+            .find("Scanning for stale locks")
+            .expect("stale-lock scan");
+        assert!(
+            report_pos < packchain_pos,
+            "snapshot report must precede packchain section"
+        );
+        assert!(
+            packchain_pos < locks_pos,
+            "packchain section must precede stale-lock scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_into_captures_fix_multiple_bundles_output() {
+        // Exercises the duplicate-bundle fixer path through `run_into`
+        // and pins the interactive-prompt output in the capture buffer.
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert(
+            "myrepo/refs/heads/main/aaaaaaaa.bundle",
+            Bytes::from("body-a"),
+        );
+        mock.insert(
+            "myrepo/refs/heads/main/bbbbbbbb.bundle",
+            Bytes::from("body-b"),
+        );
+        let prompter = ScriptedPrompter::new([Answer::Select(0), Answer::Confirm(true)]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let (result, output) = capture_run(&doctor).await;
+        result.expect("fix-multiple run");
+
+        assert!(
+            output.contains("Fix multiple bundles for repo myrepo and ref refs/heads/main"),
+            "fixer header missing: {output:?}",
+        );
+        assert!(
+            output.contains("Keeping aaaaaaaa"),
+            "keeper announcement missing: {output:?}",
+        );
+        assert!(
+            output.contains("Moving bbbbbbbb to new branch"),
+            "eviction line missing: {output:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn run_into_captures_fix_head_output() {
+        // Exercises the HEAD-fixer path and pins its output lines.
+        let mock = MockStore::new();
+        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        let prompter = ScriptedPrompter::new([Answer::Select(0)]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let (result, output) = capture_run(&doctor).await;
+        result.expect("fix-head run");
+
+        assert!(
+            output.contains("Fix invalid HEAD for repo myrepo"),
+            "HEAD fixer header missing: {output:?}",
+        );
+        assert!(
+            output.contains("Setting refs/heads/main as HEAD"),
+            "HEAD assignment line missing: {output:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn run_into_captures_stale_lock_output() {
+        // Exercises the stale-lock listing + deletion path and pins
+        // the report lines in the capture buffer.
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        let stale = OffsetDateTime::now_utc() - time::Duration::seconds(120);
+        mock.insert_with(
+            "myrepo/refs/heads/main/LOCK#.lock",
+            Bytes::new(),
+            stale,
+            PutOpts::default(),
+        );
+        let opts = DoctorOpts {
+            delete_stale_locks: true,
+            ..DoctorOpts::default()
+        };
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", opts, &prompter);
+        let (result, output) = capture_run(&doctor).await;
+        result.expect("stale-lock-delete run");
+
+        assert!(
+            output.contains("Found stale locks:"),
+            "stale-lock listing header missing: {output:?}",
+        );
+        assert!(
+            output.contains("Deleting stale locks..."),
+            "deletion progress line missing: {output:?}",
+        );
+        assert!(
+            output.contains("Deleted myrepo/refs/heads/main/LOCK#.lock"),
+            "individual deletion confirmation missing: {output:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn run_into_captures_aborted_output() {
+        // Exercises the user-decline path in fix_multiple_bundles and
+        // pins the "Aborted" line in the capture buffer. The early
+        // return after "Aborted" must prevent any keeper/eviction
+        // output from appearing.
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("myrepo/refs/heads/main/aaa.bundle", Bytes::from("a"));
+        mock.insert("myrepo/refs/heads/main/bbb.bundle", Bytes::from("b"));
+        let prompter = ScriptedPrompter::new([Answer::Select(0), Answer::Confirm(false)]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let (result, output) = capture_run(&doctor).await;
+        result.expect("user-abort run");
+
+        assert!(
+            output.contains("Fix multiple bundles for repo myrepo"),
+            "fixer header missing: {output:?}",
+        );
+        assert!(
+            output.contains("Aborted"),
+            "abort message missing: {output:?}",
+        );
+        // The early return after "Aborted" must prevent the
+        // keeper announcement and eviction lines from appearing.
+        assert!(
+            !output.contains("Keeping"),
+            "keeper line must not appear after user abort: {output:?}",
+        );
+        assert!(
+            !output.contains("Moving"),
+            "eviction line must not appear after user abort: {output:?}",
         );
     }
 }
