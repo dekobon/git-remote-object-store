@@ -95,7 +95,7 @@ pub(crate) fn build_blob_sas_url(
     // sub-second precision. `Iso8601::DEFAULT` includes nanoseconds,
     // which Azure rejects; the manual format below matches what
     // `Azure-SDK-for-.NET`'s SAS-builder emits.
-    let signed_expiry = format_iso8601_utc(expiry)?;
+    let signed_expiry = format_iso8601_utc(expiry);
 
     let canonical_resource = format!("/blob/{}/{container}/{blob_path}", signing.account);
 
@@ -162,9 +162,16 @@ pub(crate) fn build_blob_sas_url(
 /// Format an `OffsetDateTime` as `YYYY-MM-DDTHH:MM:SSZ` (ISO 8601 in
 /// UTC, second precision, `Z` suffix). Wire-format constant lives
 /// at the top of the module ([`SAS_EXPIRY_FORMAT`]).
-fn format_iso8601_utc(t: OffsetDateTime) -> Result<String, ObjectStoreError> {
+///
+/// Infallible for `OffsetDateTime` + this format-description: the
+/// only documented `time::error::Format` variants are buffer-write
+/// (impossible against `String`) and component-not-present
+/// (impossible — `OffsetDateTime` carries every component the
+/// ISO-8601 formatter needs). The `expect` documents the invariant
+/// per the project's "Unreachable Defensive Code" rule.
+fn format_iso8601_utc(t: OffsetDateTime) -> String {
     t.format(&Iso8601::<SAS_EXPIRY_FORMAT>)
-        .map_err(|e| ObjectStoreError::Other(format!("ISO-8601 format failed: {e}").into()))
+        .expect("ISO-8601 second-precision format is infallible for OffsetDateTime + String")
 }
 
 #[cfg(test)]
@@ -184,10 +191,27 @@ mod tests {
         }
     }
 
+    /// Parse a SAS URL's query string into a sorted map of
+    /// `key → value`. `BTreeMap` ordering is incidental — these
+    /// tests assert by key name without coupling to the production
+    /// code's `query_pairs()` insertion order.
+    ///
+    /// **Note**: a sibling helper of the same name lives in
+    /// `cli/tests/common/mod.rs` for the live integration tests.
+    /// The two are intentionally separate (cargo cannot share
+    /// helpers across `tests/` and `cli/tests/` without widening
+    /// the lib's public surface via `test-util`). Keep this
+    /// docstring and the sibling's in sync.
+    fn query_pairs_btree(url: &Url) -> std::collections::BTreeMap<String, String> {
+        url.query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect()
+    }
+
     #[test]
     fn iso8601_formatter_drops_sub_second_precision_and_uses_z_suffix() {
         let t = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp");
-        let s = format_iso8601_utc(t).expect("formats");
+        let s = format_iso8601_utc(t);
         assert_eq!(s, "2023-11-14T22:13:20Z");
     }
 
@@ -208,10 +232,7 @@ mod tests {
         .expect("SAS URL builds");
 
         let parsed = Url::parse(&url).expect("emitted URL parses");
-        let pairs: std::collections::BTreeMap<String, String> = parsed
-            .query_pairs()
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect();
+        let pairs = query_pairs_btree(&parsed);
         assert_eq!(
             pairs.get("sv").map(String::as_str),
             Some(SAS_SIGNED_VERSION)
@@ -283,10 +304,7 @@ mod tests {
         .expect("https SAS URL builds");
 
         let http_parsed = Url::parse(&http_url).expect("http URL parses");
-        let http_pairs: std::collections::BTreeMap<String, String> = http_parsed
-            .query_pairs()
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect();
+        let http_pairs = query_pairs_btree(&http_parsed);
         assert_eq!(
             http_pairs.get("spr").map(String::as_str),
             Some("https,http"),
