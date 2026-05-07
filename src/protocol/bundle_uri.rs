@@ -48,7 +48,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::warn;
 
 use crate::keys;
-use crate::object_store::ObjectStore;
+use crate::object_store::{ObjectStore, ObjectStoreError};
 use crate::packchain::PackchainError;
 use crate::packchain::keys::is_chain_json_key;
 use crate::packchain::schema::ChainManifest;
@@ -78,10 +78,17 @@ pub(crate) struct BundleUriOpts {
 /// variant.
 #[derive(Debug, thiserror::Error)]
 pub enum BundleUriError {
-    /// Object-store transport failure during the chain.json listing
-    /// or fetch.
+    /// Object-store transport / parse failure surfaced through the
+    /// packchain engine (chain.json listing or fetch).
     #[error(transparent)]
     Packchain(#[from] PackchainError),
+    /// Direct object-store error from
+    /// [`ObjectStore::presigned_get_url`]. Distinct from
+    /// `Packchain` so the per-entry `bundle_url_for_emission`
+    /// failure path doesn't synthesise a fake `PackchainError::Store`
+    /// wrapper just to nest the same `ObjectStoreError`.
+    #[error(transparent)]
+    Store(#[from] ObjectStoreError),
     /// I/O failure writing the response to the protocol writer.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -290,10 +297,7 @@ async fn bundle_url_for_emission(
     };
     let bundle_key = keys::bundle_key(remote.prefix(), ref_path, full_at);
     let ttl = std::time::Duration::from_secs(ttl_seconds.get());
-    store
-        .presigned_get_url(&bundle_key, ttl)
-        .await
-        .map_err(|e| BundleUriError::Packchain(PackchainError::Store(e)))
+    Ok(store.presigned_get_url(&bundle_key, ttl).await?)
 }
 
 /// Build a canonical (unsigned) bucket URL for the baseline bundle
@@ -495,99 +499,21 @@ mod tests {
         );
     }
 
-    /// Decorator over [`MockStore`] that returns a deterministic
-    /// "presigned" URL so the dispatch path in
-    /// [`bundle_url_for_emission`] can be exercised without a real
-    /// backend. The URL shape mirrors what S3 presigning emits
-    /// (`X-Amz-Signature=` + `X-Amz-Expires=`) so assertions can
-    /// look for the same query parameters that a live test would.
-    struct StubPresignStore {
-        inner: MockStore,
-    }
-
-    #[async_trait::async_trait]
-    impl ObjectStore for StubPresignStore {
-        async fn list(
-            &self,
-            prefix: &str,
-        ) -> Result<Vec<crate::object_store::ObjectMeta>, crate::object_store::ObjectStoreError>
-        {
-            self.inner.list(prefix).await
-        }
-        async fn get_to_file(
-            &self,
-            key: &str,
-            dest: &std::path::Path,
-            opts: crate::object_store::GetOpts,
-        ) -> Result<(), crate::object_store::ObjectStoreError> {
-            self.inner.get_to_file(key, dest, opts).await
-        }
-        async fn get_bytes(
-            &self,
-            key: &str,
-        ) -> Result<bytes::Bytes, crate::object_store::ObjectStoreError> {
-            self.inner.get_bytes(key).await
-        }
-        async fn get_bytes_range(
-            &self,
-            key: &str,
-            range: std::ops::Range<u64>,
-        ) -> Result<bytes::Bytes, crate::object_store::ObjectStoreError> {
-            self.inner.get_bytes_range(key, range).await
-        }
-        async fn put_bytes(
-            &self,
-            key: &str,
-            body: bytes::Bytes,
-            opts: crate::object_store::PutOpts,
-        ) -> Result<(), crate::object_store::ObjectStoreError> {
-            self.inner.put_bytes(key, body, opts).await
-        }
-        async fn put_if_absent(
-            &self,
-            key: &str,
-            body: bytes::Bytes,
-        ) -> Result<bool, crate::object_store::ObjectStoreError> {
-            self.inner.put_if_absent(key, body).await
-        }
-        async fn head(
-            &self,
-            key: &str,
-        ) -> Result<crate::object_store::ObjectMeta, crate::object_store::ObjectStoreError>
-        {
-            self.inner.head(key).await
-        }
-        async fn copy(
-            &self,
-            src: &str,
-            dst: &str,
-        ) -> Result<(), crate::object_store::ObjectStoreError> {
-            self.inner.copy(src, dst).await
-        }
-        async fn delete(&self, key: &str) -> Result<(), crate::object_store::ObjectStoreError> {
-            self.inner.delete(key).await
-        }
-        async fn presigned_get_url(
-            &self,
-            key: &str,
-            ttl: std::time::Duration,
-        ) -> Result<String, crate::object_store::ObjectStoreError> {
-            Ok(format!(
-                "https://stub.example/{key}?X-Amz-Expires={}&X-Amz-Signature=DEADBEEF",
-                ttl.as_secs(),
-            ))
-        }
-    }
-
     #[tokio::test]
     async fn presign_ttl_emits_presigned_url_via_dispatch() {
         // With a backend that supports presigning, `bundle_url_for_emission`
         // routes through `ObjectStore::presigned_get_url` instead of
-        // building a canonical URL. Verifies the dispatch path end-to-end.
-        let store = StubPresignStore {
-            inner: MockStore::new(),
-        };
-        write_test_chain(&store.inner, Some("repo"), &ref_main(), SHA_TIP, SHA_FULL).await;
+        // building a canonical URL. Arm `MockStore`'s presign stub
+        // (test-only hook) to return a deterministic SigV4-shaped
+        // URL and verify the dispatch path end-to-end.
+        let store = MockStore::new();
+        store.set_presign_stub(Some(|key: &str, ttl: std::time::Duration| {
+            Ok(format!(
+                "https://stub.example/{key}?X-Amz-Expires={}&X-Amz-Signature=DEADBEEF",
+                ttl.as_secs(),
+            ))
+        }));
+        write_test_chain(&store, Some("repo"), &ref_main(), SHA_TIP, SHA_FULL).await;
         let remote = parse(
             "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo\
              ?engine=packchain&bundle_uri=1&bundle_uri_presign_ttl=3600",

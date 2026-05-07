@@ -122,31 +122,31 @@ fn resolve_alias(account: &str, alias: &str) -> Result<ResolvedCredentials, Obje
 
     if let Ok(key_b64) = env::var(&key_var) {
         let policy = SharedKeySigningPolicy::new(account, &key_b64)?;
-        return Ok(policy_with_sas_key(
+        return Ok(resolved(
             Arc::new(policy),
-            SasSigningKey {
+            Some(SasSigningKey {
                 account: account.to_owned(),
                 key: Secret::new(key_b64),
-            },
+            }),
         ));
     }
     if let Ok(conn) = env::var(&conn_var) {
         let parsed = parse_connection_string(&conn)?;
         let policy = SharedKeySigningPolicy::new(&parsed.account, &parsed.key_b64)?;
-        return Ok(policy_with_sas_key(
+        return Ok(resolved(
             Arc::new(policy),
-            SasSigningKey {
+            Some(SasSigningKey {
                 account: parsed.account,
                 key: Secret::new(parsed.key_b64),
-            },
+            }),
         ));
     }
     if let Ok(sas) = env::var(&sas_var) {
         let policy = SasSigningPolicy::new(&sas)?;
         // SAS-env-var path has no storage key, so we cannot derive
-        // a fresh per-blob SAS for `bundle-uri` presigning. Leave
-        // `sas_signing_key` as `None`.
-        return Ok(policy_only(Arc::new(policy)));
+        // a fresh per-blob SAS for `bundle-uri` presigning. Pass
+        // `None` to make the missing key explicit at the call site.
+        return Ok(resolved(Arc::new(policy), None));
     }
 
     Err(ObjectStoreError::Other(
@@ -158,19 +158,20 @@ fn resolve_alias(account: &str, alias: &str) -> Result<ResolvedCredentials, Obje
     ))
 }
 
-fn policy_only(policy: Arc<dyn Policy>) -> ResolvedCredentials {
+/// Build a [`ResolvedCredentials`] from a per-try signing policy
+/// plus an optional SAS-signing key. The two `Option<SasSigningKey>`
+/// states make the single distinction between alias paths explicit
+/// at the call site: `Some(...)` for shared-key / connection-string
+/// (presigning is reachable), `None` for SAS-env-var (presigning
+/// returns `Unsupported`).
+fn resolved(
+    policy: Arc<dyn Policy>,
+    sas_signing_key: Option<SasSigningKey>,
+) -> ResolvedCredentials {
     ResolvedCredentials {
         token_credential: None,
         per_try_policy: Some(policy),
-        sas_signing_key: None,
-    }
-}
-
-fn policy_with_sas_key(policy: Arc<dyn Policy>, sas_key: SasSigningKey) -> ResolvedCredentials {
-    ResolvedCredentials {
-        token_credential: None,
-        per_try_policy: Some(policy),
-        sas_signing_key: Some(sas_key),
+        sas_signing_key,
     }
 }
 
@@ -478,7 +479,12 @@ fn canonicalized_resource(account: &str, url: &Url) -> String {
     out
 }
 
-fn hmac_sha256_base64(data: &str, key: &Secret) -> Result<String, String> {
+/// HMAC-SHA256 a base64-encoded `key` over `data` and return a
+/// base64-encoded MAC. Used by both the shared-key signing policy
+/// (`Authorization: SharedKey …` header) and the service-blob SAS
+/// builder ([`super::sas`]) — same primitive, same byte sequence,
+/// same error wording.
+pub(super) fn hmac_sha256_base64(data: &str, key: &Secret) -> Result<String, String> {
     let key_bytes = BASE64
         .decode(key.secret().as_bytes())
         .map_err(|e| format!("AccountKey base64 decode: {e}"))?;
