@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   control characters, `.lock` suffixes). Mirrors the packchain-side
   hardening from #72 — both engines now validate ref paths before
   emitting them in the `list` response (#73).
+- `Doctor::run` now delegates to `run_into<W: Write>` with an
+  injectable writer, making the full doctor output (report, fixer
+  prompts, stale-lock scan) unit-testable without spawning the
+  management binary (#74).
 
 ### Added
 
