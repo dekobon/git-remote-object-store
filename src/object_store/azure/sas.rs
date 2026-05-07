@@ -31,10 +31,6 @@
 
 use std::time::Duration;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use time::OffsetDateTime;
 use time::format_description::well_known::Iso8601;
 use url::Url;
@@ -45,6 +41,20 @@ use crate::object_store::azure::auth::SasSigningKey;
 /// Signed-version field embedded in the SAS token. See module-level
 /// docs for the rationale.
 pub(crate) const SAS_SIGNED_VERSION: &str = "2022-11-02";
+
+/// ISO-8601 format-description for [`format_iso8601_utc`]: UTC,
+/// second precision (no fractional seconds), `Z` suffix. Azure SAS
+/// rejects sub-second precision and the `+00:00` offset form, so
+/// the project's stock `Rfc3339` formatter does not work — this
+/// constant pins the exact wire shape Azure accepts.
+const SAS_EXPIRY_FORMAT: time::format_description::well_known::iso8601::EncodedConfig = {
+    use time::format_description::well_known::iso8601::{Config, TimePrecision};
+    Config::DEFAULT
+        .set_time_precision(TimePrecision::Second {
+            decimal_digits: None,
+        })
+        .encode()
+};
 
 /// Build a service-blob SAS URL granting read access to `blob_path`
 /// (relative to the container) for `ttl`. The returned URL is
@@ -97,7 +107,12 @@ pub(crate) fn build_blob_sas_url(
     // `https,http` so the SAS works with the actual request
     // scheme — Azure SAS spec forbids `http`-alone, so the
     // combined value is the only legal way to permit HTTP.
-    let signed_protocol = if base_url.scheme().eq_ignore_ascii_case("https") {
+    // `Url::scheme()` returns lowercase per RFC 3986 / `url` crate
+    // normalisation, so a plain `==` is sufficient — no need for
+    // `eq_ignore_ascii_case`. `crate::url::parse` only accepts
+    // `https` or `http` (the `s3+`/`az+` prefix strip), so any
+    // future scheme would be a bug elsewhere.
+    let signed_protocol = if base_url.scheme() == "https" {
         "https"
     } else {
         "https,http"
@@ -126,13 +141,8 @@ pub(crate) fn build_blob_sas_url(
          "
     );
 
-    let key_bytes = BASE64
-        .decode(signing.key.secret().as_bytes())
-        .map_err(|e| ObjectStoreError::Other(format!("AccountKey base64 decode: {e}").into()))?;
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key_bytes)
-        .map_err(|e| ObjectStoreError::Other(format!("HMAC init: {e}").into()))?;
-    mac.update(string_to_sign.as_bytes());
-    let signature_b64 = BASE64.encode(mac.finalize().into_bytes());
+    let signature_b64 = super::auth::hmac_sha256_base64(&string_to_sign, &signing.key)
+        .map_err(|e| ObjectStoreError::Other(e.into()))?;
 
     // SAS URLs use percent-encoded query values per RFC 3986; the
     // `url` crate's `Serializer` handles the encoding (notably the
@@ -150,16 +160,10 @@ pub(crate) fn build_blob_sas_url(
 }
 
 /// Format an `OffsetDateTime` as `YYYY-MM-DDTHH:MM:SSZ` (ISO 8601 in
-/// UTC, second precision, `Z` suffix). Azure SAS rejects sub-second
-/// precision and the `+00:00` offset form.
+/// UTC, second precision, `Z` suffix). Wire-format constant lives
+/// at the top of the module ([`SAS_EXPIRY_FORMAT`]).
 fn format_iso8601_utc(t: OffsetDateTime) -> Result<String, ObjectStoreError> {
-    use time::format_description::well_known::iso8601::{Config, EncodedConfig, TimePrecision};
-    const SECOND_PRECISION: EncodedConfig = Config::DEFAULT
-        .set_time_precision(TimePrecision::Second {
-            decimal_digits: None,
-        })
-        .encode();
-    t.format(&Iso8601::<SECOND_PRECISION>)
+    t.format(&Iso8601::<SAS_EXPIRY_FORMAT>)
         .map_err(|e| ObjectStoreError::Other(format!("ISO-8601 format failed: {e}").into()))
 }
 
@@ -233,32 +237,72 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::similar_names)]
     fn build_blob_sas_url_with_http_base_signs_combined_protocol() {
         // Azurite localhost test path (and operator-allowed
         // cleartext per ENV_ALLOW_HTTP) must produce a SAS that
         // works over HTTP. Azure SAS spec rejects `spr=http`
         // alone, so the implementation signs `https,http`
         // (combined value) when the base URL is HTTP.
-        let base =
+        //
+        // Two assertions are load-bearing here:
+        //
+        //   1. The emitted `spr` query parameter is `https,http`.
+        //   2. The signature for the HTTP base differs from the
+        //      signature for the equivalent HTTPS base. Without this
+        //      cross-check, a regression that emits the right `spr`
+        //      query *value* but feeds the wrong `signed_protocol`
+        //      string into the HMAC would still pass (a wire-format-
+        //      consistent but signature-broken token, which Azurite
+        //      rejects with 403 — the live Azurite test catches that
+        //      shape only after a network round-trip).
+        let signing = azurite_signing();
+        let ttl = Duration::from_hours(1);
+        let http_base =
             Url::parse("http://127.0.0.1:10000/devstoreaccount1/repo/refs/heads/main/aa.bundle")
-                .expect("base parses");
-        let url = build_blob_sas_url(
-            &base,
+                .expect("http base parses");
+        let https_base = Url::parse(
+            "https://devstoreaccount1.blob.core.windows.net/repo/refs/heads/main/aa.bundle",
+        )
+        .expect("https base parses");
+        let http_url = build_blob_sas_url(
+            &http_base,
             "repo",
             "refs/heads/main/aa.bundle",
-            &azurite_signing(),
-            Duration::from_hours(1),
+            &signing,
+            ttl,
         )
-        .expect("SAS URL builds");
-        let parsed = Url::parse(&url).expect("emitted URL parses");
-        let pairs: std::collections::BTreeMap<String, String> = parsed
+        .expect("http SAS URL builds");
+        let https_url = build_blob_sas_url(
+            &https_base,
+            "repo",
+            "refs/heads/main/aa.bundle",
+            &signing,
+            ttl,
+        )
+        .expect("https SAS URL builds");
+
+        let http_parsed = Url::parse(&http_url).expect("http URL parses");
+        let http_pairs: std::collections::BTreeMap<String, String> = http_parsed
             .query_pairs()
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
         assert_eq!(
-            pairs.get("spr").map(String::as_str),
+            http_pairs.get("spr").map(String::as_str),
             Some("https,http"),
-            "HTTP base URL → spr must be `https,http` (combined): {pairs:?}",
+            "HTTP base URL → spr must be `https,http` (combined): {http_pairs:?}",
+        );
+
+        // The signed-protocol field is part of `string_to_sign`, so
+        // flipping `https` ↔ `https,http` must change the resulting
+        // HMAC. Mutation-verified during /audit-tests: a regression
+        // that signs `https` while emitting `spr=https,http` makes
+        // these two `sig` values match and the assertion fires.
+        assert_ne!(
+            sig_param(&http_url),
+            sig_param(&https_url),
+            "signature must encode signed_protocol: HTTP and HTTPS bases must produce \
+             distinct signatures even with the same TTL/key/blob",
         );
     }
 

@@ -118,7 +118,19 @@ struct MockState {
     /// Tests that exercise per-chunk progress (LFS agent) set a small
     /// chunk size so a multi-byte body produces multiple events.
     progress_chunk_size: Option<u64>,
+    /// Closure that supplies a deterministic URL for
+    /// [`MockStore::presigned_get_url`] when armed by
+    /// [`MockStore::set_presign_stub`]. Receives the bucket-relative
+    /// `key` and requested `ttl`. `None` (default) keeps the trait's
+    /// default `Unsupported` behaviour so tests that don't opt in
+    /// see the same error a `MockStore` would otherwise return.
+    presign_stub: Option<Arc<PresignStubFn>>,
 }
+
+/// Function shape for [`MockStore::set_presign_stub`] — borrowed key
+/// and copy-`Duration` so the stub can render any URL it likes.
+pub type PresignStubFn =
+    dyn Fn(&str, std::time::Duration) -> Result<String, ObjectStoreError> + Send + Sync;
 
 /// In-memory [`ObjectStore`] for tests.
 ///
@@ -149,6 +161,23 @@ impl MockStore {
     /// at chunk granularity.
     pub fn set_progress_chunk_size(&self, chunk_size: Option<u64>) {
         self.with_state(|s| s.progress_chunk_size = chunk_size);
+    }
+
+    /// Arm a closure that returns the URL [`presigned_get_url`] will
+    /// emit. Used by `bundle-uri` dispatch tests to verify the
+    /// presigning code path without a real `SigV4` / SAS backend.
+    /// `None` clears the stub and reverts to the default
+    /// `ObjectStoreError::Unsupported` error.
+    ///
+    /// [`presigned_get_url`]: ObjectStore::presigned_get_url
+    pub fn set_presign_stub<F>(&self, stub: Option<F>)
+    where
+        F: Fn(&str, std::time::Duration) -> Result<String, ObjectStoreError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.with_state(|s| s.presign_stub = stub.map(|f| Arc::new(f) as Arc<PresignStubFn>));
     }
 
     /// Seed the store with `body` under `key`, stamping `last_modified` to
@@ -493,6 +522,25 @@ impl ObjectStore for MockStore {
                 .map(|_| ())
                 .ok_or_else(|| ObjectStoreError::NotFound(key.to_string()))
         })
+    }
+
+    /// Override for [`ObjectStore::presigned_get_url`]. Defers to the
+    /// stub closure when [`MockStore::set_presign_stub`] has armed
+    /// one; otherwise falls back to the trait's default `Unsupported`
+    /// error. Lets `bundle-uri` dispatch tests assert that the
+    /// presigning code path is taken without standing up a real
+    /// `SigV4` / SAS implementation.
+    async fn presigned_get_url(
+        &self,
+        key: &str,
+        ttl: std::time::Duration,
+    ) -> Result<String, ObjectStoreError> {
+        if let Some(stub) = self.with_state(|s| s.presign_stub.clone()) {
+            return stub(key, ttl);
+        }
+        Err(ObjectStoreError::Unsupported(
+            "presigned URLs are not supported by this backend".to_owned(),
+        ))
     }
 }
 

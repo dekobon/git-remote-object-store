@@ -90,8 +90,11 @@ pub enum ObjectStoreError {
     /// methods such as `presigned_get_url` that not every backend
     /// can satisfy (e.g. `MockStore` in tests, or `AzureStore`
     /// configured with a `TokenCredential` rather than a shared
-    /// account key — the latter cannot generate a service-SAS).
-    #[error("backend does not support operation: {0}")]
+    /// account key — the latter cannot generate a service-SAS). The
+    /// payload is the full operator-facing message; the variant
+    /// adds no prefix of its own so chained errors do not double-
+    /// say "not supported".
+    #[error("{0}")]
     Unsupported(String),
 
     /// Any backend failure that does not fit the variants above.
