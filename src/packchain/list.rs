@@ -88,7 +88,7 @@ pub(crate) async fn list_refs(
                 warn!(key = %m.key, "packchain list: chain.json key has unexpected shape; skipping");
                 return None;
             };
-            if RefName::new(&ref_path).is_err() {
+            if !RefName::is_valid(&ref_path) {
                 warn!(
                     key = %m.key,
                     ref_path = %ref_path,

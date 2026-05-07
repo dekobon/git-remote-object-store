@@ -113,6 +113,16 @@ impl RefName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// `true` iff `name` would be accepted by [`RefName::new`]. A
+    /// borrow-only predicate for callers that just need the validity
+    /// check without keeping the wrapped value — avoids the `String`
+    /// allocation [`new`](Self::new) performs on its `impl Into<String>`
+    /// argument.
+    #[must_use]
+    pub fn is_valid(name: &str) -> bool {
+        gix_validate::reference::name(BStr::new(name)).is_ok()
+    }
 }
 
 impl fmt::Display for RefName {
@@ -981,6 +991,20 @@ mod tests {
                 RefName::new(*name).is_err(),
                 "expected RefName::new({name:?}) to fail",
             );
+        }
+    }
+
+    #[test]
+    fn ref_name_is_valid_matches_new() {
+        // `RefName::is_valid` is the borrow-only predicate equivalent
+        // of `RefName::new(...).is_ok()`. Pin parity on both sides so a
+        // future glue change to `gix-validate` can't drift the two
+        // surfaces apart.
+        for name in ["refs/heads/main", "refs/heads/feature/x", "refs/tags/v1"] {
+            assert!(RefName::is_valid(name), "expected is_valid({name:?})");
+        }
+        for name in INVALID_REF_NAMES {
+            assert!(!RefName::is_valid(name), "expected !is_valid({name:?})",);
         }
     }
 

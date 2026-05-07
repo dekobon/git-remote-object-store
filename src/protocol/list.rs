@@ -16,6 +16,7 @@
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::warn;
 
+use crate::git::RefName;
 use crate::keys;
 use crate::object_store::{ObjectStore, ObjectStoreError};
 use crate::packchain::list as packchain_list;
@@ -198,9 +199,6 @@ fn parse_bundle_key(rel_key: &str) -> Option<(&str, &str)> {
     if segments[0] != "refs" {
         return None;
     }
-    if segments.iter().any(|s| s.is_empty()) {
-        return None;
-    }
     let last = segments.last()?;
     let sha = last.strip_suffix(".bundle")?;
     if sha.len() != 40 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
@@ -209,7 +207,20 @@ fn parse_bundle_key(rel_key: &str) -> Option<(&str, &str)> {
     // ref_path is everything before the trailing "/<sha>.bundle".
     // The `-1` drops the `/` separator between ref_path and last segment.
     let split_at = rel_key.len() - last.len() - 1;
-    Some((&rel_key[..split_at], sha))
+    let ref_path = &rel_key[..split_at];
+    // Defense-in-depth: reject ref paths that fail gix-validate's
+    // ref-name check (e.g. `..` traversal, control characters).
+    // Mirrors the packchain-side hardening added in #72 — see
+    // `packchain::list::list_refs`.
+    if !RefName::is_valid(ref_path) {
+        warn!(
+            rel_key = %rel_key,
+            ref_path = %ref_path,
+            "bundle list: derived ref path is not a valid ref name; skipping",
+        );
+        return None;
+    }
+    Some((ref_path, sha))
 }
 
 #[cfg(test)]
@@ -270,6 +281,44 @@ mod tests {
     fn parse_bundle_key_rejects_empty_segment() {
         assert!(parse_bundle_key(&format!("refs/heads//{SHA}.bundle")).is_none());
         assert!(parse_bundle_key(&format!("refs//main/{SHA}.bundle")).is_none());
+    }
+
+    #[test]
+    fn parse_bundle_key_rejects_dotdot_traversal_in_ref_path() {
+        // Defense-in-depth (#73): gix-validate rejects `..` segments.
+        for key in [
+            format!("refs/heads/../etc/passwd/{SHA}.bundle"),
+            format!("refs/heads/feature/../../etc/{SHA}.bundle"),
+        ] {
+            assert!(
+                parse_bundle_key(&key).is_none(),
+                "`..` traversal must be rejected: {key:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bundle_key_rejects_control_characters_in_ref_path() {
+        // Defense-in-depth (#73): gix-validate rejects control characters.
+        for key in [
+            format!("refs/heads/main\x07/{SHA}.bundle"),
+            format!("refs/heads/main\x00/{SHA}.bundle"),
+        ] {
+            assert!(
+                parse_bundle_key(&key).is_none(),
+                "control character in ref path must be rejected: {key:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bundle_key_rejects_dot_lock_suffix() {
+        // gix-validate rejects components ending in `.lock`.
+        let key = format!("refs/heads/main.lock/{SHA}.bundle");
+        assert!(
+            parse_bundle_key(&key).is_none(),
+            "`.lock` suffix in ref component must be rejected",
+        );
     }
 
     #[test]
