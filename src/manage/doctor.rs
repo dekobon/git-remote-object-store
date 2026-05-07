@@ -198,6 +198,7 @@ impl<'a> Doctor<'a> {
         for (ref_path, r) in &snapshot.refs {
             let star = if r.is_protected { "*" } else { "" };
             let status = match r.bundles.len() {
+                0 if r.has_chain => "Ok",
                 0 => "No bundles",
                 1 => "Ok",
                 _ => "Multiple bundles",
@@ -556,6 +557,7 @@ fn format_age(hours: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manage::snapshot::analyze;
     use crate::manage::{ScriptedPrompter, scripted::Answer};
     use crate::object_store::mock::MockStore;
     use bytes::Bytes;
@@ -1107,6 +1109,172 @@ mod tests {
         assert!(rendered.contains("refs/heads/main: 27 segment(s)"));
         assert!(rendered.contains("[recommend compact]"));
         assert!(rendered.contains("142.0 MiB"));
+    }
+
+    // --- Packchain report correctness (#75) ------------------------------
+
+    #[tokio::test]
+    async fn packchain_report_shows_no_gc_or_packs_lines() {
+        // Against a packchain-shape bucket, packs/ and gc/ must NOT appear
+        // in the bundle-shape report section. This pins the cleaned output
+        // shape specified in #75.
+        let mock = MockStore::new();
+        mock.insert("repo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("repo/refs/heads/main/chain.json", Bytes::from(r#"{"v":1}"#));
+        mock.insert(
+            "repo/packs/1111111111111111111111111111111111111111.pack",
+            Bytes::from_static(b"live"),
+        );
+        mock.insert(
+            "repo/gc/tombstones-abc-1-2025-01-01T00:00:00Z.json",
+            Bytes::from_static(b"{}"),
+        );
+        mock.insert("repo/lfs/abcdef0123456789", Bytes::from("lfs-body"));
+        let prompter = ScriptedPrompter::new([]);
+        let store = store_arc(&mock);
+        let doctor = Doctor::new(Arc::clone(&store), "repo", DoctorOpts::default(), &prompter);
+        let snapshot = analyze(&*store, "repo").await.expect("analyze");
+
+        let report = doctor.report(&snapshot);
+        // No "packs", "gc", or "lfs" ref lines.
+        assert!(
+            !report.contains(" packs:"),
+            "packs must not appear in report: {report:?}",
+        );
+        assert!(
+            !report.contains(" gc:"),
+            "gc must not appear in report: {report:?}",
+        );
+        assert!(
+            !report.contains(" lfs:"),
+            "lfs must not appear in report: {report:?}",
+        );
+        // chain.json-bearing ref shows "Ok", not "No bundles".
+        assert!(
+            report.contains("refs/heads/main: Ok"),
+            "chain.json ref must show Ok: {report:?}",
+        );
+        assert!(
+            !report.contains("No bundles"),
+            "healthy packchain report must have no 'No bundles' lines: {report:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn packchain_chain_json_ref_reports_ok_not_no_bundles() {
+        // A ref with only chain.json (no .bundle) must report "Ok" in
+        // the bundle-shape section, because the pack data lives in packs/.
+        // This is the per-ref case from #75.
+        let mock = MockStore::new();
+        mock.insert("repo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("repo/refs/heads/main/chain.json", Bytes::from(r#"{"v":1}"#));
+        let prompter = ScriptedPrompter::new([]);
+        let store = store_arc(&mock);
+        let doctor = Doctor::new(Arc::clone(&store), "repo", DoctorOpts::default(), &prompter);
+        let snapshot = analyze(&*store, "repo").await.expect("analyze");
+
+        let report = doctor.report(&snapshot);
+        assert_eq!(
+            report, "repo:\n  refs/heads/main: Ok\n  HEAD: refs/heads/main\n",
+            "chain.json ref must report Ok, got: {report:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn bundle_engine_report_unchanged_by_chain_json_fix() {
+        // A bundle-engine repo with no chain.json files must produce the
+        // same output as before the #75 fix: "No bundles" for empty refs,
+        // "Ok" for single-bundle refs, "Multiple bundles" for dup refs.
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/missing"));
+        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert("myrepo/refs/heads/empty/PROTECTED#", Bytes::new());
+        let prompter = ScriptedPrompter::new([]);
+        let store = store_arc(&mock);
+        let doctor = Doctor::new(
+            Arc::clone(&store),
+            "myrepo",
+            DoctorOpts::default(),
+            &prompter,
+        );
+        let snapshot = analyze(&*store, "myrepo").await.expect("analyze");
+
+        let report = doctor.report(&snapshot);
+        // "refs/heads/empty" has no bundles and no chain.json → "No bundles".
+        assert!(
+            report.contains("refs/heads/empty: No bundles"),
+            "empty ref without chain.json must still show No bundles: {report:?}",
+        );
+        // "refs/heads/main" has one bundle → "Ok".
+        assert!(
+            report.contains("refs/heads/main: Ok"),
+            "single-bundle ref must show Ok: {report:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn packchain_multiple_bundles_still_reports_multiple() {
+        // A packchain ref with chain.json AND multiple .bundle files must
+        // still report "Multiple bundles" — the has_chain guard only fires
+        // when bundles.len() == 0. Prevents a future mistaken edit from
+        // suppressing the duplicate-bundle warning for packchain refs.
+        let mock = MockStore::new();
+        mock.insert("repo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("repo/refs/heads/main/chain.json", Bytes::from(r#"{"v":1}"#));
+        mock.insert("repo/refs/heads/main/aaa.bundle", Bytes::from("a"));
+        mock.insert("repo/refs/heads/main/bbb.bundle", Bytes::from("b"));
+        let prompter = ScriptedPrompter::new([]);
+        let store = store_arc(&mock);
+        let doctor = Doctor::new(Arc::clone(&store), "repo", DoctorOpts::default(), &prompter);
+        let snapshot = analyze(&*store, "repo").await.expect("analyze");
+
+        let report = doctor.report(&snapshot);
+        assert!(
+            report.contains("refs/heads/main: Multiple bundles"),
+            "packchain ref with multiple bundles must still warn: {report:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn packchain_chain_json_with_one_bundle_reports_ok() {
+        // A packchain ref with chain.json AND exactly one .bundle hits
+        // the `1 => "Ok"` arm (not the `0 if has_chain => "Ok"` arm).
+        // Pin the rendered status so a future refactor of the match
+        // doesn't accidentally regress this case.
+        let mock = MockStore::new();
+        mock.insert("repo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("repo/refs/heads/main/chain.json", Bytes::from(r#"{"v":1}"#));
+        mock.insert("repo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        let prompter = ScriptedPrompter::new([]);
+        let store = store_arc(&mock);
+        let doctor = Doctor::new(Arc::clone(&store), "repo", DoctorOpts::default(), &prompter);
+        let snapshot = analyze(&*store, "repo").await.expect("analyze");
+
+        let report = doctor.report(&snapshot);
+        assert_eq!(
+            report, "repo:\n  refs/heads/main: Ok\n  HEAD: refs/heads/main\n",
+            "chain.json + 1 bundle must report Ok, got: {report:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn packchain_protected_ref_shows_star_and_ok() {
+        // A packchain ref that is both protected and chain.json-bearing
+        // must render the star prefix and "Ok" status together.
+        let mock = MockStore::new();
+        mock.insert("repo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("repo/refs/heads/main/chain.json", Bytes::from(r#"{"v":1}"#));
+        mock.insert("repo/refs/heads/main/PROTECTED#", Bytes::new());
+        let prompter = ScriptedPrompter::new([]);
+        let store = store_arc(&mock);
+        let doctor = Doctor::new(Arc::clone(&store), "repo", DoctorOpts::default(), &prompter);
+        let snapshot = analyze(&*store, "repo").await.expect("analyze");
+
+        let report = doctor.report(&snapshot);
+        assert!(
+            report.contains("* refs/heads/main: Ok"),
+            "protected packchain ref must show star + Ok: {report:?}",
+        );
     }
 
     #[tokio::test]

@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prompts, stale-lock scan) unit-testable without spawning the
   management binary (#74).
 
+### Fixed
+
+- `doctor` bundle-shape report no longer misclassifies packchain
+  bookkeeping directories (`packs/`, `gc/`) and LFS storage
+  (`lfs/`) as bare refs. Refs with a `chain.json` manifest now
+  report "Ok" instead of "No bundles" (#75).
+
 ### Added
 
 - `packchain` `bundle-uri` presigned URLs (issue #76, completes
