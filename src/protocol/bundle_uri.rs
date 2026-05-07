@@ -306,6 +306,10 @@ async fn bundle_url_for_emission(
 /// [`bundle_url_for_emission`]'s presigning branch instead.
 fn canonical_bundle_url(remote: &RemoteUrl, ref_path: &str, full_at: &str) -> String {
     let bundle_key = keys::bundle_key(remote.prefix(), ref_path, full_at);
+    let endpoint = match remote {
+        RemoteUrl::S3 { endpoint, .. } | RemoteUrl::Azure { endpoint, .. } => endpoint,
+    };
+    let authority = host_authority(endpoint);
     match remote {
         // Virtual-hosted S3: the parsed `endpoint.host_str()` already
         // includes the bucket as the leftmost label (e.g.
@@ -313,39 +317,32 @@ fn canonical_bundle_url(remote: &RemoteUrl, ref_path: &str, full_at: &str) -> St
         // `<scheme>://<host>[:port]/<key>` — the bucket name lives
         // in the host, not the path.
         RemoteUrl::S3 {
-            endpoint,
             addressing: S3Addressing::VirtualHosted,
             ..
-        } => format!("{}/{bundle_key}", host_authority(endpoint)),
+        } => format!("{authority}/{bundle_key}"),
         // Path-style S3: the host has no bucket label; insert it as
         // the first path segment.
         RemoteUrl::S3 {
-            endpoint,
             bucket,
             addressing: S3Addressing::PathStyle,
             ..
-        } => format!("{}/{bucket}/{bundle_key}", host_authority(endpoint)),
+        } => format!("{authority}/{bucket}/{bundle_key}"),
         // Virtual-hosted Azure: the host already includes the
         // account (`<account>.blob.<suffix>`); URL is
         // `<host>[:port]/<container>/<key>`.
         RemoteUrl::Azure {
-            endpoint,
             container,
             addressing: AzureAddressing::VirtualHosted,
             ..
-        } => format!("{}/{container}/{bundle_key}", host_authority(endpoint)),
+        } => format!("{authority}/{container}/{bundle_key}"),
         // Path-style Azure (Azurite, custom endpoints):
         // `<host>[:port]/<account>/<container>/<key>`.
         RemoteUrl::Azure {
-            endpoint,
             account,
             container,
             addressing: AzureAddressing::PathStyle,
             ..
-        } => format!(
-            "{}/{account}/{container}/{bundle_key}",
-            host_authority(endpoint),
-        ),
+        } => format!("{authority}/{account}/{container}/{bundle_key}"),
     }
 }
 

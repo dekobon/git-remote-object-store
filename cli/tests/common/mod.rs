@@ -241,3 +241,23 @@ pub async fn assert_put_bytes_emits_chunked_progress<S: ObjectStore + ?Sized>(
         "put_bytes progress events must sum to the body size",
     );
 }
+
+/// Parse a presigned URL's query string into a sorted map of
+/// `key → value`, decoded once. Used by the `SigV4` (S3) and SAS
+/// (Azure) round-trip tests in this directory: both want to assert
+/// individual query parameters by name without coupling to insertion
+/// order. `BTreeMap` ordering is incidental — the production code
+/// does not guarantee any particular `query_pairs()` order, so tests
+/// that index into the parsed result by key are stable.
+///
+/// **Note**: a sibling helper of the same name lives in
+/// `src/object_store/azure/sas.rs::tests` for the lib-internal SAS
+/// unit tests. The two are intentionally separate (cargo cannot
+/// share helpers across `tests/` and `cli/tests/` without widening
+/// the lib's public surface via `test-util`). Keep this docstring
+/// and the sibling's in sync.
+pub fn query_pairs_btree(url: &::url::Url) -> std::collections::BTreeMap<String, String> {
+    url.query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect()
+}

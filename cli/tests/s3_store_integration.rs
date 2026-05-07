@@ -1404,10 +1404,7 @@ async fn presigned_get_url_round_trips_against_rustfs() {
         .expect("presigned_get_url");
 
     let parsed = ::url::Url::parse(&url_str).expect("presigned URL parses");
-    let pairs: std::collections::BTreeMap<String, String> = parsed
-        .query_pairs()
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
+    let pairs = common::query_pairs_btree(&parsed);
     assert_eq!(
         pairs.get("X-Amz-Expires").map(String::as_str),
         Some("3600"),
