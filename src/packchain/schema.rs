@@ -90,9 +90,9 @@ pub(crate) struct ChainManifest {
     /// Pack segments newest-first. Always non-empty after a successful
     /// push: even the first push writes a single segment (`parent_sha
     /// = None`) alongside the baseline bundle so the chain has a pack
-    /// to install during Phase 3 fetch. An empty Vec is still a valid
-    /// round-trip shape (Phase 5 GC may produce one transiently during
-    /// compaction) but no Phase 2 push writes one.
+    /// to install during fetch. An empty Vec is still a valid
+    /// round-trip shape (`manage gc` may produce one transiently
+    /// during compaction) but no push writes one.
     pub(crate) segments: Vec<ChainSegment>,
 }
 
@@ -174,11 +174,11 @@ impl PathIndex {
     /// version before returning. See [`ChainManifest::from_json_bytes`]
     /// for the error contract.
     ///
-    /// Phase 2 push writes `path-index.json` but never reads it back —
-    /// Phase 3 fetch / Phase 4 direct file access will. The reader
-    /// landed in Phase 1 alongside the writer so the wire format is
-    /// pinned by tests; until Phase 3, the function is exercised by
-    /// the schema's own round-trip tests.
+    /// Push writes `path-index.json`; `read_blob` (`src/packchain/read.rs`)
+    /// and the fetch path (`src/packchain/fetch.rs`) read it back. The
+    /// reader landed alongside the writer so the wire format stays
+    /// pinned by the schema's own round-trip tests independent of the
+    /// downstream call sites.
     ///
     /// # Errors
     ///
@@ -314,9 +314,9 @@ mod tests {
 
     #[test]
     fn chain_manifest_handles_empty_segments() {
-        // No Phase 2 push writes an empty `segments` Vec, but Phase 5
-        // GC may produce one transiently during compaction; the wire
-        // format must still round-trip cleanly.
+        // No push writes an empty `segments` Vec, but `manage gc` may
+        // produce one transiently during compaction; the wire format
+        // must still round-trip cleanly.
         let chain = ChainManifest {
             v: ChainManifest::SCHEMA_VERSION,
             tip: sha40(SHA_A),

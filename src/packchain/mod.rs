@@ -1,12 +1,12 @@
 //! Incremental pack-chain storage engine (issue #52).
 //!
-//! Phase 1 (commit `783a339`) shipped the foundation: schema types,
-//! validated [`Sha40`] newtype, key builders, and `extract_path_index`.
-//! Phase 2 (issue #63) lights up push: incremental packs keyed by
-//! content SHA, a newest-first [`schema::ChainManifest`], a nested
+//! Push (#63) writes incremental packs keyed by content SHA, a
+//! newest-first [`schema::ChainManifest`], a nested
 //! [`schema::PathIndex`] of repo paths to blob SHAs, and a baseline
-//! bundle on the first / force push so a fresh clone in Phase 3 can
-//! short-circuit. Push artefacts on the bucket:
+//! bundle on the first / force push so a fresh clone short-circuits
+//! through `bundle-uri`. Fetch (#64), direct file access (#65,
+//! `read_blob` library API), compaction (#67), and GC (#66) are all
+//! implemented in sibling modules. Push artefacts on the bucket:
 //!
 //! ```text
 //! <prefix>/FORMAT                                "packchain"
@@ -19,9 +19,11 @@
 //! <prefix>/packs/<content-sha>.idx               pack index
 //! ```
 //!
-//! Fetch (Phase 3), direct file access (Phase 4), and GC / compaction
-//! (Phase 5) are out of scope; a packchain bucket written by Phase 2
-//! is **write-only** until Phase 3.
+//! Once the push lands, fetch resolves shallow / full clones via
+//! sequential pack install (`fetch.rs`), `read_blob` reads single
+//! blobs via the path-index without rehydrating the chain
+//! (`read.rs`), and the `manage compact` / `manage gc` subcommands
+//! reap orphans and collapse the chain (`compact.rs`, `gc.rs`).
 //!
 //! ## Linearization point
 //!
@@ -29,7 +31,7 @@
 //! pre-lock, then under the per-ref lock the push writes
 //! path-index → FORMAT → HEAD → chain.json. Anything that crashed
 //! before the chain.json PUT leaves orphan keys (pack/idx/baseline at
-//! content-SHA or tip-SHA names) which Phase 5 GC reaps. Anything
+//! content-SHA or tip-SHA names) which `manage gc` reaps. Anything
 //! written after chain.json (force-push baseline cleanup) is
 //! best-effort and never fails the push.
 //!
@@ -40,7 +42,7 @@
 //! two pushers race they both upload their packs pre-lock; the loser
 //! sees `stale chain` after re-reading `chain.json` under the lock
 //! and returns without committing, leaving its pack as an
-//! unreferenced orphan that Phase 5 GC sweeps. The orphan-bandwidth
+//! unreferenced orphan that `manage gc` sweeps. The orphan-bandwidth
 //! cost is the deliberate trade-off for keeping the lock window
 //! short — an in-lock-upload alternative would block sibling pushers
 //! for the full duration of a multi-GiB upload.
@@ -68,7 +70,8 @@ pub use read::{PackIndexCache, read_blob};
 /// [`crate::protocol::push::PushError::Packchain`] variant — which is
 /// public — wraps it; making this `pub(crate)` would leak a private
 /// type through a public API. The packchain engine itself stays
-/// `pub(crate)` (see `pub(crate) mod push` etc.) until Phase 3.
+/// `pub(crate)` (see `pub(crate) mod push` etc.); only `gc` and `read`
+/// are `pub` for rustdoc / direct-access reachability.
 #[derive(Debug, thiserror::Error)]
 pub enum PackchainError {
     /// On-bucket schema declares a version this build cannot read. The
@@ -136,11 +139,11 @@ pub enum PackchainError {
     },
 
     /// `chain.json` references a pack that is not present on the
-    /// bucket. Pinning this as a typed error so a Phase 5 `doctor`
-    /// can flag it specifically rather than the operator having to
-    /// disambiguate a generic `NotFound` from a transient failure.
-    /// Issue #64 calls this out as a regression case to surface
-    /// loudly rather than silently zero-byte-fetch.
+    /// bucket. Pinning this as a typed error so `doctor` can flag it
+    /// specifically rather than the operator having to disambiguate a
+    /// generic `NotFound` from a transient failure. Issue #64 calls
+    /// this out as a regression case to surface loudly rather than
+    /// silently zero-byte-fetch.
     #[error("packchain: chain.json references missing pack at {key}")]
     PackMissing {
         /// Bucket-relative pack key recorded in `chain.json`.
@@ -196,7 +199,7 @@ pub enum PackchainError {
     /// `path-index.json` is missing for the requested ref. Distinct
     /// from [`Self::ChainAbsent`] so an operator sees which artefact is
     /// gone — chain.json being present without path-index indicates a
-    /// crashed-mid-push state Phase 5 GC will reconcile.
+    /// crashed-mid-push state `manage gc` will reconcile.
     #[error("path-index.json absent for {ref_name}; the branch's path map is unavailable")]
     PathIndexAbsent {
         /// The ref name [`read::read_blob`] was asked about.
@@ -236,7 +239,7 @@ pub enum PackchainError {
     /// Blob SHA recorded in `path-index.json` was not present in any
     /// pack referenced by `chain.json`. Indicates a corrupted bucket
     /// (path-index points at a blob the chain doesn't carry); typed
-    /// distinctly so a Phase 5 `doctor` can flag it specifically.
+    /// distinctly so `doctor` can flag it specifically.
     #[error("blob {sha} for path `{path}` not present in any chain pack")]
     BlobNotInChain {
         /// The blob SHA the path-index named.

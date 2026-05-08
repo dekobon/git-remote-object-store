@@ -2,8 +2,8 @@
 //!
 //! Sits in the packchain module rather than `crate::git` so the
 //! generic gix wrapper does not have to import packchain schema
-//! types. Phase 2's push will call [`extract_path_index`] right
-//! before writing `path-index.json`.
+//! types. Push calls [`extract_path_index`] right before writing
+//! `path-index.json`.
 
 use std::collections::BTreeMap;
 use std::str;
@@ -34,15 +34,15 @@ use super::schema::{PathIndex, PathNode, Sha40};
 /// **Recursion**: this implementation uses native call-stack recursion
 /// for tree descent. Real-world git trees are shallow (the Linux
 /// kernel sits at ~30 levels) and Rust's default stack (8 MiB) handles
-/// thousands of levels comfortably. Phase 2's push will need to
-/// revisit this if a hostile repository targets the helper with a
-/// pathologically deep tree; until then, the simple recursive shape is
-/// a deliberate trade-off favouring readability.
+/// thousands of levels comfortably. Revisit if a hostile repository
+/// targets the helper with a pathologically deep tree; until then, the
+/// simple recursive shape is a deliberate trade-off favouring
+/// readability.
 ///
 /// # Errors
 ///
 /// - [`PackchainError::ParseJson`]: never (no JSON parse here);
-///   reserved for Phase 2 push.
+///   reserved for the push call site.
 /// - [`PackchainError::InvalidSha`]: cannot fire — every blob OID we
 ///   read from gix is a valid 40-hex SHA-1.
 /// - [`PackchainError::Git`]: any underlying gix failure (object
