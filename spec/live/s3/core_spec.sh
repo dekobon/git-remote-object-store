@@ -165,9 +165,12 @@ Describe "S3 helper (live AWS): core git operations"
 		It "removes every bundle under the deleted ref"
 			# Pre-condition: the feature ref actually exists on the
 			# remote. Without this check, a setup that silently produced
-			# no bundle would let the post-condition (count == 0) pass
+			# no on-bucket state would let the post-condition pass
 			# vacuously since the helper's delete path returns Ok on a
 			# missing ref (src/protocol/push.rs delete_remote_ref).
+			# `assert_ls_remote_ref_present` is engine-agnostic;
+			# `assert_bundle_count` adds bundle-format-specific detail.
+			assert_ls_remote_ref_present "$URL" refs/heads/feature
 			if live_engine_is_bundle; then
 				assert_bundle_count live_s3_list "$BUCKET" "$PREFIX" \
 					refs/heads/feature 1

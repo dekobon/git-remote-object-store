@@ -175,6 +175,64 @@ ls_remote() {
 	echo "$LAST_GIT_OUTPUT"
 }
 
+# assert_ls_remote_ref_present <url> <ref>
+# Fail unless `git ls-remote <url> <ref>` exits 0 with a non-empty line —
+# the canonical "ref exists on the remote" response. Symmetric to
+# `assert_ls_remote_ref_absent`; intended for engine-agnostic
+# preconditions in tests where the bundle-format-only `assert_bundle_count`
+# precondition is gated behind `live_engine_is_bundle` and would otherwise
+# leave the post-condition free to pass vacuously on a silent setup
+# failure.
+assert_ls_remote_ref_present() {
+	local url="$1"
+	local ref="$2"
+	if [[ -z "$url" || -z "$ref" ]]; then
+		echo "assert_ls_remote_ref_present: requires <url> <ref>" >&2
+		return 1
+	fi
+	local output exit_code
+	output=$(git ls-remote "$url" "$ref" 2>&1)
+	exit_code=$?
+	if ((exit_code != 0)); then
+		echo "assert_ls_remote_ref_present: git ls-remote failed (exit=$exit_code)" >&2
+		echo "$output" >&2
+		return 1
+	fi
+	if [[ -z "$output" ]]; then
+		echo "assert_ls_remote_ref_present: $ref not found on remote" >&2
+		return 1
+	fi
+}
+
+# assert_ls_remote_sha <url> <ref> <expected_sha>
+# Fail unless `git ls-remote <url> <ref>` reports <expected_sha> as the
+# tip of <ref>. Engine-agnostic post-condition for tests where a
+# bundle-format-only `assert_bundle_sha_for_ref` would skip under
+# packchain and leave the assertion vacuous.
+assert_ls_remote_sha() {
+	local url="$1"
+	local ref="$2"
+	local expected="$3"
+	if [[ -z "$url" || -z "$ref" || -z "$expected" ]]; then
+		echo "assert_ls_remote_sha: requires <url> <ref> <expected_sha>" >&2
+		return 1
+	fi
+	local output exit_code actual
+	output=$(git ls-remote "$url" "$ref" 2>&1)
+	exit_code=$?
+	if ((exit_code != 0)); then
+		echo "assert_ls_remote_sha: git ls-remote failed (exit=$exit_code)" >&2
+		echo "$output" >&2
+		return 1
+	fi
+	# `ls-remote` prints `<sha>\t<ref>` per line; awk extracts the SHA.
+	actual=$(echo "$output" | awk -v r="$ref" '$2 == r {print $1; exit}')
+	if [[ "$actual" != "$expected" ]]; then
+		echo "assert_ls_remote_sha: $ref is '$actual', expected '$expected'" >&2
+		return 1
+	fi
+}
+
 # assert_ls_remote_ref_absent <url> <ref>
 # Fail unless `git ls-remote <url> <ref>` exits 0 with empty output —
 # the canonical "ref does not exist" response. A failed `git ls-remote`

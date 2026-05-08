@@ -41,10 +41,13 @@ Describe "S3 helper (live AWS): force-push and protected refs"
 		BeforeEach 'setup_divergent'
 
 		It "replaces the bundle and exits 0"
-			# Pre-condition: SHA_A is the bundle under main. Without
-			# this check, a setup that silently dropped the first push
-			# would make the post-condition (one bundle of SHA_B)
-			# indistinguishable from a fresh push of SHA_B.
+			# Pre-condition: SHA_A is the tip of main. Without this
+			# check, a setup that silently dropped the first push would
+			# make the post-condition (SHA_B at main) indistinguishable
+			# from a fresh push of SHA_B. `assert_ls_remote_sha` is
+			# engine-agnostic; `assert_bundle_sha_for_ref` adds
+			# bundle-format-specific detail.
+			assert_ls_remote_sha "$URL" refs/heads/main "$SHA_A"
 			if live_engine_is_bundle; then
 				assert_bundle_sha_for_ref live_s3_list "$BUCKET" "$PREFIX" \
 					refs/heads/main "$SHA_A"
@@ -53,6 +56,7 @@ Describe "S3 helper (live AWS): force-push and protected refs"
 			When call push_branch "$SRC" origin "+refs/heads/main:refs/heads/main"
 			The status should equal 0
 
+			assert_ls_remote_sha "$URL" refs/heads/main "$SHA_B"
 			if live_engine_is_bundle; then
 				assert_bundle_sha_for_ref live_s3_list "$BUCKET" "$PREFIX" \
 					refs/heads/main "$SHA_B"
@@ -84,6 +88,11 @@ Describe "S3 helper (live AWS): force-push and protected refs"
 			# unrelated push failures (network, permission, ...).
 			The variable LAST_GIT_OUTPUT should include "not ancestor"
 
+			# Engine-agnostic post-condition: refs/heads/main still
+			# resolves to SHA_A. Catches a regression where the rejected
+			# push corrupts on-bucket state under packchain, where the
+			# bundle-format check below would skip.
+			assert_ls_remote_sha "$URL" refs/heads/main "$SHA_A"
 			if live_engine_is_bundle; then
 				assert_bundle_count live_s3_list "$BUCKET" "$PREFIX" \
 					refs/heads/main 1
