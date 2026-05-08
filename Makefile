@@ -208,7 +208,7 @@ deny:
 # ---------------------------------------------------------------------------
 shellspec: build
 	@echo "Running shellspec CLI + support-module unit tests..."
-	@shellspec --shell bash spec/cli_basics_spec.sh spec/live_common_spec.sh spec/live_az_spec.sh
+	@shellspec --shell bash spec/cli_basics_spec.sh spec/live_common_spec.sh spec/live_az_spec.sh spec/live_s3_spec.sh
 
 # End-to-end integration suites that drive `git push` / `git fetch` /
 # `git clone` against a real rustfs (S3) or Azurite (Azure Blob)
@@ -366,7 +366,7 @@ _pc-build: _pc-test
 	cargo build --workspace --all-targets
 
 _pc-shellspec: _pc-build
-	shellspec --shell bash spec/cli_basics_spec.sh spec/live_common_spec.sh spec/live_az_spec.sh
+	shellspec --shell bash spec/cli_basics_spec.sh spec/live_common_spec.sh spec/live_az_spec.sh spec/live_s3_spec.sh
 
 _pc-shellcheck: _pc-fmt
 	$(MAKE) shellcheck
@@ -414,7 +414,7 @@ _ci-build:
 _ci-shellspec:
 	mkdir -p reports
 	shellspec --shell bash --format progress --output junit --reportdir reports \
-	  spec/cli_basics_spec.sh spec/live_common_spec.sh spec/live_az_spec.sh
+	  spec/cli_basics_spec.sh spec/live_common_spec.sh spec/live_az_spec.sh spec/live_s3_spec.sh
 
 _ci-shellcheck:
 	$(MAKE) shellcheck
