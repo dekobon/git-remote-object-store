@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn baseline_plus_incremental_install_reaches_full_history() {
         // Install baseline then incremental (oldest-first, the order
-        // Phase 3 fetch will use) and confirm every object reachable
+        // the fetch path uses) and confirm every object reachable
         // from c2 lands in the destination ODB — including c1's blob,
         // which lives only in the baseline pack. The previous version
         // of this test only checked `c2.is_reachable`; it would have

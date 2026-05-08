@@ -97,10 +97,12 @@ pub enum StorageEngine {
     Bundle,
     /// Incremental pack-chain engine (issue #52).
     ///
-    /// Phase 1 lands the URL/FORMAT plumbing only — selecting
-    /// `?engine=packchain` against an empty bucket currently aborts with
-    /// `engine not yet implemented`. Push, fetch, direct file access,
-    /// compaction, and GC follow in sub-issues under #52.
+    /// On-bucket layout: `chain.json` (newest-first manifest) plus
+    /// `path-index.json` per ref, with content-addressed packs at
+    /// `<prefix>/packs/<sha>.{pack,idx}` and a baseline bundle for
+    /// first-push fan-out. Push, fetch, direct file access (`read_blob`
+    /// library API), compaction, and GC are all implemented; see
+    /// `src/packchain/{push,fetch,read,compact,gc}.rs`.
     Packchain,
 }
 

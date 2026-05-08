@@ -60,7 +60,7 @@ enum PrepareOutcome {
 /// Pack/idx/baseline uploads happen in `prepare_push` (pre-lock), so
 /// by the time this state crosses into `perform_push_under_lock` the
 /// only on-bucket residue from a buggy abort is a set of orphan keys
-/// (pack at content-SHA, baseline at tip-SHA) that Phase 5 GC reaps.
+/// (pack at content-SHA, baseline at tip-SHA) that `manage gc` reaps.
 /// The under-lock work shrinks to path-index walk + chain.json /
 /// FORMAT / HEAD writes — bounded by JSON-PUT latency, not pack size.
 struct ReadyState {
@@ -324,7 +324,7 @@ async fn prepare_push(
     // module doc on linearization): two pushers that race both
     // upload their packs before contending for the lock; the loser
     // sees `stale chain` after re-reading and returns without
-    // touching chain.json, leaving its pack as an orphan for Phase 5
+    // touching chain.json, leaving its pack as an orphan for `manage gc`
     // GC. A single push uploads each of pack/idx/baseline exactly
     // once.
     upload_pack_idx_baseline(
@@ -517,7 +517,7 @@ async fn perform_push_under_lock(
 
     // 2. Stale-tip guard (skipped on force). Pre-lock uploads of pack
     //    + idx (and baseline, when applicable) become orphans for
-    //    Phase 5 GC.
+    //    `manage gc`.
     if !force {
         let pre_tip = prior.as_ref().map(|c| &c.tip);
         let cur_tip = current.as_ref().map(|c| &c.tip);
@@ -663,7 +663,7 @@ async fn upload_with_progress(
 /// Best-effort delete of the prior baseline bundle after a force push
 /// has already committed (i.e. `chain.json` has been overwritten).
 /// Failure here cannot fail the push: we log at `warn` so an operator
-/// notices the orphan and Phase 5 GC sweeps it later.
+/// notices the orphan and `manage gc` sweeps it later.
 async fn force_push_baseline_cleanup(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
@@ -696,7 +696,7 @@ async fn force_push_baseline_cleanup(
 
 /// Delete a packchain-engine ref: remove `chain.json`, `path-index.json`,
 /// and the baseline bundle. Pack files are NOT deleted (they may be
-/// referenced by other branches; Phase 5 GC reaps unreferenced packs).
+/// referenced by other branches; `manage gc` reaps unreferenced packs).
 ///
 /// Returns `Ok(PushOutcome::Error{ "not found"? })` when no chain.json
 /// exists; `Ok(PushOutcome::Ok)` when the chain is removed (other

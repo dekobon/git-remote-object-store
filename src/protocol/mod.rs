@@ -115,12 +115,6 @@ pub enum ProtocolError {
     #[error("invalid command: {0:?}")]
     InvalidCommand(String),
 
-    /// The bucket's resolved storage engine is not implemented in this
-    /// build. Phase 1 of issue #52 lands the `packchain` plumbing
-    /// without push/fetch logic; selecting that engine surfaces here.
-    #[error("storage engine `{0}` is not yet implemented (issue #52)")]
-    EngineNotImplemented(StorageEngine),
-
     /// `FORMAT` validation / engine resolution failed during connect.
     #[error("backend resolution failed: {0}")]
     Backend(#[from] backend::BackendError),
@@ -290,11 +284,10 @@ fn parse_command(line: &str) -> Option<Command> {
 /// # Errors
 ///
 /// Returns [`ProtocolError::Io`] on transport failure,
-/// [`ProtocolError::InvalidCommand`] for an unrecognised command,
+/// [`ProtocolError::InvalidCommand`] for an unrecognised command, and
 /// [`ProtocolError::List`] / [`ProtocolError::Fetch`] /
 /// [`ProtocolError::Push`] for backend errors in the respective
-/// operations, and [`ProtocolError::EngineNotImplemented`] when
-/// `engine` has no Phase-1 push/fetch logic (issue #52).
+/// operations.
 ///
 /// `engine` is the resolved engine returned by [`backend::build`].
 /// Threading it through the call chain (rather than re-reading
@@ -312,11 +305,11 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    // Phase 2 (packchain push) routes per command/engine pair below;
-    // Phase 3 (packchain fetch) is still unimplemented, so a packchain
-    // helper that receives a `fetch` command surfaces
-    // `EngineNotImplemented` at drain time rather than letting a
-    // bundle code path run against on-bucket packchain state.
+    // Per-command routing branches on `engine` below so packchain
+    // commands hit `crate::packchain::*` and bundle commands hit the
+    // bundle code path; the engine is bucket-authoritative (resolved
+    // from `FORMAT` in `backend::build`) so a wrong `?engine=` flag
+    // can never cross the wires.
     let mut lines = reader.lines();
     let fetched_refs = FetchedRefs::new();
     let mut batch = BatchState::new();
