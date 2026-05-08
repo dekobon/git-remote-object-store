@@ -22,7 +22,10 @@ use git_remote_object_store::object_store::mock::MockStore;
 use git_remote_object_store::protocol::ProtocolError;
 use git_remote_object_store::protocol::fetch::FetchError;
 
-use common::{drive_in, git, git_available, git_capture, make_seed_repo, s3_url_packchain};
+use common::{
+    drive_in, git, git_available, git_capture, make_seed_repo, make_seed_repo_with_annotated_tag,
+    make_seed_repo_with_tag_of_tag, s3_url_packchain,
+};
 
 /// Run a `git cat-file -e <sha>` to confirm the object is reachable
 /// in the destination repo's ODB. Returns `true` on success.
@@ -415,4 +418,131 @@ async fn shallow_fetch_depth_one_skips_baseline_download() {
         1,
         "shallow fetch must NOT download the baseline at depth=1",
     );
+}
+
+// --- Annotated-tag fetch round-trips (issue #79) -------------------
+
+#[tokio::test]
+async fn fetch_round_trip_of_annotated_tag_resolves_tag_object() {
+    // E10 / E11: push an annotated tag to the mock, fetch into an empty
+    // dst, and confirm `git cat-file -t v1` returns `tag` and
+    // `git cat-file -p v1` carries the original annotation. This is
+    // the closest hermetic analogue to the live-tier acceptance
+    // criterion in #79: the on-bucket pack must contain the tag object
+    // so the receiver's ref-update finds it.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, _commit_sha, tag_sha) = make_seed_repo_with_annotated_tag("primary", "v1");
+
+    let store = Arc::new(MockStore::new());
+    let (_, push_result) = drive_in(
+        s3_url_packchain(Some("repo")),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push refs/tags/v1:refs/tags/v1\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    push_result.expect("push must succeed");
+
+    let dst = make_empty_dst();
+    let fetch_script = format!("fetch {tag_sha} refs/tags/v1\n\n");
+    let (_, fetch_result) = drive_in(
+        s3_url_packchain(Some("repo")),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        &fetch_script,
+        dst.path().to_path_buf(),
+    )
+    .await;
+    fetch_result.expect("packchain fetch of tag must succeed");
+
+    // Tag object reachable in dst's ODB — without this the receiver
+    // can't resolve `refs/tags/v1`.
+    assert!(
+        dst_has_object(dst.path(), &tag_sha),
+        "tag {tag_sha} must be reachable in dst",
+    );
+    // git cat-file -t reports the actual on-disk object kind. If the
+    // pack only carried the commit (not the tag), this would print
+    // `commit` (because the OID would not exist as a tag on disk).
+    let kind = std::process::Command::new("git")
+        .args(["cat-file", "-t", &tag_sha])
+        .current_dir(dst.path())
+        .output()
+        .expect("spawn git cat-file -t");
+    assert!(
+        kind.status.success(),
+        "git cat-file -t failed: {}",
+        String::from_utf8_lossy(&kind.stderr),
+    );
+    let kind_text = String::from_utf8(kind.stdout).unwrap();
+    assert_eq!(
+        kind_text.trim(),
+        "tag",
+        "tag OID must decode as a tag object",
+    );
+    // The annotation message round-trips end-to-end.
+    let body = std::process::Command::new("git")
+        .args(["cat-file", "-p", &tag_sha])
+        .current_dir(dst.path())
+        .output()
+        .expect("spawn git cat-file -p");
+    let body_text = String::from_utf8(body.stdout).unwrap();
+    assert!(
+        body_text.contains("release"),
+        "annotation body must round-trip; got {body_text:?}",
+    );
+}
+
+#[tokio::test]
+async fn fetch_round_trip_of_tag_of_tag_resolves_full_chain() {
+    // E4: outer → inner → commit. Fetch must install both tag objects
+    // so `cat-file -t outer` is `tag` AND `git rev-parse outer^{}`
+    // resolves to the commit.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, commit_sha, inner_sha, outer_sha) =
+        make_seed_repo_with_tag_of_tag("primary", "inner", "outer");
+
+    let store = Arc::new(MockStore::new());
+    let (_, push_result) = drive_in(
+        s3_url_packchain(Some("repo")),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push refs/tags/outer:refs/tags/outer\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    push_result.expect("push must succeed");
+
+    let dst = make_empty_dst();
+    let fetch_script = format!("fetch {outer_sha} refs/tags/outer\n\n");
+    let (_, fetch_result) = drive_in(
+        s3_url_packchain(Some("repo")),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        &fetch_script,
+        dst.path().to_path_buf(),
+    )
+    .await;
+    fetch_result.expect("packchain fetch of tag-of-tag must succeed");
+
+    for needed in [&outer_sha, &inner_sha, &commit_sha] {
+        assert!(
+            dst_has_object(dst.path(), needed),
+            "{needed} must be reachable in dst after tag-of-tag fetch",
+        );
+    }
+    // Both tags must decode as tags (not as commits — that would
+    // indicate the tag bytes were silently re-encoded somewhere).
+    for tag in [&outer_sha, &inner_sha] {
+        let kind = std::process::Command::new("git")
+            .args(["cat-file", "-t", tag])
+            .current_dir(dst.path())
+            .output()
+            .expect("spawn git cat-file");
+        let text = String::from_utf8(kind.stdout).unwrap();
+        assert_eq!(text.trim(), "tag", "{tag} must decode as a tag object");
+    }
 }

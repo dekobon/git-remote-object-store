@@ -71,7 +71,12 @@ pub(crate) struct BuiltPack {
     pub(crate) pack_bytes: u64,
 }
 
-/// Build a baseline pack containing every object reachable from `tip`.
+/// Build a baseline pack containing every object reachable from
+/// `tip_commit`, plus the entries in `tag_chain` (typically the
+/// annotated-tag objects that lead from a tag-ref to its underlying
+/// commit). `tag_chain` is empty for branch / lightweight-tag pushes,
+/// in which case the emitted pack is byte-identical to the pre-fix
+/// behavior.
 ///
 /// `out_dir` must already exist; the resulting `.pack` and `.idx`
 /// land directly in it. Callers are responsible for `out_dir`'s
@@ -79,12 +84,19 @@ pub(crate) struct BuiltPack {
 /// `prepare_push`'s scratch area).
 pub(crate) fn build_baseline_pack(
     repo_dir: &Path,
-    tip: Sha,
+    tip_commit: Sha,
+    tag_chain: &[ObjectId],
     out_dir: &Path,
 ) -> Result<BuiltPack, PackchainError> {
     let repo = gix::open(repo_dir).map_err(crate::git::GitError::from)?;
-    let commit_ids = collect_commits_baseline(&repo, *tip.as_object_id())?;
-    build_pack(&repo, commit_ids, ObjectExpansion::TreeContents, out_dir)
+    let commit_ids = collect_commits_baseline(&repo, *tip_commit.as_object_id())?;
+    build_pack(
+        &repo,
+        commit_ids,
+        ObjectExpansion::TreeContents,
+        tag_chain,
+        out_dir,
+    )
 }
 
 /// Build an incremental (ancestor-aware) pack: every commit
@@ -100,17 +112,22 @@ pub(crate) fn build_baseline_pack(
 /// drops the short-circuit.
 pub(crate) fn build_incremental_pack(
     repo_dir: &Path,
-    prior_tip: Sha,
-    local_tip: Sha,
+    prior_commit: Sha,
+    local_commit: Sha,
+    tag_chain: &[ObjectId],
     out_dir: &Path,
 ) -> Result<BuiltPack, PackchainError> {
     let repo = gix::open(repo_dir).map_err(crate::git::GitError::from)?;
-    let commit_ids =
-        collect_commits_incremental(&repo, *local_tip.as_object_id(), *prior_tip.as_object_id())?;
+    let commit_ids = collect_commits_incremental(
+        &repo,
+        *local_commit.as_object_id(),
+        *prior_commit.as_object_id(),
+    )?;
     build_pack(
         &repo,
         commit_ids,
         ObjectExpansion::TreeAdditionsComparedToAncestor,
+        tag_chain,
         out_dir,
     )
 }
@@ -152,6 +169,7 @@ fn build_pack(
     repo: &gix::Repository,
     commit_ids: Vec<ObjectId>,
     expansion: ObjectExpansion,
+    tag_chain: &[ObjectId],
     out_dir: &Path,
 ) -> Result<BuiltPack, PackchainError> {
     // Strip the Proxy wrapper to expose the gix_pack::Find impl needed
@@ -159,7 +177,7 @@ fn build_pack(
     let mut odb = repo.objects.clone().into_inner();
     odb.prevent_pack_unload();
 
-    let (counts, _stats) = count::objects(
+    let (mut counts, _stats) = count::objects(
         odb.clone(),
         Box::new(
             commit_ids
@@ -175,6 +193,34 @@ fn build_pack(
         },
     )
     .map_err(|e| PackchainError::PackBuild(e.to_string()))?;
+
+    // Append annotated-tag objects (and any chain of tag-of-tag objects)
+    // verbatim. `AsIs` includes each input OID as a single pack entry
+    // without expansion — exactly what we want for tags, which are
+    // leaves of the reachability graph (their commit target is already
+    // in the commit-walk count above). Without this, a fetch-back of
+    // `refs/tags/v1` would fail because the tag-object OID the receiver
+    // must point the ref at is not in the ODB.
+    if !tag_chain.is_empty() {
+        let tag_ids: Vec<ObjectId> = tag_chain.to_vec();
+        let (tag_counts, _stats) = count::objects(
+            odb.clone(),
+            Box::new(
+                tag_ids
+                    .into_iter()
+                    .map(Ok::<_, Box<dyn std::error::Error + Send + Sync + 'static>>),
+            ),
+            &gix::progress::Discard,
+            &AtomicBool::new(false),
+            count::objects::Options {
+                input_object_expansion: ObjectExpansion::AsIs,
+                thread_limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| PackchainError::PackBuild(e.to_string()))?;
+        counts.extend(tag_counts);
+    }
 
     if counts.is_empty() {
         // A no-op pack would be 32 bytes (header + trailer) — legal,
@@ -415,7 +461,7 @@ mod tests {
     fn build_baseline_pack_handles_single_commit_repo() {
         let (repo_dir, tip) = fixture_single_commit();
         let out = TempDir::new().unwrap();
-        let built = build_baseline_pack(repo_dir.path(), tip, out.path()).expect("build");
+        let built = build_baseline_pack(repo_dir.path(), tip, &[], out.path()).expect("build");
         assert!(built.pack_path.exists());
         assert!(built.idx_path.exists());
         assert!(built.pack_bytes >= PACK_MIN_LEN);
@@ -430,7 +476,7 @@ mod tests {
         // (e.g.) the pack's name as gix would have written it.
         let (repo_dir, tip) = fixture_single_commit();
         let out = TempDir::new().unwrap();
-        let built = build_baseline_pack(repo_dir.path(), tip, out.path()).expect("build");
+        let built = build_baseline_pack(repo_dir.path(), tip, &[], out.path()).expect("build");
         let pack_bytes = std::fs::read(&built.pack_path).unwrap();
         assert!(pack_bytes.len() >= PACK_TRAILER_LEN);
         let trailer_start = pack_bytes.len() - PACK_TRAILER_LEN;
@@ -446,7 +492,7 @@ mod tests {
         // assert every commit / tree / blob is present.
         let (repo_dir, c1, c2) = fixture_two_commits();
         let out = TempDir::new().unwrap();
-        let built = build_baseline_pack(repo_dir.path(), c2, out.path()).expect("build");
+        let built = build_baseline_pack(repo_dir.path(), c2, &[], out.path()).expect("build");
 
         let dst = TempDir::new().unwrap();
         let dst_repo = gix::init(dst.path()).unwrap();
@@ -499,11 +545,11 @@ mod tests {
 
         let out_baseline = TempDir::new().unwrap();
         let baseline =
-            build_baseline_pack(repo_dir.path(), c1, out_baseline.path()).expect("baseline");
+            build_baseline_pack(repo_dir.path(), c1, &[], out_baseline.path()).expect("baseline");
 
         let out_incr = TempDir::new().unwrap();
-        let incr =
-            build_incremental_pack(repo_dir.path(), c1, c2, out_incr.path()).expect("incremental");
+        let incr = build_incremental_pack(repo_dir.path(), c1, c2, &[], out_incr.path())
+            .expect("incremental");
 
         let baseline_idx =
             gix_pack::index::File::at(&baseline.idx_path, gix_hash::Kind::Sha1).unwrap();
@@ -536,10 +582,10 @@ mod tests {
 
         let out_baseline = TempDir::new().unwrap();
         let baseline =
-            build_baseline_pack(repo_dir.path(), c1, out_baseline.path()).expect("baseline");
+            build_baseline_pack(repo_dir.path(), c1, &[], out_baseline.path()).expect("baseline");
         let out_incr = TempDir::new().unwrap();
-        let incr =
-            build_incremental_pack(repo_dir.path(), c1, c2, out_incr.path()).expect("incremental");
+        let incr = build_incremental_pack(repo_dir.path(), c1, c2, &[], out_incr.path())
+            .expect("incremental");
 
         // Walk the source repo to find blob1 (the c1-only blob).
         let src = gix::open(repo_dir.path()).unwrap();
@@ -591,6 +637,158 @@ mod tests {
         assert!(
             odb.contains(&blob1),
             "blob1 (c1-only) must be reachable after installing baseline + incremental",
+        );
+    }
+
+    // --- tag-chain inclusion ------------------------------------------
+
+    fn write_annotated_tag(
+        repo: &gix::Repository,
+        target: ObjectId,
+        target_kind: gix::object::Kind,
+        name: &str,
+    ) -> ObjectId {
+        let tag = gix::objs::Tag {
+            target,
+            target_kind,
+            name: name.into(),
+            tagger: Some(signature().to_owned().expect("static signature is valid")),
+            message: "release".into(),
+            pgp_signature: None,
+        };
+        repo.write_object(&tag).unwrap().detach()
+    }
+
+    /// Install a pack into a fresh ODB and return the destination repo.
+    fn install_into_fresh_repo(pack_path: &Path) -> (TempDir, gix::Repository) {
+        let dst = TempDir::new().unwrap();
+        let dst_repo = gix::init(dst.path()).unwrap();
+        let pack_dir = dst_repo.git_dir().join("objects/pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pf = File::open(pack_path).unwrap();
+        let mut r = BufReader::new(pf);
+        gix_pack::Bundle::write_to_directory(
+            &mut r,
+            Some(&pack_dir),
+            &mut gix::progress::Discard,
+            &AtomicBool::new(false),
+            None::<gix::odb::Handle>,
+            gix_pack::bundle::write::Options {
+                object_hash: gix_hash::Kind::Sha1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        (dst, dst_repo)
+    }
+
+    #[test]
+    fn build_baseline_pack_includes_tag_object_when_tag_chain_nonempty() {
+        // E3: annotated tag → commit. The pack must contain the tag
+        // object so a fetch-back can update `refs/tags/v1` to the tag
+        // OID and resolve `v1^{}`.
+        let (repo_dir, _c1, c2) = fixture_two_commits();
+        let repo = gix::open(repo_dir.path()).unwrap();
+        let tag_oid =
+            write_annotated_tag(&repo, *c2.as_object_id(), gix::object::Kind::Commit, "v1");
+        drop(repo);
+
+        let out = TempDir::new().unwrap();
+        let built =
+            build_baseline_pack(repo_dir.path(), c2, &[tag_oid], out.path()).expect("build");
+
+        let (_dst_dir, dst_repo) = install_into_fresh_repo(&built.pack_path);
+        let odb = dst_repo.objects.clone().into_inner();
+        assert!(odb.contains(&tag_oid), "tag object must be in pack");
+        assert!(
+            odb.contains(c2.as_object_id()),
+            "tag's commit target must also be in pack",
+        );
+        // Decode the tag and pin its target to catch a corruption
+        // regression where `tag_oid` is in the pack but the bytes are
+        // wrong (would resolve to a different target).
+        let tag_obj = dst_repo
+            .find_object(tag_oid)
+            .expect("find tag")
+            .peel_to_kind(gix::object::Kind::Tag)
+            .expect("peel to tag");
+        let target = tag_obj.into_tag().target_id().expect("decode tag");
+        assert_eq!(
+            target.detach(),
+            *c2.as_object_id(),
+            "tag must point at the commit",
+        );
+    }
+
+    #[test]
+    fn build_baseline_pack_includes_full_chain_for_tag_of_tag() {
+        // E4: outer → inner → commit. Both tag objects must land in the
+        // pack so a receiver can resolve both refs.
+        let (repo_dir, _c1, c2) = fixture_two_commits();
+        let repo = gix::open(repo_dir.path()).unwrap();
+        let inner = write_annotated_tag(
+            &repo,
+            *c2.as_object_id(),
+            gix::object::Kind::Commit,
+            "inner",
+        );
+        let outer = write_annotated_tag(&repo, inner, gix::object::Kind::Tag, "outer");
+        drop(repo);
+
+        let out = TempDir::new().unwrap();
+        let built =
+            build_baseline_pack(repo_dir.path(), c2, &[outer, inner], out.path()).expect("build");
+
+        let (_dst_dir, dst_repo) = install_into_fresh_repo(&built.pack_path);
+        let odb = dst_repo.objects.clone().into_inner();
+        assert!(odb.contains(&outer), "outer tag must be in pack");
+        assert!(odb.contains(&inner), "inner tag must be in pack");
+        assert!(
+            odb.contains(c2.as_object_id()),
+            "commit target must also be in pack",
+        );
+    }
+
+    #[test]
+    fn build_baseline_pack_with_empty_tag_chain_emits_same_object_count_as_today() {
+        // E1, E2: regression guard. The AsIs second-pass MUST be gated
+        // on `tag_chain.is_empty()` — if it always ran, an empty chain
+        // would still produce a (zero-entry) extra count, which would
+        // fail the `counts.is_empty()` short-circuit a different way
+        // OR (worse) silently inflate `num_entries`. Pin the count to
+        // the pre-fix expected value.
+        let (repo_dir, _c1, c2) = fixture_two_commits();
+        let out = TempDir::new().unwrap();
+        let built = build_baseline_pack(repo_dir.path(), c2, &[], out.path()).expect("build");
+        let idx = gix_pack::index::File::at(&built.idx_path, gix_hash::Kind::Sha1).unwrap();
+        // 2 commits + 2 trees + 3 blobs = 7 (a-v1, a-v2, b)
+        assert_eq!(
+            idx.num_objects(),
+            7,
+            "branch-tip baseline must emit 7 objects (no tag chain to add)",
+        );
+    }
+
+    #[test]
+    fn build_incremental_pack_includes_new_tag_chain() {
+        // E8 (partial — incremental shape with a tag): the new tag
+        // moves to a descendant commit. The incremental pack carries
+        // the tag-of-the-new-tip alongside the commit-walk additions.
+        let (repo_dir, c1, c2) = fixture_two_commits();
+        let repo = gix::open(repo_dir.path()).unwrap();
+        let new_tag =
+            write_annotated_tag(&repo, *c2.as_object_id(), gix::object::Kind::Commit, "v2");
+        drop(repo);
+
+        let out = TempDir::new().unwrap();
+        let built = build_incremental_pack(repo_dir.path(), c1, c2, &[new_tag], out.path())
+            .expect("incremental");
+
+        let (_dst_dir, dst_repo) = install_into_fresh_repo(&built.pack_path);
+        let odb = dst_repo.objects.clone().into_inner();
+        assert!(
+            odb.contains(&new_tag),
+            "new tag must be in incremental pack"
         );
     }
 }

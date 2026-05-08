@@ -178,6 +178,82 @@ pub fn make_seed_repo(n: usize, salt: &str) -> (tempfile::TempDir, Vec<String>) 
     (dir, shas)
 }
 
+/// Initialise a fresh repo with one commit and an annotated tag
+/// `<tag_name>` pointing at it. Returns `(dir, commit_sha, tag_sha)`.
+/// The annotated tag creates a tag-object (not a lightweight tag), so
+/// `tag_sha != commit_sha`.
+pub fn make_seed_repo_with_annotated_tag(
+    salt: &str,
+    tag_name: &str,
+) -> (tempfile::TempDir, String, String) {
+    let (dir, shas) = make_seed_repo(1, salt);
+    git(
+        &[
+            "tag",
+            "-a",
+            tag_name,
+            "-m",
+            "release",
+            "--no-sign",
+            shas[0].as_str(),
+        ],
+        dir.path(),
+    );
+    let tag_sha = git_capture(&["rev-parse", tag_name], dir.path())
+        .trim()
+        .to_owned();
+    assert_ne!(
+        tag_sha, shas[0],
+        "annotated tag must have its own object SHA",
+    );
+    (dir, shas[0].clone(), tag_sha)
+}
+
+/// Initialise a fresh repo with one commit and a tag-of-tag chain:
+/// `<outer_name>` (annotated) → `<inner_name>` (annotated) → commit.
+/// Returns `(dir, commit_sha, inner_tag_sha, outer_tag_sha)`.
+pub fn make_seed_repo_with_tag_of_tag(
+    salt: &str,
+    inner_name: &str,
+    outer_name: &str,
+) -> (tempfile::TempDir, String, String, String) {
+    let (dir, shas) = make_seed_repo(1, salt);
+    git(
+        &[
+            "tag",
+            "-a",
+            inner_name,
+            "-m",
+            "inner",
+            "--no-sign",
+            shas[0].as_str(),
+        ],
+        dir.path(),
+    );
+    let inner_sha = git_capture(&["rev-parse", inner_name], dir.path())
+        .trim()
+        .to_owned();
+    // `git tag -a v1 inner` creates a tag-of-tag (CLI git resolves the
+    // arg's OID without peeling).
+    git(
+        &[
+            "tag",
+            "-a",
+            outer_name,
+            "-m",
+            "outer",
+            "--no-sign",
+            inner_sha.as_str(),
+        ],
+        dir.path(),
+    );
+    let outer_sha = git_capture(&["rev-parse", outer_name], dir.path())
+        .trim()
+        .to_owned();
+    assert_ne!(inner_sha, outer_sha, "outer must wrap inner");
+    (dir, shas[0].clone(), inner_sha, outer_sha)
+}
+
 /// Build a `?engine=packchain` URL pointing at a fake S3 bucket.
 pub fn s3_url_packchain(prefix: Option<&str>) -> RemoteUrl {
     let raw = match prefix {

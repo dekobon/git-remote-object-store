@@ -23,11 +23,20 @@ use serde_json::Value;
 use time::Duration;
 use time::OffsetDateTime;
 
-use common::{drive_in, git, git_available, git_capture, make_seed_repo, s3_url_packchain};
+use common::{
+    drive_in, git, git_available, git_capture, make_seed_repo, make_seed_repo_with_annotated_tag,
+    make_seed_repo_with_tag_of_tag, s3_url_packchain,
+};
 
 /// Read and parse `<prefix>/refs/heads/main/chain.json` from the mock.
 fn read_chain(store: &MockStore, prefix: &str) -> Value {
-    let key = format!("{prefix}/refs/heads/main/chain.json");
+    read_chain_for(store, prefix, "refs/heads/main")
+}
+
+/// Read and parse `<prefix>/<ref_name>/chain.json` from the mock —
+/// generalisation of [`read_chain`] for tag-ref tests.
+fn read_chain_for(store: &MockStore, prefix: &str, ref_name: &str) -> Value {
+    let key = format!("{prefix}/{ref_name}/chain.json");
     let bytes = futures::executor::block_on(store.get_bytes(&key)).expect("chain.json must exist");
     serde_json::from_slice(&bytes).expect("chain.json must be valid JSON")
 }
@@ -684,4 +693,236 @@ async fn concurrent_different_refs_share_format_and_head() {
 #[allow(dead_code)]
 fn touch(path: &Path) {
     std::fs::write(path, b"").unwrap();
+}
+
+// --- Annotated-tag pushes (issue #79) -------------------------------
+
+/// Read a packchain segment's `.idx` file from the mock and return the
+/// set of OIDs it enumerates. Lets tests assert that a specific tag /
+/// commit OID is present in the on-bucket pack — the strongest check
+/// available short of a fetch round-trip.
+fn pack_idx_oids(store: &MockStore, prefix: &str, pack_path_in_chain: &str) -> Vec<String> {
+    // pack_path_in_chain is e.g. "packs/<sha>.pack" — derive the .idx
+    // sibling and download it from the mock.
+    let idx_relative = pack_path_in_chain.replace(".pack", ".idx");
+    let key = format!("{prefix}/{idx_relative}");
+    let bytes = futures::executor::block_on(store.get_bytes(&key)).expect(".idx must exist");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let idx_path = tmp.path().join("scan.idx");
+    std::fs::write(&idx_path, &bytes).unwrap();
+    let idx = gix_pack::index::File::at(&idx_path, gix_hash::Kind::Sha1).expect("parse idx");
+    let mut oids = Vec::with_capacity(idx.num_objects() as usize);
+    for entry in idx.iter() {
+        oids.push(entry.oid.to_string());
+    }
+    oids
+}
+
+#[tokio::test]
+async fn first_push_of_annotated_tag_lands_pack_with_tag_object() {
+    // E3 from the plan. Pushing `refs/tags/v1` (annotated) must:
+    //   1. succeed with `ok refs/tags/v1`,
+    //   2. record `chain.tip == tag_sha` (unpeeled, the ref's actual
+    //      target),
+    //   3. include the tag-object OID in segment-0's `.idx`.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, commit_sha, tag_sha) = make_seed_repo_with_annotated_tag("primary", "v1");
+
+    let store = Arc::new(MockStore::new());
+    let (out, result) = drive_in(
+        s3_url_packchain(Some("repo")),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push refs/tags/v1:refs/tags/v1\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    result.expect("annotated tag push must succeed");
+    assert_eq!(
+        std::str::from_utf8(&out).unwrap(),
+        "ok refs/tags/v1\n\n",
+        "wire output: ok line for tag ref + terminator",
+    );
+
+    // chain.tip is the unpeeled tag SHA — the receiver sets the ref to
+    // that exact OID.
+    let chain = read_chain_for(&store, "repo", "refs/tags/v1");
+    assert_eq!(
+        chain["tip"], tag_sha,
+        "chain.tip must be the tag OID, not the underlying commit",
+    );
+
+    // Segment-0 pack contains both the commit AND the tag object. Pin
+    // both, since dropping the tag (regression) or dropping the commit
+    // (different bug) both break fetch.
+    let segments = chain["segments"].as_array().unwrap();
+    let pack_path = segments[0]["pack"].as_str().unwrap();
+    let oids = pack_idx_oids(&store, "repo", pack_path);
+    assert!(
+        oids.iter().any(|o| o == &tag_sha),
+        "segment-0 pack must include the tag object {tag_sha}; got {oids:?}",
+    );
+    assert!(
+        oids.iter().any(|o| o == &commit_sha),
+        "segment-0 pack must include the commit target {commit_sha}; got {oids:?}",
+    );
+}
+
+#[tokio::test]
+async fn first_push_of_tag_of_tag_lands_full_chain_in_pack() {
+    // E4: an annotated tag pointing at another annotated tag. Both
+    // tag objects must land in segment-0's pack; otherwise a fetch
+    // could resolve `outer` only by also having `inner`.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, commit_sha, inner_sha, outer_sha) =
+        make_seed_repo_with_tag_of_tag("primary", "inner", "outer");
+
+    let store = Arc::new(MockStore::new());
+    let (out, result) = drive_in(
+        s3_url_packchain(Some("repo")),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push refs/tags/outer:refs/tags/outer\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    result.expect("tag-of-tag push must succeed");
+    assert_eq!(std::str::from_utf8(&out).unwrap(), "ok refs/tags/outer\n\n");
+
+    let chain = read_chain_for(&store, "repo", "refs/tags/outer");
+    let pack_path = chain["segments"].as_array().unwrap()[0]["pack"]
+        .as_str()
+        .unwrap();
+    let oids = pack_idx_oids(&store, "repo", pack_path);
+    for needed in [&outer_sha, &inner_sha, &commit_sha] {
+        assert!(
+            oids.iter().any(|o| o == needed),
+            "tag-of-tag pack must contain {needed}; got {oids:?}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn repushing_same_annotated_tag_is_idempotent() {
+    // E7: a second push of the same annotated tag (same OID, no force)
+    // must produce identical observable state — same `ok` line, no new
+    // pack/idx keys, unchanged chain.json. The production code achieves
+    // this via a short-circuit in `prepare_push`, but a full re-execution
+    // would also be idempotent (content-addressed packs, deterministic
+    // chain.json, idempotent put_if_absent on FORMAT/HEAD), so this test
+    // only pins the observable contract — not the short-circuit path
+    // specifically.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, _commit_sha, _tag_sha) = make_seed_repo_with_annotated_tag("primary", "v1");
+
+    let store = Arc::new(MockStore::new());
+    let (_, r1) = drive_in(
+        s3_url_packchain(Some("repo")),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push refs/tags/v1:refs/tags/v1\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    r1.expect("first push must succeed");
+    let chain_1 = read_chain_for(&store, "repo", "refs/tags/v1").to_string();
+    let key_count_1 = store.keys().len();
+
+    let (out, r2) = drive_in(
+        s3_url_packchain(Some("repo")),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push refs/tags/v1:refs/tags/v1\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    r2.expect("idempotent re-push must succeed");
+    assert_eq!(std::str::from_utf8(&out).unwrap(), "ok refs/tags/v1\n\n");
+    let chain_2 = read_chain_for(&store, "repo", "refs/tags/v1").to_string();
+    let key_count_2 = store.keys().len();
+    assert_eq!(chain_1, chain_2, "chain.json unchanged on idempotent push");
+    assert_eq!(
+        key_count_1, key_count_2,
+        "no new bucket keys created on idempotent push",
+    );
+}
+
+#[tokio::test]
+async fn tag_pointing_to_blob_emits_error_outcome() {
+    // E6: a tag whose target is a blob is not yet supported. The push
+    // must surface `error refs/tags/blob-tag "..."` containing the
+    // `TagTargetUnsupported` text — not a panic, not a malformed pack
+    // upload.
+    use std::io::Write as _;
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, _shas) = make_seed_repo(1, "primary");
+    // Create a blob (file-backed; `git hash-object -w <file>` writes
+    // it into the ODB), then build a tag object pointing at it via
+    // `git mktag` — the only CLI-friendly way to forge a tag-of-blob.
+    std::fs::write(seed.path().join("blob-target"), b"data\n").unwrap();
+    let blob_oid = git_capture(&["hash-object", "-w", "blob-target"], seed.path())
+        .trim()
+        .to_owned();
+
+    // Build a raw tag-object body and write it via `git mktag`.
+    let tag_body = format!(
+        "object {blob_oid}\n\
+         type blob\n\
+         tag blob-tag\n\
+         tagger Test <test@example.com> 0 +0000\n\
+         \n\
+         pointing-at-blob\n",
+    );
+    let tag_path = seed.path().join("tag-body.txt");
+    std::fs::write(&tag_path, &tag_body).unwrap();
+    // `git mktag` reads from stdin and writes the object, returning OID.
+    let mktag = std::process::Command::new("git")
+        .args(["mktag"])
+        .current_dir(seed.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn git mktag");
+    mktag
+        .stdin
+        .as_ref()
+        .unwrap()
+        .write_all(tag_body.as_bytes())
+        .unwrap();
+    let out = mktag.wait_with_output().expect("git mktag");
+    assert!(
+        out.status.success(),
+        "git mktag failed: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let tag_sha = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+    // Create the ref pointing at the tag object.
+    git(&["update-ref", "refs/tags/blob-tag", &tag_sha], seed.path());
+
+    let store = Arc::new(MockStore::new());
+    let (out, result) = drive_in(
+        s3_url_packchain(Some("repo")),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push refs/tags/blob-tag:refs/tags/blob-tag\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    result.expect("push must complete (per-ref error, not protocol error)");
+    let wire = std::str::from_utf8(&out).unwrap();
+    assert!(
+        wire.starts_with("error refs/tags/blob-tag "),
+        "expected error line, got {wire:?}",
+    );
+    assert!(
+        wire.contains("only tag-of-commit is supported"),
+        "expected TagTargetUnsupported text, got {wire:?}",
+    );
 }

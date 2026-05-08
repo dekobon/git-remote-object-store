@@ -15,7 +15,10 @@ use git_remote_object_store::object_store::{ObjectStore, PutOpts};
 use time::Duration;
 use time::OffsetDateTime;
 
-use common::{drive_in, git, git_available, make_seed_repo, s3_url_with_zip};
+use common::{
+    drive_in, git, git_available, make_seed_repo, make_seed_repo_with_annotated_tag,
+    s3_url_with_zip,
+};
 
 #[tokio::test]
 async fn push_to_empty_remote_uploads_bundle_and_seeds_head() {
@@ -705,5 +708,48 @@ async fn pre_existing_malformed_bundle_key_surfaces_parse_error() {
     assert!(
         store.contains(bad_key),
         "malformed bundle must remain untouched (doctor's job to clean up)",
+    );
+}
+
+// --- Annotated-tag push: bundle's pack must contain the tag (issue #79)
+
+#[tokio::test]
+async fn bundle_first_push_of_annotated_tag_lands_bundle_at_tag_sha() {
+    // E9 push side. The bundle file is named after the ref's actual
+    // target (the tag-OID for an annotated tag). Pin both:
+    //   1. Push succeeds (no `Expected object of kind commit` regression
+    //      via bundle's path).
+    //   2. The bundle file lands at `<tag_sha>.bundle` (not the
+    //      underlying-commit SHA).
+    // The push-then-fetch round-trip in `protocol_fetch.rs` covers the
+    // stronger property — that the bundle's *pack* includes the tag
+    // object — so this test only pins the bundle's wire-key shape.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, commit_sha, tag_sha) = make_seed_repo_with_annotated_tag("primary", "v1");
+    assert_ne!(commit_sha, tag_sha, "fixture must produce distinct OIDs");
+
+    let store = Arc::new(MockStore::new());
+    let (out, result) = drive_in(
+        s3_url_with_zip(Some("repo"), false),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push refs/tags/v1:refs/tags/v1\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    result.expect("bundle annotated-tag push must succeed");
+    assert_eq!(std::str::from_utf8(&out).unwrap(), "ok refs/tags/v1\n\n");
+
+    let tag_key = format!("repo/refs/tags/v1/{tag_sha}.bundle");
+    assert!(
+        store.contains(&tag_key),
+        "bundle must land at {tag_key} (named after the tag OID)",
+    );
+    let commit_key = format!("repo/refs/tags/v1/{commit_sha}.bundle");
+    assert!(
+        !store.contains(&commit_key),
+        "bundle must NOT be named after the commit (would mean we peeled before naming)",
     );
 }

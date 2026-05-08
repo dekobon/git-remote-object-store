@@ -278,6 +278,17 @@ pub enum GitError {
         #[source]
         source: std::str::Utf8Error,
     },
+    /// A tag-ref's target chain ends at a tree or blob (not a commit).
+    /// Tag-of-commit is supported across both engines; tag-of-tree and
+    /// tag-of-blob require additional walk semantics not yet implemented.
+    /// Tracked separately as a feature request.
+    #[error("tag {oid} points to {kind:?}; only tag-of-commit is supported")]
+    TagTargetUnsupported {
+        /// The tag object whose target is unsupported.
+        oid: ObjectId,
+        /// The leaf kind reached after peeling through the tag chain.
+        kind: gix::object::Kind,
+    },
 }
 
 impl From<gix::open::Error> for GitError {
@@ -452,6 +463,48 @@ pub fn is_ancestor(repo: &Repository, ancestor: Sha, descendant: Sha) -> Result<
         Ok(base) => Ok(base.detach() == ancestor_oid),
         Err(gix::repository::merge_base::Error::NotFound { .. }) => Ok(false),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Peel `tip` to its underlying commit, collecting any annotated-tag
+/// objects encountered along the way.
+///
+/// Returns `(commit_sha, tag_chain)`. `tag_chain` is empty when `tip`
+/// is already a commit (branch tips, lightweight tags). For an
+/// annotated tag the chain contains the tag OID; for an annotated tag
+/// of an annotated tag, the chain contains the outer then inner tag
+/// OIDs (walk order).
+///
+/// Used by both pack engines so that the tag objects themselves land
+/// in the emitted pack — without them, a receiver could install all
+/// commit-reachable objects yet still fail to update `refs/tags/v1`
+/// because the tag-object OID it must point to is not in the ODB.
+///
+/// # Errors
+///
+/// - [`GitError::FindObject`] if `tip` or any intermediate tag's
+///   target is missing from the ODB.
+/// - [`GitError::PeelToKind`] if a tag object's bytes do not decode.
+/// - [`GitError::TagTargetUnsupported`] if the chain terminates at a
+///   tree or blob — tag-of-commit is the only supported leaf today.
+pub(crate) fn peel_to_commit_with_tag_chain(
+    repo: &Repository,
+    tip: Sha,
+) -> Result<(Sha, Vec<ObjectId>), GitError> {
+    let mut tag_chain = Vec::new();
+    let mut current = *tip.as_object_id();
+    loop {
+        let object = repo.find_object(current)?;
+        match object.kind {
+            gix::object::Kind::Commit => return Ok((Sha::from_object_id(current), tag_chain)),
+            gix::object::Kind::Tag => {
+                tag_chain.push(current);
+                current = object.into_tag().target_id()?.detach();
+            }
+            kind @ (gix::object::Kind::Tree | gix::object::Kind::Blob) => {
+                return Err(GitError::TagTargetUnsupported { oid: current, kind });
+            }
+        }
     }
 }
 
@@ -1070,6 +1123,117 @@ mod tests {
             !is_ancestor(&repo, Sha::from_object_id(a), Sha::from_object_id(b))
                 .expect("is_ancestor")
         );
+    }
+
+    // --- peel_to_commit_with_tag_chain --------------------------------
+
+    fn write_annotated_tag(
+        repo: &Repository,
+        target: ObjectId,
+        target_kind: gix::object::Kind,
+        name: &str,
+    ) -> ObjectId {
+        let tag = gix::objs::Tag {
+            target,
+            target_kind,
+            name: name.into(),
+            tagger: Some(signature().to_owned().expect("static signature is valid")),
+            message: "test".into(),
+            pgp_signature: None,
+        };
+        repo.write_object(&tag).expect("write tag").detach()
+    }
+
+    #[test]
+    fn peel_branch_tip_returns_commit_with_empty_chain() {
+        let (repo, _dir) = empty_repo();
+        let commit = add_commit(&repo, "refs/heads/main", &[], "c");
+        let (peeled, chain) =
+            peel_to_commit_with_tag_chain(&repo, Sha::from_object_id(commit)).expect("peel");
+        assert_eq!(peeled.as_object_id(), &commit);
+        assert!(chain.is_empty(), "branch tip has no tag chain");
+    }
+
+    #[test]
+    fn peel_lightweight_tag_returns_commit_with_empty_chain() {
+        // A lightweight tag is a ref pointing directly at a commit — there
+        // is no tag object to walk through. We pass the commit OID
+        // directly (the same OID `git::branch::resolve` would return for
+        // a lightweight tag ref).
+        let (repo, _dir) = empty_repo();
+        let commit = add_commit(&repo, "refs/heads/main", &[], "c");
+        let (peeled, chain) =
+            peel_to_commit_with_tag_chain(&repo, Sha::from_object_id(commit)).expect("peel");
+        assert_eq!(peeled.as_object_id(), &commit);
+        assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn peel_annotated_tag_returns_commit_with_one_element_chain() {
+        let (repo, _dir) = empty_repo();
+        let commit = add_commit(&repo, "refs/heads/main", &[], "c");
+        let tag = write_annotated_tag(&repo, commit, gix::object::Kind::Commit, "v1");
+        let (peeled, chain) =
+            peel_to_commit_with_tag_chain(&repo, Sha::from_object_id(tag)).expect("peel");
+        assert_eq!(peeled.as_object_id(), &commit);
+        assert_eq!(chain, vec![tag]);
+    }
+
+    #[test]
+    fn peel_tag_of_tag_returns_commit_with_outer_then_inner_chain() {
+        let (repo, _dir) = empty_repo();
+        let commit = add_commit(&repo, "refs/heads/main", &[], "c");
+        let inner = write_annotated_tag(&repo, commit, gix::object::Kind::Commit, "inner");
+        let outer = write_annotated_tag(&repo, inner, gix::object::Kind::Tag, "outer");
+        let (peeled, chain) =
+            peel_to_commit_with_tag_chain(&repo, Sha::from_object_id(outer)).expect("peel");
+        assert_eq!(peeled.as_object_id(), &commit);
+        // Walk order: outer encountered first, then inner.
+        assert_eq!(chain, vec![outer, inner]);
+    }
+
+    #[test]
+    fn peel_tag_pointing_to_tree_errors_with_tag_target_unsupported() {
+        use gix::objs::tree::{Entry, EntryKind};
+        let (repo, _dir) = empty_repo();
+        // Build a freestanding tree object the tag can point at.
+        let blob = repo.write_blob(b"x").expect("write blob").detach();
+        let tree_id = repo
+            .write_object(&gix::objs::Tree {
+                entries: vec![Entry {
+                    mode: EntryKind::Blob.into(),
+                    filename: "x".into(),
+                    oid: blob,
+                }],
+            })
+            .expect("write tree")
+            .detach();
+        let tag = write_annotated_tag(&repo, tree_id, gix::object::Kind::Tree, "tree-tag");
+        let err = peel_to_commit_with_tag_chain(&repo, Sha::from_object_id(tag))
+            .expect_err("tag-of-tree must be rejected");
+        match err {
+            GitError::TagTargetUnsupported { oid, kind } => {
+                assert_eq!(oid, tree_id);
+                assert_eq!(kind, gix::object::Kind::Tree);
+            }
+            other => panic!("expected TagTargetUnsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peel_tag_pointing_to_blob_errors_with_tag_target_unsupported() {
+        let (repo, _dir) = empty_repo();
+        let blob_id = repo.write_blob(b"data").expect("write blob").detach();
+        let tag = write_annotated_tag(&repo, blob_id, gix::object::Kind::Blob, "blob-tag");
+        let err = peel_to_commit_with_tag_chain(&repo, Sha::from_object_id(tag))
+            .expect_err("tag-of-blob must be rejected");
+        match err {
+            GitError::TagTargetUnsupported { oid, kind } => {
+                assert_eq!(oid, blob_id);
+                assert_eq!(kind, gix::object::Kind::Blob);
+            }
+            other => panic!("expected TagTargetUnsupported, got {other:?}"),
+        }
     }
 
     #[test]
