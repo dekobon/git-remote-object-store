@@ -282,12 +282,22 @@ pub enum GitError {
     /// Tag-of-commit is supported across both engines; tag-of-tree and
     /// tag-of-blob require additional walk semantics not yet implemented.
     /// Tracked separately as a feature request.
-    #[error("tag {oid} points to {kind:?}; only tag-of-commit is supported")]
+    #[error("ref target {oid} resolves to {kind:?}; only commit targets are supported")]
     TagTargetUnsupported {
-        /// The tag object whose target is unsupported.
+        /// The object whose kind is unsupported.
         oid: ObjectId,
         /// The leaf kind reached after peeling through the tag chain.
         kind: gix::object::Kind,
+    },
+    /// A tag chain visited the same OID twice — i.e. a cycle. Real git
+    /// objects cannot form cycles (each tag's OID is determined by the
+    /// SHA-1 of its content, which includes the target OID, so a cycle
+    /// would require a SHA-1 preimage). This guard exists for adversarial
+    /// or corrupted ODB inputs that bypass the hashing invariant.
+    #[error("tag chain contains a cycle at {oid}")]
+    TagChainCycle {
+        /// The OID at which the cycle was detected.
+        oid: ObjectId,
     },
 }
 
@@ -487,13 +497,24 @@ pub fn is_ancestor(repo: &Repository, ancestor: Sha, descendant: Sha) -> Result<
 /// - [`GitError::PeelToKind`] if a tag object's bytes do not decode.
 /// - [`GitError::TagTargetUnsupported`] if the chain terminates at a
 ///   tree or blob — tag-of-commit is the only supported leaf today.
+/// - [`GitError::TagChainCycle`] if the chain visits the same OID
+///   twice (corrupted or adversarial ODB only — real git tags cannot
+///   cycle).
 pub(crate) fn peel_to_commit_with_tag_chain(
     repo: &Repository,
     tip: Sha,
 ) -> Result<(Sha, Vec<ObjectId>), GitError> {
+    // `visited` defends against cyclic chains in a corrupted or
+    // adversarial ODB. Real git tags cannot cycle (a cycle would
+    // require a SHA-1 preimage), so the HashSet stays at length ≤ chain
+    // depth, which is typically 0–2 in practice.
+    let mut visited: HashSet<ObjectId> = HashSet::new();
     let mut tag_chain = Vec::new();
     let mut current = *tip.as_object_id();
     loop {
+        if !visited.insert(current) {
+            return Err(GitError::TagChainCycle { oid: current });
+        }
         let object = repo.find_object(current)?;
         match object.kind {
             gix::object::Kind::Commit => return Ok((Sha::from_object_id(current), tag_chain)),

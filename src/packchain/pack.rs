@@ -195,32 +195,14 @@ fn build_pack(
     .map_err(|e| PackchainError::PackBuild(e.to_string()))?;
 
     // Append annotated-tag objects (and any chain of tag-of-tag objects)
-    // verbatim. `AsIs` includes each input OID as a single pack entry
-    // without expansion — exactly what we want for tags, which are
-    // leaves of the reachability graph (their commit target is already
-    // in the commit-walk count above). Without this, a fetch-back of
-    // `refs/tags/v1` would fail because the tag-object OID the receiver
-    // must point the ref at is not in the ODB.
-    if !tag_chain.is_empty() {
-        let tag_ids: Vec<ObjectId> = tag_chain.to_vec();
-        let (tag_counts, _stats) = count::objects(
-            odb.clone(),
-            Box::new(
-                tag_ids
-                    .into_iter()
-                    .map(Ok::<_, Box<dyn std::error::Error + Send + Sync + 'static>>),
-            ),
-            &gix::progress::Discard,
-            &AtomicBool::new(false),
-            count::objects::Options {
-                input_object_expansion: ObjectExpansion::AsIs,
-                thread_limit: Some(1),
-                ..Default::default()
-            },
-        )
-        .map_err(|e| PackchainError::PackBuild(e.to_string()))?;
-        counts.extend(tag_counts);
-    }
+    // verbatim. Without this, a fetch-back of `refs/tags/v1` would fail
+    // because the tag-object OID the receiver must point the ref at is
+    // not in the ODB. `count_objects_as_is` is shared with `bundle.rs`
+    // so both engines stay in lockstep.
+    counts.extend(
+        crate::bundle::count_objects_as_is(odb.clone(), tag_chain)
+            .map_err(|e| PackchainError::PackBuild(e.to_string()))?,
+    );
 
     if counts.is_empty() {
         // A no-op pack would be 32 bytes (header + trailer) — legal,

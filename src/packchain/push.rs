@@ -480,30 +480,33 @@ fn local_git_work_packchain(
     let (local_commit, tag_chain) =
         git::peel_to_commit_with_tag_chain(&repo, local_sha).map_err(PushError::Git)?;
 
-    // Ancestor check first — it tolerates a missing prior OID (the
-    // synthesised remote-only case in tests, and the unrelated-history
-    // case in production), while peeling does not. If the prior tip is
-    // present locally and is not an ancestor, reject. If it's missing,
-    // `is_ancestor` returns false via gix's NotFound path → also
-    // rejected.
-    if let (Some(prior), false) = (prior_tip, force_push)
-        && !git::is_ancestor(&repo, prior, local_sha).map_err(PushError::Git)?
-    {
-        return Ok(Err(GitProbeError::NotAncestor));
-    }
-
-    // The prior chain.tip can be a tag OID when a previous push of
-    // the same ref was an annotated tag. Peel it for the incremental
-    // pack's `with_hidden` walk. By construction we only reach this
-    // point when `prior` was an ancestor of `local_sha`, so it is
-    // present in the local ODB and the peel is sound.
-    let prior_commit = match (force_push, prior_tip) {
-        (false, Some(prior)) => Some(
-            git::peel_to_commit_with_tag_chain(&repo, prior)
-                .map_err(PushError::Git)?
-                .0,
-        ),
-        _ => None,
+    // Compute the peeled prior commit and check ancestry in one pass.
+    // We pass commits to `is_ancestor` (gix's `merge_base` does not peel
+    // tag OIDs internally — see gix-0.83 `repository/revision.rs`), so a
+    // non-force tag re-push gets a clean `NotAncestor` rejection rather
+    // than a confusing merge-base error.
+    //
+    // Peeling fails when the prior tip is not in the local ODB — the
+    // synthesised remote-only OID in `non_force_push_rejects_when_remote_not_ancestor`
+    // and the unrelated-history case in production. Treat
+    // `GitError::FindObject` as not-an-ancestor; propagate other peel
+    // errors so a corrupted ODB surfaces a real diagnostic instead of
+    // being masked as a refusal.
+    let prior_commit = if !force_push && let Some(prior) = prior_tip {
+        match git::peel_to_commit_with_tag_chain(&repo, prior) {
+            Ok((commit, _)) => {
+                if !git::is_ancestor(&repo, commit, local_commit).map_err(PushError::Git)? {
+                    return Ok(Err(GitProbeError::NotAncestor));
+                }
+                Some(commit)
+            }
+            Err(crate::git::GitError::FindObject(_)) => {
+                return Ok(Err(GitProbeError::NotAncestor));
+            }
+            Err(e) => return Err(PushError::Git(e)),
+        }
+    } else {
+        None
     };
 
     if rev_walk_crosses_shallow_boundary(&repo, local_commit).map_err(PushError::Packchain)? {
