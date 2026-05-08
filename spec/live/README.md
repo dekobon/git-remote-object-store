@@ -213,11 +213,12 @@ make shellspec-live-azure
 make shellspec-live   # fans out to S3 + Azure if both are configured
 ```
 
-To pass a different storage engine through to the helper URL:
+By default each target runs every implemented engine in turn (`bundle`,
+`packchain`). Scope a run to a single engine with `ENGINES=`:
 
 ```bash
-make shellspec-live-s3 ENGINE=bundle
-make shellspec-live-azure ENGINE=bundle
+make shellspec-live-s3 ENGINES=bundle
+make shellspec-live-azure ENGINES=packchain
 ```
 
 ## Cleanup
