@@ -163,6 +163,49 @@ fn verify_pack_magic<R: Read>(file: &mut R) -> Result<(), BundleError> {
     Ok(())
 }
 
+/// Count `object_ids` verbatim — one pack entry per input OID, no
+/// expansion. Used by both engines to append annotated-tag objects (and
+/// any tag-of-tag chain) to a pack alongside a commit-walk count: the
+/// tag objects themselves are leaves of the reachability graph (their
+/// commit target is already in the commit count), so `AsIs` is the
+/// correct expansion.
+///
+/// Returns an empty `Vec` for an empty input. Callers concatenate the
+/// result onto their own `count::objects` output.
+///
+/// # Errors
+///
+/// Returns the underlying [`count::objects::Error`] verbatim. Callers
+/// wrap in their engine's error type.
+pub(crate) fn count_objects_as_is<F>(
+    odb: F,
+    object_ids: &[ObjectId],
+) -> Result<Vec<gix_pack::data::output::Count>, count::objects::Error>
+where
+    F: gix_pack::Find + Send + Clone + 'static,
+{
+    if object_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let owned = object_ids.to_vec();
+    let (counts, _) = count::objects(
+        odb,
+        Box::new(
+            owned
+                .into_iter()
+                .map(Ok::<_, Box<dyn std::error::Error + Send + Sync + 'static>>),
+        ),
+        &gix::progress::Discard,
+        &AtomicBool::new(false),
+        count::objects::Options {
+            input_object_expansion: count::objects::ObjectExpansion::AsIs,
+            thread_limit: Some(1),
+            ..Default::default()
+        },
+    )?;
+    Ok(counts)
+}
+
 /// Create a git bundle v2 file at `<folder>/<sha>.bundle` and return the path.
 ///
 /// `spec` is resolved against the repository at `cwd` (a fully-qualified ref
@@ -210,27 +253,7 @@ pub fn create(cwd: &Path, folder: &Path, sha: Sha, spec: &str) -> Result<PathBuf
     // contains commit-reachable objects but not the tag object itself,
     // so a fetch-back of the tag ref would fail to update
     // `refs/tags/v1` because the tag-OID isn't in the receiver's ODB.
-    // `AsIs` includes each input as a single pack entry without
-    // expansion — exactly what tag objects (leaves of reachability)
-    // need.
-    if !tag_chain.is_empty() {
-        let (tag_counts, _) = count::objects(
-            odb.clone(),
-            Box::new(
-                tag_chain
-                    .into_iter()
-                    .map(Ok::<_, Box<dyn std::error::Error + Send + Sync + 'static>>),
-            ),
-            &gix::progress::Discard,
-            &AtomicBool::new(false),
-            count::objects::Options {
-                input_object_expansion: count::objects::ObjectExpansion::AsIs,
-                thread_limit: Some(1),
-                ..Default::default()
-            },
-        )?;
-        counts.extend(tag_counts);
-    }
+    counts.extend(count_objects_as_is(odb.clone(), &tag_chain)?);
 
     let num_entries = u32::try_from(counts.len())
         .map_err(|_| BundleError::PackEntry("too many objects for a single pack".to_owned()))?;

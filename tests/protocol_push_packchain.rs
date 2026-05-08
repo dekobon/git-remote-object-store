@@ -807,6 +807,97 @@ async fn first_push_of_tag_of_tag_lands_full_chain_in_pack() {
 }
 
 #[tokio::test]
+async fn force_retag_replaces_pack_with_new_tag_object() {
+    // E8: push annotated `v1 → commit_a`, then `git tag -af v1 commit_b`
+    // and force-push. The new chain.tip must be the new tag SHA, the
+    // new segment-0 pack must contain the new tag object, and the old
+    // tag's OID must NOT appear in the new pack (the force replaces
+    // the chain — the old segment is reapable orphan storage). This
+    // pins the force-retag interaction with the tag-chain plumbing
+    // added in #79; without it, a regression that dropped tag_chain
+    // on the force path would not be caught by the new-tag-push or
+    // idempotent-repush tests.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    // commit_a is the old tag's target; the test does not assert anything
+    // about it (commit_b descends from commit_a in this fixture, but
+    // that's a fixture property, not a force-retag contract).
+    let (seed, _commit_a, tag_v1_a) = make_seed_repo_with_annotated_tag("primary", "v1");
+
+    let store = Arc::new(MockStore::new());
+    let (_, r1) = drive_in(
+        s3_url_packchain(Some("repo")),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push refs/tags/v1:refs/tags/v1\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    r1.expect("first tag push must succeed");
+
+    // Add a second commit and retag v1 to it.
+    std::fs::write(seed.path().join("f1.txt"), b"second\n").unwrap();
+    git(&["add", "."], seed.path());
+    git(
+        &["commit", "--quiet", "-m", "step2", "--no-gpg-sign"],
+        seed.path(),
+    );
+    let commit_b = git_capture(&["rev-parse", "HEAD"], seed.path())
+        .trim()
+        .to_owned();
+    git(
+        &["tag", "-af", "v1", "-m", "release v1 again", &commit_b],
+        seed.path(),
+    );
+    let tag_v1_b = git_capture(&["rev-parse", "v1"], seed.path())
+        .trim()
+        .to_owned();
+    assert_ne!(tag_v1_a, tag_v1_b, "retag must produce a new tag OID");
+
+    // Force-push (the leading `+` flips the spec's force flag).
+    let (out, r2) = drive_in(
+        s3_url_packchain(Some("repo")),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push +refs/tags/v1:refs/tags/v1\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    r2.expect("force-retag must succeed");
+    assert_eq!(std::str::from_utf8(&out).unwrap(), "ok refs/tags/v1\n\n");
+
+    // chain.tip moved to the new tag OID (unpeeled).
+    let chain = read_chain_for(&store, "repo", "refs/tags/v1");
+    assert_eq!(
+        chain["tip"], tag_v1_b,
+        "chain.tip must be the new tag OID after force-retag",
+    );
+    let segments = chain["segments"].as_array().unwrap();
+    assert_eq!(
+        segments.len(),
+        1,
+        "force-retag must collapse to a single segment",
+    );
+
+    // The new segment-0 pack contains the new tag and the new commit;
+    // the old tag's OID is not in this pack.
+    let pack_path = segments[0]["pack"].as_str().unwrap();
+    let oids = pack_idx_oids(&store, "repo", pack_path);
+    assert!(
+        oids.iter().any(|o| o == &tag_v1_b),
+        "new pack must include the new tag {tag_v1_b}; got {oids:?}",
+    );
+    assert!(
+        oids.iter().any(|o| o == &commit_b),
+        "new pack must include the new commit {commit_b}; got {oids:?}",
+    );
+    assert!(
+        !oids.iter().any(|o| o == &tag_v1_a),
+        "new pack must NOT include the old tag {tag_v1_a}; got {oids:?}",
+    );
+}
+
+#[tokio::test]
 async fn repushing_same_annotated_tag_is_idempotent() {
     // E7: a second push of the same annotated tag (same OID, no force)
     // must produce identical observable state — same `ok` line, no new
@@ -922,7 +1013,7 @@ async fn tag_pointing_to_blob_emits_error_outcome() {
         "expected error line, got {wire:?}",
     );
     assert!(
-        wire.contains("only tag-of-commit is supported"),
+        wire.contains("only commit targets are supported"),
         "expected TagTargetUnsupported text, got {wire:?}",
     );
 }
