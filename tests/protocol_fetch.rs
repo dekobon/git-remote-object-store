@@ -685,3 +685,61 @@ async fn shallow_fetch_limits_visible_commit_count() {
         "expected {DEPTH} visible commits after depth={DEPTH} fetch, got {visible}: {log:?}"
     );
 }
+
+// --- Annotated-tag fetch round-trip via bundle engine (issue #79) ---
+
+#[tokio::test]
+async fn bundle_fetch_round_trip_of_annotated_tag_resolves_tag_object() {
+    // E10 bundle fetch side. Push an annotated tag through the bundle
+    // engine, fetch into an empty dst, and confirm `cat-file -t v1`
+    // returns `tag`. Without the fix, bundle's pack would only carry
+    // commit-reachable objects and the destination's ref-update step
+    // would have nothing to point at for the tag-OID.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, _commit_sha, tag_sha) = common::make_seed_repo_with_annotated_tag("primary", "v1");
+
+    let store = Arc::new(MockStore::new());
+    let (_, push_result) = drive_in(
+        s3_url(Some("repo")),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push refs/tags/v1:refs/tags/v1\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    push_result.expect("bundle annotated-tag push must succeed");
+
+    let dst = tempfile::tempdir().expect("dst tempdir");
+    git(&["init", "--quiet", "--initial-branch=main"], dst.path());
+    git(&["config", "user.email", "test@example.com"], dst.path());
+    git(&["config", "user.name", "Test"], dst.path());
+    git(&["config", "commit.gpgsign", "false"], dst.path());
+
+    let fetch_script = format!("fetch {tag_sha} refs/tags/v1\n\n");
+    let (_, fetch_result) = drive_in(
+        s3_url(Some("repo")),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        &fetch_script,
+        dst.path().to_path_buf(),
+    )
+    .await;
+    fetch_result.expect("bundle fetch of tag must succeed");
+
+    let kind = std::process::Command::new("git")
+        .args(["cat-file", "-t", &tag_sha])
+        .current_dir(dst.path())
+        .output()
+        .expect("spawn git cat-file");
+    assert!(
+        kind.status.success(),
+        "git cat-file -t failed: {}",
+        String::from_utf8_lossy(&kind.stderr),
+    );
+    assert_eq!(
+        String::from_utf8(kind.stdout).unwrap().trim(),
+        "tag",
+        "tag OID must decode as a tag object after bundle fetch round-trip",
+    );
+}

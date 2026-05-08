@@ -96,9 +96,26 @@ enum GitProbeError {
     Shallow,
 }
 
-/// Captured local-git output: resolved SHA + repo working dir.
+/// Captured local-git output: resolved SHA + repo working dir +
+/// peeled-commit / tag-chain context for tag-ref pushes.
+///
+/// `local_sha` is the ref's actual target — the tag OID for an
+/// annotated tag, the commit OID for a branch or lightweight tag.
+/// `local_commit` is the peeled commit (always a commit OID); it
+/// equals `local_sha` for branches/lightweight tags. `tag_chain` is
+/// the sequence of tag-object OIDs encountered between the two
+/// (empty for the non-tag case, length ≥ 1 for annotated tags). The
+/// pack-build path needs the commit for `rev_walk` and the chain so
+/// the tag objects themselves land in the emitted pack.
+///
+/// `prior_commit` is the peeled prior chain.tip (also potentially a
+/// tag OID), needed by the incremental pack's `with_hidden` walk and
+/// by the ancestry check. `None` on first push.
 struct LocalGit {
     local_sha: Sha,
+    local_commit: Sha,
+    tag_chain: Vec<gix_hash::ObjectId>,
+    prior_commit: Option<Sha>,
     cwd: PathBuf,
 }
 
@@ -306,14 +323,19 @@ async fn prepare_push(
     // hinted at: a baseline pack carries no prerequisite; an
     // incremental pack carries exactly one. The compiler now enforces
     // it, so `build_pack_and_baseline` no longer needs an `expect`.
-    let kind = match (force_push, prior_tip_sha) {
+    // `prior_commit` is the peeled prior chain.tip; for tag pushes the
+    // unpeeled `prior_tip_sha` may be a tag OID, but the incremental
+    // walk needs a commit on both sides.
+    let kind = match (force_push, local.prior_commit) {
         (true, _) | (false, None) => PackKind::Baseline,
-        (false, Some(prior_tip)) => PackKind::Incremental { prior_tip },
+        (false, Some(prior_commit)) => PackKind::Incremental { prior_commit },
     };
     let (pack, baseline_bundle) = build_pack_and_baseline(
         local.cwd.clone(),
         temp_dir.path().to_owned(),
         local_sha,
+        local.local_commit,
+        local.tag_chain.clone(),
         kind,
         local_spec.clone(),
     )
@@ -384,8 +406,10 @@ enum PackKind {
     /// Full snapshot from the local tip — first push or force push.
     Baseline,
     /// Thin pack reachable from the local tip but not from
-    /// `prior_tip` (the prior chain.tip).
-    Incremental { prior_tip: Sha },
+    /// `prior_commit` (the prior chain.tip, peeled to its commit so
+    /// the incremental walk's `with_hidden` sees a commit OID even if
+    /// the previous push was for an annotated tag).
+    Incremental { prior_commit: Sha },
 }
 
 /// Run the (possibly slow) pack + baseline bundle build off the
@@ -394,20 +418,30 @@ async fn build_pack_and_baseline(
     cwd: PathBuf,
     temp_path: PathBuf,
     local_sha: Sha,
+    local_commit: Sha,
+    tag_chain: Vec<gix_hash::ObjectId>,
     kind: PackKind,
     local_spec: String,
 ) -> Result<(BuiltPack, Option<PathBuf>), PushError> {
     let result = tokio::task::spawn_blocking(move || {
         let (pack, needs_baseline) = match kind {
-            PackKind::Baseline => (build_baseline_pack(&cwd, local_sha, &temp_path)?, true),
-            PackKind::Incremental { prior_tip } => (
-                build_incremental_pack(&cwd, prior_tip, local_sha, &temp_path)?,
+            PackKind::Baseline => (
+                build_baseline_pack(&cwd, local_commit, &tag_chain, &temp_path)?,
+                true,
+            ),
+            PackKind::Incremental { prior_commit } => (
+                build_incremental_pack(&cwd, prior_commit, local_commit, &tag_chain, &temp_path)?,
                 false,
             ),
         };
         let baseline = if needs_baseline {
             // bundle::create reuses the bundle-engine code path verbatim
-            // — no drift between the two engines' baseline shapes.
+            // — no drift between the two engines' baseline shapes. The
+            // bundle engine peels and includes the tag chain itself
+            // (see src/bundle.rs), so passing the unpeeled tag OID as
+            // `local_sha` is correct: the bundle file is named after
+            // the ref's actual target, and its pack contents include
+            // both the commit-reachable graph and the tag chain.
             let bundle_path = crate::bundle::create(&cwd, &temp_path, local_sha, &local_spec)
                 .map_err(|e| PackchainError::PackBuild(format!("baseline bundle: {e}")))?;
             Some(bundle_path)
@@ -437,18 +471,53 @@ fn local_git_work_packchain(
         return Ok(Err(GitProbeError::LocalRefNotFound));
     };
 
+    // Peel the resolved OID: branch / lightweight tag → unchanged;
+    // annotated tag → underlying commit + tag-chain. Ancestry and
+    // shallow-boundary checks must run against the peeled commit
+    // because gix's `rev_walk` / `merge_base` reject non-commit input.
+    // Tag-of-tree / tag-of-blob errors out cleanly here as
+    // `GitError::TagTargetUnsupported`.
+    let (local_commit, tag_chain) =
+        git::peel_to_commit_with_tag_chain(&repo, local_sha).map_err(PushError::Git)?;
+
+    // Ancestor check first — it tolerates a missing prior OID (the
+    // synthesised remote-only case in tests, and the unrelated-history
+    // case in production), while peeling does not. If the prior tip is
+    // present locally and is not an ancestor, reject. If it's missing,
+    // `is_ancestor` returns false via gix's NotFound path → also
+    // rejected.
     if let (Some(prior), false) = (prior_tip, force_push)
         && !git::is_ancestor(&repo, prior, local_sha).map_err(PushError::Git)?
     {
         return Ok(Err(GitProbeError::NotAncestor));
     }
 
-    if rev_walk_crosses_shallow_boundary(&repo, local_sha).map_err(PushError::Packchain)? {
+    // The prior chain.tip can be a tag OID when a previous push of
+    // the same ref was an annotated tag. Peel it for the incremental
+    // pack's `with_hidden` walk. By construction we only reach this
+    // point when `prior` was an ancestor of `local_sha`, so it is
+    // present in the local ODB and the peel is sound.
+    let prior_commit = match (force_push, prior_tip) {
+        (false, Some(prior)) => Some(
+            git::peel_to_commit_with_tag_chain(&repo, prior)
+                .map_err(PushError::Git)?
+                .0,
+        ),
+        _ => None,
+    };
+
+    if rev_walk_crosses_shallow_boundary(&repo, local_commit).map_err(PushError::Packchain)? {
         return Ok(Err(GitProbeError::Shallow));
     }
 
     drop(repo);
-    Ok(Ok(LocalGit { local_sha, cwd }))
+    Ok(Ok(LocalGit {
+        local_sha,
+        local_commit,
+        tag_chain,
+        prior_commit,
+        cwd,
+    }))
 }
 
 /// Returns `true` when `tip` is reachable through a `.git/shallow`

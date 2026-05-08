@@ -283,12 +283,23 @@ async fn compact_under_lock(
     install_chain_into_repo(&repo_dir, &download_dir, &chain, ref_name).await?;
 
     // Build the fresh baseline pack at the current tip. After this
-    // returns, `<output_dir>/<content_sha>.{pack,idx}` exist.
+    // returns, `<output_dir>/<content_sha>.{pack,idx}` exist. For tag
+    // refs, `tip_sha` may be a tag OID; peel it to a commit and carry
+    // the tag chain so the rebuilt baseline pack contains the tag
+    // objects (otherwise post-compaction fetches couldn't resolve the
+    // tag ref). Peeling happens inside the blocking task because
+    // `gix::Repository` is `!Sync`.
     let new_pack = {
         let repo_dir = repo_dir.clone();
         let output_dir = output_dir.clone();
-        tokio::task::spawn_blocking(move || build_baseline_pack(&repo_dir, tip_sha, &output_dir))
-            .await??
+        tokio::task::spawn_blocking(move || -> Result<_, PackchainError> {
+            let repo = gix::open(&repo_dir).map_err(crate::git::GitError::from)?;
+            let (tip_commit, tag_chain) = crate::git::peel_to_commit_with_tag_chain(&repo, tip_sha)
+                .map_err(PackchainError::Git)?;
+            drop(repo);
+            build_baseline_pack(&repo_dir, tip_commit, &tag_chain, &output_dir)
+        })
+        .await??
     };
 
     // Compute fresh path-index.
@@ -587,9 +598,9 @@ mod tests {
 
         // Baseline pack at c1, plus incremental packs for c2 and c3.
         let out_dir = TempDir::new().unwrap();
-        let baseline = build_baseline_pack(repo_dir.path(), c1, out_dir.path()).unwrap();
-        let inc2 = build_incremental_pack(repo_dir.path(), c1, c2, out_dir.path()).unwrap();
-        let inc3 = build_incremental_pack(repo_dir.path(), c2, c3, out_dir.path()).unwrap();
+        let baseline = build_baseline_pack(repo_dir.path(), c1, &[], out_dir.path()).unwrap();
+        let inc2 = build_incremental_pack(repo_dir.path(), c1, c2, &[], out_dir.path()).unwrap();
+        let inc3 = build_incremental_pack(repo_dir.path(), c2, c3, &[], out_dir.path()).unwrap();
 
         // Upload packs + idx files.
         for built in [&baseline, &inc2, &inc3] {

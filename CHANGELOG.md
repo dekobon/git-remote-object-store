@@ -37,6 +37,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bookkeeping directories (`packs/`, `gc/`) and LFS storage
   (`lfs/`) as bare refs. Refs with a `chain.json` manifest now
   report "Ok" instead of "No bundles" (#75).
+- Pushing an annotated tag now works against both engines. The
+  packchain engine previously crashed at push time
+  (`Expected object of kind commit but got tag`) because
+  `gix::Repository::rev_walk` was called with the unpeeled tag-OID.
+  The bundle engine appeared to succeed but emitted a pack
+  containing only commit-reachable objects, so a fetch-back of the
+  tag could not resolve the ref. Both engines now peel the
+  resolved spec to its underlying commit and append the tag chain
+  (annotated tag, or tag-of-tag) verbatim into the emitted pack
+  via a second `count::objects` pass with
+  `ObjectExpansion::AsIs`. Branch and lightweight-tag pushes are
+  unaffected. Tag refs whose target is a tree or blob are
+  explicitly rejected with `GitError::TagTargetUnsupported`;
+  tracked separately as a feature request (#79).
 
 ### Removed
 

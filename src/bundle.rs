@@ -177,7 +177,7 @@ pub fn create(cwd: &Path, folder: &Path, sha: Sha, spec: &str) -> Result<PathBuf
     // must ensure `sha` was derived from the same `spec` immediately before
     // this call; divergence (e.g. a concurrent ref update) produces a bundle
     // whose header SHA does not match its pack content.
-    let (tip_id, ref_name) = resolve_spec_to_ref(&repo, spec)?;
+    let (tip_id, ref_name, tag_chain) = resolve_spec_to_ref(&repo, spec)?;
     let commit_ids = collect_commit_ids(&repo, tip_id)?;
 
     // Strip the Proxy wrapper to expose the gix_pack::Find impl needed by the
@@ -189,7 +189,7 @@ pub fn create(cwd: &Path, folder: &Path, sha: Sha, spec: &str) -> Result<PathBuf
     odb.prevent_pack_unload();
 
     // Count every object reachable from the commits (commits + trees + blobs).
-    let (counts, _) = count::objects(
+    let (mut counts, _) = count::objects(
         odb.clone(),
         Box::new(
             commit_ids
@@ -204,6 +204,33 @@ pub fn create(cwd: &Path, folder: &Path, sha: Sha, spec: &str) -> Result<PathBuf
             ..Default::default()
         },
     )?;
+
+    // For tag-ref pushes, append the annotated-tag objects (and any
+    // tag-of-tag chain) verbatim. Without this, the bundle's pack
+    // contains commit-reachable objects but not the tag object itself,
+    // so a fetch-back of the tag ref would fail to update
+    // `refs/tags/v1` because the tag-OID isn't in the receiver's ODB.
+    // `AsIs` includes each input as a single pack entry without
+    // expansion — exactly what tag objects (leaves of reachability)
+    // need.
+    if !tag_chain.is_empty() {
+        let (tag_counts, _) = count::objects(
+            odb.clone(),
+            Box::new(
+                tag_chain
+                    .into_iter()
+                    .map(Ok::<_, Box<dyn std::error::Error + Send + Sync + 'static>>),
+            ),
+            &gix::progress::Discard,
+            &AtomicBool::new(false),
+            count::objects::Options {
+                input_object_expansion: count::objects::ObjectExpansion::AsIs,
+                thread_limit: Some(1),
+                ..Default::default()
+            },
+        )?;
+        counts.extend(tag_counts);
+    }
 
     let num_entries = u32::try_from(counts.len())
         .map_err(|_| BundleError::PackEntry("too many objects for a single pack".to_owned()))?;
@@ -339,7 +366,13 @@ pub fn unbundle(
     Ok(())
 }
 
-/// Resolve `spec` in `repo` to `(commit_oid, canonical_ref_name)`.
+/// Resolve `spec` in `repo` to `(commit_oid, canonical_ref_name, tag_chain)`.
+///
+/// `tag_chain` is the sequence of tag-object OIDs encountered while
+/// peeling — empty for branches and lightweight tags, length ≥ 1 for
+/// annotated tags. Callers append these to the pack with `AsIs`
+/// expansion so receivers can install the tag object alongside the
+/// commit-reachable graph.
 ///
 /// gix ref names are required to be valid UTF-8 by `gix-validate`, so
 /// the conversion below cannot fail in practice; it is wrapped in an
@@ -348,12 +381,14 @@ pub fn unbundle(
 fn resolve_spec_to_ref(
     repo: &gix::Repository,
     spec: &str,
-) -> Result<(ObjectId, String), BundleError> {
-    let tip_id = repo
-        .rev_parse_single(BStr::new(spec))?
-        .object()?
-        .peel_to_kind(gix::objs::Kind::Commit)?
-        .id;
+) -> Result<(ObjectId, String, Vec<ObjectId>), BundleError> {
+    let resolved = repo.rev_parse_single(BStr::new(spec))?.detach();
+    // Reuse the shared peel helper so bundle and packchain agree on
+    // tag-of-tree / tag-of-blob handling and chain order.
+    let (tip_sha, tag_chain) =
+        crate::git::peel_to_commit_with_tag_chain(repo, Sha::from_object_id(resolved))
+            .map_err(|e| BundleError::Git(Box::new(e)))?;
+    let tip_id = *tip_sha.as_object_id();
 
     // Follow symrefs one level (HEAD -> refs/heads/main) for the bundle ref line.
     let ref_name = match repo.try_find_reference(spec) {
@@ -370,7 +405,7 @@ fn resolve_spec_to_ref(
         _ => spec.to_owned(),
     };
 
-    Ok((tip_id, ref_name))
+    Ok((tip_id, ref_name, tag_chain))
 }
 
 /// Errors from [`create`] and [`unbundle`].
@@ -412,6 +447,11 @@ pub enum BundleError {
     /// I/O error.
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// Underlying git operation failed (peel, find-object, etc.) —
+    /// surfaces e.g. `GitError::TagTargetUnsupported` from the shared
+    /// peel helper.
+    #[error(transparent)]
+    Git(Box<crate::git::GitError>),
 }
 
 impl From<gix::open::Error> for BundleError {
@@ -614,6 +654,206 @@ mod tests {
                 );
             }
             other => panic!("expected InvalidHeader for truncation, got {other:?}"),
+        }
+    }
+
+    // --- create / unbundle round-trips with tag chains ----------------
+
+    use gix::actor::SignatureRef;
+    use tempfile::TempDir;
+
+    fn signature() -> SignatureRef<'static> {
+        SignatureRef {
+            name: BStr::new("Tester"),
+            email: BStr::new("t@example.com"),
+            time: "0 +0000",
+        }
+    }
+
+    /// Single-commit fixture; returns `(repo_dir, commit_oid)`.
+    fn fixture_commit() -> (TempDir, ObjectId) {
+        let tmp = TempDir::new().unwrap();
+        let repo = gix::init(tmp.path()).unwrap();
+        let blob = repo.write_blob(b"hello").unwrap().detach();
+        let tree = repo
+            .write_object(&gix::objs::Tree {
+                entries: vec![gix::objs::tree::Entry {
+                    mode: gix::objs::tree::EntryKind::Blob.into(),
+                    filename: "a.txt".into(),
+                    oid: blob,
+                }],
+            })
+            .unwrap()
+            .detach();
+        let commit = repo
+            .commit_as(
+                signature(),
+                signature(),
+                "refs/heads/main",
+                "first",
+                tree,
+                std::iter::empty::<ObjectId>(),
+            )
+            .unwrap()
+            .detach();
+        (tmp, commit)
+    }
+
+    fn write_annotated_tag(
+        repo: &gix::Repository,
+        target: ObjectId,
+        target_kind: gix::object::Kind,
+        name: &str,
+    ) -> ObjectId {
+        let tag = gix::objs::Tag {
+            target,
+            target_kind,
+            name: name.into(),
+            tagger: Some(signature().to_owned().expect("static signature is valid")),
+            message: "release".into(),
+            pgp_signature: None,
+        };
+        repo.write_object(&tag).unwrap().detach()
+    }
+
+    fn create_tag_ref(repo: &gix::Repository, name: &str, target: ObjectId) {
+        repo.reference(
+            name,
+            target,
+            gix::refs::transaction::PreviousValue::MustNotExist,
+            "create tag",
+        )
+        .unwrap();
+    }
+
+    /// Install a bundle into a fresh repo and return the destination
+    /// repo handle (and its tempdir, which keeps the on-disk state alive).
+    fn install_bundle_into_fresh_repo(
+        bundle_path: &Path,
+        sha: Sha,
+        ref_name: &RefName,
+    ) -> (TempDir, gix::Repository) {
+        let dst = TempDir::new().unwrap();
+        gix::init(dst.path()).unwrap();
+        let folder = bundle_path.parent().unwrap().to_owned();
+        unbundle(dst.path(), &folder, sha, ref_name).unwrap();
+        let dst_repo = gix::open(dst.path()).unwrap();
+        (dst, dst_repo)
+    }
+
+    #[test]
+    fn bundle_create_round_trips_annotated_tag() {
+        // E9: bundle's pack must include the tag object so a fetch-back
+        // resolves `refs/tags/v1` to the tag-OID and `v1^{}` finds the
+        // commit.
+        let (repo_dir, commit) = fixture_commit();
+        let repo = gix::open(repo_dir.path()).unwrap();
+        let tag_oid = write_annotated_tag(&repo, commit, gix::object::Kind::Commit, "v1");
+        create_tag_ref(&repo, "refs/tags/v1", tag_oid);
+        drop(repo);
+
+        let folder = TempDir::new().unwrap();
+        let tag_sha = Sha::from_object_id(tag_oid);
+        let bundle_path =
+            create(repo_dir.path(), folder.path(), tag_sha, "refs/tags/v1").expect("create bundle");
+
+        let ref_name = RefName::new("refs/tags/v1").unwrap();
+        let (_dst_dir, dst_repo) = install_bundle_into_fresh_repo(&bundle_path, tag_sha, &ref_name);
+        let odb = dst_repo.objects.clone().into_inner();
+        assert!(
+            odb.contains(&tag_oid),
+            "tag object must be installed by unbundle",
+        );
+        assert!(
+            odb.contains(&commit),
+            "commit target must also be installed"
+        );
+        let tag_obj = dst_repo
+            .find_object(tag_oid)
+            .unwrap()
+            .peel_to_kind(gix::object::Kind::Tag)
+            .unwrap();
+        assert_eq!(
+            tag_obj.into_tag().target_id().unwrap().detach(),
+            commit,
+            "round-tripped tag must point at the original commit",
+        );
+    }
+
+    #[test]
+    fn bundle_create_with_branch_tip_emits_unchanged_pack() {
+        // E1: regression — the second AsIs pass MUST be gated on a
+        // non-empty tag chain. Pin the object count for the
+        // commit-only case (commit + tree + blob = 3).
+        let (repo_dir, commit) = fixture_commit();
+        let folder = TempDir::new().unwrap();
+        create(
+            repo_dir.path(),
+            folder.path(),
+            Sha::from_object_id(commit),
+            "refs/heads/main",
+        )
+        .expect("create bundle");
+
+        // Install into a fresh repo and count via the .idx that
+        // gix-pack derives — `num_objects()` is the wire-stable
+        // measure that catches the AsIs second-pass leaking into the
+        // empty-tag-chain code path.
+        let dst = TempDir::new().unwrap();
+        gix::init(dst.path()).unwrap();
+        let ref_name = RefName::new("refs/heads/main").unwrap();
+        unbundle(
+            dst.path(),
+            folder.path(),
+            Sha::from_object_id(commit),
+            &ref_name,
+        )
+        .unwrap();
+        let dst_repo = gix::open(dst.path()).unwrap();
+        // Find the installed pack and count its entries.
+        let pack_dir = dst_repo.git_dir().join("objects/pack");
+        let idx_path = std::fs::read_dir(&pack_dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|ext| ext == "idx"))
+            .expect("idx file must exist");
+        let idx = gix_pack::index::File::at(&idx_path, gix_hash::Kind::Sha1).unwrap();
+        assert_eq!(
+            idx.num_objects(),
+            3,
+            "branch-tip bundle must contain commit + tree + blob (no tag chain)",
+        );
+    }
+
+    #[test]
+    fn bundle_create_rejects_tag_pointing_to_blob_with_tag_target_unsupported() {
+        // E6: tag-of-blob is out of scope; bundle::create must surface
+        // the typed `TagTargetUnsupported` error rather than emitting a
+        // partial pack.
+        let (repo_dir, _commit) = fixture_commit();
+        let repo = gix::open(repo_dir.path()).unwrap();
+        let blob = repo.write_blob(b"data").unwrap().detach();
+        let tag_oid = write_annotated_tag(&repo, blob, gix::object::Kind::Blob, "blob-tag");
+        create_tag_ref(&repo, "refs/tags/blob-tag", tag_oid);
+        drop(repo);
+
+        let folder = TempDir::new().unwrap();
+        let err = create(
+            repo_dir.path(),
+            folder.path(),
+            Sha::from_object_id(tag_oid),
+            "refs/tags/blob-tag",
+        )
+        .expect_err("tag-of-blob must be rejected");
+        match err {
+            BundleError::Git(boxed) => match *boxed {
+                crate::git::GitError::TagTargetUnsupported { kind, .. } => {
+                    assert_eq!(kind, gix::object::Kind::Blob);
+                }
+                other => panic!("expected TagTargetUnsupported, got {other:?}"),
+            },
+            other => panic!("expected BundleError::Git, got {other:?}"),
         }
     }
 }

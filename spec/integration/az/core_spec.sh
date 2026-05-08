@@ -136,8 +136,31 @@ Describe "Azure helper: core git operations against Azurite"
 				refs/tags/v1 "$SHA_TAG"
 		}
 
+		# Fetch round-trip — the on-bucket pack must contain the tag
+		# object, otherwise `git fetch` lands the commits but cannot
+		# update `refs/tags/v1` to the tag-OID.
+		verify_tag_round_trips_via_fetch() {
+			local DST="$SHELLSPEC_TMPDIR/dst-$$-$RANDOM"
+			git clone -q "$URL" "$DST" || return 1
+			local kind
+			kind=$(git -C "$DST" cat-file -t v1 2>/dev/null) || return 1
+			[[ "$kind" == "tag" ]] || {
+				echo "expected tag, got $kind" >&2
+				return 1
+			}
+			git -C "$DST" cat-file -p v1 | grep -q "release v1" || {
+				echo "annotation message did not round-trip" >&2
+				return 1
+			}
+		}
+
 		It "lands a bundle for each new ref"
 			When call verify_branch_and_tag
+			The status should equal 0
+		End
+
+		It "round-trips the annotated tag through fetch"
+			When call verify_tag_round_trips_via_fetch
 			The status should equal 0
 		End
 	End
