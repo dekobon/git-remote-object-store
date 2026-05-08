@@ -88,6 +88,7 @@ The runner verifies these are on `PATH`:
 - `git` (>= 2.40)
 - `git-lfs` (only required for `lfs_spec.sh`)
 - `jq`
+- `script(1)` (only required for `manage_cli_spec.sh`)
 
 Missing tools fail fast with the missing list (not one-by-one).
 
@@ -177,6 +178,7 @@ The runner verifies these are on `PATH`:
 - `git` (>= 2.40)
 - `git-lfs` (only required for `lfs_spec.sh`)
 - `jq`
+- `script(1)` (only required for `manage_cli_spec.sh`)
 
 Missing tools fail fast with the missing list (not one-by-one).
 
