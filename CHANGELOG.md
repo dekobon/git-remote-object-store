@@ -18,6 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   injectable writer, making the full doctor output (report, fixer
   prompts, stale-lock scan) unit-testable without spawning the
   management binary (#74).
+- `make shellspec-live-s3` and `make shellspec-live-azure` now run
+  every implemented storage engine in turn (`bundle`, `packchain`)
+  instead of bundle only. The Makefile knob `ENGINE=<name>` is
+  replaced with `ENGINES="<name> ..."`; pass `ENGINES=bundle` (or
+  `ENGINES=packchain`) to scope a run to a single engine. Empty
+  `ENGINES` is rejected at the target boundary instead of silently
+  no-opping.
+- Stale `Phase N / not yet implemented` doc-comments across the
+  `packchain` module rewritten to reflect shipped reality: push
+  (#63), fetch (#64), `read_blob` (#65), GC (#66), and compaction
+  (#67) are described as implemented; references to "Phase 5 GC"
+  replaced with `manage gc`.
 
 ### Fixed
 
@@ -26,8 +38,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`lfs/`) as bare refs. Refs with a `chain.json` manifest now
   report "Ok" instead of "No bundles" (#75).
 
+### Removed
+
+- **Breaking** (Rust API): `ProtocolError::EngineNotImplemented`
+  variant removed. The variant was a leftover from packchain Phase 1
+  scaffolding and was never constructed once push (#63), fetch (#64),
+  `read_blob` (#65), GC (#66), and compaction (#67) shipped. Both
+  `StorageEngine` variants (`bundle`, `packchain`) cover the full
+  protocol surface, so the variant could not fire. Downstream code
+  that exhaustively matched `ProtocolError` and had a branch for
+  `EngineNotImplemented` will need to drop the branch (the branch was
+  dead code anyway).
+
 ### Added
 
+- Live-cloud shellspec tier expanded to engine parity. New
+  `spec/live_s3_spec.sh` mirrors `spec/live_az_spec.sh`'s structure
+  with unit-level coverage of `spec/support/live_s3.sh` (URL grammar,
+  `aws` argv composition, `clear_prefix` safety guard) — runs as part
+  of the default `make shellspec` suite, no cloud calls. New
+  `spec/live/{s3,az}/manage_cli_spec.sh` and
+  `spec/live/{s3,az}/shallow_fetch_spec.sh` port the integration-tier
+  `manage_cli` and `shallow_fetch` scenarios to the live tier so the
+  management CLI and shallow-fetch paths are exercised against real
+  AWS / Azure SDK chains.
+- `assert_ls_remote_ref_present` and `assert_ls_remote_sha` helpers
+  in `spec/support/git_scenarios.sh` provide engine-agnostic pre/
+  post-conditions for tests where the bundle-format-only assertions
+  (`assert_bundle_count`, `assert_bundle_sha_for_ref`) are gated
+  behind `live_engine_is_bundle` and would otherwise pass vacuously
+  under packchain. Applied retroactively to `core_spec.sh`
+  delete-branch and `force_push_spec.sh` force-push tests for both
+  engines.
+- `script(1)` added to the live-tier tools list in
+  `spec/live/README.md` (only required for `manage_cli_spec.sh`'s
+  pty-allocated `delete-branch` confirmation prompt).
 - `packchain` `bundle-uri` presigned URLs (issue #76, completes
   the deferred follow-up from #71): a new
   `?bundle_uri_presign_ttl=<seconds>` URL flag asks the helper to
