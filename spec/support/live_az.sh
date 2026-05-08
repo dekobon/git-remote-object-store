@@ -72,9 +72,13 @@ live_az_credential_env_value() {
 # have configured (e.g. a previous `az login` that points at a
 # different subscription).
 #
-# Auth flags are placed BEFORE the user's args so that `set -x` traces
-# read in the conventional order (`az storage --account-name X
-# --account-key Y blob list ...`). Az CLI itself is order-agnostic.
+# Auth flags are appended AFTER the user's args. The az CLI resolves
+# the subcommand path (`storage` → `blob` → `upload`) positionally
+# before parsing leaf-command options, so inserting `--account-name X`
+# between `storage` and `blob` causes the parser to treat the value
+# `X` as a subgroup candidate and fail with "misspelled or not
+# recognized." Once the full path is consumed, options can appear in
+# any order at the tail.
 #
 # Usage: live_az <storage-subcommand> [args...]
 #   e.g. live_az blob list --container-name foo --prefix bar
@@ -100,7 +104,7 @@ live_az() {
 			return 1
 			;;
 	esac
-	az storage "${auth_args[@]}" "$@"
+	az storage "$@" "${auth_args[@]}"
 }
 
 # live_az_url <prefix>
