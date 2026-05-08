@@ -232,20 +232,27 @@ shellspec-integration: shellspec-integration-s3 shellspec-integration-azure
 # acknowledgement variable `LIVE_TESTS_I_UNDERSTAND_THIS_COSTS_MONEY=1`
 # to be exported in the operator's environment; without it every spec
 # aborts at `BeforeAll` with a loud message. See `spec/live/README.md`
-# for setup, env vars, costs, and cleanup details. `ENGINE` defaults
-# to `bundle`; pass `ENGINE=...` to forward a different storage engine
-# through to the helper URL.
-ENGINE ?= bundle
+# for setup, env vars, costs, and cleanup details. `ENGINES` defaults
+# to every implemented storage engine, so the live suite exercises each
+# one in turn against the same backend. Override with `ENGINES=bundle`
+# (or `ENGINES=packchain`) to scope a run to a single engine.
+ENGINES ?= bundle packchain
 
 shellspec-live-s3: build
-	@echo "Running shellspec live AWS S3 suite..."
-	@LIVE_S3=1 LIVE_ENGINE="$(ENGINE)" shellspec --shell bash -j 1 \
-	  spec/cli_basics_spec.sh spec/live/s3
+	@[ -n "$(strip $(ENGINES))" ] || { echo "ENGINES is empty (set ENGINES=bundle, =packchain, or unset to use the default)" >&2; exit 1; }
+	@for engine in $(ENGINES); do \
+	  echo "Running shellspec live AWS S3 suite ($$engine)..."; \
+	  LIVE_S3=1 LIVE_ENGINE="$$engine" shellspec --shell bash -j 1 \
+	    spec/cli_basics_spec.sh spec/live/s3 || exit $$?; \
+	done
 
 shellspec-live-azure: build
-	@echo "Running shellspec live Azure Blob suite..."
-	@LIVE_AZ=1 LIVE_ENGINE="$(ENGINE)" shellspec --shell bash -j 1 \
-	  spec/cli_basics_spec.sh spec/live/az
+	@[ -n "$(strip $(ENGINES))" ] || { echo "ENGINES is empty (set ENGINES=bundle, =packchain, or unset to use the default)" >&2; exit 1; }
+	@for engine in $(ENGINES); do \
+	  echo "Running shellspec live Azure Blob suite ($$engine)..."; \
+	  LIVE_AZ=1 LIVE_ENGINE="$$engine" shellspec --shell bash -j 1 \
+	    spec/cli_basics_spec.sh spec/live/az || exit $$?; \
+	done
 
 # Umbrella target. Fans out to every live-cloud suite. The S3 and Azure
 # targets are independent — operators can run either or both depending
