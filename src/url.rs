@@ -105,14 +105,21 @@ pub enum StorageEngine {
 }
 
 impl StorageEngine {
+    /// Every storage engine this client recognises.
+    ///
+    /// Single source of truth for diagnostics that need to enumerate
+    /// the supported set (see [`Self::supported_list_str`]). When a new
+    /// variant is added, append it here and every diagnostic that drives
+    /// its wording from this list updates automatically.
+    pub(crate) const ALL: &'static [Self] = &[Self::Bundle, Self::Packchain];
+
     /// Parse an engine from its canonical string name. Returns `None` for
     /// unrecognised names.
     pub(crate) fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "bundle" => Some(Self::Bundle),
-            "packchain" => Some(Self::Packchain),
-            _ => None,
-        }
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|engine| engine.as_str() == name)
     }
 
     /// The canonical name for this engine, as stored in the `FORMAT` key and
@@ -123,6 +130,21 @@ impl StorageEngine {
             Self::Bundle => "bundle",
             Self::Packchain => "packchain",
         }
+    }
+
+    /// Human-readable comma-separated list of every supported engine name,
+    /// each wrapped in backticks (e.g. `` "`bundle`, `packchain`" ``).
+    ///
+    /// Used by [`ParseError::UnknownEngine`] and
+    /// [`crate::protocol::backend::BackendError::UnknownStoredEngine`] so
+    /// that diagnostics stay in sync with [`Self::ALL`].
+    #[must_use]
+    pub(crate) fn supported_list_str() -> String {
+        Self::ALL
+            .iter()
+            .map(|engine| format!("`{}`", engine.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -262,7 +284,10 @@ pub enum ParseError {
     #[error("unknown query flag `{0}`")]
     UnknownFlag(String),
     /// `?engine=` value is not a recognised engine name.
-    #[error("unknown engine `{0}`; expected `bundle`")]
+    #[error(
+        "unknown engine `{0}`; expected one of {supported}",
+        supported = StorageEngine::supported_list_str()
+    )]
     UnknownEngine(String),
     /// An `amazonaws.com` hostname that cannot be a valid S3 endpoint.
     ///
@@ -1068,6 +1093,27 @@ mod tests {
             matches!(err, ParseError::UnknownEngine(ref s) if s.is_empty()),
             "expected UnknownEngine(\"\"), got {err:?}",
         );
+    }
+
+    #[test]
+    fn unknown_engine_error_message_lists_every_supported_engine() {
+        // Iterating over `StorageEngine::ALL` keeps this regression test
+        // synchronised with the enum: a new variant whose name is missing
+        // from the rendered diagnostic fails this assertion.
+        let err =
+            parse("s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=pack").unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("unknown engine `pack`"),
+            "missing rejected-value in `{rendered}`",
+        );
+        for engine in StorageEngine::ALL {
+            assert!(
+                rendered.contains(&format!("`{}`", engine.as_str())),
+                "UnknownEngine message must mention engine `{}`, got `{rendered}`",
+                engine.as_str(),
+            );
+        }
     }
 
     #[test]
