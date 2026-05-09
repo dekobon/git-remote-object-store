@@ -175,7 +175,7 @@ async fn classify_into(
     }
 
     let entry = snapshot.refs.entry(ref_path.to_owned()).or_default();
-    if last.starts_with("PROTECTED#") {
+    if last.starts_with(crate::keys::PROTECTED_MARKER_SEGMENT) {
         entry.is_protected = true;
     } else if let Some(sha) = last.strip_suffix(".bundle") {
         entry.bundles.push(BundleEntry {

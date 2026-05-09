@@ -169,12 +169,21 @@ pub(crate) fn enumerate_tree_closure(
 /// symlink at this tree level, and recurses into subtrees.
 ///
 /// `ancestors` is the set of tree OIDs on the current descent path —
-/// pushed on entry, popped before return. If `tree_id` is already in
-/// the set the descent has hit a cycle and aborts with
-/// [`PackchainError::TreeCycle`]. The set is per-descent rather than
-/// global because shared subtrees at distinct paths (`src/foo/` and
-/// `vendor/foo/` with identical content) are legitimate and must each
-/// be walked — only re-entry on the active path is a cycle.
+/// pushed on entry, popped before return on the success path. If
+/// `tree_id` is already in the set the descent has hit a cycle and
+/// aborts with [`PackchainError::TreeCycle`]. The set is per-descent
+/// rather than global because shared subtrees at distinct paths
+/// (`src/foo/` and `vendor/foo/` with identical content) are
+/// legitimate and must each be walked — only re-entry on the active
+/// path is a cycle.
+///
+/// **Pop discipline on error**: when an inner `?` propagates a failure,
+/// `tree_id` is left in `ancestors` rather than popped. This is safe
+/// because the only caller is [`extract_path_index`], which constructs
+/// a fresh `HashSet` per invocation and does not reuse it after an
+/// error returns. If a future caller threads the same set across
+/// multiple `walk_tree` calls, switch to a drop-guard (`scopeguard`,
+/// or a small RAII wrapper) so the pop runs unconditionally.
 fn walk_tree(
     repo: &Repository,
     tree_id: ObjectId,

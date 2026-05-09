@@ -26,7 +26,20 @@ use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, ProgressSin
 use crate::url::StorageEngine;
 
 /// Default per-ref lock TTL, in seconds.
+/// Default lock TTL (seconds) when [`ENV_LOCK_TTL_SECONDS`] is unset
+/// or unparseable.
+///
+/// Widened to `pub` under `cfg(any(test, feature = "test-util"))` so
+/// integration tests can pin the wire-format error message without
+/// re-deriving the magic number from a parallel literal that could
+/// drift from this constant unnoticed.
+#[cfg(not(any(test, feature = "test-util")))]
 pub(crate) const DEFAULT_LOCK_TTL_SECONDS: u64 = 60;
+
+/// Default lock TTL (seconds) when [`ENV_LOCK_TTL_SECONDS`] is unset
+/// or unparseable. Exposed for integration-test wire-format pinning.
+#[cfg(any(test, feature = "test-util"))]
+pub const DEFAULT_LOCK_TTL_SECONDS: u64 = 60;
 
 /// Push configuration that is constant across an entire batch.
 ///
@@ -195,13 +208,21 @@ pub(crate) fn head_key(prefix: Option<&str>) -> String {
     keys::join(prefix.unwrap_or(""), "HEAD")
 }
 
-/// Bundle-candidate filter: drop any key containing `PROTECTED#`,
-/// `.zip`, `/LOCKS/`, or ending in `.lock`. The case-sensitive `.lock`
+/// Bundle-candidate filter: drop any protected-marker key, `.zip`,
+/// `/LOCKS/`, or any `.lock` key. The case-sensitive `.lock`
 /// suffix is deliberate — bucket keys are case-sensitive and the lock
 /// filename is hard-coded.
+///
+/// The protection check uses last-segment equality via
+/// [`keys::is_protected_marker_segment`] — substring matching against
+/// the full key would false-match any future schema artefact whose
+/// path happened to contain the marker literal.
 #[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn is_bundle_candidate(key: &str) -> bool {
-    !key.contains("PROTECTED#")
+    let last_is_protected_marker = key
+        .rsplit_once('/')
+        .is_some_and(|(_, last)| keys::is_protected_marker_segment(last));
+    !last_is_protected_marker
         && !key.contains(".zip")
         && !key.contains("/LOCKS/")
         && !key.ends_with(".lock")
@@ -223,13 +244,17 @@ async fn bundles_for_ref(
         .collect())
 }
 
-/// Returns `true` iff a `<prefix>/<ref>/PROTECTED#…` marker exists.
+/// Returns `true` iff a `<prefix>/<ref>/PROTECTED#` marker exists.
 pub(crate) async fn is_protected(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
     remote_ref: &RefName,
 ) -> Result<bool, ObjectStoreError> {
-    let listing = format!("{}PROTECTED#", ref_listing_prefix(prefix, remote_ref));
+    let listing = format!(
+        "{}{}",
+        ref_listing_prefix(prefix, remote_ref),
+        keys::PROTECTED_MARKER_SEGMENT,
+    );
     let metas = store.list(&listing).await?;
     Ok(!metas.is_empty())
 }
@@ -888,17 +913,26 @@ const DELETE_EXPECTED_WITH_ZIP: usize = 2;
 /// appropriate error.
 ///
 /// The listing is **unfiltered** on purpose — it counts `LOCK#.lock`,
-/// `PROTECTED#`, and `repo.zip` against the expected total. Three
-/// behaviours fall out:
+/// `PROTECTED#`, and `repo.zip` against the expected total. The
+/// protected-marker case shares the "extra keys" branch with genuine
+/// multi-bundle corruption; the routing distinguishes them by inspecting
+/// the listing for the marker. Three behaviours fall out:
 ///
-/// 1. A protected ref (`PROTECTED#` marker) cannot be deleted via
-///    `git push :ref`. The marker is detected before the generic
-///    multi-bundle error, and a protection-specific refusal is emitted
-///    that names the management CLI's `unprotect` workflow.
-/// 2. A genuine multi-bundle/corruption case (extra keys, no
-///    `PROTECTED#` marker) still falls through to the doctor message.
-/// 3. A ref whose only object is a stale `LOCK#.lock` deletes that
-///    lock as if it were the bundle and returns `ok`.
+/// 1. **Protected ref** — listing includes a key whose final segment
+///    is the [`keys::PROTECTED_MARKER_SEGMENT`]. Emit a
+///    protection-specific refusal naming the management CLI's
+///    `unprotect` workflow. Example listing:
+///    `[ "<prefix>/refs/heads/main/<sha>.bundle",
+///       "<prefix>/refs/heads/main/PROTECTED#" ]` — count exceeds
+///    `expected = 1`, marker present, route to (1).
+/// 2. **Genuine multi-bundle / corruption** — count exceeds
+///    `expected`, no marker. Fall through to the doctor message.
+///    Example listing:
+///    `[ "<prefix>/refs/heads/main/<sha-a>.bundle",
+///       "<prefix>/refs/heads/main/<sha-b>.bundle" ]`.
+/// 3. **Stale lock alone** — single `LOCK#.lock` key matches the
+///    expected count and is deleted as if it were the bundle. Returns
+///    `ok`. (Behaviour predates the protection-routing split.)
 async fn delete_remote_ref(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
@@ -925,7 +959,11 @@ async fn delete_remote_ref(
             remote_ref: remote_ref_str,
             message: r#""not found"?"#.to_owned(),
         })
-    } else if entries.iter().any(|e| e.key.contains("PROTECTED#")) {
+    } else if entries.iter().any(|e| {
+        e.key
+            .rsplit_once('/')
+            .is_some_and(|(_, last)| keys::is_protected_marker_segment(last))
+    }) {
         Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
             message:
