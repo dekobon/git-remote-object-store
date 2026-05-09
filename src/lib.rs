@@ -49,13 +49,13 @@
 //!
 //! # Architecture
 //!
-//! This crate was originally seeded as a Rust port of
-//! [`awslabs/git-remote-s3`][upstream] and now stands on its own,
-//! adding an Azure Blob Storage backend alongside S3. The on-bucket
-//! object layout is preserved so existing buckets written by the
-//! upstream Python tool remain readable.
-//!
-//! [upstream]: https://github.com/awslabs/git-remote-s3
+//! This crate ships two backends behind one shared [`ObjectStore`]
+//! trait — AWS S3 (and S3-compatible endpoints) and Azure Blob
+//! Storage. The on-bucket key layout, locking semantics, helper-
+//! protocol behaviour, and management-CLI shape are this project's
+//! own decisions; the only external contracts are the git
+//! helper-protocol, the LFS protocol, and the cloud-provider HTTP
+//! APIs.
 
 pub(crate) mod bundle;
 pub mod git;

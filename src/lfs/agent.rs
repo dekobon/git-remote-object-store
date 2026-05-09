@@ -23,8 +23,7 @@ use crate::lfs::oid::LfsOid;
 use crate::lfs::protocol::{CompleteEvent, EventError, ProgressEvent};
 use crate::object_store::{GetOpts, ObjectStore, ObjectStoreError, ProgressSink, PutOpts};
 
-/// Generic error code surfaced in `complete` event payloads. Matches
-/// upstream `git_remote_s3/lfs.py:write_error_event` (`code=2`).
+/// Generic error code surfaced in `complete` event payloads.
 const ERR_CODE_GENERIC: u32 = 2;
 
 /// Driver for a single LFS session against one remote.
@@ -79,9 +78,8 @@ impl Agent {
     /// Handle an `upload` event: skip when the key already exists,
     /// otherwise stream the file body and emit per-chunk progress plus
     /// a final complete event. Progress events flow live as the body
-    /// crosses chunk boundaries (matching upstream
-    /// `git_remote_s3/lfs.py:25-41`'s `ProgressPercentage` callback)
-    /// instead of as one trailing event with the full size.
+    /// crosses chunk boundaries instead of as one trailing event with
+    /// the full size.
     pub(crate) async fn upload<W: AsyncWrite + Unpin>(
         &self,
         oid_raw: &str,
@@ -519,9 +517,8 @@ mod tests {
 
     /// When the body crosses the configured chunk threshold, the LFS
     /// agent must emit at least two `progress` events so `git-lfs` can
-    /// render motion and detect stalls. The previous behaviour
-    /// (single end-of-transfer event) regressed the upstream Python
-    /// per-chunk semantics — see issue #44.
+    /// render motion and detect stalls. A previous single-end-of-transfer
+    /// event regressed per-chunk semantics — see issue #44.
     #[tokio::test]
     async fn upload_emits_chunked_progress_for_multipart_body() {
         let store = MockStore::new();

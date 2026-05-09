@@ -544,9 +544,8 @@ async fn batched_push_continues_after_per_push_transport_failure() {
 #[tokio::test]
 async fn lock_release_failure_overrides_successful_push() {
     // When the push itself succeeds but the lock cannot be released,
-    // the outcome must be `error <ref> ...`, not `ok <ref>`. This
-    // matches upstream `cmd_push`'s `finally` block
-    // (`../git-remote-s3/git_remote_s3/remote.py:297-303`).
+    // the outcome must be `error <ref> ...`, not `ok <ref>`, so the
+    // operator is alerted instead of silently leaving a dangling lock.
     use git_remote_object_store::object_store::mock::Fault;
     if !git_available() {
         eprintln!("skipping: git not on PATH");

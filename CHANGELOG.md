@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Documentation positioning shift.** The project no longer documents
+  itself as a Rust port of, or maintains any compatibility contract
+  with, `awslabs/git-remote-s3` (Python). The on-bucket key layout,
+  URL grammar, locking semantics, error wording, helper-protocol
+  output bytes, LFS JSON events, and management-CLI shape are all this
+  project's own decisions, free to evolve. README, `AGENTS.md`,
+  crate-level docs, `src/url.rs::StorageEngine::Bundle`, and the
+  lessons-learned guide were rewritten to drop the "upstream Python
+  tool" framing; every in-source `git_remote_s3/...py[:LINE]` citation
+  comment was stripped from `src/`, `cli/`, and `tests/`. The
+  `bucket-compat` issue label is no longer used. The `awslabs` /
+  `bgahagan` / `nicolas-graves` projects are still credited in the
+  README as inspiration; nothing else.
+
+  Binary names (`git-remote-s3-https`, `git-remote-az-https`, …) and
+  URL scheme prefixes (`s3+https://`, `az+https://`) are unchanged.
+  Renaming them is a breaking change and is deliberately out of scope
+  for this positioning shift; any future rename will be tracked on its
+  own issue.
+
 ### Added
 
 - Annotated-tag refs whose chain ends at a tree or blob now push

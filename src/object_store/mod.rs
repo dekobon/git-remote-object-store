@@ -38,9 +38,6 @@ pub use self::error::{BoxError, ObjectStoreError};
 /// event per ranged GET on multipart downloads, one event per body
 /// chunk on small-object reads, and a single end-of-transfer event on
 /// single-PUT uploads. Callers accumulate `bytes_so_far` themselves.
-/// Matches upstream `ProgressPercentage.__call__` in
-/// `../git-remote-s3/git_remote_s3/lfs.py:25-41` (one event per network
-/// chunk).
 ///
 /// The callback runs on the backend's task and may be invoked from a
 /// spawned worker, so it must be cheap and non-blocking. The LFS agent
@@ -105,8 +102,7 @@ pub struct ObjectMeta {
 /// Optional `put_bytes` / `put_path` knobs.
 ///
 /// `content_disposition` and `user_metadata` are populated only by the
-/// zip-archive push path (`../git-remote-s3/git_remote_s3/remote.py:275-281`),
-/// where upstream supplies `Content-Disposition` and the
+/// zip-archive push path, which supplies `Content-Disposition` and the
 /// `codepipeline-artifact-revision-summary` user metadata. `progress`
 /// is populated by the LFS agent so long uploads can drive the
 /// `git-lfs` progress bar; left `None` for bundle / lock / HEAD writes

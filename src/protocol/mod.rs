@@ -150,9 +150,7 @@ enum Command {
 /// Which batched command stream is currently being collected.
 ///
 /// Push and fetch are mutually exclusive within a batch — switching
-/// between them resets the accumulator (matches upstream's
-/// `process_cmd` mode flip in
-/// `../git-remote-s3/git_remote_s3/remote.py:498-536`).
+/// between them resets the accumulator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Fetch,
@@ -275,8 +273,7 @@ fn parse_command(line: &str) -> Option<Command> {
 }
 
 /// Run the helper REPL until stdin closes (clean exit) or the writer
-/// breaks (`BrokenPipe` — also a clean exit, mirroring upstream's
-/// `os.dup2(devnull, stdout)` trick).
+/// breaks (`BrokenPipe` — also a clean exit).
 ///
 /// `repo_dir` is the local repository the helper is operating against;
 /// the parallel fetch path uses it as the cwd for `git bundle unbundle`.
@@ -380,7 +377,7 @@ where
                         (Mode::Fetch, StorageEngine::Bundle) => {
                             // Take depth so it applies to *this* batch only; a
                             // subsequent fetch without a fresh `option depth`
-                            // line must clone fully, matching upstream git's
+                            // line must clone fully, matching git's
                             // per-operation depth contract.
                             fetch_batch(&ctx, cmds, fetched_refs.clone(), depth.take()).await?;
                         }
@@ -459,9 +456,8 @@ mod tests {
     #[test]
     fn parse_command_rejects_garbage() {
         assert_eq!(parse_command("nonsense\n"), None);
-        // Whitespace-only is treated as garbage (parity with upstream's
-        // strict `cmd == "\n"` blank-line check; only a literal blank
-        // line is the batch separator).
+        // Whitespace-only is treated as garbage; only a literal blank
+        // line is the batch separator.
         assert_eq!(parse_command("   \n"), None);
         // Double-space inside a recognised command is rejected. Pinning
         // strict byte-exact matching on the protocol verbs against any

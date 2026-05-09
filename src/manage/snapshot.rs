@@ -1,8 +1,7 @@
 //! Read-only view of a repository's on-bucket layout, built by listing
 //! `<prefix>/` and grouping the results into refs, bundles, protection
-//! markers, and HEAD. Mirrors the `analyze_repo` step in upstream
-//! `../git-remote-s3/git_remote_s3/manage.py`, but flattened to the
-//! single-repo case (one CLI invocation == one prefix).
+//! markers, and HEAD. Flattened to the single-repo case (one CLI
+//! invocation == one prefix).
 
 use std::collections::BTreeMap;
 
@@ -78,10 +77,9 @@ impl RepoSnapshot {
 ///
 /// `prefix` must be the full repository prefix from the parsed remote
 /// URL (e.g. `acme/myrepo`), without a trailing `/` — this function
-/// appends one to match the upstream listing semantics. An empty
-/// `prefix` means "list the entire bucket/container" (root-of-bucket
-/// repository) and skips the trailing `/` to avoid emitting a
-/// leading-slash list prefix.
+/// appends one. An empty `prefix` means "list the entire
+/// bucket/container" (root-of-bucket repository) and skips the trailing
+/// `/` to avoid emitting a leading-slash list prefix.
 ///
 /// Performs one `list` call. Production callers always already have a
 /// listing in hand and use [`analyze_objects`] directly to share the

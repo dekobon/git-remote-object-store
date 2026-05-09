@@ -11,9 +11,8 @@ use std::str::FromStr;
 use thiserror::Error;
 
 /// Length of a SHA-256 hex string. The LFS spec pins SHA-256, and the
-/// upstream agent (`../git-remote-s3/git_remote_s3/lfs.py`) uses
-/// `event["oid"]` verbatim as a key suffix; we enforce the format up
-/// front so a bad event cannot poison the bucket namespace.
+/// agent uses `event["oid"]` verbatim as a key suffix; we enforce the
+/// format up front so a bad event cannot poison the bucket namespace.
 const SHA256_HEX_LEN: usize = 64;
 
 /// Validated lowercase SHA-256 hex string.

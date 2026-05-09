@@ -1,19 +1,16 @@
 //! Parallel `fetch` handler.
 //!
 //! The remote-helper protocol delivers `fetch` commands as a batch
-//! terminated by a blank line (see `gitremote-helpers(1)`). Upstream
-//! Python's `process_fetch_cmds` (`../git-remote-s3/git_remote_s3/remote.py:477-496`)
-//! services the batch with a `ThreadPoolExecutor`; we mirror that with a
-//! [`tokio::task::JoinSet`] bounded by a [`tokio::sync::Semaphore`] of
-//! [`MAX_FETCH_CONCURRENCY`] permits — matching upstream's
-//! `max_concurrency=8` setting.
+//! terminated by a blank line (see `gitremote-helpers(1)`). The batch
+//! is serviced by a [`tokio::task::JoinSet`] bounded by a
+//! [`tokio::sync::Semaphore`] of [`MAX_FETCH_CONCURRENCY`] permits.
 //!
 //! Per fetch:
 //! 1. Download `<prefix>/<ref>/<sha>.bundle` to a private tempdir
 //! 2. `git bundle unbundle` it for `<ref>` (subprocess, see [`crate::git`])
 //! 3. Mark the SHA as fetched in the session-wide [`FetchedRefs`] set
 //!    so a second batch within the same REPL session skips work that
-//!    has already happened (parity with upstream's `fetched_refs` list).
+//!    has already happened.
 //!
 //! Stdout discipline: this handler emits nothing on stdout. The trailing
 //! blank-line terminator is the REPL's responsibility — see
@@ -33,9 +30,7 @@ use crate::git::{self, GitError, RefName, RefNameError, Sha, ShaError};
 use crate::keys;
 use crate::object_store::{GetOpts, ObjectStore, ObjectStoreError};
 
-/// Maximum number of in-flight bundle fetches per batch. Matches
-/// upstream `boto3.s3.transfer.TransferConfig(max_concurrency=8)` from
-/// `../git-remote-s3/git_remote_s3/remote.py:147`.
+/// Maximum number of in-flight bundle fetches per batch.
 pub(crate) const MAX_FETCH_CONCURRENCY: usize = 8;
 
 /// Errors surfaced by the fetch path.
@@ -82,9 +77,8 @@ pub enum FetchError {
 
 /// Session-wide set of SHAs already fetched in this REPL run.
 ///
-/// Cloning is cheap (`Arc` bump). Behaviour mirrors upstream's
-/// `fetched_refs` list + `fetched_refs_lock`: lookups and insertions
-/// are serialised, but the lock is released around the long-running
+/// Cloning is cheap (`Arc` bump). Lookups and insertions are
+/// serialised, but the lock is released around the long-running
 /// download/unbundle so concurrent fetches actually run in parallel.
 #[derive(Clone, Default)]
 pub(crate) struct FetchedRefs {

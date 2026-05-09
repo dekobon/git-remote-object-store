@@ -639,7 +639,7 @@ async fn head_with_empty_body_is_ignored() {
 #[tokio::test]
 async fn fetch_then_push_mode_flip_drops_buffered_fetch() {
     // The push is `:refs/heads/main` (delete a ref). With nothing
-    // seeded in the store, this returns the upstream-style
+    // seeded in the store, this returns the
     // `error <ref> "not found"?` outcome — a deterministic byte-exact
     // line we can pin. The fetch line targets a SHA that is NOT in the
     // store; if the fetch ran, the helper would error with

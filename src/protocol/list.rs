@@ -1,7 +1,6 @@
 //! Handlers for `list` and `list for-push` remote-helper commands.
 //!
-//! Mirrors `cmd_list` and `list_refs` in
-//! `../git-remote-s3/git_remote_s3/remote.py`. The wire format is:
+//! The wire format is:
 //!
 //! ```text
 //! <sha> <ref>\n          ← one line per bundle, sorted by LastModified desc
@@ -76,8 +75,7 @@ where
     };
 
     // Print `@<ref> HEAD` only when not for-push, HEAD is present, and the
-    // listed entries include the head ref. Mirrors upstream's
-    // loop-and-match behaviour in `cmd_list`.
+    // listed entries include the head ref.
     if !for_push
         && let Some(head_ref) = read_remote_head(store, prefix).await?
         && entries.iter().any(|e| e.ref_path == head_ref)
@@ -111,8 +109,8 @@ async fn collect_bundles(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
 ) -> Result<Vec<ListedRef>, ObjectStoreError> {
-    // Match upstream: `list_objects_v2(Prefix=prefix)` with no trailing
-    // slash. The strip step below disambiguates sibling-prefix collisions.
+    // List with `Prefix=prefix` and no trailing slash. The strip step
+    // below disambiguates sibling-prefix collisions.
     let listed = store.list(prefix.unwrap_or("")).await?;
 
     // Parse every match exactly once, carrying the timestamp alongside

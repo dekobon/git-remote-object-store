@@ -2,10 +2,7 @@
 //!
 //! These commands operate against the same on-bucket object layout as
 //! the helper protocol (bundles under `<prefix>/<ref>/`, `PROTECTED#`
-//! markers, lock files). The shapes of the user-facing commands were
-//! seeded from the upstream Python `git_remote_s3.manage` module
-//! (`../git-remote-s3/git_remote_s3/manage.py`), which remains a
-//! useful reference but is not authoritative.
+//! markers, lock files).
 //!
 //! The library entry points (`Doctor`, `ManageBranch`) take an
 //! [`ObjectStore`][crate::object_store::ObjectStore] and a
@@ -24,10 +21,7 @@ use thiserror::Error;
 
 use crate::object_store::ObjectStoreError;
 
-/// Default lock TTL in seconds, matching the upstream Python value.
-///
-/// Mirrors `DEFAULT_LOCK_TTL_SECONDS` in
-/// `../git-remote-s3/git_remote_s3/remote.py`.
+/// Default lock TTL in seconds.
 pub const DEFAULT_LOCK_TTL_SECONDS: u64 = 60;
 
 /// `true` iff `key` is a lock-file key. The `.lock` suffix is a
@@ -80,7 +74,7 @@ pub enum ManageError {
     /// Packchain engine surface error. Surfaced by the `doctor`'s
     /// engine-aware audit path. Carries the typed source so the
     /// `main`-level downcast can recognise transport failures and
-    /// emit the upstream-compatible `fatal:` line.
+    /// emit the categorical `fatal:` line.
     #[error(transparent)]
     Packchain(#[from] crate::packchain::PackchainError),
 }
