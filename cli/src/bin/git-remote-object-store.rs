@@ -110,7 +110,7 @@ enum Command {
         force: bool,
 
         /// Hours a tombstone must age before its packs are eligible
-        /// for sweep. Default reads the `GIT_REMOTE_S3_GC_GRACE_HOURS`
+        /// for sweep. Default reads the `GIT_REMOTE_OBJECT_STORE_GC_GRACE_HOURS`
         /// environment variable (falling back to 24).
         #[arg(long, value_name = "HOURS")]
         grace_hours: Option<u64>,
@@ -150,7 +150,7 @@ enum Command {
 
         /// Grace hours for the optional `--with-gc` sweep; ignored
         /// without `--with-gc`. Default reads
-        /// `GIT_REMOTE_S3_GC_GRACE_HOURS` (falling back to 24).
+        /// `GIT_REMOTE_OBJECT_STORE_GC_GRACE_HOURS` (falling back to 24).
         #[arg(long, value_name = "HOURS")]
         gc_grace_hours: Option<u64>,
     },
