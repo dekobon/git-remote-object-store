@@ -5,6 +5,15 @@
 **Status:** resolved — native implementation in `src/bundle.rs` via
 `gix-pack 0.69`.
 
+> **Frozen snapshot.** Captured against `gix` 0.82 / `gix-pack` 0.69.
+> The version pins below reflect the API surface at the time of the
+> spike. The findings (no `bundle` reader/writer in any
+> `gix-*` sub-crate; bundle support remains a `git` subprocess
+> contract) still hold against current `gix` releases — the
+> conclusion is API-shape, not version-specific. Newer pin numbers
+> are intentionally not back-filled; this document is a point-in-time
+> investigation, not living documentation.
+
 ## Question
 
 Can [`gix`][gix] 0.82 create and consume git bundle files (`git bundle
