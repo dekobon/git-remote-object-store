@@ -303,6 +303,18 @@ assert_shallow_file_exists() {
 	fi
 }
 
+# assert_shallow_file_absent <dir>
+# Fail if <dir>/.git/shallow is present. A fully-deepened repository must
+# not retain the file — its presence alone signals shallow semantics to
+# git, so a deepen-to-full-history fetch must unlink it.
+assert_shallow_file_absent() {
+	local dir="$1"
+	if [[ -e "${dir}/.git/shallow" ]]; then
+		echo "assert_shallow_file_absent: ${dir}/.git/shallow unexpectedly present" >&2
+		return 1
+	fi
+}
+
 # build_linear_history <src> <url> <n>
 # Initialise a repo at <src>, push <n> sequential commits to <url>, and
 # echo the tip SHA. Suitable for both S3 and Azure backends (the URL

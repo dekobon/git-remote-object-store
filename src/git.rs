@@ -32,6 +32,7 @@ use gix::progress::Discard;
 use gix::remote::Direction;
 use gix_hash::ObjectId;
 use thiserror::Error;
+use tracing::debug;
 
 /// SHA-1 commit OID, displayed as 40 lowercase hex characters.
 ///
@@ -595,51 +596,94 @@ pub(crate) fn shallow_boundaries(
 /// 40 hex digits + '\n' per `.git/shallow` entry.
 const SHA1_HEX_LINE_LEN: usize = 41;
 
-/// Write `boundaries` to `<git_dir>/shallow`, merging with any existing
-/// entries. The file is one SHA-1 hex per line, sorted for stable output.
+/// Rewrite `<git_dir>/shallow` so that it lists exactly the commits that
+/// remain shallow boundaries — `boundaries` plus any pre-existing entry
+/// whose parents are still missing from the local ODB.
 ///
-/// Read-then-merge-then-atomically-rewrite preserves any boundaries
-/// previously written by another process or by an earlier shallow
-/// fetch in the same repository (e.g. `git fetch --depth 2` from a
-/// depth-1 clone deepens rather than overwrites).
+/// `repo_dir` is the working-tree root (or the git directory itself for a
+/// bare repo); the actual `.git/shallow` location is derived internally
+/// to handle linked-worktree and `--separate-git-dir` layouts.
 ///
-/// Empty `boundaries` and an absent `.git/shallow` is a no-op: a fully
-/// cloned repository must not have a `.git/shallow` file.
+/// A shallow boundary is a commit whose parents are not present locally;
+/// git's `shallow.c::register_shallow` grafts every entry in
+/// `.git/shallow` to be parentless (and frees the in-memory parent
+/// pointers), so a stale entry suppresses newly-installed parents. After
+/// a deepening fetch the previous boundary's parents land in the ODB
+/// and the entry must be dropped, otherwise `git log` still stops at the
+/// old shallow tip even though deeper history is reachable.
+///
+/// Algorithm:
+/// 1. Pre-existing entries that are *also* in `boundaries` are kept
+///    unconditionally (the new fetch explicitly designated them).
+/// 2. Each remaining pre-existing entry is dropped iff every parent is
+///    present in `repo`'s ODB; an octopus-merge entry stays as long as
+///    *any* parent is still missing. Entries pointing at a missing or
+///    non-commit object are also dropped (stale).
+/// 3. If the resulting set is empty, `.git/shallow` is unlinked when
+///    present — a fully-deepened repository must not retain the file
+///    (matches git's own behaviour in `shallow.c::prune_shallow`).
+///
+/// The file format is one SHA-1 hex per line, sorted for stable output;
+/// the existing parser is lenient (skips blank or malformed lines) so
+/// external tooling's annotations do not break the read pass.
 ///
 /// # Errors
 ///
-/// Returns [`GitError::Io`] if the file cannot be read or written, or
-/// [`GitError::ConfigLock`] if the lock file cannot be acquired.
-pub(crate) fn write_shallow_file(git_dir: &Path, boundaries: &[ObjectId]) -> Result<(), GitError> {
-    let path = git_dir.join("shallow");
+/// Returns [`GitError::Open`] if `repo_dir` cannot be opened as a gix
+/// repository, [`GitError::Io`] if the file cannot be read, written, or
+/// unlinked, or [`GitError::ConfigLock`] if the lock file cannot be
+/// acquired.
+pub(crate) fn write_shallow_file(repo_dir: &Path, boundaries: &[ObjectId]) -> Result<(), GitError> {
+    let path = git_dir_for(repo_dir).join("shallow");
 
-    // Merge with whatever the file already holds. Format is one
-    // 40-hex line per boundary; parse leniently (skip blank lines and
-    // unrecognised content) so an external tool's annotations don't
-    // break us.
-    let mut merged: HashSet<ObjectId> = HashSet::new();
+    // Read existing entries leniently: skip blank lines and content that
+    // isn't a 40-hex SHA so external annotations or stray whitespace do
+    // not abort the rewrite.
+    let mut existing: HashSet<ObjectId> = HashSet::new();
     for line in read_or_empty(&path)?.split(|&b| b == b'\n') {
         let line = line.trim_ascii();
         if !line.is_empty()
             && let Ok(oid) = ObjectId::from_hex(line)
         {
-            merged.insert(oid);
+            existing.insert(oid);
         }
     }
-    for oid in boundaries {
-        merged.insert(*oid);
+
+    // Seed the final set with the new boundaries — they are kept
+    // unconditionally regardless of ODB state. The remaining pre-existing
+    // entries are stale candidates: they're kept only if their parents
+    // are still missing from the ODB.
+    let mut final_set: HashSet<ObjectId> = boundaries.iter().copied().collect();
+    existing.retain(|oid| !final_set.contains(oid));
+    let stale = existing;
+
+    if !stale.is_empty() {
+        let repo = gix::open(repo_dir).map_err(|e| GitError::Open(Box::new(e)))?;
+        // Hoisting the ODB handle out of the loop matches the
+        // skip-when-empty guard above: every entry's parent lookup
+        // goes through the same Arc-cloned handle.
+        let odb = repo.objects.clone().into_inner();
+        for oid in stale {
+            if entry_remains_a_boundary(&repo, &odb, oid) {
+                final_set.insert(oid);
+            }
+        }
     }
 
-    if merged.is_empty() {
-        // No new boundaries and nothing to preserve; do not create an
-        // empty `.git/shallow` (its presence alone signals shallow
-        // semantics to git).
+    if final_set.is_empty() {
+        // A fully-deepened repository must not retain `.git/shallow`;
+        // the file's mere presence triggers shallow semantics in git.
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            return Err(GitError::Io(e));
+        }
         return Ok(());
     }
 
     // Stable on-disk order. ObjectId: Ord sorts by raw SHA bytes, which
     // is the same order as the hex strings the file contains.
-    let mut sorted: Vec<ObjectId> = merged.into_iter().collect();
+    let mut sorted: Vec<ObjectId> = final_set.into_iter().collect();
     sorted.sort_unstable();
 
     let mut buf = Vec::with_capacity(sorted.len() * SHA1_HEX_LINE_LEN);
@@ -647,6 +691,77 @@ pub(crate) fn write_shallow_file(git_dir: &Path, boundaries: &[ObjectId]) -> Res
         writeln!(buf, "{}", oid.to_hex()).map_err(GitError::Io)?;
     }
     write_atomic(&path, &buf)
+}
+
+/// Resolve the on-disk git directory for `repo_dir`.
+///
+/// Three layouts are handled in priority order:
+/// 1. `.git/` is a directory → normal clone.
+/// 2. `.git` is a file → linked worktree or `--separate-git-dir`; the
+///    file contains `gitdir: <path>` pointing to the real git dir.
+/// 3. No `.git` entry → bare repository; `repo_dir` is the git dir.
+fn git_dir_for(repo_dir: &Path) -> PathBuf {
+    let candidate = repo_dir.join(".git");
+    if candidate.is_dir() {
+        return candidate;
+    }
+    // Linked-worktree / --separate-git-dir: `.git` is a text file whose
+    // sole content is `gitdir: <path>`. Follow the pointer so that
+    // write_shallow_file lands in the real git directory.
+    if candidate.is_file()
+        && let Ok(content) = std::fs::read_to_string(&candidate)
+        && let Some(rest) = content.trim().strip_prefix("gitdir:")
+    {
+        let pointed = Path::new(rest.trim());
+        let resolved = if pointed.is_absolute() {
+            pointed.to_path_buf()
+        } else {
+            repo_dir.join(pointed)
+        };
+        if resolved.is_dir() {
+            return resolved;
+        }
+    }
+    // Bare repository: the working tree root is the git directory.
+    repo_dir.to_path_buf()
+}
+
+/// Decide whether `oid` is still a shallow boundary in `repo`.
+///
+/// Returns `true` iff `oid` resolves to a commit whose parent set is
+/// non-empty and at least one parent is missing from the ODB. A missing
+/// object, a non-commit, or a parentless commit is treated as stale and
+/// pruned (`false`). Transient lookup errors fall through to `false`
+/// with a `debug!` so a single unreadable boundary cannot block the
+/// rewrite — the worst-case effect is a stale entry being dropped, which
+/// never causes incorrect repository state.
+fn entry_remains_a_boundary(
+    repo: &gix::Repository,
+    odb: &impl gix_pack::Find,
+    oid: ObjectId,
+) -> bool {
+    let object = match repo.find_object(oid) {
+        Ok(o) => o,
+        Err(e) => {
+            debug!(%oid, error = %e, "shallow entry not found in ODB; pruning");
+            return false;
+        }
+    };
+    let commit = match object.peel_to_kind(gix::object::Kind::Commit) {
+        Ok(c) => c.into_commit(),
+        Err(e) => {
+            debug!(%oid, error = %e, "shallow entry does not peel to a commit; pruning");
+            return false;
+        }
+    };
+    // Single-pass: a commit with no parents is a vacuous (root) boundary
+    // and gets pruned; otherwise short-circuit on the first parent that
+    // is still missing from the ODB.
+    let mut parents = commit.parent_ids().map(gix::Id::detach).peekable();
+    if parents.peek().is_none() {
+        return false;
+    }
+    parents.any(|p| !odb.contains(&p))
 }
 
 /// Write a zip archive of the tree at `spec` to `<folder>/repo.zip` and
@@ -955,17 +1070,12 @@ mod tests {
         (repo, dir)
     }
 
-    fn add_commit(
-        repo: &Repository,
-        ref_name: &str,
-        parents: &[ObjectId],
-        message: &str,
-    ) -> ObjectId {
+    /// Persist a one-blob tree so `archive()` has something to emit and
+    /// bundle round-trips carry real content. `repo.empty_tree()` builds
+    /// a `Tree` value without writing it, which would leave commits
+    /// referencing a dangling tree id.
+    fn make_marker_tree(repo: &Repository) -> ObjectId {
         use gix::objs::tree::{Entry, EntryKind};
-        // Write a one-blob tree so archive() has something to emit and
-        // bundle round-trips carry real content. `repo.empty_tree()`
-        // builds a `Tree` value but doesn't persist the object, which
-        // would leave commits referencing a dangling tree id.
         let blob_id = repo.write_blob(b"hello\n").expect("write blob").detach();
         let tree = gix::objs::Tree {
             entries: vec![Entry {
@@ -974,7 +1084,16 @@ mod tests {
                 oid: blob_id,
             }],
         };
-        let tree_id = repo.write_object(&tree).expect("write tree").detach();
+        repo.write_object(&tree).expect("write tree").detach()
+    }
+
+    fn add_commit(
+        repo: &Repository,
+        ref_name: &str,
+        parents: &[ObjectId],
+        message: &str,
+    ) -> ObjectId {
+        let tree_id = make_marker_tree(repo);
         let id = repo
             .commit_as(
                 signature(),
@@ -986,6 +1105,34 @@ mod tests {
             )
             .expect("commit_as");
         id.detach()
+    }
+
+    /// Write a commit object whose parent list contains OIDs that may
+    /// or may not be present in the ODB — the gix object writer does
+    /// not check parent reachability. Used to construct synthetic
+    /// "orphan" or "octopus with a missing parent" inputs for the
+    /// shallow-pruning tests.
+    fn commit_with_synthetic_parents(
+        repo: &Repository,
+        parents: &[ObjectId],
+        message: &str,
+    ) -> ObjectId {
+        let tree_id = make_marker_tree(repo);
+        let sig = gix::actor::Signature {
+            name: "Test".into(),
+            email: "test@example.com".into(),
+            time: gix::date::Time::default(),
+        };
+        let commit = gix::objs::Commit {
+            tree: tree_id,
+            parents: parents.iter().copied().collect(),
+            author: sig.clone(),
+            committer: sig,
+            encoding: None,
+            message: message.into(),
+            extra_headers: Vec::new(),
+        };
+        repo.write_object(&commit).expect("write commit").detach()
     }
 
     fn git_available() -> bool {
@@ -1750,38 +1897,27 @@ mod tests {
 
     #[test]
     fn write_shallow_file_writes_boundaries_when_absent() {
-        let (repo, _dir) = empty_repo();
+        let (repo, dir) = empty_repo();
         let a = add_commit(&repo, "refs/heads/main", &[], "a");
-        write_shallow_file(repo.git_dir(), &[a]).expect("write");
+        write_shallow_file(dir.path(), &[a]).expect("write");
         let path = repo.git_dir().join("shallow");
         let contents = std::fs::read_to_string(&path).expect("read shallow");
         assert_eq!(contents, format!("{a}\n"));
     }
 
     #[test]
-    fn write_shallow_file_merges_with_existing_file() {
-        let (repo, _dir) = empty_repo();
-        let a = add_commit(&repo, "refs/heads/main", &[], "a");
-        let b = add_commit(&repo, "refs/heads/main", &[a], "b");
-        let path = repo.git_dir().join("shallow");
-        std::fs::write(&path, format!("{a}\n")).expect("seed");
-        write_shallow_file(repo.git_dir(), &[b]).expect("merge");
-        let contents = std::fs::read_to_string(&path).expect("read");
-        // Both entries present, sorted lexicographically.
-        let mut expected = [format!("{a}"), format!("{b}")];
-        expected.sort();
-        assert_eq!(contents.trim(), expected.join("\n"));
-    }
-
-    #[test]
     fn write_shallow_file_dedupes_entries() {
-        let (repo, _dir) = empty_repo();
+        // Same SHA seeded and passed in the new boundaries: HashSet
+        // dedup yields a single line. `a` is a root commit (no
+        // parents), so the prune-by-ODB pass cannot reject it on
+        // membership grounds — it lands in the file because it is in
+        // `boundaries`.
+        let (repo, dir) = empty_repo();
         let a = add_commit(&repo, "refs/heads/main", &[], "a");
         let path = repo.git_dir().join("shallow");
         std::fs::write(&path, format!("{a}\n")).expect("seed");
-        write_shallow_file(repo.git_dir(), &[a]).expect("merge");
+        write_shallow_file(dir.path(), &[a]).expect("write");
         let contents = std::fs::read_to_string(&path).expect("read");
-        // One line, not two.
         assert_eq!(contents, format!("{a}\n"));
     }
 
@@ -1789,25 +1925,130 @@ mod tests {
     fn write_shallow_file_no_boundaries_no_existing_does_not_create_file() {
         // Empty boundaries + no existing file = no `.git/shallow`. A
         // fully cloned repo must not have this file.
-        let (repo, _dir) = empty_repo();
+        let (repo, dir) = empty_repo();
         let path = repo.git_dir().join("shallow");
-        write_shallow_file(repo.git_dir(), &[]).expect("noop");
+        write_shallow_file(dir.path(), &[]).expect("noop");
         assert!(!path.exists(), "shallow file unexpectedly created");
     }
 
     #[test]
-    fn write_shallow_file_empty_boundaries_preserves_existing() {
-        // If `.git/shallow` already has entries, an empty new
-        // boundary set must not delete them — the merge with prior
-        // shallow state is what makes deepening (`fetch --depth N+M`)
-        // work without losing previous markers.
-        let (repo, _dir) = empty_repo();
+    fn write_shallow_file_prunes_existing_when_parents_in_odb() {
+        // The deepen scenario: `.git/shallow` previously held the
+        // depth-1 tip; the deepening fetch installs the parent and
+        // computes the new depth-N boundary. The old tip must be
+        // pruned (its parent is now in the ODB), leaving only the new
+        // boundary in the file.
+        let (repo, dir) = empty_repo();
+        let a = add_commit(&repo, "refs/heads/main", &[], "a");
+        let b = add_commit(&repo, "refs/heads/main", &[a], "b");
+        let path = repo.git_dir().join("shallow");
+        std::fs::write(&path, format!("{b}\n")).expect("seed depth-1 tip");
+        write_shallow_file(dir.path(), &[a]).expect("deepen");
+        let contents = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(contents, format!("{a}\n"));
+    }
+
+    #[test]
+    fn write_shallow_file_unlinks_when_set_becomes_empty_after_pruning() {
+        // Deepen-to-full-history: the existing tip's parents are now
+        // in the ODB AND no new boundary is being added. The file
+        // must be unlinked — its presence alone signals shallow
+        // semantics to git, so a fully-deepened repo cannot keep it.
+        let (repo, dir) = empty_repo();
+        let a = add_commit(&repo, "refs/heads/main", &[], "a");
+        let b = add_commit(&repo, "refs/heads/main", &[a], "b");
+        let path = repo.git_dir().join("shallow");
+        std::fs::write(&path, format!("{b}\n")).expect("seed");
+        write_shallow_file(dir.path(), &[]).expect("deepen-to-full");
+        assert!(!path.exists(), "shallow file should be unlinked");
+    }
+
+    #[test]
+    fn write_shallow_file_drops_existing_root_commit() {
+        // A root commit has no parents, so the "all parents in ODB"
+        // predicate is vacuously true — the entry is a no-op marker
+        // and gets pruned. (`register_shallow` grafting a parentless
+        // commit to parentlessness is a no-op anyway.)
+        let (repo, dir) = empty_repo();
+        let a = add_commit(&repo, "refs/heads/main", &[], "a");
+        let b = add_commit(&repo, "refs/heads/main", &[a], "b");
+        let path = repo.git_dir().join("shallow");
+        std::fs::write(&path, format!("{a}\n")).expect("seed");
+        write_shallow_file(dir.path(), &[b]).expect("write");
+        let contents = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(contents, format!("{b}\n"));
+    }
+
+    #[test]
+    fn write_shallow_file_unlinks_when_only_existing_was_root() {
+        let (repo, dir) = empty_repo();
         let a = add_commit(&repo, "refs/heads/main", &[], "a");
         let path = repo.git_dir().join("shallow");
         std::fs::write(&path, format!("{a}\n")).expect("seed");
-        write_shallow_file(repo.git_dir(), &[]).expect("noop");
+        write_shallow_file(dir.path(), &[]).expect("write");
+        assert!(!path.exists(), "shallow file should be unlinked");
+    }
+
+    #[test]
+    fn write_shallow_file_keeps_existing_when_a_parent_is_missing() {
+        // Build a commit whose parent is a synthetic OID that was
+        // never written to the ODB. The shallow entry must be kept
+        // because its parent is not reachable locally — pruning it
+        // would expose git to a dangling parent ref.
+        let (repo, dir) = empty_repo();
+        let synthetic_parent =
+            ObjectId::from_hex(b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").expect("synthetic OID");
+        let orphan = commit_with_synthetic_parents(&repo, &[synthetic_parent], "orphan");
+        let new_root = add_commit(&repo, "refs/heads/main", &[], "new_root");
+        let path = repo.git_dir().join("shallow");
+        std::fs::write(&path, format!("{orphan}\n")).expect("seed");
+        write_shallow_file(dir.path(), &[new_root]).expect("write");
         let contents = std::fs::read_to_string(&path).expect("read");
-        assert_eq!(contents, format!("{a}\n"));
+        let mut expected = [format!("{orphan}"), format!("{new_root}")];
+        expected.sort();
+        assert_eq!(contents.trim(), expected.join("\n"));
+    }
+
+    #[test]
+    fn write_shallow_file_keeps_octopus_merge_when_any_parent_missing() {
+        // Octopus merge with three parents, of which one is synthetic
+        // (not in ODB). The entry stays in `.git/shallow` until ALL
+        // parents are reachable; otherwise pruning would expose git
+        // to a dangling parent.
+        let (repo, dir) = empty_repo();
+        let p1 = add_commit(&repo, "refs/heads/p1", &[], "p1");
+        let p2 = add_commit(&repo, "refs/heads/p2", &[], "p2");
+        let synthetic =
+            ObjectId::from_hex(b"cafef00dcafef00dcafef00dcafef00dcafef00d").expect("synthetic");
+        let merge = commit_with_synthetic_parents(&repo, &[p1, p2, synthetic], "octopus");
+        let path = repo.git_dir().join("shallow");
+        std::fs::write(&path, format!("{merge}\n")).expect("seed");
+        write_shallow_file(dir.path(), &[]).expect("write");
+        let contents = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(contents, format!("{merge}\n"));
+    }
+
+    #[test]
+    fn write_shallow_file_drops_entry_pointing_at_non_commit() {
+        // A `.git/shallow` line that resolves to a tree (not a
+        // commit) is stale; drop it.
+        let (repo, dir) = empty_repo();
+        let tree_id = make_marker_tree(&repo);
+        let path = repo.git_dir().join("shallow");
+        std::fs::write(&path, format!("{tree_id}\n")).expect("seed");
+        write_shallow_file(dir.path(), &[]).expect("write");
+        assert!(!path.exists(), "stale tree entry should not preserve file");
+    }
+
+    #[test]
+    fn write_shallow_file_drops_entry_missing_from_odb() {
+        let (repo, dir) = empty_repo();
+        let synthetic =
+            ObjectId::from_hex(b"abcdef0123456789abcdef0123456789abcdef01").expect("synthetic");
+        let path = repo.git_dir().join("shallow");
+        std::fs::write(&path, format!("{synthetic}\n")).expect("seed");
+        write_shallow_file(dir.path(), &[]).expect("write");
+        assert!(!path.exists(), "missing-OID entry should not preserve file");
     }
 
     // --- bundle / unbundle (native gix-pack) --------------------------

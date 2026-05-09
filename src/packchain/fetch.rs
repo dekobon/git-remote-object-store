@@ -61,8 +61,7 @@ use crate::git::{self, RefName, Sha};
 use crate::keys;
 use crate::object_store::{GetOpts, ObjectStore, ObjectStoreError};
 use crate::protocol::fetch::{
-    FetchError, FetchedRefs, MAX_FETCH_CONCURRENCY, ShallowBoundaries, git_dir_for,
-    parse_fetch_args,
+    FetchError, FetchedRefs, MAX_FETCH_CONCURRENCY, ShallowBoundaries, parse_fetch_args,
 };
 
 use super::PackchainError;
@@ -138,13 +137,15 @@ pub(crate) async fn fetch_batch(
         }
     }
 
+    // Run unconditionally on success even with empty `collected`: the
+    // rewrite must prune stale pre-existing entries whose parents have
+    // just landed in the ODB (a deepen-to-full history fetch shrinks
+    // the file to nothing and unlinks it).
     if first_err.is_none() && depth.is_some() {
         let collected = boundaries.drain();
-        if !collected.is_empty() {
-            let git_dir = git_dir_for(ctx.repo_dir.as_path());
-            tokio::task::spawn_blocking(move || git::write_shallow_file(&git_dir, &collected))
-                .await??;
-        }
+        let repo_dir = ctx.repo_dir.as_path().to_path_buf();
+        tokio::task::spawn_blocking(move || git::write_shallow_file(&repo_dir, &collected))
+            .await??;
     }
 
     first_err.map_or(Ok(()), Err)

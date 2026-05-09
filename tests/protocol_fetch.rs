@@ -743,3 +743,159 @@ async fn bundle_fetch_round_trip_of_annotated_tag_resolves_tag_object() {
         "tag OID must decode as a tag object after bundle fetch round-trip",
     );
 }
+
+/// Build a linear history of `n` commits in `dir` and return the SHAs
+/// from oldest to newest.
+fn build_linear_history(dir: &Path, n: usize) -> Vec<String> {
+    git(&["init", "--quiet", "--initial-branch=main"], dir);
+    git(&["config", "user.email", "test@example.com"], dir);
+    git(&["config", "user.name", "Test"], dir);
+    git(&["config", "commit.gpgsign", "false"], dir);
+    let mut shas = Vec::with_capacity(n);
+    for i in 0..n {
+        std::fs::write(dir.join("hello.txt"), format!("hi {i}\n")).unwrap();
+        git(&["add", "hello.txt"], dir);
+        git(
+            &["commit", "--quiet", "-m", &format!("c{i}"), "--no-gpg-sign"],
+            dir,
+        );
+        let sha = git_capture(&["rev-parse", "HEAD"], dir).trim().to_owned();
+        shas.push(sha);
+    }
+    shas
+}
+
+#[tokio::test]
+async fn fetch_with_depth_3_after_depth_1_deepens() {
+    // Issue #78 regression test. A depth-1 clone leaves `.git/shallow`
+    // containing the tip; the helper used to MERGE new boundaries into
+    // the file, leaving the old tip in place after a deepen. Git treats
+    // every entry in `.git/shallow` as hard parentless via grafts, so
+    // the old tip suppressed the newly-installed parents and `git log`
+    // still showed only 1 commit. The fix prunes any pre-existing
+    // entry whose parents have just landed in the ODB.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let seed = tempfile::tempdir().expect("tempdir");
+    let shas = build_linear_history(seed.path(), 5);
+    let tip_sha = &shas[4];
+    let depth_3_boundary = &shas[2];
+    let bundle = bundle_ref(seed.path(), tip_sha, "refs/heads/main");
+
+    let store = MockStore::new();
+    store.insert(format!("repo/refs/heads/main/{tip_sha}.bundle"), bundle);
+
+    let dst = make_dst_repo();
+    // Simulate the post-depth-1-clone state: `.git/shallow = [tip]`.
+    let shallow_path = dst.path().join(".git").join("shallow");
+    std::fs::write(&shallow_path, format!("{tip_sha}\n")).unwrap();
+
+    let script = format!("option depth 3\nfetch {tip_sha} refs/heads/main\n\n");
+    let (_out, result) = drive_in(
+        s3_url(Some("repo")),
+        Arc::new(store),
+        &script,
+        dst.path().to_path_buf(),
+    )
+    .await;
+    result.expect("deepening fetch should succeed");
+
+    let shallow = std::fs::read_to_string(&shallow_path).expect("shallow exists");
+    assert_eq!(
+        shallow.trim(),
+        depth_3_boundary,
+        "after deepen-from-1-to-3, shallow file must contain exactly the depth-3 boundary; got {shallow:?}"
+    );
+}
+
+#[tokio::test]
+async fn fetch_with_depth_unlinks_stale_shallow_when_history_fits() {
+    // Deepen-to-full-history: a depth-1 clone of a 3-commit history,
+    // then fetch with depth=10. Every parent now lands in the ODB, the
+    // pre-existing tip entry is no longer a boundary, and no new
+    // boundary is added. The file must be unlinked — its presence
+    // alone signals shallow semantics to git.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let seed = tempfile::tempdir().expect("tempdir");
+    let shas = build_linear_history(seed.path(), 3);
+    let tip_sha = &shas[2];
+    let bundle = bundle_ref(seed.path(), tip_sha, "refs/heads/main");
+
+    let store = MockStore::new();
+    store.insert(format!("repo/refs/heads/main/{tip_sha}.bundle"), bundle);
+
+    let dst = make_dst_repo();
+    let shallow_path = dst.path().join(".git").join("shallow");
+    std::fs::write(&shallow_path, format!("{tip_sha}\n")).unwrap();
+
+    let script = format!("option depth 10\nfetch {tip_sha} refs/heads/main\n\n");
+    let (_out, result) = drive_in(
+        s3_url(Some("repo")),
+        Arc::new(store),
+        &script,
+        dst.path().to_path_buf(),
+    )
+    .await;
+    result.expect("deepen-to-full fetch should succeed");
+
+    assert!(
+        !shallow_path.exists(),
+        "shallow file must be unlinked when no boundaries remain after pruning"
+    );
+}
+
+#[tokio::test]
+async fn fetch_re_shallow_to_smaller_depth() {
+    // The reverse of the deepen flow: a depth-3 clone has shallow =
+    // [T-2]. A subsequent `git fetch --depth 1` re-shallows to the
+    // tip — old T-2 is pruned (its parents are in the ODB), new tip
+    // is added. Verifies that pruning works when the new depth is
+    // SHALLOWER than the existing boundary's depth.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let seed = tempfile::tempdir().expect("tempdir");
+    let shas = build_linear_history(seed.path(), 5);
+    let tip_sha = &shas[4];
+    let depth_3_boundary = &shas[2];
+    let bundle = bundle_ref(seed.path(), tip_sha, "refs/heads/main");
+
+    let store = MockStore::new();
+    store.insert(format!("repo/refs/heads/main/{tip_sha}.bundle"), bundle);
+
+    let dst = make_dst_repo();
+    let shallow_path = dst.path().join(".git").join("shallow");
+    std::fs::write(&shallow_path, format!("{depth_3_boundary}\n")).unwrap();
+
+    let script = format!("option depth 1\nfetch {tip_sha} refs/heads/main\n\n");
+    let (_out, result) = drive_in(
+        s3_url(Some("repo")),
+        Arc::new(store),
+        &script,
+        dst.path().to_path_buf(),
+    )
+    .await;
+    result.expect("re-shallow fetch should succeed");
+
+    let shallow = std::fs::read_to_string(&shallow_path).expect("shallow exists");
+    assert_eq!(
+        shallow.trim(),
+        tip_sha,
+        "re-shallow to depth-1 must replace [T-2] with [tip]; got {shallow:?}"
+    );
+}
+
+// The "preserves disjoint orphan shallow entry" path — keeping a
+// pre-existing entry whose parents are not in the ODB — is covered at
+// the unit level by `git::tests::write_shallow_file_keeps_existing_when_a_parent_is_missing`,
+// which can construct a real commit with synthetic parent OIDs via
+// `commit_with_synthetic_parents`. Reproducing that here is awkward
+// because the destination repo is initialised by a separate `git init`
+// process; the unit test exercises the same write_shallow_file path
+// without that complication.

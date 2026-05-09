@@ -33,6 +33,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `git fetch --depth=N` from a shallow clone now correctly deepens the
+  local repository. The helper previously merged new shallow boundaries
+  with the prior `.git/shallow`, leaving the original tip in the file;
+  git treats every entry in `.git/shallow` as hard parentless via
+  `shallow.c::register_shallow` grafts, so the newly-installed parent
+  commits stayed hidden and `git log` still showed only the tip. The
+  helper now prunes any prior boundary whose parents are present in the
+  ODB before writing, and unlinks the file when no boundaries remain
+  (matching git's own `prune_shallow` semantics). Affects both bundle
+  and packchain engines and all storage backends — the issue was first
+  observed against real Azure but reproduces on every tier. New
+  shellspec coverage exercises re-shallow, deepen-to-full-history, and
+  successive-deepen flows (#78).
 - `doctor` bundle-shape report no longer misclassifies packchain
   bookkeeping directories (`packs/`, `gc/`) and LFS storage
   (`lfs/`) as bare refs. Refs with a `chain.json` manifest now
