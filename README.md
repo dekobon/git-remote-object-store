@@ -148,7 +148,7 @@ REPL; parallel `fetch`; locked `push`; the management CLI (`doctor` /
 `delete-branch` / `protect` / `unprotect`); the LFS custom-transfer
 agent; and the release pipeline.
 
-Git operations are gitoxide-backed where `gix` 0.82 has the surface
+Git operations are gitoxide-backed where `gix` has the surface
 we need — rev-parse, is-ancestor, ref-name validation, remote-URL
 inspection, archive / last-commit-message, ref discovery, object
 resolution. Bundle `create` and `unbundle` still shell out to the
