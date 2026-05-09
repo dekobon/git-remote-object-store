@@ -103,11 +103,14 @@ pub enum BackendError {
     },
 
     /// The `FORMAT` key records an engine name this binary does not support.
-    // Update the supported-engine list in this message when StorageEngine
-    // gains new variants.
+    ///
+    /// The supported-engine list is rendered from
+    /// [`StorageEngine::supported_list_str`] so adding a new variant
+    /// updates this message automatically.
     #[error(
         "bucket uses unknown storage engine `{stored}`; \
-         this client only supports `bundle`"
+         this client supports {}",
+        StorageEngine::supported_list_str()
     )]
     UnknownStoredEngine {
         /// The engine name as written in the `FORMAT` key.
@@ -737,10 +740,21 @@ mod tests {
         let err = BackendError::UnknownStoredEngine {
             stored: "pack".into(),
         };
-        assert_eq!(
-            fatal_message(&err),
-            "fatal: bucket uses unknown storage engine `pack`; this client only supports `bundle`",
+        let fatal = fatal_message(&err);
+        assert!(
+            fatal.starts_with("fatal: bucket uses unknown storage engine `pack`;"),
+            "missing prefix in {fatal}",
         );
+        // The supported-engine list is driven by `StorageEngine::ALL`.
+        // Asserting against every variant means a new engine that fails
+        // to update the diagnostic wording will surface here automatically.
+        for engine in StorageEngine::ALL {
+            assert!(
+                fatal.contains(&format!("`{}`", engine.as_str())),
+                "fatal_message for UnknownStoredEngine must mention engine `{}`, got `{fatal}`",
+                engine.as_str(),
+            );
+        }
     }
 
     #[tokio::test]
