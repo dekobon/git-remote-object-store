@@ -30,8 +30,9 @@
 //!
 //! ### Phase 1 (mark)
 //!
-//! 1. List `<prefix>/refs/heads/*/chain.json`, parse each, collect
-//!    referenced pack content-shas.
+//! 1. List `<prefix>/refs/**/chain.json` across every ref namespace
+//!    (`refs/heads/`, `refs/tags/`, `refs/notes/`, etc.), parse each,
+//!    collect referenced pack content-shas.
 //! 2. **Fail closed** on parse error: abort, log the bad key, do not
 //!    write tombstones. A corrupt chain could under-report the
 //!    referenced set and tombstone live packs.
@@ -496,13 +497,15 @@ fn is_tombstone_key(key: &str, prefix: &str) -> bool {
     key.starts_with(&expected_prefix)
 }
 
-/// List every `<prefix>/refs/heads/*/chain.json` and union the pack
-/// content-shas they reference. Fail closed on parse error.
+/// List every `<prefix>/refs/**/chain.json` (across every ref
+/// namespace — `refs/heads/`, `refs/tags/`, `refs/notes/`, etc.) and
+/// union the pack content-shas they reference. Fail closed on parse
+/// error.
 async fn list_referenced_packs(
     store: &dyn ObjectStore,
     prefix: &str,
 ) -> Result<HashSet<Sha40>, PackchainError> {
-    let refs_prefix = keys::join(prefix, "refs/heads/");
+    let refs_prefix = keys::join(prefix, "refs/");
     let metas = store.list(&refs_prefix).await?;
     let mut referenced: HashSet<Sha40> = HashSet::new();
     for meta in metas {
@@ -678,6 +681,129 @@ mod tests {
         assert_eq!(outcome.orphan_count, 1);
         let metas = store.list("repo/gc/").await.unwrap();
         assert!(metas.is_empty(), "dry-run must not write tombstone");
+    }
+
+    #[tokio::test]
+    async fn mark_treats_tag_chain_referenced_packs_as_live() {
+        // A pack referenced only from a chain under refs/tags/ must
+        // not be tombstoned. (Regression for issue #89.)
+        let store = MockStore::new();
+        let chain = ChainManifest {
+            v: 1,
+            tip: sha40(SHA_TIP),
+            full_at: sha40(SHA_FULL),
+            segments: vec![segment(SHA_PACK_LIVE, None)],
+        };
+        let tag_ref = RefName::new("refs/tags/v1").unwrap();
+        write_chain(&store, Some("repo"), &tag_ref, &chain)
+            .await
+            .unwrap();
+        insert_pack_pair(&store, Some("repo"), SHA_PACK_LIVE);
+        insert_pack_pair(&store, Some("repo"), SHA_PACK_ORPHAN);
+
+        let referenced = list_referenced_packs(&store, "repo").await.unwrap();
+        assert!(
+            referenced.contains(&sha40(SHA_PACK_LIVE)),
+            "pack referenced from refs/tags/ chain must be in the live set",
+        );
+
+        let outcome = mark(&store, "repo", MarkOpts::default()).await.unwrap();
+        assert_eq!(outcome.orphan_count, 1);
+        let body = store.get_bytes(&outcome.tombstone_key).await.unwrap();
+        let parsed = Tombstone::from_json_bytes(&body).unwrap();
+        assert_eq!(parsed.orphan_packs, vec![sha40(SHA_PACK_ORPHAN)]);
+    }
+
+    #[tokio::test]
+    async fn mark_treats_notes_chain_referenced_packs_as_live() {
+        // refs/notes/commits is the standard git notes ref. A pack
+        // referenced only from a notes chain must not be tombstoned.
+        let store = MockStore::new();
+        let chain = ChainManifest {
+            v: 1,
+            tip: sha40(SHA_TIP),
+            full_at: sha40(SHA_FULL),
+            segments: vec![segment(SHA_PACK_LIVE, None)],
+        };
+        let notes_ref = RefName::new("refs/notes/commits").unwrap();
+        write_chain(&store, Some("repo"), &notes_ref, &chain)
+            .await
+            .unwrap();
+        insert_pack_pair(&store, Some("repo"), SHA_PACK_LIVE);
+
+        let referenced = list_referenced_packs(&store, "repo").await.unwrap();
+        assert!(
+            referenced.contains(&sha40(SHA_PACK_LIVE)),
+            "pack referenced from refs/notes/ chain must be in the live set",
+        );
+
+        let outcome = mark(&store, "repo", MarkOpts::default()).await.unwrap();
+        assert_eq!(outcome.orphan_count, 0);
+    }
+
+    #[tokio::test]
+    async fn list_referenced_packs_unions_across_namespaces() {
+        // A live chain in refs/heads/ AND in refs/tags/ both
+        // contribute to the referenced set.
+        let store = MockStore::new();
+        let head_chain = ChainManifest {
+            v: 1,
+            tip: sha40(SHA_TIP),
+            full_at: sha40(SHA_FULL),
+            segments: vec![segment(SHA_PACK_LIVE, None)],
+        };
+        write_chain(&store, Some("repo"), &ref_main(), &head_chain)
+            .await
+            .unwrap();
+        let tag_chain = ChainManifest {
+            v: 1,
+            tip: sha40(SHA_TIP),
+            full_at: sha40(SHA_FULL),
+            segments: vec![segment(SHA_PACK_ORPHAN_2, None)],
+        };
+        let tag_ref = RefName::new("refs/tags/v1").unwrap();
+        write_chain(&store, Some("repo"), &tag_ref, &tag_chain)
+            .await
+            .unwrap();
+
+        let referenced = list_referenced_packs(&store, "repo").await.unwrap();
+        assert!(referenced.contains(&sha40(SHA_PACK_LIVE)));
+        assert!(referenced.contains(&sha40(SHA_PACK_ORPHAN_2)));
+        assert_eq!(referenced.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_referenced_packs_ignores_sibling_artefacts() {
+        // path-index.json, .bundle baselines, and other artefacts
+        // under refs/<namespace>/<name>/ must not be parsed as
+        // chain.json.
+        let store = MockStore::new();
+        seed_live_chain(&store, Some("repo")).await;
+        // Add sibling artefacts that share the ref directory.
+        store.insert(
+            "repo/refs/heads/main/path-index.json",
+            Bytes::from_static(b"{}"),
+        );
+        store.insert(
+            format!("repo/refs/heads/main/{SHA_TIP}.bundle"),
+            Bytes::from_static(b"BUNDLE"),
+        );
+        // And a tombstone-style key under refs/ that must be filtered.
+        store.insert(
+            "repo/refs/tags/v1/path-index.json",
+            Bytes::from_static(b"{}"),
+        );
+
+        let referenced = list_referenced_packs(&store, "repo").await.unwrap();
+        assert_eq!(referenced.len(), 1);
+        assert!(referenced.contains(&sha40(SHA_PACK_LIVE)));
+    }
+
+    #[tokio::test]
+    async fn list_referenced_packs_empty_for_no_chains() {
+        let store = MockStore::new();
+        let referenced = list_referenced_packs(&store, "repo").await.unwrap();
+        assert!(referenced.is_empty());
     }
 
     #[tokio::test]

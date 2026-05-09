@@ -80,6 +80,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `packchain gc` no longer tombstones (and after grace, deletes) packs
+  reachable only from chains under non-`refs/heads/` namespaces.
+  `list_referenced_packs` previously listed `<prefix>/refs/heads/`,
+  so chains under `refs/tags/`, `refs/notes/`, `refs/pull/`, etc.
+  were invisible to the mark phase and their packs were treated as
+  orphans. The listing prefix is now `<prefix>/refs/`; the existing
+  `is_chain_json_key` and `parse_pack_key_sha` filters remain
+  sufficient to reject sibling artefacts. This is a data-loss-class
+  fix; no on-bucket layout change. (#89)
 - `git fetch --depth=N` from a shallow clone now correctly deepens the
   local repository. The helper previously merged new shallow boundaries
   with the prior `.git/shallow`, leaving the original tip in the file;
