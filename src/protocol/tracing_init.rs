@@ -27,8 +27,6 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 /// Canonical env var read at startup to bump the verbosity floor.
 pub const ENV_VERBOSE: &str = "GIT_REMOTE_OBJECT_STORE_VERBOSE";
-/// Upstream-compatibility alias; ignored when `ENV_VERBOSE` is also set.
-pub const ENV_VERBOSE_LEGACY: &str = "GIT_REMOTE_S3_VERBOSE";
 
 /// Handle returned by [`init`] so callers can flip the subscriber's filter
 /// at runtime. The underlying layer type is intentionally hidden behind a
@@ -102,10 +100,7 @@ fn env_verbose_at_least(threshold: u32) -> bool {
 }
 
 fn read_verbose_env() -> u32 {
-    if let Some(n) = env::var(ENV_VERBOSE).ok().and_then(|v| parse_verbose(&v)) {
-        return n;
-    }
-    env::var(ENV_VERBOSE_LEGACY)
+    env::var(ENV_VERBOSE)
         .ok()
         .and_then(|v| parse_verbose(&v))
         .unwrap_or(0)
