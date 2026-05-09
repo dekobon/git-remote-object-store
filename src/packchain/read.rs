@@ -498,13 +498,11 @@ async fn read_object_from_chain(
     cache: &PackIndexCache,
     depth: &mut u32,
 ) -> Result<ResolvedObject, PackchainError> {
-    if *depth > MAX_DELTA_DEPTH {
-        return Err(PackchainError::DeltaTooDeep {
-            max: MAX_DELTA_DEPTH,
-        });
-    }
-    *depth += 1;
-
+    // Note: the delta-depth guard lives in `decode_entry`, the single
+    // chokepoint every recursive resolution path traverses. Putting it
+    // here would miss the OFS_DELTA branch, which recurses through
+    // `decode_entry` directly without coming back via this function
+    // (issue #83).
     for segment in segments {
         let content_sha = pack_content_sha(segment)?;
         let idx = load_index(store, prefix, &content_sha, cache).await?;
@@ -659,6 +657,19 @@ async fn decode_entry(
     cache: &PackIndexCache,
     depth: &mut u32,
 ) -> Result<ResolvedObject, PackchainError> {
+    // Single chokepoint for the delta-depth budget: every recursive
+    // delta resolution path — REF_DELTA via `read_object_from_chain`
+    // and OFS_DELTA via the direct recursion below — re-enters here.
+    // Guarding only `read_object_from_chain` (the previous shape) let
+    // a pure-OFS_DELTA chain stack-overflow because OFS_DELTA never
+    // re-routed through it (issue #83).
+    if *depth > MAX_DELTA_DEPTH {
+        return Err(PackchainError::DeltaTooDeep {
+            max: MAX_DELTA_DEPTH,
+        });
+    }
+    *depth += 1;
+
     let entry =
         gix_pack::data::Entry::from_bytes(raw, pack_offset, gix_hash::Kind::Sha1.len_in_bytes())
             .map_err(|e| PackchainError::MalformedPackEntry {
@@ -1466,5 +1477,336 @@ mod tests {
             matches!(err, PackchainError::MalformedDelta { reason } if reason.contains("destination size")),
             "expected MalformedDelta undershoot error, got {err:?}",
         );
+    }
+
+    // --- delta-depth guard (issue #83) -------------------------------------
+    //
+    // The fix moves the depth guard from `read_object_from_chain` into
+    // `decode_entry`, the single chokepoint every recursive resolution
+    // path traverses. These tests exercise both the boundary and the
+    // OFS_DELTA bypass that the old shape allowed.
+    //
+    // The synthesised packs use bounded payloads (small literal byte
+    // strings), so the `as usize` / `as u8` casts cannot truncate at
+    // runtime. Suppressing the lints here keeps the test setup direct;
+    // production code paths use `try_from`.
+
+    use crate::object_store::mock::MockStore;
+    use flate2::Compression;
+    use flate2::write::ZlibEncoder;
+    use std::io::Write;
+
+    /// Encode a pack-entry header per gix-pack's canonical encoding:
+    /// 4-bit type tag + 4-bit low size, then 7-bit continuation bytes
+    /// for the upper bits of `size`. This is the inverse of
+    /// `gix_pack::data::entry::decode::parse_header_info`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn encode_pack_entry_header(type_id: u8, mut size: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        let low4 = (size & 0x0f) as u8;
+        size >>= 4;
+        let mut byte = (type_id << 4) | low4;
+        if size != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        while size != 0 {
+            let mut next = (size & 0x7f) as u8;
+            size >>= 7;
+            if size != 0 {
+                next |= 0x80;
+            }
+            out.push(next);
+        }
+        out
+    }
+
+    /// Encode an `OFS_DELTA` `base_distance` per the gix-pack
+    /// `parse_leb64` shape (offset-LEB128, with implicit `+1` between
+    /// continuation bytes).
+    #[allow(clippy::cast_possible_truncation)]
+    fn encode_ofs_delta_distance(distance: u64) -> Vec<u8> {
+        // The decoder's invariant: `value = ((((b0 & 0x7f) + 1) << 7) |
+        // (b1 & 0x7f) + 1) << 7) | ...` — i.e. each continuation step
+        // adds one before shifting. Build the byte sequence by
+        // repeatedly subtracting one and shifting right, so the decoder
+        // reconstructs the original distance.
+        let mut bytes = Vec::new();
+        let mut v = distance;
+        bytes.push((v & 0x7f) as u8);
+        v >>= 7;
+        while v != 0 {
+            v -= 1;
+            bytes.push(((v & 0x7f) as u8) | 0x80);
+            v >>= 7;
+        }
+        bytes.reverse();
+        bytes
+    }
+
+    fn zlib_compress(data: &[u8]) -> Vec<u8> {
+        let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
+        e.write_all(data).expect("zlib encode");
+        e.finish().expect("zlib finish")
+    }
+
+    /// Build a delta payload with the canonical varint header and a
+    /// single-insert opcode that copies `payload` literally. The result
+    /// reconstructs to `payload` regardless of the base content (the
+    /// source-size check still runs against the base, so callers must
+    /// pass `base_size` matching their base).
+    #[allow(clippy::cast_possible_truncation)]
+    fn make_insert_delta(base_size: u64, payload: &[u8]) -> Vec<u8> {
+        let mut d = Vec::new();
+        // src_size and dst_size as size-varint (low-bit-first, MSB
+        // continuation), per `read_size_varint`.
+        let put_varint = |mut v: u64, buf: &mut Vec<u8>| loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                buf.push(byte);
+                return;
+            }
+            buf.push(byte | 0x80);
+        };
+        put_varint(base_size, &mut d);
+        put_varint(payload.len() as u64, &mut d);
+        // Insert opcode: low 7 bits are length. Tests use small literals.
+        assert!(payload.len() < 0x80, "test literal too long for one insert");
+        d.push(payload.len() as u8);
+        d.extend_from_slice(payload);
+        d
+    }
+
+    /// Append a complete pack entry (header + zlib-compressed payload)
+    /// to `pack` and record the entry's start offset in `offsets`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn push_pack_entry(
+        pack: &mut Vec<u8>,
+        offsets: &mut Vec<u64>,
+        type_id: u8,
+        ofs_delta_distance: Option<u64>,
+        decompressed_payload: &[u8],
+    ) {
+        let start = pack.len() as u64;
+        offsets.push(start);
+        pack.extend(encode_pack_entry_header(
+            type_id,
+            decompressed_payload.len() as u64,
+        ));
+        if let Some(d) = ofs_delta_distance {
+            pack.extend(encode_ofs_delta_distance(d));
+        }
+        pack.extend(zlib_compress(decompressed_payload));
+    }
+
+    /// Wire up a `PackIndexCache` with a hand-rolled `CachedIndex`
+    /// whose only contract with the test is `sorted_offsets`. The
+    /// stored idx file is a zero-entry v2 stub; tests call
+    /// `decode_entry` directly so the file-side lookup is never used.
+    fn install_cached_index(
+        cache: &PackIndexCache,
+        prefix: &str,
+        content_sha: &Sha40,
+        offsets: Vec<u64>,
+    ) {
+        let cached = CachedIndex {
+            file: minimal_v2_idx(),
+            sorted_offsets: offsets,
+            bytes: 1_024,
+        };
+        cache.insert((prefix.to_owned(), content_sha.clone()), Arc::new(cached));
+    }
+
+    fn minimal_v2_idx() -> gix_pack::index::File<Vec<u8>> {
+        let mut data = Vec::with_capacity(8 + 256 * 4 + 40);
+        data.extend_from_slice(b"\xfftOc");
+        data.extend_from_slice(&2u32.to_be_bytes());
+        for _ in 0..256 {
+            data.extend_from_slice(&0u32.to_be_bytes());
+        }
+        data.extend_from_slice(&[0u8; 20]);
+        data.extend_from_slice(&[0u8; 20]);
+        gix_pack::index::File::from_data(
+            data,
+            std::path::PathBuf::from("dummy.idx"),
+            gix_hash::Kind::Sha1,
+        )
+        .expect("hand-crafted minimal v2 idx parses")
+    }
+
+    /// `decode_entry` is the single chokepoint for the depth budget:
+    /// invoking it with `*depth > MAX_DELTA_DEPTH` must fail before
+    /// any decode work happens. This is what catches a recursive
+    /// caller (`REF_DELTA` via `read_object_from_chain`, or `OFS_DELTA`
+    /// directly) blowing past the cap.
+    #[tokio::test]
+    async fn decode_entry_rejects_when_depth_already_over_cap() {
+        let store = MockStore::new();
+        let cache = PackIndexCache::default();
+        let chain: Vec<ChainSegment> = Vec::new();
+        let content_sha = sha40(SHA_A);
+        // Any well-formed Blob entry — depth check fires first, so
+        // contents are immaterial.
+        let mut pack = Vec::new();
+        let mut offsets = Vec::new();
+        push_pack_entry(&mut pack, &mut offsets, 3 /* BLOB */, None, b"x");
+
+        let mut depth = MAX_DELTA_DEPTH + 1;
+        let err = decode_entry(
+            &store,
+            None,
+            &chain,
+            &content_sha,
+            offsets[0],
+            &pack[usize::try_from(offsets[0]).unwrap()..],
+            &cache,
+            &mut depth,
+        )
+        .await
+        .expect_err("over-cap depth must fail");
+        assert!(
+            matches!(err, PackchainError::DeltaTooDeep { max } if max == MAX_DELTA_DEPTH),
+            "expected DeltaTooDeep, got {err:?}",
+        );
+    }
+
+    /// At exactly `*depth == MAX_DELTA_DEPTH` and a non-delta entry,
+    /// `decode_entry` must succeed: a non-delta base reached at the
+    /// boundary is the deepest legal point in the chain. This is the
+    /// off-by-one boundary opposite the failing case above.
+    #[tokio::test]
+    async fn decode_entry_at_cap_with_non_delta_base_succeeds() {
+        let store = MockStore::new();
+        let cache = PackIndexCache::default();
+        let chain: Vec<ChainSegment> = Vec::new();
+        let content_sha = sha40(SHA_A);
+        let mut pack = Vec::new();
+        let mut offsets = Vec::new();
+        push_pack_entry(
+            &mut pack,
+            &mut offsets,
+            3, /* BLOB */
+            None,
+            b"deepest-base",
+        );
+
+        let mut depth = MAX_DELTA_DEPTH;
+        let resolved = decode_entry(
+            &store,
+            None,
+            &chain,
+            &content_sha,
+            offsets[0],
+            &pack[usize::try_from(offsets[0]).unwrap()..],
+            &cache,
+            &mut depth,
+        )
+        .await
+        .expect("blob at MAX boundary must decode");
+        assert_eq!(resolved.payload, b"deepest-base");
+        assert_eq!(resolved.kind, ObjectKind::Blob);
+    }
+
+    /// Pre-fix regression: a pure-`OFS_DELTA` chain bypassed the depth
+    /// guard because the recursive call hopped through `decode_entry`
+    /// directly without re-entering `read_object_from_chain`. With the
+    /// guard moved into `decode_entry`, a 2-entry pack (a base blob +
+    /// one `OFS_DELTA` pointing at it) entered with
+    /// `depth = MAX_DELTA_DEPTH` must fail on the recursive call to the
+    /// base, even though the outer entry is itself a single layer.
+    ///
+    /// Synthesised in-memory pack — does NOT actually approach a real
+    /// stack-overflow depth, so this test would behave identically (and
+    /// pass) on the unfixed code's `REF_DELTA` path. It catches the
+    /// `OFS_DELTA` bypass specifically.
+    #[tokio::test]
+    async fn ofs_delta_recursion_consumes_depth_budget() {
+        let store = MockStore::new();
+        let cache = PackIndexCache::default();
+        let chain: Vec<ChainSegment> = Vec::new();
+        let content_sha = sha40(SHA_A);
+
+        let base_payload = b"base-blob";
+        let mut pack = Vec::new();
+        let mut offsets = Vec::new();
+        // Entry 0: BLOB base.
+        push_pack_entry(&mut pack, &mut offsets, 3, None, base_payload);
+        // Entry 1: OFS_DELTA pointing back to entry 0. The encoded
+        // distance per gix-pack is `entry_offset - base_offset`; entry
+        // 1's start is `pack.len()` before the push, so capture it
+        // explicitly.
+        let delta = make_insert_delta(base_payload.len() as u64, b"reconstructed");
+        let entry1_start = pack.len() as u64;
+        let distance = entry1_start - offsets[0];
+        push_pack_entry(&mut pack, &mut offsets, 6, Some(distance), &delta);
+
+        // Plant the pack body in the store under the canonical key so
+        // `fetch_entry_bytes` can range-GET the base. The cache is
+        // pre-populated with the offsets so no .idx round-trip is
+        // needed.
+        store.insert(pack_key(None, &content_sha), Bytes::from(pack.clone()));
+        install_cached_index(&cache, "", &content_sha, offsets.clone());
+
+        // Enter at exactly MAX_DELTA_DEPTH so the OFS_DELTA pass bumps
+        // the budget to MAX+1 and the recursive base decode trips the
+        // guard.
+        let mut depth = MAX_DELTA_DEPTH;
+        let err = decode_entry(
+            &store,
+            None,
+            &chain,
+            &content_sha,
+            offsets[1],
+            &pack[usize::try_from(offsets[1]).unwrap()..],
+            &cache,
+            &mut depth,
+        )
+        .await
+        .expect_err("OFS_DELTA recursion must trip the depth guard");
+        assert!(
+            matches!(err, PackchainError::DeltaTooDeep { max } if max == MAX_DELTA_DEPTH),
+            "expected DeltaTooDeep from OFS_DELTA recursion, got {err:?}",
+        );
+    }
+
+    /// Below the cap, the same `OFS_DELTA` shape decodes cleanly. This
+    /// pins the positive case so the boundary test above is meaningful
+    /// (without it, a regression that always returned `DeltaTooDeep`
+    /// would still pass the over-cap assertion).
+    #[tokio::test]
+    async fn ofs_delta_below_cap_decodes() {
+        let store = MockStore::new();
+        let cache = PackIndexCache::default();
+        let chain: Vec<ChainSegment> = Vec::new();
+        let content_sha = sha40(SHA_A);
+
+        let base_payload = b"base";
+        let mut pack = Vec::new();
+        let mut offsets = Vec::new();
+        push_pack_entry(&mut pack, &mut offsets, 3, None, base_payload);
+        let delta = make_insert_delta(base_payload.len() as u64, b"hi");
+        let entry1_start = pack.len() as u64;
+        let distance = entry1_start - offsets[0];
+        push_pack_entry(&mut pack, &mut offsets, 6, Some(distance), &delta);
+
+        store.insert(pack_key(None, &content_sha), Bytes::from(pack.clone()));
+        install_cached_index(&cache, "", &content_sha, offsets.clone());
+
+        let mut depth = 0u32;
+        let resolved = decode_entry(
+            &store,
+            None,
+            &chain,
+            &content_sha,
+            offsets[1],
+            &pack[usize::try_from(offsets[1]).unwrap()..],
+            &cache,
+            &mut depth,
+        )
+        .await
+        .expect("OFS_DELTA decodes below cap");
+        assert_eq!(resolved.payload, b"hi");
+        assert_eq!(resolved.kind, ObjectKind::Blob);
     }
 }

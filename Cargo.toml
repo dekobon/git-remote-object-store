@@ -199,6 +199,13 @@ reqwest = { version = "0.13", default-features = false, features = [
 # Property-based testing for URL round-trip parse/format.
 proptest = "1"
 
+# zlib compression for synthesised pack bytes in unit tests. Production
+# code only needs `Decompress` (provided by `gix::features::zlib`); the
+# delta-depth regression test in `packchain::read::tests` constructs a
+# valid pack entry payload at test time, which requires the deflate
+# direction. `flate2` is already in the transitive graph via `gix-pack`.
+flate2 = "1"
+
 # RustFS testcontainer used by `tests/s3_store_integration.rs` (gated on the
 # `integration-s3` Cargo feature). Cargo does not allow `optional = true` on
 # dev-dependencies, so this compiles for every `cargo test` invocation but
