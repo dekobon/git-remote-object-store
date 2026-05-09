@@ -362,6 +362,47 @@ async fn delete_remote_ref_removes_single_bundle() {
 }
 
 #[tokio::test]
+async fn delete_protected_remote_ref_emits_protection_refusal() {
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, shas) = make_seed_repo(1, "primary");
+    let store = Arc::new(MockStore::new());
+    // Seed a bundle and a PROTECTED# marker. The delete-path listing
+    // counts both keys, inflating past `expected`; the helper must
+    // detect the marker and emit a protection-specific refusal.
+    store.insert(
+        format!("repo/refs/heads/main/{}.bundle", &shas[0]),
+        Bytes::from_static(b"x"),
+    );
+    store.insert("repo/refs/heads/main/PROTECTED#", Bytes::from_static(b""));
+
+    let (out, result) = drive_in(
+        s3_url_with_zip(Some("repo"), false),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push :refs/heads/main\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    result.expect("delete should produce a refusal");
+    let text = std::str::from_utf8(&out).unwrap();
+    // Exact wire bytes: protection refusal mentions both `protected`
+    // and the `unprotect` workflow, ends with the `?` recoverable
+    // marker, and is followed by the empty-line batch terminator.
+    assert_eq!(
+        text,
+        "error refs/heads/main \"ref is protected. \
+         Run git-remote-object-store unprotect <url> <branch> \
+         to remove protection before deleting.\"?\n\n",
+    );
+    // Both keys must remain — the helper must not delete on the way
+    // to the refusal.
+    assert!(store.contains(&format!("repo/refs/heads/main/{}.bundle", &shas[0])));
+    assert!(store.contains("repo/refs/heads/main/PROTECTED#"));
+}
+
+#[tokio::test]
 async fn delete_missing_remote_ref_emits_not_found() {
     if !git_available() {
         eprintln!("skipping: git not on PATH");
