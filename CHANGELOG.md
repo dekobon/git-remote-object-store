@@ -77,6 +77,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#63), fetch (#64), `read_blob` (#65), GC (#66), and compaction
   (#67) are described as implemented; references to "Phase 5 GC"
   replaced with `manage gc`.
+- **Breaking** (env var): `GIT_REMOTE_S3_LOCK_TTL_SECONDS` renamed
+  to `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`, dropping the
+  legacy `GIT_REMOTE_S3_` prefix and aligning with
+  `GIT_REMOTE_OBJECT_STORE_ALLOW_HTTP`. Hard rename with no
+  read-both shim — operators who set the old name in CI or
+  shell config must update to the new (#90).
+- **Breaking** (env var): `GIT_REMOTE_S3_GC_GRACE_HOURS` renamed
+  to `GIT_REMOTE_OBJECT_STORE_GC_GRACE_HOURS`, mirroring #90.
+  Hard rename, no read-both shim. (#91)
+- **Breaking** (env var): the `GIT_REMOTE_S3_VERBOSE` upstream-compat
+  alias is removed; only `GIT_REMOTE_OBJECT_STORE_VERBOSE` is read.
+  AGENTS.md disclaims any awslabs/git-remote-s3 parity, so the shim
+  was misleading. (#93)
+- README dependency status text drops the hardcoded `gix 0.82`
+  reference in favour of version-neutral wording, so future
+  bumps do not require documentation churn (#88).
 
 ### Fixed
 
@@ -89,6 +105,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `is_chain_json_key` and `parse_pack_key_sha` filters remain
   sufficient to reject sibling artefacts. This is a data-loss-class
   fix; no on-bucket layout change. (#89)
+- The packchain helper-protocol `list` command now surfaces refs in
+  every `refs/*` namespace, not only `refs/heads/`. `list_refs`
+  previously scanned `<prefix>/refs/heads/` only, so tags
+  (`refs/tags/`), notes (`refs/notes/`), and other namespaces were
+  invisible to `git ls-remote` / `git clone` against the packchain
+  engine. Mirrors the gc.rs fix landed for #89. (#82)
+- `OFS_DELTA` recursion in `packchain::read::decode_entry` now
+  consumes the same `MAX_DELTA_DEPTH` budget as `REF_DELTA`. The
+  guard previously lived in `read_object_from_chain`, which only
+  the `REF_DELTA` branch re-entered, so a long pure-`OFS_DELTA`
+  chain in a malformed or attacker-controlled pack could
+  stack-overflow the reader. Security/DoS fix; no on-bucket
+  format change. (#83)
+- `packchain compact` now deletes the previous baseline bundle
+  after the new `chain.json` is durable, instead of leaking it
+  forever. The old `<sha>.bundle` lived outside the `packs/`
+  namespace that GC scans, so each compact silently leaked
+  bucket storage. Delete runs under the same per-ref lock and
+  tolerates `NotFound` for idempotency. (#84)
+- `walk_tree` (the recursive helper backing `extract_path_index`)
+  is now bounded by an ancestor-set cycle detector. A corrupted
+  or adversarial ODB whose tree references itself directly or
+  transitively previously caused unbounded recursion and a
+  stack overflow. The detector tracks the per-descent ancestor
+  set so legitimate shared subtrees at distinct paths still
+  walk correctly; cycles abort with the new typed
+  `PackchainError::TreeCycle { oid }`. (#81)
+- Engine diagnostics list every supported engine. The
+  `UnknownStoredEngine` and `?engine=` parse errors previously
+  said "this client only supports `bundle`", omitting the
+  `packchain` engine. Both wordings are now driven from a
+  single `StorageEngine::ALL` source so future variants update
+  the message automatically. (#85)
+- `git push :protected-branch` now reports a protection-specific
+  refusal that names the management CLI's `unprotect` workflow,
+  instead of misreporting the situation as multi-bundle
+  corruption and pointing users at `doctor`. The `PROTECTED#`
+  marker is detected before the generic fallback; the
+  multi-bundle error path is preserved for genuine
+  corruption. (#86)
+- Push-refusal tests now pin exact wire bytes (including the
+  trailing `?` recoverable-error marker) at the call sites
+  flagged in #87, and the protected-ref refusal test asserts
+  the would-be local-tip bundle was not uploaded on refusal.
+  Pure test tightening; no production code change. (#87)
+- `delete_remote_ref` now distinguishes the protected-marker case
+  from genuine multi-bundle corruption with a last-segment
+  equality check on `keys::PROTECTED_MARKER_SEGMENT`, replacing
+  the previous substring match. Protects against a future bucket
+  schema where the literal could appear outside the marker
+  segment. The shared marker constant is also reused by
+  `is_bundle_candidate`, `is_protected`, `manage::branch`, and
+  `manage::snapshot`. (#94)
 - `git fetch --depth=N` from a shallow clone now correctly deepens the
   local repository. The helper previously merged new shallow boundaries
   with the prior `.git/shallow`, leaving the original tip in the file;
