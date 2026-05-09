@@ -645,8 +645,6 @@ AZSTORE_PROD_KEY=<base64-key> \
 
 ```bash
 GIT_REMOTE_OBJECT_STORE_VERBOSE=2 git push origin main
-# upstream-compat alias also works:
-GIT_REMOTE_S3_VERBOSE=2 git push origin main
 ```
 
 Git's own verbosity knob also reaches the helper at runtime:
