@@ -21,7 +21,7 @@ use gix_pack::data::output::{count, entry};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-use crate::git::{RefName, Sha};
+use crate::git::{PeeledTip, RefName, Sha};
 
 /// First line of every git bundle v2 file.
 const BUNDLE_V2_MAGIC: &str = "# v2 git bundle";
@@ -209,19 +209,25 @@ where
 /// Create a git bundle v2 file at `<folder>/<sha>.bundle` and return the path.
 ///
 /// `spec` is resolved against the repository at `cwd` (a fully-qualified ref
-/// name, a short name, `HEAD`, or a bare commit OID). All objects reachable
-/// from the resolved commit are packed. The bundle is written atomically via a
-/// temp file so partial bundles are never visible to concurrent readers.
+/// name, a short name, `HEAD`, or a bare commit / tree / blob OID). The
+/// bundle's pack carries the leaf object plus everything needed to
+/// reconstruct the ref:
+///
+/// - **Commit-tipped**: every commit reachable from the leaf, expanded
+///   to trees + blobs, plus the tag chain.
+/// - **Tree-tipped**: the leaf tree plus its full subtree + blob
+///   closure (gitlinks skipped), plus the tag chain.
+/// - **Blob-tipped**: the leaf blob plus the tag chain.
+///
+/// The bundle is written atomically via a temp file so partial bundles
+/// are never visible to concurrent readers.
 pub fn create(cwd: &Path, folder: &Path, sha: Sha, spec: &str) -> Result<PathBuf, BundleError> {
     let repo = gix::open(cwd)?;
 
     // `sha` names the bundle file and appears in the bundle header ref line.
-    // `tip_id` is resolved fresh here and drives the object walk. Callers
-    // must ensure `sha` was derived from the same `spec` immediately before
-    // this call; divergence (e.g. a concurrent ref update) produces a bundle
-    // whose header SHA does not match its pack content.
-    let (tip_id, ref_name, tag_chain) = resolve_spec_to_ref(&repo, spec)?;
-    let commit_ids = collect_commit_ids(&repo, tip_id)?;
+    // `peeled` carries the leaf kind + tag chain; the seed-set for the count
+    // phase depends on the kind.
+    let (peeled, ref_name) = resolve_spec_to_ref(&repo, spec)?;
 
     // Strip the Proxy wrapper to expose the gix_pack::Find impl needed by the
     // output pipeline (gix::OdbHandle = Proxy<Cache<...>> does not implement
@@ -231,18 +237,39 @@ pub fn create(cwd: &Path, folder: &Path, sha: Sha, spec: &str) -> Result<PathBuf
     // panics unless the handle has been pinned against pack unloading.
     odb.prevent_pack_unload();
 
-    // Count every object reachable from the commits (commits + trees + blobs).
+    // Dispatch on leaf kind: commit-tipped uses TreeContents over the
+    // commit walk; tree-tipped enumerates the tree closure and uses
+    // AsIs; blob-tipped passes the single blob with AsIs.
+    let (input_oids, expansion, tag_chain) = match peeled {
+        PeeledTip::Commit { commit, tag_chain } => {
+            let ids = collect_commit_ids(&repo, *commit.as_object_id())?;
+            (
+                ids,
+                count::objects::ObjectExpansion::TreeContents,
+                tag_chain,
+            )
+        }
+        PeeledTip::Tree { tree, tag_chain } => {
+            let ids = crate::packchain::git::enumerate_tree_closure(&repo, tree)
+                .map_err(|e| BundleError::Git(Box::new(e)))?;
+            (ids, count::objects::ObjectExpansion::AsIs, tag_chain)
+        }
+        PeeledTip::Blob { blob, tag_chain } => {
+            (vec![blob], count::objects::ObjectExpansion::AsIs, tag_chain)
+        }
+    };
+
     let (mut counts, _) = count::objects(
         odb.clone(),
         Box::new(
-            commit_ids
+            input_oids
                 .into_iter()
                 .map(Ok::<_, Box<dyn std::error::Error + Send + Sync + 'static>>),
         ),
         &gix::progress::Discard,
         &AtomicBool::new(false),
         count::objects::Options {
-            input_object_expansion: count::objects::ObjectExpansion::TreeContents,
+            input_object_expansion: expansion,
             thread_limit: Some(1),
             ..Default::default()
         },
@@ -250,7 +277,7 @@ pub fn create(cwd: &Path, folder: &Path, sha: Sha, spec: &str) -> Result<PathBuf
 
     // For tag-ref pushes, append the annotated-tag objects (and any
     // tag-of-tag chain) verbatim. Without this, the bundle's pack
-    // contains commit-reachable objects but not the tag object itself,
+    // contains the leaf-reachable objects but not the tag object itself,
     // so a fetch-back of the tag ref would fail to update
     // `refs/tags/v1` because the tag-OID isn't in the receiver's ODB.
     counts.extend(count_objects_as_is(odb.clone(), &tag_chain)?);
@@ -389,13 +416,13 @@ pub fn unbundle(
     Ok(())
 }
 
-/// Resolve `spec` in `repo` to `(commit_oid, canonical_ref_name, tag_chain)`.
+/// Resolve `spec` in `repo` to `(peeled, canonical_ref_name)`.
 ///
-/// `tag_chain` is the sequence of tag-object OIDs encountered while
-/// peeling — empty for branches and lightweight tags, length ≥ 1 for
-/// annotated tags. Callers append these to the pack with `AsIs`
-/// expansion so receivers can install the tag object alongside the
-/// commit-reachable graph.
+/// `peeled` is the [`PeeledTip`] produced by walking the resolved OID
+/// through any annotated-tag chain — its variant identifies the leaf
+/// kind, and `tag_chain()` lists the tag objects encountered. Both are
+/// shared with the packchain engine so the two engines agree on tag /
+/// tree / blob handling and chain order.
 ///
 /// gix ref names are required to be valid UTF-8 by `gix-validate`, so
 /// the conversion below cannot fail in practice; it is wrapped in an
@@ -404,14 +431,10 @@ pub fn unbundle(
 fn resolve_spec_to_ref(
     repo: &gix::Repository,
     spec: &str,
-) -> Result<(ObjectId, String, Vec<ObjectId>), BundleError> {
+) -> Result<(PeeledTip, String), BundleError> {
     let resolved = repo.rev_parse_single(BStr::new(spec))?.detach();
-    // Reuse the shared peel helper so bundle and packchain agree on
-    // tag-of-tree / tag-of-blob handling and chain order.
-    let (tip_sha, tag_chain) =
-        crate::git::peel_to_commit_with_tag_chain(repo, Sha::from_object_id(resolved))
-            .map_err(|e| BundleError::Git(Box::new(e)))?;
-    let tip_id = *tip_sha.as_object_id();
+    let peeled = crate::git::peel_tag_chain(repo, Sha::from_object_id(resolved))
+        .map_err(|e| BundleError::Git(Box::new(e)))?;
 
     // Follow symrefs one level (HEAD -> refs/heads/main) for the bundle ref line.
     let ref_name = match repo.try_find_reference(spec) {
@@ -428,7 +451,7 @@ fn resolve_spec_to_ref(
         _ => spec.to_owned(),
     };
 
-    Ok((tip_id, ref_name, tag_chain))
+    Ok((peeled, ref_name))
 }
 
 /// Errors from [`create`] and [`unbundle`].
@@ -471,8 +494,8 @@ pub enum BundleError {
     #[error(transparent)]
     Io(#[from] io::Error),
     /// Underlying git operation failed (peel, find-object, etc.) —
-    /// surfaces e.g. `GitError::TagTargetUnsupported` from the shared
-    /// peel helper.
+    /// surfaces errors from the shared `peel_tag_chain` helper and
+    /// from tree-closure enumeration.
     #[error(transparent)]
     Git(Box<crate::git::GitError>),
 }
@@ -850,10 +873,10 @@ mod tests {
     }
 
     #[test]
-    fn bundle_create_rejects_tag_pointing_to_blob_with_tag_target_unsupported() {
-        // E6: tag-of-blob is out of scope; bundle::create must surface
-        // the typed `TagTargetUnsupported` error rather than emitting a
-        // partial pack.
+    fn bundle_create_round_trips_tag_pointing_to_blob() {
+        // #80: tag-of-blob is now supported. Bundle's pack contains
+        // exactly the leaf blob and the tag object — no commit walk,
+        // no tree closure.
         let (repo_dir, _commit) = fixture_commit();
         let repo = gix::open(repo_dir.path()).unwrap();
         let blob = repo.write_blob(b"data").unwrap().detach();
@@ -862,21 +885,95 @@ mod tests {
         drop(repo);
 
         let folder = TempDir::new().unwrap();
-        let err = create(
+        let tag_sha = Sha::from_object_id(tag_oid);
+        let bundle_path = create(
             repo_dir.path(),
             folder.path(),
-            Sha::from_object_id(tag_oid),
+            tag_sha,
             "refs/tags/blob-tag",
         )
-        .expect_err("tag-of-blob must be rejected");
-        match err {
-            BundleError::Git(boxed) => match *boxed {
-                crate::git::GitError::TagTargetUnsupported { kind, .. } => {
-                    assert_eq!(kind, gix::object::Kind::Blob);
-                }
-                other => panic!("expected TagTargetUnsupported, got {other:?}"),
-            },
-            other => panic!("expected BundleError::Git, got {other:?}"),
+        .expect("blob-tag bundle must build");
+
+        let ref_name = RefName::new("refs/tags/blob-tag").unwrap();
+        let (_dst_dir, dst_repo) = install_bundle_into_fresh_repo(&bundle_path, tag_sha, &ref_name);
+        let odb = dst_repo.objects.clone().into_inner();
+        assert!(odb.contains(&tag_oid), "tag object must land in pack");
+        assert!(odb.contains(&blob), "blob target must land in pack");
+        // The pack must NOT carry the unrelated commit / tree / blob
+        // from the fixture — the leaf's chain is just `tag → blob`.
+        // Pin the exact object count so a regression that accidentally
+        // walked the fixture's commit graph would be caught.
+        let pack_dir = dst_repo.git_dir().join("objects/pack");
+        let idx_path = std::fs::read_dir(&pack_dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|ext| ext == "idx"))
+            .expect("idx file must exist");
+        let idx = gix_pack::index::File::at(&idx_path, gix_hash::Kind::Sha1).unwrap();
+        assert_eq!(
+            idx.num_objects(),
+            2,
+            "blob-tag bundle must contain exactly the blob + the tag",
+        );
+        // Decode the tag and pin its target kind.
+        let tag_obj = dst_repo
+            .find_object(tag_oid)
+            .unwrap()
+            .peel_to_kind(gix::object::Kind::Tag)
+            .unwrap();
+        let target_id = tag_obj.into_tag().target_id().unwrap().detach();
+        assert_eq!(
+            target_id, blob,
+            "tag must point at the blob it was created for",
+        );
+    }
+
+    #[test]
+    fn bundle_create_round_trips_tag_pointing_to_tree() {
+        // #80: tag-of-tree round-trips through bundle. Pack carries the
+        // tag, the leaf tree, and every blob in the tree closure.
+        let (repo_dir, commit) = fixture_commit();
+        let repo = gix::open(repo_dir.path()).unwrap();
+        let tree_id = repo
+            .find_object(commit)
+            .unwrap()
+            .peel_to_kind(gix::object::Kind::Commit)
+            .unwrap()
+            .into_commit()
+            .tree_id()
+            .unwrap()
+            .detach();
+        let tag_oid = write_annotated_tag(&repo, tree_id, gix::object::Kind::Tree, "tree-tag");
+        create_tag_ref(&repo, "refs/tags/tree-tag", tag_oid);
+        // Capture the blobs the leaf tree references so we can assert
+        // they survived the round-trip.
+        let tree_blobs: Vec<ObjectId> = {
+            let tree_obj = repo.find_object(tree_id).unwrap().into_tree();
+            tree_obj
+                .iter()
+                .map(|e| e.unwrap().oid().to_owned())
+                .collect()
+        };
+        drop(repo);
+
+        let folder = TempDir::new().unwrap();
+        let tag_sha = Sha::from_object_id(tag_oid);
+        let bundle_path = create(
+            repo_dir.path(),
+            folder.path(),
+            tag_sha,
+            "refs/tags/tree-tag",
+        )
+        .expect("tree-tag bundle must build");
+
+        let ref_name = RefName::new("refs/tags/tree-tag").unwrap();
+        let (_dst_dir, dst_repo) = install_bundle_into_fresh_repo(&bundle_path, tag_sha, &ref_name);
+        let odb = dst_repo.objects.clone().into_inner();
+        assert!(odb.contains(&tag_oid), "tag must land in pack");
+        assert!(odb.contains(&tree_id), "leaf tree must land in pack");
+        for blob in &tree_blobs {
+            assert!(odb.contains(blob), "tree blob {blob} must land in pack");
         }
     }
 }

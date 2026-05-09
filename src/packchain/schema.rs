@@ -154,21 +154,34 @@ pub(crate) struct ChainSegment {
 }
 
 /// `path-index.json` — nested-tree map from repo paths to blob SHAs at
-/// the current tip commit.
+/// the current tip.
+///
+/// The `tip` field stores the **unpeeled** chain.tip OID — the
+/// outermost tag for tag refs, the commit OID for branch refs, the tree
+/// OID for a bare-tree ref. Path-index is omitted entirely for
+/// blob-tipped chains (no tree to walk).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PathIndex {
     /// Schema version. Always [`PathIndex::SCHEMA_VERSION`] when
     /// written.
     pub(crate) v: u32,
-    /// SHA-1 of the commit this index reflects.
-    pub(crate) commit: Sha40,
-    /// Top-level entries at the repo root.
+    /// Unpeeled chain.tip OID this index belongs to.
+    pub(crate) tip: Sha40,
+    /// Top-level entries at the repo root (commit-tip) or the leaf tree
+    /// (tree-tip).
     pub(crate) tree: BTreeMap<String, PathNode>,
 }
 
 impl PathIndex {
     /// On-bucket schema version this build reads and writes.
-    pub(crate) const SCHEMA_VERSION: u32 = 1;
+    ///
+    /// Bumped to 2 in #80 when the field formerly known as `commit` was
+    /// renamed to `tip` (now stores the unpeeled chain.tip in all cases,
+    /// including tree-tipped chains where there is no commit). Per
+    /// `AGENTS.md` greenfield rule, no read-side migration is provided —
+    /// stale `path-index.json` files in older buckets are treated as
+    /// absent and re-emitted on the next push.
+    pub(crate) const SCHEMA_VERSION: u32 = 2;
 
     /// Parse `bytes` as `path-index.json`, validating the schema
     /// version before returning. See [`ChainManifest::from_json_bytes`]
@@ -180,18 +193,30 @@ impl PathIndex {
     /// pinned by the schema's own round-trip tests independent of the
     /// downstream call sites.
     ///
+    /// **Version pre-check**: the `v` field is parsed first via a
+    /// minimal `{ v: u32 }` shim so a stale v=1 path-index (which had
+    /// the field formerly known as `commit` instead of `tip`) surfaces
+    /// as [`PackchainError::UnsupportedSchemaVersion`] rather than a
+    /// misleading [`PackchainError::ParseJson`] about a missing `tip`
+    /// field.
+    ///
     /// # Errors
     ///
     /// See [`ChainManifest::from_json_bytes`].
     #[allow(dead_code)]
     pub(crate) fn from_json_bytes(bytes: &[u8]) -> Result<Self, PackchainError> {
-        let parsed: Self = serde_json::from_slice(bytes)?;
-        if parsed.v != Self::SCHEMA_VERSION {
+        #[derive(Deserialize)]
+        struct VersionPeek {
+            v: u32,
+        }
+        let peek: VersionPeek = serde_json::from_slice(bytes)?;
+        if peek.v != Self::SCHEMA_VERSION {
             return Err(PackchainError::UnsupportedSchemaVersion {
-                found: parsed.v,
+                found: peek.v,
                 expected: Self::SCHEMA_VERSION,
             });
         }
+        let parsed: Self = serde_json::from_slice(bytes)?;
         Ok(parsed)
     }
 
@@ -410,7 +435,7 @@ mod tests {
         ]);
         PathIndex {
             v: PathIndex::SCHEMA_VERSION,
-            commit: sha40(SHA_A),
+            tip: sha40(SHA_A),
             tree: BTreeMap::from([
                 ("Cargo.toml".to_string(), PathNode::Blob(sha40(SHA_C))),
                 ("src".to_string(), PathNode::Tree(src_subtree)),
@@ -447,7 +472,7 @@ mod tests {
         // strings, subtrees are objects. Phase 4 (read_blob) walks
         // exactly this shape.
         let json = format!(
-            r#"{{"v":1,"commit":"{SHA_A}","tree":{{"src":{{"main.rs":"{SHA_B}","mod":{{"inner.rs":"{SHA_C}"}}}}}}}}"#,
+            r#"{{"v":2,"tip":"{SHA_A}","tree":{{"src":{{"main.rs":"{SHA_B}","mod":{{"inner.rs":"{SHA_C}"}}}}}}}}"#,
         );
         let decoded = PathIndex::from_json_bytes(json.as_bytes()).unwrap();
         // Walk: root.src must be a Tree containing main.rs (Blob) and
@@ -466,21 +491,39 @@ mod tests {
     #[test]
     fn path_index_rejects_unsupported_version() {
         let mut index = fixture_path_index();
-        index.v = 2;
+        index.v = 99;
         let bytes = index.to_json_pretty().unwrap();
         let err = PathIndex::from_json_bytes(&bytes).unwrap_err();
         assert!(matches!(
             err,
             PackchainError::UnsupportedSchemaVersion {
-                found: 2,
-                expected: 1
+                found: 99,
+                expected: 2
+            },
+        ));
+    }
+
+    #[test]
+    fn path_index_rejects_old_v1_commit_field_after_schema_bump() {
+        // Stale `path-index.json` from earlier builds (v=1, field name
+        // `commit`) is treated as schema-mismatch — readers surface
+        // `UnsupportedSchemaVersion`, the on-disk file is treated as
+        // absent, and the next push re-emits in the new shape. Per
+        // AGENTS.md greenfield rule, no `serde(alias)` shim.
+        let json = format!(r#"{{"v":1,"commit":"{SHA_A}","tree":{{}}}}"#);
+        let err = PathIndex::from_json_bytes(json.as_bytes()).unwrap_err();
+        assert!(matches!(
+            err,
+            PackchainError::UnsupportedSchemaVersion {
+                found: 1,
+                expected: 2,
             },
         ));
     }
 
     #[test]
     fn path_index_rejects_invalid_blob_sha() {
-        let json = format!(r#"{{"v":1,"commit":"{SHA_A}","tree":{{"a":"not-a-sha"}}}}"#);
+        let json = format!(r#"{{"v":2,"tip":"{SHA_A}","tree":{{"a":"not-a-sha"}}}}"#);
         let err = PathIndex::from_json_bytes(json.as_bytes()).unwrap_err();
         // Note: with `serde(untagged)`, an untagged enum that fails
         // every variant produces a generic "untagged enum" parse

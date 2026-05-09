@@ -279,17 +279,6 @@ pub enum GitError {
         #[source]
         source: std::str::Utf8Error,
     },
-    /// A tag-ref's target chain ends at a tree or blob (not a commit).
-    /// Tag-of-commit is supported across both engines; tag-of-tree and
-    /// tag-of-blob require additional walk semantics not yet implemented.
-    /// Tracked separately as a feature request.
-    #[error("ref target {oid} resolves to {kind:?}; only commit targets are supported")]
-    TagTargetUnsupported {
-        /// The object whose kind is unsupported.
-        oid: ObjectId,
-        /// The leaf kind reached after peeling through the tag chain.
-        kind: gix::object::Kind,
-    },
     /// A tag chain visited the same OID twice — i.e. a cycle. Real git
     /// objects cannot form cycles (each tag's OID is determined by the
     /// SHA-1 of its content, which includes the target OID, so a cycle
@@ -477,34 +466,63 @@ pub fn is_ancestor(repo: &Repository, ancestor: Sha, descendant: Sha) -> Result<
     }
 }
 
-/// Peel `tip` to its underlying commit, collecting any annotated-tag
-/// objects encountered along the way.
+/// Result of peeling a ref's target through any annotated-tag chain.
 ///
-/// Returns `(commit_sha, tag_chain)`. `tag_chain` is empty when `tip`
-/// is already a commit (branch tips, lightweight tags). For an
-/// annotated tag the chain contains the tag OID; for an annotated tag
-/// of an annotated tag, the chain contains the outer then inner tag
-/// OIDs (walk order).
+/// The variant tells the caller what kind of leaf object the chain
+/// terminates at; `tag_chain` is the ordered sequence of tag-object OIDs
+/// encountered along the way (newest-first, i.e. outer then inner).
+/// `tag_chain` is empty for branch / lightweight-tag pushes and for bare
+/// non-tag refs that point directly at a tree or blob.
 ///
-/// Used by both pack engines so that the tag objects themselves land
-/// in the emitted pack — without them, a receiver could install all
-/// commit-reachable objects yet still fail to update `refs/tags/v1`
-/// because the tag-object OID it must point to is not in the ODB.
+/// Used by both pack engines: the tag objects themselves are appended to
+/// the emitted pack so a receiver can install the full chain, and the
+/// leaf-kind variant decides whether the pack is built from a commit
+/// rev-walk, a tree closure, or a single blob.
+pub(crate) enum PeeledTip {
+    /// Chain terminates at a commit — the canonical case (branch tips,
+    /// lightweight tags, annotated tags of commits).
+    Commit {
+        commit: Sha,
+        tag_chain: Vec<ObjectId>,
+    },
+    /// Chain terminates at a tree (annotated tag of tree, or a bare ref
+    /// pointing at a tree). The pack carries the tree plus its full
+    /// recursive subtree + blob closure verbatim, no rev-walk.
+    Tree {
+        tree: ObjectId,
+        tag_chain: Vec<ObjectId>,
+    },
+    /// Chain terminates at a blob (annotated tag of blob, or a bare ref
+    /// pointing at a blob). The pack carries the blob plus the tag
+    /// chain — there is no tree to walk.
+    Blob {
+        blob: ObjectId,
+        tag_chain: Vec<ObjectId>,
+    },
+}
+
+/// Peel `tip` through any annotated-tag chain to its leaf object.
+///
+/// Returns a [`PeeledTip`] whose variant identifies the leaf kind
+/// (commit / tree / blob) and whose `tag_chain` lists the tag objects
+/// encountered in walk order (outer first, inner last). For a branch
+/// tip or lightweight tag the chain is empty and the variant is
+/// `Commit`.
+///
+/// Both pack engines call this so the tag objects themselves land in
+/// the emitted pack — without them a receiver could install all
+/// reachable objects yet still fail to update `refs/tags/v1` because
+/// the tag-OID it must point at is not in the ODB.
 ///
 /// # Errors
 ///
 /// - [`GitError::FindObject`] if `tip` or any intermediate tag's
 ///   target is missing from the ODB.
 /// - [`GitError::PeelToKind`] if a tag object's bytes do not decode.
-/// - [`GitError::TagTargetUnsupported`] if the chain terminates at a
-///   tree or blob — tag-of-commit is the only supported leaf today.
 /// - [`GitError::TagChainCycle`] if the chain visits the same OID
 ///   twice (corrupted or adversarial ODB only — real git tags cannot
 ///   cycle).
-pub(crate) fn peel_to_commit_with_tag_chain(
-    repo: &Repository,
-    tip: Sha,
-) -> Result<(Sha, Vec<ObjectId>), GitError> {
+pub(crate) fn peel_tag_chain(repo: &Repository, tip: Sha) -> Result<PeeledTip, GitError> {
     // `visited` defends against cyclic chains in a corrupted or
     // adversarial ODB. Real git tags cannot cycle (a cycle would
     // require a SHA-1 preimage), so the HashSet stays at length ≤ chain
@@ -518,13 +536,27 @@ pub(crate) fn peel_to_commit_with_tag_chain(
         }
         let object = repo.find_object(current)?;
         match object.kind {
-            gix::object::Kind::Commit => return Ok((Sha::from_object_id(current), tag_chain)),
+            gix::object::Kind::Commit => {
+                return Ok(PeeledTip::Commit {
+                    commit: Sha::from_object_id(current),
+                    tag_chain,
+                });
+            }
             gix::object::Kind::Tag => {
                 tag_chain.push(current);
                 current = object.into_tag().target_id()?.detach();
             }
-            kind @ (gix::object::Kind::Tree | gix::object::Kind::Blob) => {
-                return Err(GitError::TagTargetUnsupported { oid: current, kind });
+            gix::object::Kind::Tree => {
+                return Ok(PeeledTip::Tree {
+                    tree: current,
+                    tag_chain,
+                });
+            }
+            gix::object::Kind::Blob => {
+                return Ok(PeeledTip::Blob {
+                    blob: current,
+                    tag_chain,
+                });
             }
         }
     }
@@ -1293,7 +1325,7 @@ mod tests {
         );
     }
 
-    // --- peel_to_commit_with_tag_chain --------------------------------
+    // --- peel_tag_chain -----------------------------------------------
 
     fn write_annotated_tag(
         repo: &Repository,
@@ -1313,16 +1345,6 @@ mod tests {
     }
 
     #[test]
-    fn peel_branch_tip_returns_commit_with_empty_chain() {
-        let (repo, _dir) = empty_repo();
-        let commit = add_commit(&repo, "refs/heads/main", &[], "c");
-        let (peeled, chain) =
-            peel_to_commit_with_tag_chain(&repo, Sha::from_object_id(commit)).expect("peel");
-        assert_eq!(peeled.as_object_id(), &commit);
-        assert!(chain.is_empty(), "branch tip has no tag chain");
-    }
-
-    #[test]
     fn peel_lightweight_tag_returns_commit_with_empty_chain() {
         // A lightweight tag is a ref pointing directly at a commit — there
         // is no tag object to walk through. We pass the commit OID
@@ -1330,10 +1352,17 @@ mod tests {
         // a lightweight tag ref).
         let (repo, _dir) = empty_repo();
         let commit = add_commit(&repo, "refs/heads/main", &[], "c");
-        let (peeled, chain) =
-            peel_to_commit_with_tag_chain(&repo, Sha::from_object_id(commit)).expect("peel");
-        assert_eq!(peeled.as_object_id(), &commit);
-        assert!(chain.is_empty());
+        let peeled = peel_tag_chain(&repo, Sha::from_object_id(commit)).expect("peel");
+        match peeled {
+            PeeledTip::Commit {
+                commit: peeled_commit,
+                tag_chain,
+            } => {
+                assert_eq!(peeled_commit.as_object_id(), &commit);
+                assert!(tag_chain.is_empty());
+            }
+            other => panic!("expected Commit variant, got {:?}", variant_name(&other)),
+        }
     }
 
     #[test]
@@ -1341,10 +1370,17 @@ mod tests {
         let (repo, _dir) = empty_repo();
         let commit = add_commit(&repo, "refs/heads/main", &[], "c");
         let tag = write_annotated_tag(&repo, commit, gix::object::Kind::Commit, "v1");
-        let (peeled, chain) =
-            peel_to_commit_with_tag_chain(&repo, Sha::from_object_id(tag)).expect("peel");
-        assert_eq!(peeled.as_object_id(), &commit);
-        assert_eq!(chain, vec![tag]);
+        let peeled = peel_tag_chain(&repo, Sha::from_object_id(tag)).expect("peel");
+        match peeled {
+            PeeledTip::Commit {
+                commit: peeled_commit,
+                tag_chain,
+            } => {
+                assert_eq!(peeled_commit.as_object_id(), &commit);
+                assert_eq!(tag_chain, vec![tag]);
+            }
+            other => panic!("expected Commit variant, got {:?}", variant_name(&other)),
+        }
     }
 
     #[test]
@@ -1353,20 +1389,25 @@ mod tests {
         let commit = add_commit(&repo, "refs/heads/main", &[], "c");
         let inner = write_annotated_tag(&repo, commit, gix::object::Kind::Commit, "inner");
         let outer = write_annotated_tag(&repo, inner, gix::object::Kind::Tag, "outer");
-        let (peeled, chain) =
-            peel_to_commit_with_tag_chain(&repo, Sha::from_object_id(outer)).expect("peel");
-        assert_eq!(peeled.as_object_id(), &commit);
-        // Walk order: outer encountered first, then inner.
-        assert_eq!(chain, vec![outer, inner]);
+        let peeled = peel_tag_chain(&repo, Sha::from_object_id(outer)).expect("peel");
+        match peeled {
+            PeeledTip::Commit {
+                commit: peeled_commit,
+                tag_chain,
+            } => {
+                assert_eq!(peeled_commit.as_object_id(), &commit);
+                // Walk order: outer encountered first, then inner.
+                assert_eq!(tag_chain, vec![outer, inner]);
+            }
+            other => panic!("expected Commit variant, got {:?}", variant_name(&other)),
+        }
     }
 
-    #[test]
-    fn peel_tag_pointing_to_tree_errors_with_tag_target_unsupported() {
+    /// Build a freestanding tree object suitable for `peel_tag_chain` tests.
+    fn write_tree_with_one_blob(repo: &gix::Repository) -> (ObjectId, ObjectId) {
         use gix::objs::tree::{Entry, EntryKind};
-        let (repo, _dir) = empty_repo();
-        // Build a freestanding tree object the tag can point at.
         let blob = repo.write_blob(b"x").expect("write blob").detach();
-        let tree_id = repo
+        let tree = repo
             .write_object(&gix::objs::Tree {
                 entries: vec![Entry {
                     mode: EntryKind::Blob.into(),
@@ -1376,31 +1417,110 @@ mod tests {
             })
             .expect("write tree")
             .detach();
+        (tree, blob)
+    }
+
+    #[test]
+    fn peel_tag_pointing_to_tree_returns_tree_variant() {
+        let (repo, _dir) = empty_repo();
+        let (tree_id, _blob) = write_tree_with_one_blob(&repo);
         let tag = write_annotated_tag(&repo, tree_id, gix::object::Kind::Tree, "tree-tag");
-        let err = peel_to_commit_with_tag_chain(&repo, Sha::from_object_id(tag))
-            .expect_err("tag-of-tree must be rejected");
-        match err {
-            GitError::TagTargetUnsupported { oid, kind } => {
-                assert_eq!(oid, tree_id);
-                assert_eq!(kind, gix::object::Kind::Tree);
+        let peeled = peel_tag_chain(&repo, Sha::from_object_id(tag)).expect("peel");
+        match peeled {
+            PeeledTip::Tree { tree, tag_chain } => {
+                assert_eq!(tree, tree_id);
+                assert_eq!(tag_chain, vec![tag]);
             }
-            other => panic!("expected TagTargetUnsupported, got {other:?}"),
+            other => panic!("expected Tree variant, got {:?}", variant_name(&other)),
         }
     }
 
     #[test]
-    fn peel_tag_pointing_to_blob_errors_with_tag_target_unsupported() {
+    fn peel_tag_pointing_to_blob_returns_blob_variant() {
         let (repo, _dir) = empty_repo();
         let blob_id = repo.write_blob(b"data").expect("write blob").detach();
         let tag = write_annotated_tag(&repo, blob_id, gix::object::Kind::Blob, "blob-tag");
-        let err = peel_to_commit_with_tag_chain(&repo, Sha::from_object_id(tag))
-            .expect_err("tag-of-blob must be rejected");
-        match err {
-            GitError::TagTargetUnsupported { oid, kind } => {
-                assert_eq!(oid, blob_id);
-                assert_eq!(kind, gix::object::Kind::Blob);
+        let peeled = peel_tag_chain(&repo, Sha::from_object_id(tag)).expect("peel");
+        match peeled {
+            PeeledTip::Blob { blob, tag_chain } => {
+                assert_eq!(blob, blob_id);
+                assert_eq!(tag_chain, vec![tag]);
             }
-            other => panic!("expected TagTargetUnsupported, got {other:?}"),
+            other => panic!("expected Blob variant, got {:?}", variant_name(&other)),
+        }
+    }
+
+    #[test]
+    fn peel_tag_of_tag_of_tree_returns_tree_with_outer_then_inner_chain() {
+        let (repo, _dir) = empty_repo();
+        let (tree_id, _blob) = write_tree_with_one_blob(&repo);
+        let inner = write_annotated_tag(&repo, tree_id, gix::object::Kind::Tree, "inner");
+        let outer = write_annotated_tag(&repo, inner, gix::object::Kind::Tag, "outer");
+        let peeled = peel_tag_chain(&repo, Sha::from_object_id(outer)).expect("peel");
+        match peeled {
+            PeeledTip::Tree { tree, tag_chain } => {
+                assert_eq!(tree, tree_id);
+                assert_eq!(tag_chain, vec![outer, inner]);
+            }
+            other => panic!("expected Tree variant, got {:?}", variant_name(&other)),
+        }
+    }
+
+    #[test]
+    fn peel_depth_three_tag_chain_to_blob_preserves_chain_order() {
+        // Three nested tags ending at a blob. Catches off-by-one in the
+        // walk that tag-of-tag (depth 2) tests would miss.
+        let (repo, _dir) = empty_repo();
+        let blob_id = repo.write_blob(b"data").expect("write blob").detach();
+        let inner = write_annotated_tag(&repo, blob_id, gix::object::Kind::Blob, "inner");
+        let middle = write_annotated_tag(&repo, inner, gix::object::Kind::Tag, "middle");
+        let outer = write_annotated_tag(&repo, middle, gix::object::Kind::Tag, "outer");
+        let peeled = peel_tag_chain(&repo, Sha::from_object_id(outer)).expect("peel");
+        match peeled {
+            PeeledTip::Blob { blob, tag_chain } => {
+                assert_eq!(blob, blob_id);
+                assert_eq!(tag_chain, vec![outer, middle, inner]);
+            }
+            other => panic!("expected Blob variant, got {:?}", variant_name(&other)),
+        }
+    }
+
+    #[test]
+    fn peel_bare_tree_ref_returns_tree_with_empty_chain() {
+        // A ref pointing directly at a tree (no tag wrapper) is legal in
+        // git. Empty tag_chain is the natural fallout of treating chain
+        // length and leaf kind as orthogonal.
+        let (repo, _dir) = empty_repo();
+        let (tree_id, _blob) = write_tree_with_one_blob(&repo);
+        let peeled = peel_tag_chain(&repo, Sha::from_object_id(tree_id)).expect("peel");
+        match peeled {
+            PeeledTip::Tree { tree, tag_chain } => {
+                assert_eq!(tree, tree_id);
+                assert!(tag_chain.is_empty());
+            }
+            other => panic!("expected Tree variant, got {:?}", variant_name(&other)),
+        }
+    }
+
+    #[test]
+    fn peel_bare_blob_ref_returns_blob_with_empty_chain() {
+        let (repo, _dir) = empty_repo();
+        let blob_id = repo.write_blob(b"data").expect("write blob").detach();
+        let peeled = peel_tag_chain(&repo, Sha::from_object_id(blob_id)).expect("peel");
+        match peeled {
+            PeeledTip::Blob { blob, tag_chain } => {
+                assert_eq!(blob, blob_id);
+                assert!(tag_chain.is_empty());
+            }
+            other => panic!("expected Blob variant, got {:?}", variant_name(&other)),
+        }
+    }
+
+    fn variant_name(p: &PeeledTip) -> &'static str {
+        match p {
+            PeeledTip::Commit { .. } => "Commit",
+            PeeledTip::Tree { .. } => "Tree",
+            PeeledTip::Blob { .. } => "Blob",
         }
     }
 

@@ -44,7 +44,7 @@ use gix_pack::data::output::count::objects::ObjectExpansion;
 use gix_pack::data::output::{count, entry};
 use tempfile::{NamedTempFile, TempDir};
 
-use crate::git::Sha;
+use crate::git::{PeeledTip, Sha};
 
 use super::PackchainError;
 use super::schema::Sha40;
@@ -71,12 +71,25 @@ pub(crate) struct BuiltPack {
     pub(crate) pack_bytes: u64,
 }
 
-/// Build a baseline pack containing every object reachable from
-/// `tip_commit`, plus the entries in `tag_chain` (typically the
-/// annotated-tag objects that lead from a tag-ref to its underlying
-/// commit). `tag_chain` is empty for branch / lightweight-tag pushes,
-/// in which case the emitted pack is byte-identical to the pre-fix
-/// behavior.
+/// Build a baseline pack for `peeled`, plus its tag chain.
+///
+/// Three branches by leaf kind:
+///
+/// - **Commit**: walk every commit reachable from the leaf commit and
+///   expand each via [`ObjectExpansion::TreeContents`] (commits + trees +
+///   blobs). The pre-#80 path; emitted pack is byte-identical for
+///   commit-tipped refs.
+/// - **Tree**: enumerate the leaf tree's full closure (subtrees + blobs,
+///   gitlinks skipped) via
+///   [`super::git::enumerate_tree_closure`] and feed it with
+///   [`ObjectExpansion::AsIs`]. We do not rely on `TreeContents`
+///   accepting a bare-tree input — that expansion is documented for
+///   commits and tags only.
+/// - **Blob**: pack the single leaf blob with
+///   [`ObjectExpansion::AsIs`]. No tree to walk.
+///
+/// In every branch the tag chain is appended verbatim so a fetch-back
+/// of `refs/tags/v1` resolves the ref to the unpeeled tag OID.
 ///
 /// `out_dir` must already exist; the resulting `.pack` and `.idx`
 /// land directly in it. Callers are responsible for `out_dir`'s
@@ -84,19 +97,34 @@ pub(crate) struct BuiltPack {
 /// `prepare_push`'s scratch area).
 pub(crate) fn build_baseline_pack(
     repo_dir: &Path,
-    tip_commit: Sha,
-    tag_chain: &[ObjectId],
+    peeled: PeeledTip,
     out_dir: &Path,
 ) -> Result<BuiltPack, PackchainError> {
     let repo = gix::open(repo_dir).map_err(crate::git::GitError::from)?;
-    let commit_ids = collect_commits_baseline(&repo, *tip_commit.as_object_id())?;
-    build_pack(
-        &repo,
-        commit_ids,
-        ObjectExpansion::TreeContents,
-        tag_chain,
-        out_dir,
-    )
+    match peeled {
+        PeeledTip::Commit { commit, tag_chain } => {
+            let commit_ids = collect_commits_baseline(&repo, *commit.as_object_id())?;
+            build_pack(
+                &repo,
+                commit_ids,
+                ObjectExpansion::TreeContents,
+                &tag_chain,
+                out_dir,
+            )
+        }
+        PeeledTip::Tree { tree, tag_chain } => {
+            let oids =
+                super::git::enumerate_tree_closure(&repo, tree).map_err(PackchainError::Git)?;
+            build_pack(&repo, oids, ObjectExpansion::AsIs, &tag_chain, out_dir)
+        }
+        PeeledTip::Blob { blob, tag_chain } => build_pack(
+            &repo,
+            vec![blob],
+            ObjectExpansion::AsIs,
+            &tag_chain,
+            out_dir,
+        ),
+    }
 }
 
 /// Build an incremental (ancestor-aware) pack: every commit
@@ -165,9 +193,14 @@ fn collect_commits_incremental(
 /// the pack at `<out_dir>/<sha>.pack`, and produces the matching `.idx`
 /// at `<out_dir>/<sha>.idx` via a second pass through
 /// [`gix_pack::Bundle::write_to_directory`].
+///
+/// `input_oids` is the seed set for the count phase: commit OIDs for a
+/// commit-walk (with `expansion = TreeContents` /
+/// `TreeAdditionsComparedToAncestor`), or pre-enumerated raw OIDs for a
+/// tree/blob-tipped pack (with `expansion = AsIs`).
 fn build_pack(
     repo: &gix::Repository,
-    commit_ids: Vec<ObjectId>,
+    input_oids: Vec<ObjectId>,
     expansion: ObjectExpansion,
     tag_chain: &[ObjectId],
     out_dir: &Path,
@@ -180,7 +213,7 @@ fn build_pack(
     let (mut counts, _stats) = count::objects(
         odb.clone(),
         Box::new(
-            commit_ids
+            input_oids
                 .into_iter()
                 .map(Ok::<_, Box<dyn std::error::Error + Send + Sync + 'static>>),
         ),
@@ -347,6 +380,13 @@ mod tests {
         }
     }
 
+    /// Build the `PeeledTip::Commit` form `build_baseline_pack` now
+    /// expects. Tests in this module pre-#80 passed `(commit, tag_chain)`
+    /// directly — the helper keeps the change-set localised.
+    fn commit_tip(commit: Sha, tag_chain: Vec<ObjectId>) -> PeeledTip {
+        PeeledTip::Commit { commit, tag_chain }
+    }
+
     /// Build a fixture repo with two commits on `refs/heads/main`.
     /// Returns `(tempdir keeping the repo alive, c1, c2)`.
     fn fixture_two_commits() -> (TempDir, Sha, Sha) {
@@ -443,7 +483,8 @@ mod tests {
     fn build_baseline_pack_handles_single_commit_repo() {
         let (repo_dir, tip) = fixture_single_commit();
         let out = TempDir::new().unwrap();
-        let built = build_baseline_pack(repo_dir.path(), tip, &[], out.path()).expect("build");
+        let built = build_baseline_pack(repo_dir.path(), commit_tip(tip, vec![]), out.path())
+            .expect("build");
         assert!(built.pack_path.exists());
         assert!(built.idx_path.exists());
         assert!(built.pack_bytes >= PACK_MIN_LEN);
@@ -458,7 +499,8 @@ mod tests {
         // (e.g.) the pack's name as gix would have written it.
         let (repo_dir, tip) = fixture_single_commit();
         let out = TempDir::new().unwrap();
-        let built = build_baseline_pack(repo_dir.path(), tip, &[], out.path()).expect("build");
+        let built = build_baseline_pack(repo_dir.path(), commit_tip(tip, vec![]), out.path())
+            .expect("build");
         let pack_bytes = std::fs::read(&built.pack_path).unwrap();
         assert!(pack_bytes.len() >= PACK_TRAILER_LEN);
         let trailer_start = pack_bytes.len() - PACK_TRAILER_LEN;
@@ -474,7 +516,8 @@ mod tests {
         // assert every commit / tree / blob is present.
         let (repo_dir, c1, c2) = fixture_two_commits();
         let out = TempDir::new().unwrap();
-        let built = build_baseline_pack(repo_dir.path(), c2, &[], out.path()).expect("build");
+        let built = build_baseline_pack(repo_dir.path(), commit_tip(c2, vec![]), out.path())
+            .expect("build");
 
         let dst = TempDir::new().unwrap();
         let dst_repo = gix::init(dst.path()).unwrap();
@@ -527,7 +570,8 @@ mod tests {
 
         let out_baseline = TempDir::new().unwrap();
         let baseline =
-            build_baseline_pack(repo_dir.path(), c1, &[], out_baseline.path()).expect("baseline");
+            build_baseline_pack(repo_dir.path(), commit_tip(c1, vec![]), out_baseline.path())
+                .expect("baseline");
 
         let out_incr = TempDir::new().unwrap();
         let incr = build_incremental_pack(repo_dir.path(), c1, c2, &[], out_incr.path())
@@ -564,7 +608,8 @@ mod tests {
 
         let out_baseline = TempDir::new().unwrap();
         let baseline =
-            build_baseline_pack(repo_dir.path(), c1, &[], out_baseline.path()).expect("baseline");
+            build_baseline_pack(repo_dir.path(), commit_tip(c1, vec![]), out_baseline.path())
+                .expect("baseline");
         let out_incr = TempDir::new().unwrap();
         let incr = build_incremental_pack(repo_dir.path(), c1, c2, &[], out_incr.path())
             .expect("incremental");
@@ -676,8 +721,8 @@ mod tests {
         drop(repo);
 
         let out = TempDir::new().unwrap();
-        let built =
-            build_baseline_pack(repo_dir.path(), c2, &[tag_oid], out.path()).expect("build");
+        let built = build_baseline_pack(repo_dir.path(), commit_tip(c2, vec![tag_oid]), out.path())
+            .expect("build");
 
         let (_dst_dir, dst_repo) = install_into_fresh_repo(&built.pack_path);
         let odb = dst_repo.objects.clone().into_inner();
@@ -718,8 +763,12 @@ mod tests {
         drop(repo);
 
         let out = TempDir::new().unwrap();
-        let built =
-            build_baseline_pack(repo_dir.path(), c2, &[outer, inner], out.path()).expect("build");
+        let built = build_baseline_pack(
+            repo_dir.path(),
+            commit_tip(c2, vec![outer, inner]),
+            out.path(),
+        )
+        .expect("build");
 
         let (_dst_dir, dst_repo) = install_into_fresh_repo(&built.pack_path);
         let odb = dst_repo.objects.clone().into_inner();
@@ -741,7 +790,8 @@ mod tests {
         // the pre-fix expected value.
         let (repo_dir, _c1, c2) = fixture_two_commits();
         let out = TempDir::new().unwrap();
-        let built = build_baseline_pack(repo_dir.path(), c2, &[], out.path()).expect("build");
+        let built = build_baseline_pack(repo_dir.path(), commit_tip(c2, vec![]), out.path())
+            .expect("build");
         let idx = gix_pack::index::File::at(&built.idx_path, gix_hash::Kind::Sha1).unwrap();
         // 2 commits + 2 trees + 3 blobs = 7 (a-v1, a-v2, b)
         assert_eq!(
@@ -772,5 +822,121 @@ mod tests {
             odb.contains(&new_tag),
             "new tag must be in incremental pack"
         );
+    }
+
+    // --- non-commit tip pack-build (issue #80) ------------------------
+
+    /// Resolve `c2`'s root tree OID. The fixture has two commits whose
+    /// trees differ, so the tree-tip tests pin to `c2`'s tree.
+    fn root_tree_of(commit: Sha, repo_dir: &Path) -> ObjectId {
+        let repo = gix::open(repo_dir).unwrap();
+        repo.find_object(*commit.as_object_id())
+            .unwrap()
+            .peel_to_kind(gix::object::Kind::Commit)
+            .unwrap()
+            .into_commit()
+            .tree_id()
+            .unwrap()
+            .detach()
+    }
+
+    #[test]
+    fn build_baseline_pack_for_tree_tip_includes_tree_closure_and_tag() {
+        // Tag-of-tree: peel terminates at a tree, pack must carry the
+        // tree, every reachable subtree, every blob, and the tag chain.
+        let (repo_dir, _c1, c2) = fixture_two_commits();
+        let root_tree = root_tree_of(c2, repo_dir.path());
+        let repo = gix::open(repo_dir.path()).unwrap();
+        let tag = write_annotated_tag(&repo, root_tree, gix::object::Kind::Tree, "v1-tree");
+        drop(repo);
+
+        let out = TempDir::new().unwrap();
+        let peeled = PeeledTip::Tree {
+            tree: root_tree,
+            tag_chain: vec![tag],
+        };
+        let built = build_baseline_pack(repo_dir.path(), peeled, out.path()).expect("build");
+        let (_dst_dir, dst_repo) = install_into_fresh_repo(&built.pack_path);
+        let odb = dst_repo.objects.clone().into_inner();
+        assert!(odb.contains(&tag), "tag object must be in pack");
+        assert!(odb.contains(&root_tree), "leaf tree must be in pack");
+
+        // The fixture's c2 tree has two blobs (a.txt v2, b.txt new) at
+        // the root with no subtrees — pin both blob OIDs by walking the
+        // tree from the source repo.
+        let src = gix::open(repo_dir.path()).unwrap();
+        let tree_obj = src.find_object(root_tree).unwrap().into_tree();
+        for entry in tree_obj.iter() {
+            let entry = entry.unwrap();
+            assert!(
+                odb.contains(entry.oid()),
+                "blob {:?} must be in pack",
+                entry.oid(),
+            );
+        }
+    }
+
+    #[test]
+    fn build_baseline_pack_for_blob_tip_packs_only_blob_and_tag() {
+        // Tag-of-blob: pack must carry the blob and the tag, nothing
+        // else. Asserting the .idx object count pins the contract.
+        let (repo_dir, _c1, _c2) = fixture_two_commits();
+        let repo = gix::open(repo_dir.path()).unwrap();
+        let blob = repo.write_blob(b"leaf").unwrap().detach();
+        let tag = write_annotated_tag(&repo, blob, gix::object::Kind::Blob, "v1-blob");
+        drop(repo);
+
+        let out = TempDir::new().unwrap();
+        let peeled = PeeledTip::Blob {
+            blob,
+            tag_chain: vec![tag],
+        };
+        let built = build_baseline_pack(repo_dir.path(), peeled, out.path()).expect("build");
+        let idx = gix_pack::index::File::at(&built.idx_path, gix_hash::Kind::Sha1).unwrap();
+        assert_eq!(
+            idx.num_objects(),
+            2,
+            "blob-tip pack must contain exactly the blob + the tag",
+        );
+
+        let (_dst_dir, dst_repo) = install_into_fresh_repo(&built.pack_path);
+        let odb = dst_repo.objects.clone().into_inner();
+        assert!(odb.contains(&blob));
+        assert!(odb.contains(&tag));
+    }
+
+    #[test]
+    fn build_baseline_pack_for_bare_tree_ref_emits_tree_with_empty_chain() {
+        // A ref pointing directly at a tree (no tag wrapper). Empty
+        // tag_chain is allowed and must not regress the empty-chain
+        // codepath in `count_objects_as_is`. The pack must carry the
+        // full tree closure (subtree blobs included) — without the
+        // closure check, a regression that emitted only the tree-OID
+        // and dropped descent would still pass.
+        let (repo_dir, _c1, c2) = fixture_two_commits();
+        let root_tree = root_tree_of(c2, repo_dir.path());
+
+        let out = TempDir::new().unwrap();
+        let peeled = PeeledTip::Tree {
+            tree: root_tree,
+            tag_chain: Vec::new(),
+        };
+        let built = build_baseline_pack(repo_dir.path(), peeled, out.path()).expect("build");
+
+        let (_dst_dir, dst_repo) = install_into_fresh_repo(&built.pack_path);
+        let odb = dst_repo.objects.clone().into_inner();
+        assert!(odb.contains(&root_tree));
+        // Pin every blob the leaf tree references — this catches a
+        // regression where `enumerate_tree_closure` stopped descending.
+        let src = gix::open(repo_dir.path()).unwrap();
+        let tree_obj = src.find_object(root_tree).unwrap().into_tree();
+        for entry in tree_obj.iter() {
+            let entry = entry.unwrap();
+            assert!(
+                odb.contains(entry.oid()),
+                "tree blob {:?} must be in pack",
+                entry.oid(),
+            );
+        }
     }
 }

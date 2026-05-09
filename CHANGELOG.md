@@ -7,8 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Annotated-tag refs whose chain ends at a tree or blob now push
+  and fetch correctly across both the `bundle` and `packchain`
+  engines. The pack carries the tag chain plus the leaf object — for
+  tree-tipped chains, the full recursive blob closure is included
+  via an explicit depth-first walk fed to `count::objects` with
+  `ObjectExpansion::AsIs` (gix-pack's `TreeContents` expansion is
+  documented for commits/tags only, so we don't rely on it for bare
+  tree input). Bare-tree and bare-blob refs (a ref pointing directly
+  at a tree or blob with no tag wrapper) are supported as a natural
+  extension of the same dispatch. Force-push is the only way to
+  convert a commit-tipped ref to a non-commit-tipped ref (and
+  vice-versa); a non-force kind change is rejected as
+  not-an-ancestor (#80).
+
 ### Changed
 
+- **Breaking** (on-bucket schema): `path-index.json` field `commit`
+  is renamed to `tip` and now stores the unpeeled chain.tip OID
+  instead of the underlying commit SHA. The schema version is
+  bumped from 1 to 2; per the project's greenfield policy
+  (`AGENTS.md`) no read-side migration is provided, so stale v=1
+  files in older buckets are treated as absent and re-emitted on
+  the next push. Tree-tipped chains (annotated tag of tree, bare
+  tree ref) now have a `path-index.json`; blob-tipped chains do
+  not, since there is no tree to walk (#80).
 - `parse_bundle_key` now rejects bundle keys whose extracted ref
   path fails `gix-validate`'s ref-name check (`..` traversal,
   control characters, `.lock` suffixes). Mirrors the packchain-side
@@ -61,12 +86,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (annotated tag, or tag-of-tag) verbatim into the emitted pack
   via a second `count::objects` pass with
   `ObjectExpansion::AsIs`. Branch and lightweight-tag pushes are
-  unaffected. Tag refs whose target is a tree or blob are
-  explicitly rejected with `GitError::TagTargetUnsupported`;
-  tracked separately as a feature request (#79).
+  unaffected. Tag refs whose target is a tree or blob were
+  initially rejected; #80 lifted that restriction (#79).
 
 ### Removed
 
+- **Breaking** (Rust API): `GitError::TagTargetUnsupported` variant
+  removed. The variant existed only to reject tag-of-tree /
+  tag-of-blob pushes deferred from #79; #80 implements full support
+  for those cases, so the rejection path no longer fires.
+  Downstream code that exhaustively matched `GitError` and had a
+  branch for `TagTargetUnsupported` will need to drop the branch
+  (the kind dispatch now lives inside the new `PeeledTip` enum
+  returned by `peel_tag_chain`).
 - **Breaking** (Rust API): `ProtocolError::EngineNotImplemented`
   variant removed. The variant was a leftover from packchain Phase 1
   scaffolding and was never constructed once push (#63), fetch (#64),

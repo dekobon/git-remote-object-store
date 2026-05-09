@@ -76,6 +76,31 @@ tag_in_repo() {
 	fi
 }
 
+# mktag_in_repo <dir> <ref-name> <target-oid> <target-kind>
+# Build a raw tag-object pointing at <target-oid> of <target-kind>
+# (commit, tree, or blob) and create the ref <ref-name> pointing at
+# the tag. Echoes the new tag OID on success. The only CLI-friendly
+# way to forge tag-of-tree / tag-of-blob refs (porcelain `git tag -a`
+# does not accept a bare tree / blob target without a peel detour).
+mktag_in_repo() {
+	local dir="$1"
+	local ref_name="$2"
+	local target_oid="$3"
+	local target_kind="$4"
+	if [[ -z "$dir" || -z "$ref_name" || -z "$target_oid" || -z "$target_kind" ]]; then
+		echo "mktag_in_repo: requires <dir> <ref-name> <target-oid> <target-kind>" >&2
+		return 1
+	fi
+	local tag_basename="${ref_name##*/}"
+	local body
+	body=$(printf 'object %s\ntype %s\ntag %s\ntagger Test <test@example.com> 0 +0000\n\nintegration-test tag\n' \
+		"$target_oid" "$target_kind" "$tag_basename")
+	local tag_sha
+	tag_sha=$(printf '%s' "$body" | git -C "$dir" mktag) || return 1
+	git -C "$dir" update-ref "$ref_name" "$tag_sha" || return 1
+	echo "$tag_sha"
+}
+
 # add_remote <dir> <name> <url>
 # Add a remote named <name> with URL <url> to the repo at <dir>.
 add_remote() {
