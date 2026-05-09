@@ -37,7 +37,7 @@ use tracing::{debug, info, warn};
 
 use crate::git::{self, RefName, Sha};
 use crate::keys;
-use crate::object_store::{GetOpts, ObjectStore, PutOpts};
+use crate::object_store::{GetOpts, ObjectStore, ObjectStoreError, PutOpts};
 use crate::protocol::fetch::MAX_FETCH_CONCURRENCY;
 use crate::protocol::push::{acquire_lock, lock_key, release_lock};
 
@@ -333,6 +333,15 @@ async fn compact_under_lock(
     let new_pack_key = pack_key(prefix, &new_pack.content_sha);
     let new_idx_key = pack_idx_key(prefix, &new_pack.content_sha);
     let new_bundle_key = keys::bundle_key(prefix, ref_name, chain.tip.as_str());
+    // Capture the pre-rewrite baseline bundle key. Once `write_chain`
+    // commits the new manifest, the old `<full_at>.bundle` becomes
+    // unreachable — and bundle keys live outside the `packs/`
+    // namespace that `gc::list_pack_shas` scans, so without an
+    // explicit delete here the file would leak forever (issue #84).
+    // We delete only when `full_at` actually moved; if the tip is
+    // unchanged (compact collapsing only non-baseline packs), the
+    // old key equals the new one and is still live.
+    let old_bundle_key = keys::bundle_key(prefix, ref_name, chain.full_at.as_str());
     upload_pack_and_idx(
         store,
         &new_pack_key,
@@ -362,6 +371,12 @@ async fn compact_under_lock(
         segments: vec![new_segment],
     };
     write_chain(store, prefix, ref_name, &new_chain).await?;
+
+    // chain.json is now durable — the old baseline bundle is
+    // unreachable. See [`delete_prior_baseline_bundle`] for why
+    // this delete must run under the same lock and after the
+    // chain.json commit.
+    delete_prior_baseline_bundle(store, &old_bundle_key, &new_bundle_key).await?;
 
     info!(
         ref_path = %ref_name.as_str(),
@@ -506,6 +521,42 @@ async fn upload_bundle(
         .await
         .map_err(PackchainError::Store)?;
     Ok(())
+}
+
+/// Delete the prior `<full_at>.bundle` once the new chain.json is
+/// durable.
+///
+/// Called from [`compact_under_lock`] AFTER the `write_chain` PUT —
+/// any reader after that point follows the new chain.json and never
+/// references the old key. Running under the per-ref lock prevents a
+/// concurrent push from reusing the same `full_at` SHA between our
+/// chain commit and our delete.
+///
+/// Skips when `old == new` (compact left `full_at` unchanged — the
+/// keys alias the same live bundle). Tolerates `NotFound` so a retry
+/// after a partial completion is idempotent (issue #84).
+async fn delete_prior_baseline_bundle(
+    store: &dyn ObjectStore,
+    old_bundle_key: &str,
+    new_bundle_key: &str,
+) -> Result<(), PackchainError> {
+    if old_bundle_key == new_bundle_key {
+        return Ok(());
+    }
+    match store.delete(old_bundle_key).await {
+        Ok(()) => {
+            debug!(key = %old_bundle_key, "compact: deleted prior baseline bundle");
+            Ok(())
+        }
+        Err(ObjectStoreError::NotFound(_)) => {
+            debug!(
+                key = %old_bundle_key,
+                "compact: prior baseline bundle already absent",
+            );
+            Ok(())
+        }
+        Err(e) => Err(PackchainError::Store(e)),
+    }
 }
 
 #[cfg(test)]
@@ -777,7 +828,7 @@ mod tests {
         // segment at tip with full_at = tip and the new pack
         // content-sha is uploaded.
         let store = MockStore::new();
-        let (_repo, prior, _c1, _c2, c3) = lay_down_three_segment_chain(&store, "repo").await;
+        let (_repo, prior, c1, _c2, c3) = lay_down_three_segment_chain(&store, "repo").await;
 
         // Delete the fixture's path-index so the post-compact
         // assertion below is observable: compact writing the
@@ -828,6 +879,17 @@ mod tests {
             "fresh baseline bundle at the new tip must be uploaded",
         );
 
+        // The PRIOR baseline bundle (at c1) must have been deleted —
+        // it is unreachable from the new chain.json and lives outside
+        // the `packs/` namespace that GC scans, so leaking it would
+        // accumulate orphan files forever (issue #84).
+        let prior_bundle_key = format!("repo/refs/heads/main/{c1}.bundle");
+        assert!(
+            !store.contains(&prior_bundle_key),
+            "compact must delete the prior baseline bundle once \
+             chain.json no longer references it",
+        );
+
         // The fresh path-index.json at the ref must exist. We
         // explicitly deleted the fixture's pre-existing one above
         // so this assertion catches a regression where compact
@@ -842,6 +904,85 @@ mod tests {
         assert!(
             !store.contains(&lock),
             "compact must release the per-ref lock on success",
+        );
+    }
+
+    #[tokio::test]
+    async fn second_compact_after_successful_compact_is_already_minimal() {
+        // Idempotency at the public `compact()` entrypoint: a successful
+        // compact deletes the prior baseline bundle and rewrites the chain
+        // to a single segment at the tip. A second compact against the
+        // same ref must observe `AlreadyMinimal` and do nothing.
+        //
+        // NOTE: this test does NOT cover the `delete_prior_baseline_bundle`
+        // `NotFound` branch — the second compact short-circuits at
+        // `AlreadyMinimal` before reaching the helper, so removing the
+        // `NotFound` tolerance from production code does not make this
+        // test fail. The helper's `NotFound` branch is covered directly
+        // by `delete_prior_baseline_bundle_tolerates_already_absent`.
+        let store = MockStore::new();
+        let (_repo, _prior, c1, _c2, _c3) = lay_down_three_segment_chain(&store, "repo").await;
+
+        let prior_bundle_key = format!("repo/refs/heads/main/{c1}.bundle");
+        // Fixture invariant: the prior baseline bundle is written; assert
+        // up-front so the test fails loudly if the fixture changes shape.
+        assert!(store.contains(&prior_bundle_key));
+
+        let outcome = compact(&store, Some("repo"), &ref_main(), opts(true))
+            .await
+            .unwrap();
+        assert_eq!(outcome.action, CompactAction::Compacted);
+        assert!(!store.contains(&prior_bundle_key));
+
+        let second = compact(&store, Some("repo"), &ref_main(), opts(true))
+            .await
+            .unwrap();
+        assert_eq!(second.action, CompactAction::AlreadyMinimal);
+    }
+
+    #[tokio::test]
+    async fn delete_prior_baseline_bundle_tolerates_already_absent() {
+        // Direct unit-level coverage of the `NotFound` branch.
+        // `second_compact_after_successful_compact_is_already_minimal`
+        // exercises idempotency at the public `compact()` entrypoint,
+        // but its second run short-circuits via `AlreadyMinimal` before
+        // reaching the helper — so it cannot catch a regression that
+        // breaks the helper's `NotFound` tolerance. This test calls the
+        // helper directly with an old key that does not exist on the
+        // store, locking down the tolerated `NotFound` swallow that
+        // issue #84's fix relies on.
+        let store = MockStore::new();
+        // Old key intentionally absent; new key intentionally present.
+        // Distinct keys so the early `old == new` short-circuit does
+        // not fire — the delete must actually be attempted.
+        let old_key = "repo/refs/heads/main/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bundle";
+        let new_key = "repo/refs/heads/main/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bundle";
+        store.insert(new_key, Bytes::from_static(b"new"));
+        delete_prior_baseline_bundle(&store, old_key, new_key)
+            .await
+            .expect("missing old bundle must be tolerated");
+        assert!(
+            store.contains(new_key),
+            "tolerating NotFound on the old key must not touch the new key",
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_prior_baseline_bundle_skips_when_keys_alias() {
+        // The `old_key == new_key` short-circuit guards the case where
+        // compact left `full_at` unchanged (collapsing only non-baseline
+        // segments). A real delete here would erase the live baseline
+        // bundle the new chain still points at — exactly the bug the
+        // guard prevents.
+        let store = MockStore::new();
+        let key = "repo/refs/heads/main/cccccccccccccccccccccccccccccccccccccccc.bundle";
+        store.insert(key, Bytes::from_static(b"live"));
+        delete_prior_baseline_bundle(&store, key, key)
+            .await
+            .expect("aliasing keys must short-circuit cleanly");
+        assert!(
+            store.contains(key),
+            "aliasing keys must not delete the live baseline bundle",
         );
     }
 
