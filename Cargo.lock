@@ -1853,6 +1853,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "dialoguer",
+ "flate2",
  "futures",
  "gix",
  "gix-archive",
