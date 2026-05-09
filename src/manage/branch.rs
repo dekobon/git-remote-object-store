@@ -75,7 +75,11 @@ impl<'a> ManageBranch<'a> {
     fn protected_key(&self) -> String {
         keys::join(
             &self.prefix,
-            &format!("refs/heads/{}/PROTECTED#", self.branch),
+            &format!(
+                "refs/heads/{}/{}",
+                self.branch,
+                keys::PROTECTED_MARKER_SEGMENT,
+            ),
         )
     }
 

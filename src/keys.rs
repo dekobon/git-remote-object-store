@@ -13,6 +13,26 @@
 
 use std::fmt;
 
+/// Final-segment name written for protected refs. Shape on bucket:
+/// `<prefix>/<ref-path>/PROTECTED#`. The literal `#` keeps it cleanly
+/// outside the bundle/lock/zip namespaces and `gix-validate` rejects
+/// `#` in ref names, so the marker cannot be confused with a real ref.
+///
+/// Use [`is_protected_marker_segment`] to test a candidate last
+/// segment for the marker — substring matching against the full key
+/// is unsafe (the literal could appear elsewhere in a future schema).
+pub(crate) const PROTECTED_MARKER_SEGMENT: &str = "PROTECTED#";
+
+/// Returns `true` iff `last_segment` is the protected-marker name.
+///
+/// Callers that hold the full key should split with `rsplit_once('/')`
+/// and pass the trailing segment. Substring matching against the full
+/// key is unsafe — see the type-level note on
+/// [`PROTECTED_MARKER_SEGMENT`].
+pub(crate) fn is_protected_marker_segment(last_segment: &str) -> bool {
+    last_segment == PROTECTED_MARKER_SEGMENT
+}
+
 /// Join `prefix` and `suffix` with a single `/`, omitting both the
 /// separator and the prefix entirely when `prefix` is empty.
 ///

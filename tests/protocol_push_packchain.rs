@@ -383,13 +383,14 @@ async fn lock_contention_returns_error_outcome() {
     let text = std::str::from_utf8(&out).unwrap();
     // Pin the exact wire bytes — the trailing `?` matters because git
     // treats `error <ref> "..."?` as recoverable and the inverse as fatal.
-    // The TTL number is a runtime parameter (`GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`,
-    // defaulting to 60), so the expected line embeds the same value the
-    // helper used.
+    // The TTL number is a runtime parameter
+    // (`GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`); the default flows
+    // from `DEFAULT_LOCK_TTL_SECONDS` so a future change to the default
+    // updates both production code and this test in lockstep.
     let ttl_secs: u64 = std::env::var("GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(60);
+        .unwrap_or(git_remote_object_store::protocol::push::DEFAULT_LOCK_TTL_SECONDS);
     let expected = format!(
         "error refs/heads/main \"failed to acquire ref lock at \
          repo/refs/heads/main/LOCK#.lock. Another client may be pushing. \
