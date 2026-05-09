@@ -8,10 +8,11 @@
 //! the bundle handler returns stale tips on packchain remotes,
 //! breaking `git ls-remote`, `git fetch`, and `git pull`.
 //!
-//! This module's [`list_refs`] reads `<prefix>/refs/heads/*/chain.json`
-//! and reports the parsed `chain.tip` per ref — the actual current
-//! tip of each branch. The wire format the protocol layer emits is
-//! unchanged.
+//! This module's [`list_refs`] reads `<prefix>/refs/**/chain.json`
+//! across every ref namespace (`refs/heads/`, `refs/tags/`,
+//! `refs/notes/`, etc.) and reports the parsed `chain.tip` per ref —
+//! the actual current tip of each ref. The wire format the protocol
+//! layer emits is unchanged.
 //!
 //! ## Failure modes
 //!
@@ -42,7 +43,8 @@ pub(crate) struct ChainRef {
     /// Current tip SHA — `chain.tip`, **not** the baseline
     /// `full_at` filename SHA.
     pub(crate) sha: String,
-    /// Full ref path (`refs/heads/<branch>`).
+    /// Full ref path (`refs/heads/<branch>`, `refs/tags/<tag>`,
+    /// `refs/notes/<name>`, …).
     pub(crate) ref_path: String,
     /// `chain.json`'s `last_modified`. The protocol layer sorts
     /// newest-first across refs for parity with bundle's
@@ -50,7 +52,8 @@ pub(crate) struct ChainRef {
     pub(crate) last_modified: OffsetDateTime,
 }
 
-/// List every packchain ref under `<prefix>/refs/heads/`.
+/// List every packchain ref under `<prefix>/refs/` across every ref
+/// namespace (`refs/heads/`, `refs/tags/`, `refs/notes/`, etc.).
 ///
 /// Returns an empty `Vec` for an empty bucket or a bucket that has
 /// no `chain.json` files (e.g. a freshly-`FORMAT`ed packchain bucket
@@ -66,7 +69,7 @@ pub(crate) async fn list_refs(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
 ) -> Result<Vec<ChainRef>, PackchainError> {
-    let refs_prefix = keys::join(prefix.unwrap_or(""), "refs/heads/");
+    let refs_prefix = keys::join(prefix.unwrap_or(""), "refs/");
     let metas = store.list(&refs_prefix).await?;
 
     // Two-phase: first filter and validate ref names synchronously,
@@ -445,6 +448,124 @@ mod tests {
             !entries.iter().any(|e| e.ref_path.contains("..")),
             "no entry with `..` in ref_path may reach the list output",
         );
+    }
+
+    #[tokio::test]
+    async fn list_refs_surfaces_tag_chain() {
+        // Regression for issue #82: chains under `refs/tags/` were
+        // invisible to the helper-protocol `list` command before the
+        // listing prefix was widened from `refs/heads/` to `refs/`.
+        let store = MockStore::new();
+        write_test_chain(
+            &store,
+            Some("repo"),
+            &ref_("refs/tags/v1"),
+            SHA_TIP,
+            SHA_TIP,
+        )
+        .await;
+        let entries = list_refs(&store, Some("repo")).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ref_path, "refs/tags/v1");
+        assert_eq!(entries[0].sha, SHA_TIP);
+    }
+
+    #[tokio::test]
+    async fn list_refs_surfaces_notes_chain() {
+        // `refs/notes/commits` is the canonical git-notes ref. It
+        // must surface alongside heads and tags.
+        let store = MockStore::new();
+        write_test_chain(
+            &store,
+            Some("repo"),
+            &ref_("refs/notes/commits"),
+            SHA_TIP,
+            SHA_TIP,
+        )
+        .await;
+        let entries = list_refs(&store, Some("repo")).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ref_path, "refs/notes/commits");
+        assert_eq!(entries[0].sha, SHA_TIP);
+    }
+
+    #[tokio::test]
+    async fn list_refs_collects_chains_from_mixed_namespaces() {
+        // Heads, tags, and notes coexisting under one prefix must
+        // all appear in the listing with their correct tips.
+        let store = MockStore::new();
+        write_test_chain(
+            &store,
+            Some("repo"),
+            &ref_("refs/heads/main"),
+            SHA_TIP,
+            SHA_FULL,
+        )
+        .await;
+        write_test_chain(
+            &store,
+            Some("repo"),
+            &ref_("refs/tags/v1"),
+            SHA_TIP_DEV,
+            SHA_TIP_DEV,
+        )
+        .await;
+        write_test_chain(
+            &store,
+            Some("repo"),
+            &ref_("refs/notes/commits"),
+            SHA_FULL,
+            SHA_FULL,
+        )
+        .await;
+        let entries = list_refs(&store, Some("repo")).await.unwrap();
+        let by_ref: std::collections::HashMap<_, _> = entries
+            .iter()
+            .map(|e| (e.ref_path.clone(), e.sha.clone()))
+            .collect();
+        assert_eq!(by_ref.len(), 3, "all three namespaces must appear");
+        assert_eq!(
+            by_ref.get("refs/heads/main").map(String::as_str),
+            Some(SHA_TIP),
+        );
+        assert_eq!(
+            by_ref.get("refs/tags/v1").map(String::as_str),
+            Some(SHA_TIP_DEV),
+        );
+        assert_eq!(
+            by_ref.get("refs/notes/commits").map(String::as_str),
+            Some(SHA_FULL),
+        );
+    }
+
+    #[tokio::test]
+    async fn list_refs_ignores_non_chain_siblings_under_tag_namespace() {
+        // The same sibling-artefact discipline that protects
+        // `refs/heads/` must apply to every namespace the widened
+        // prefix now covers. A `path-index.json` or `<sha>.bundle`
+        // sitting under `refs/tags/v1/` must not surface as a ref.
+        let store = MockStore::new();
+        write_test_chain(
+            &store,
+            Some("repo"),
+            &ref_("refs/tags/v1"),
+            SHA_TIP,
+            SHA_TIP,
+        )
+        .await;
+        store.insert(
+            "repo/refs/tags/v1/path-index.json",
+            Bytes::from(format!(r#"{{"v":1,"commit":"{SHA_TIP}","tree":{{}}}}"#).into_bytes()),
+        );
+        store.insert(
+            format!("repo/refs/tags/v1/{SHA_TIP}.bundle"),
+            Bytes::from_static(b"baseline"),
+        );
+
+        let entries = list_refs(&store, Some("repo")).await.unwrap();
+        assert_eq!(entries.len(), 1, "exactly one chain.json processed");
+        assert_eq!(entries[0].ref_path, "refs/tags/v1");
+        assert_eq!(entries[0].sha, SHA_TIP);
     }
 
     #[tokio::test]
