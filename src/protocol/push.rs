@@ -888,14 +888,16 @@ const DELETE_EXPECTED_WITH_ZIP: usize = 2;
 /// appropriate error.
 ///
 /// The listing is **unfiltered** on purpose — it counts `LOCK#.lock`,
-/// `PROTECTED#`, and `repo.zip` against the expected total. Two
+/// `PROTECTED#`, and `repo.zip` against the expected total. Three
 /// behaviours fall out:
 ///
 /// 1. A protected ref (`PROTECTED#` marker) cannot be deleted via
-///    `git push :ref`: the marker inflates the count past `expected`,
-///    triggering the multi-bundle error. Removing the marker first
-///    (via the management CLI's `unprotect`) is required.
-/// 2. A ref whose only object is a stale `LOCK#.lock` deletes that
+///    `git push :ref`. The marker is detected before the generic
+///    multi-bundle error, and a protection-specific refusal is emitted
+///    that names the management CLI's `unprotect` workflow.
+/// 2. A genuine multi-bundle/corruption case (extra keys, no
+///    `PROTECTED#` marker) still falls through to the doctor message.
+/// 3. A ref whose only object is a stale `LOCK#.lock` deletes that
 ///    lock as if it were the bundle and returns `ok`.
 async fn delete_remote_ref(
     store: &dyn ObjectStore,
@@ -922,6 +924,13 @@ async fn delete_remote_ref(
         Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
             message: r#""not found"?"#.to_owned(),
+        })
+    } else if entries.iter().any(|e| e.key.contains("PROTECTED#")) {
+        Ok(PushOutcome::Error {
+            remote_ref: remote_ref_str,
+            message:
+                r#""ref is protected. Run git-remote-object-store unprotect <url> <branch> to remove protection before deleting."?"#
+                    .to_owned(),
         })
     } else {
         Ok(PushOutcome::Error {
@@ -1287,9 +1296,9 @@ mod tests {
 
     #[tokio::test]
     async fn delete_remote_ref_rejects_protected_marker() {
-        // PROTECTED# is unfiltered for the delete-path count: protected
-        // refs cannot be deleted via `git push :ref` because the marker
-        // inflates the count.
+        // PROTECTED# is unfiltered for the delete-path count, but we
+        // detect the marker before the generic multi-bundle error and
+        // emit a protection-specific refusal that names `unprotect`.
         let store = MockStore::new();
         let r = rn("refs/heads/main");
         let bundle = format!("repo/refs/heads/main/{SHA}.bundle");
@@ -1303,7 +1312,7 @@ mod tests {
             PushOutcome::Error { message, .. } => {
                 assert_eq!(
                     message,
-                    r#""multiple bundles exist on server. Run git-remote-object-store doctor to fix."?"#,
+                    r#""ref is protected. Run git-remote-object-store unprotect <url> <branch> to remove protection before deleting."?"#,
                 );
             }
             PushOutcome::Ok { .. } => panic!("expected Error outcome"),
@@ -1312,6 +1321,32 @@ mod tests {
         // to the error branch would still satisfy the message check.
         assert!(store.contains(&bundle));
         assert!(store.contains(protected));
+    }
+
+    #[tokio::test]
+    async fn delete_remote_ref_reports_corruption_without_protected_marker() {
+        // Two bundles, no PROTECTED# marker → genuine corruption case
+        // still falls through to the doctor message.
+        let store = MockStore::new();
+        let r = rn("refs/heads/main");
+        let bundle_a = format!("repo/refs/heads/main/{SHA}.bundle");
+        let bundle_b = format!("repo/refs/heads/main/{OTHER_SHA}.bundle");
+        store.insert(&bundle_a, Bytes::from_static(b"a"));
+        store.insert(&bundle_b, Bytes::from_static(b"b"));
+        let outcome = delete_remote_ref(&store, Some("repo"), &r, false)
+            .await
+            .unwrap();
+        match outcome {
+            PushOutcome::Error { message, .. } => {
+                assert_eq!(
+                    message,
+                    r#""multiple bundles exist on server. Run git-remote-object-store doctor to fix."?"#,
+                );
+            }
+            PushOutcome::Ok { .. } => panic!("expected Error outcome"),
+        }
+        assert!(store.contains(&bundle_a));
+        assert!(store.contains(&bundle_b));
     }
 
     #[tokio::test]
