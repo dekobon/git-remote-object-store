@@ -117,11 +117,12 @@ async fn push_non_fast_forward_is_rejected_without_force() {
     .await;
     result.expect("push should produce a refusal, not abort");
     let text = std::str::from_utf8(&out).unwrap();
-    assert!(
-        text.starts_with("error refs/heads/main "),
-        "expected error line, got {text:?}",
+    // Pin the exact wire bytes — the trailing `?` matters because git
+    // treats `error <ref> "..."?` as recoverable and the inverse as fatal.
+    assert_eq!(
+        text, "error refs/heads/main \"remote ref is not ancestor of refs/heads/main.\"?\n\n",
+        "got {text:?}",
     );
-    assert!(text.contains("not ancestor"), "got {text:?}");
     // The pre-existing unrelated bundle is left untouched.
     assert!(store.contains(&format!("repo/refs/heads/main/{unrelated_sha}.bundle")));
 }
@@ -186,10 +187,23 @@ async fn force_push_protected_falls_back_to_ancestor_check() {
     .await;
     result.expect("push should produce a refusal");
     let text = std::str::from_utf8(&out).unwrap();
-    assert!(text.contains("not ancestor"), "got {text:?}");
+    // Pin the exact wire bytes — the trailing `?` marks the error as
+    // recoverable, and a regression that drops it would silently turn
+    // a soft refusal into a fatal abort on the git side.
+    assert_eq!(
+        text, "error refs/heads/main \"remote ref is not ancestor of refs/heads/main.\"?\n\n",
+        "got {text:?}",
+    );
     // Pre-existing unrelated bundle untouched.
     assert!(store.contains(&format!("repo/refs/heads/main/{unrelated_sha}.bundle")));
-    let _ = shas;
+    // The would-be local-tip bundle must NOT have been uploaded — a
+    // regression that erroneously uploads on refusal would leave the
+    // bundle key behind and pass any message-only assertion.
+    let local_sha = &shas[0];
+    assert!(
+        !store.contains(&format!("repo/refs/heads/main/{local_sha}.bundle")),
+        "refused push must not upload the local-tip bundle",
+    );
 }
 
 #[tokio::test]

@@ -346,11 +346,14 @@ async fn non_force_push_rejects_when_remote_not_ancestor() {
     .await;
     result.expect("push should refuse, not abort");
     let text = std::str::from_utf8(&out).unwrap();
-    assert!(
-        text.starts_with("error refs/heads/main "),
-        "expected refusal line, got {text:?}",
+    // Pin the exact wire bytes — the trailing `?` matters because git
+    // treats `error <ref> "..."?` as recoverable and the inverse as fatal.
+    // The packchain engine must surface the same wire format as the
+    // bundle engine for non-ancestor refusals.
+    assert_eq!(
+        text, "error refs/heads/main \"remote ref is not ancestor of refs/heads/main.\"?\n\n",
+        "got {text:?}",
     );
-    assert!(text.contains("not ancestor"), "got {text:?}");
 }
 
 #[tokio::test]
@@ -378,7 +381,22 @@ async fn lock_contention_returns_error_outcome() {
     .await;
     result.expect("push should refuse, not abort");
     let text = std::str::from_utf8(&out).unwrap();
-    assert!(text.contains("failed to acquire ref lock"), "got {text:?}");
+    // Pin the exact wire bytes — the trailing `?` matters because git
+    // treats `error <ref> "..."?` as recoverable and the inverse as fatal.
+    // The TTL number is a runtime parameter (`GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`,
+    // defaulting to 60), so the expected line embeds the same value the
+    // helper used.
+    let ttl_secs: u64 = std::env::var("GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    let expected = format!(
+        "error refs/heads/main \"failed to acquire ref lock at \
+         repo/refs/heads/main/LOCK#.lock. Another client may be pushing. \
+         If this persists beyond {ttl_secs}s, run git-remote-object-store \
+         doctor to inspect and optionally clear stale locks.\"?\n\n",
+    );
+    assert_eq!(text, expected, "got {text:?}");
     // Lock untouched (not ours to release).
     assert!(store.contains("repo/refs/heads/main/LOCK#.lock"));
 }
