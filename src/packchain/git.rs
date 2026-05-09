@@ -5,7 +5,7 @@
 //! types. Push calls [`extract_path_index`] right before writing
 //! `path-index.json`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::str;
 
 use gix::Repository;
@@ -19,14 +19,17 @@ use super::schema::{PathIndex, PathNode, Sha40};
 
 /// Walk the tree associated with `peeled` and build a [`PathIndex`].
 ///
-/// `unpeeled_tip` is the chain.tip recorded on the bucket (the
-/// outermost tag OID for tag refs, the commit OID for branch refs, the
-/// tree OID for a bare-tree ref). It is stored verbatim in the
+/// `unpeeled_tip` is the chain.tip recorded on the bucket — the
+/// outermost tag OID for tag refs, the commit OID for branch refs,
+/// the tree OID for a bare-tree ref, and (for blob-tipped refs that
+/// short-circuit via `Ok(None)` below) the blob OID, though it goes
+/// unused in that branch. It is stored verbatim in the
 /// [`PathIndex::tip`] field so a reader of `path-index.json` can
 /// correlate the index back to the chain entry that produced it.
 ///
-/// Returns `Ok(None)` for a blob-tipped chain — there is no tree to
-/// index, so the engine omits `path-index.json` entirely.
+/// Returns `Ok(None)` for blob-tipped chains (annotated tag of blob,
+/// or a bare ref pointing at a blob) — there is no tree to index, so
+/// the engine omits `path-index.json` entirely.
 ///
 /// Submodule entries (`EntryKind::Commit` — gitlink mode 160000) are
 /// skipped: their target lives in another repository, so there is no
@@ -85,14 +88,25 @@ pub(crate) fn extract_path_index(
     }))
 }
 
-/// Enumerate every OID inside the tree closure rooted at `tree`.
+/// Enumerate every distinct OID inside the tree closure rooted at
+/// `tree`.
 ///
 /// Returns the tree itself, every reachable subtree, and every blob
 /// (regular, executable, or symlink). Submodule entries
 /// (`EntryKind::Commit` — gitlink mode 160000) are skipped because
 /// their target lives in another repository and is therefore not in
-/// this ODB. The order is depth-first stack order — gix-pack does not
+/// this ODB. Order is depth-first stack order — gix-pack does not
 /// require any particular ordering for `ObjectExpansion::AsIs`.
+///
+/// **Deduplication**: each OID is emitted at most once. Real git
+/// history dedupes blobs aggressively (two paths with identical
+/// content share a blob OID; two parent trees with identical
+/// content share a tree OID), so a naive walker would yield the
+/// same OID multiple times and produce a malformed pack. The
+/// internal `visited` set also breaks cycles defensively, even
+/// though content-addressing makes tree cycles impossible in a
+/// healthy ODB — a corrupted or adversarial ODB cannot make this
+/// loop run forever.
 ///
 /// Used by the pack-build path for tree-tipped refs (annotated tag of
 /// tree, bare-tree ref). The resulting `Vec` is fed to
@@ -112,17 +126,29 @@ pub(crate) fn enumerate_tree_closure(
     use gix::objs::tree::EntryKind;
 
     let mut oids = Vec::new();
+    let mut visited: HashSet<ObjectId> = HashSet::new();
     let mut stack = vec![tree];
     while let Some(current) = stack.pop() {
+        // First-pop dedupe: a tree may be pushed onto the stack
+        // multiple times by separate parents. Skipping repeats is
+        // also the cycle break for adversarial ODBs.
+        if !visited.insert(current) {
+            continue;
+        }
         oids.push(current);
         let object = repo.find_object(current)?.peel_to_kind(Kind::Tree)?;
-        let tree = object.into_tree();
-        for entry in tree.iter() {
+        for entry in object.into_tree().iter() {
             let entry = entry?;
             match entry.kind() {
                 EntryKind::Tree => stack.push(entry.oid().to_owned()),
                 EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
-                    oids.push(entry.oid().to_owned());
+                    let oid = entry.oid().to_owned();
+                    // Blobs are emitted directly (not stack-routed) so
+                    // we don't pay an extra heap push for leaves; the
+                    // visited-gate keeps shared blobs unique.
+                    if visited.insert(oid) {
+                        oids.push(oid);
+                    }
                 }
                 EntryKind::Commit => {
                     // Submodule / gitlink. Target lives in another repo;
@@ -526,6 +552,89 @@ mod tests {
             !oids.contains(&gitlink_oid),
             "gitlink OID must be skipped (lives in another repo)",
         );
+    }
+
+    #[test]
+    fn enumerate_tree_closure_dedupes_shared_blob() {
+        // Two tree entries pointing at the same blob OID — common in
+        // real git history (identical files at different paths share
+        // a blob). The closure must emit the blob exactly once;
+        // duplicates would produce a malformed pack downstream.
+        let tmp = TempDir::new().unwrap();
+        let repo = gix::init(tmp.path()).unwrap();
+        let blob = repo.write_blob(b"shared").unwrap().detach();
+        let tree = repo
+            .write_object(&gix::objs::Tree {
+                entries: vec![
+                    Entry {
+                        mode: EntryKind::Blob.into(),
+                        filename: "a".into(),
+                        oid: blob,
+                    },
+                    Entry {
+                        mode: EntryKind::Blob.into(),
+                        filename: "b".into(),
+                        oid: blob,
+                    },
+                ],
+            })
+            .unwrap()
+            .detach();
+        let oids = enumerate_tree_closure(&repo, tree).unwrap();
+        assert_eq!(
+            oids.len(),
+            2,
+            "shared blob must be emitted exactly once (got {oids:?})",
+        );
+        assert!(oids.contains(&tree));
+        assert!(oids.contains(&blob));
+    }
+
+    #[test]
+    fn enumerate_tree_closure_dedupes_shared_subtree() {
+        // Two tree entries (different filenames) pointing at the same
+        // subtree OID. Possible in real history when sibling
+        // directories have identical content. Closure must emit the
+        // subtree and its blob exactly once each.
+        let tmp = TempDir::new().unwrap();
+        let repo = gix::init(tmp.path()).unwrap();
+        let blob = repo.write_blob(b"leaf").unwrap().detach();
+        let subtree = repo
+            .write_object(&gix::objs::Tree {
+                entries: vec![Entry {
+                    mode: EntryKind::Blob.into(),
+                    filename: "leaf.txt".into(),
+                    oid: blob,
+                }],
+            })
+            .unwrap()
+            .detach();
+        let root = repo
+            .write_object(&gix::objs::Tree {
+                entries: vec![
+                    Entry {
+                        mode: EntryKind::Tree.into(),
+                        filename: "left".into(),
+                        oid: subtree,
+                    },
+                    Entry {
+                        mode: EntryKind::Tree.into(),
+                        filename: "right".into(),
+                        oid: subtree,
+                    },
+                ],
+            })
+            .unwrap()
+            .detach();
+        let oids = enumerate_tree_closure(&repo, root).unwrap();
+        assert_eq!(
+            oids.len(),
+            3,
+            "root + shared subtree (once) + shared blob (once); got {oids:?}",
+        );
+        assert!(oids.contains(&root));
+        assert!(oids.contains(&subtree));
+        assert!(oids.contains(&blob));
     }
 
     #[test]
