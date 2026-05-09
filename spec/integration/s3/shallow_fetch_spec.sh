@@ -90,4 +90,90 @@ Describe "S3 helper: shallow fetch"
 			assert_commit_count "$DST" 3
 		End
 	End
+
+	Describe "git fetch --depth 1 from a depth-3 clone re-shallows"
+		# The reverse of deepen: existing shallow boundary at depth-3
+		# must be pruned in favour of the depth-1 boundary. The
+		# stale-pruning logic is symmetric across depth changes.
+		setup() {
+			BUCKET=$(rustfs_unique_bucket)
+			PREFIX="myrepo"
+			rustfs_make_bucket "$BUCKET"
+			URL=$(rustfs_url "$BUCKET" "$PREFIX")
+			SRC="$SHELLSPEC_TMPDIR/src-$$-$RANDOM"
+			DST="$SHELLSPEC_TMPDIR/dst-$$-$RANDOM"
+			TIP_SHA=$(build_linear_history "$SRC" "$URL" 5)
+			shallow_clone_remote 3 "$URL" "$DST" >/dev/null
+			assert_commit_count "$DST" 3
+		}
+		BeforeEach 'setup'
+
+		do_re_shallow() { fetch_remote "$DST" origin --depth=1; }
+
+		It "shows 1 commit after re-shallowing"
+			When call do_re_shallow
+			The status should equal 0
+			assert_shallow_file_exists "$DST"
+			assert_commit_count "$DST" 1
+		End
+	End
+
+	Describe "git fetch --depth N (N >= history) removes the shallow file"
+		# When the requested depth exceeds the available history, no
+		# new boundary is needed. The pre-existing depth-1 entry must
+		# also be pruned because its parents are now in the ODB. The
+		# file must be unlinked — its presence alone signals shallow
+		# semantics to git.
+		setup() {
+			BUCKET=$(rustfs_unique_bucket)
+			PREFIX="myrepo"
+			rustfs_make_bucket "$BUCKET"
+			URL=$(rustfs_url "$BUCKET" "$PREFIX")
+			SRC="$SHELLSPEC_TMPDIR/src-$$-$RANDOM"
+			DST="$SHELLSPEC_TMPDIR/dst-$$-$RANDOM"
+			TIP_SHA=$(build_linear_history "$SRC" "$URL" 3)
+			shallow_clone_remote 1 "$URL" "$DST" >/dev/null
+			assert_commit_count "$DST" 1
+		}
+		BeforeEach 'setup'
+
+		do_deepen_to_full() { fetch_remote "$DST" origin --depth=10; }
+
+		It "unlinks .git/shallow and exposes full history"
+			When call do_deepen_to_full
+			The status should equal 0
+			assert_shallow_file_absent "$DST"
+			assert_commit_count "$DST" 3
+		End
+	End
+
+	Describe "successive deepening 1 -> 2 -> 3"
+		# Multiple consecutive deepens must each prune the prior
+		# boundary. Catches a regression where pruning only handled
+		# the depth-1 -> depth-N transition and not arbitrary chains.
+		setup() {
+			BUCKET=$(rustfs_unique_bucket)
+			PREFIX="myrepo"
+			rustfs_make_bucket "$BUCKET"
+			URL=$(rustfs_url "$BUCKET" "$PREFIX")
+			SRC="$SHELLSPEC_TMPDIR/src-$$-$RANDOM"
+			DST="$SHELLSPEC_TMPDIR/dst-$$-$RANDOM"
+			TIP_SHA=$(build_linear_history "$SRC" "$URL" 5)
+			shallow_clone_remote 1 "$URL" "$DST" >/dev/null
+			assert_commit_count "$DST" 1
+		}
+		BeforeEach 'setup'
+
+		do_deepen_chain() {
+			fetch_remote "$DST" origin --depth=2 >/dev/null || return $?
+			assert_commit_count "$DST" 2 || return 1
+			fetch_remote "$DST" origin --depth=3
+		}
+
+		It "shows 3 commits after the chained deepens"
+			When call do_deepen_chain
+			The status should equal 0
+			assert_commit_count "$DST" 3
+		End
+	End
 End

@@ -21,7 +21,7 @@
 
 use std::collections::HashSet;
 use std::num::NonZeroU32;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use gix_hash::ObjectId;
@@ -244,51 +244,21 @@ pub(crate) async fn fetch_batch(
     // ODB, so its BFS results would be incomplete — better to leave
     // `.git/shallow` untouched and let git report the underlying error
     // than to write a half-built boundary set.
+    //
+    // The call runs unconditionally on success even when `collected` is
+    // empty: the rewrite must prune any stale pre-existing entries
+    // whose parents have just landed in the ODB (a deepen-to-full
+    // history fetch shrinks the file to nothing and unlinks it).
     if first_err.is_none() && depth.is_some() {
         let collected = boundaries.drain();
-        if !collected.is_empty() {
-            let git_dir = git_dir_for(ctx.repo_dir.as_path());
-            tokio::task::spawn_blocking(move || git::write_shallow_file(&git_dir, &collected))
-                .await
-                .map_err(FetchError::from)?
-                .map_err(FetchError::from)?;
-        }
+        let repo_dir = ctx.repo_dir.as_path().to_path_buf();
+        tokio::task::spawn_blocking(move || git::write_shallow_file(&repo_dir, &collected))
+            .await
+            .map_err(FetchError::from)?
+            .map_err(FetchError::from)?;
     }
 
     first_err.map_or(Ok(()), Err)
-}
-
-/// Resolve the on-disk git directory for `repo_dir`.
-///
-/// Three layouts are handled in priority order:
-/// 1. `.git/` is a directory → normal clone.
-/// 2. `.git` is a file → linked worktree or `--separate-git-dir`; the
-///    file contains `gitdir: <path>` pointing to the real git dir.
-/// 3. No `.git` entry → bare repository; `repo_dir` is the git dir.
-pub(crate) fn git_dir_for(repo_dir: &Path) -> PathBuf {
-    let candidate = repo_dir.join(".git");
-    if candidate.is_dir() {
-        return candidate;
-    }
-    // Linked-worktree / --separate-git-dir: `.git` is a text file whose
-    // sole content is `gitdir: <path>`. Follow the pointer so that
-    // write_shallow_file lands in the real git directory.
-    if candidate.is_file()
-        && let Ok(content) = std::fs::read_to_string(&candidate)
-        && let Some(rest) = content.trim().strip_prefix("gitdir:")
-    {
-        let pointed = std::path::Path::new(rest.trim());
-        let resolved = if pointed.is_absolute() {
-            pointed.to_path_buf()
-        } else {
-            repo_dir.join(pointed)
-        };
-        if resolved.is_dir() {
-            return resolved;
-        }
-    }
-    // Bare repository: the working tree root is the git directory.
-    repo_dir.to_path_buf()
 }
 
 /// Per-task fetch context: bundles every parameter that varies across

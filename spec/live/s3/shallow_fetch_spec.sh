@@ -80,4 +80,73 @@ Describe "S3 helper (live AWS): shallow fetch"
 			assert_commit_count "$DST" 3
 		End
 	End
+
+	Describe "git fetch --depth 1 from a depth-3 clone re-shallows"
+		setup() {
+			PREFIX=$(live_s3_unique_prefix)
+			URL=$(live_s3_url "$PREFIX")
+			SRC="$SHELLSPEC_TMPDIR/src-$$-$RANDOM"
+			DST="$SHELLSPEC_TMPDIR/dst-$$-$RANDOM"
+			TIP_SHA=$(build_linear_history "$SRC" "$URL" 5)
+			shallow_clone_remote 3 "$URL" "$DST" >/dev/null
+			assert_commit_count "$DST" 3
+		}
+		BeforeEach 'setup'
+
+		do_re_shallow() { fetch_remote "$DST" origin --depth=1; }
+
+		It "shows 1 commit after re-shallowing"
+			When call do_re_shallow
+			The status should equal 0
+			assert_shallow_file_exists "$DST"
+			assert_commit_count "$DST" 1
+		End
+	End
+
+	Describe "git fetch --depth N (N >= history) removes the shallow file"
+		setup() {
+			PREFIX=$(live_s3_unique_prefix)
+			URL=$(live_s3_url "$PREFIX")
+			SRC="$SHELLSPEC_TMPDIR/src-$$-$RANDOM"
+			DST="$SHELLSPEC_TMPDIR/dst-$$-$RANDOM"
+			TIP_SHA=$(build_linear_history "$SRC" "$URL" 3)
+			shallow_clone_remote 1 "$URL" "$DST" >/dev/null
+			assert_commit_count "$DST" 1
+		}
+		BeforeEach 'setup'
+
+		do_deepen_to_full() { fetch_remote "$DST" origin --depth=10; }
+
+		It "unlinks .git/shallow and exposes full history"
+			When call do_deepen_to_full
+			The status should equal 0
+			assert_shallow_file_absent "$DST"
+			assert_commit_count "$DST" 3
+		End
+	End
+
+	Describe "successive deepening 1 -> 2 -> 3"
+		setup() {
+			PREFIX=$(live_s3_unique_prefix)
+			URL=$(live_s3_url "$PREFIX")
+			SRC="$SHELLSPEC_TMPDIR/src-$$-$RANDOM"
+			DST="$SHELLSPEC_TMPDIR/dst-$$-$RANDOM"
+			TIP_SHA=$(build_linear_history "$SRC" "$URL" 5)
+			shallow_clone_remote 1 "$URL" "$DST" >/dev/null
+			assert_commit_count "$DST" 1
+		}
+		BeforeEach 'setup'
+
+		do_deepen_chain() {
+			fetch_remote "$DST" origin --depth=2 >/dev/null || return $?
+			assert_commit_count "$DST" 2 || return 1
+			fetch_remote "$DST" origin --depth=3
+		}
+
+		It "shows 3 commits after the chained deepens"
+			When call do_deepen_chain
+			The status should equal 0
+			assert_commit_count "$DST" 3
+		End
+	End
 End
