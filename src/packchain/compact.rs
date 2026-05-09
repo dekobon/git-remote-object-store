@@ -283,31 +283,32 @@ async fn compact_under_lock(
     install_chain_into_repo(&repo_dir, &download_dir, &chain, ref_name).await?;
 
     // Build the fresh baseline pack at the current tip. After this
-    // returns, `<output_dir>/<content_sha>.{pack,idx}` exist. For tag
-    // refs, `tip_sha` may be a tag OID; peel it to a commit and carry
-    // the tag chain so the rebuilt baseline pack contains the tag
-    // objects (otherwise post-compaction fetches couldn't resolve the
-    // tag ref). Peeling happens inside the blocking task because
-    // `gix::Repository` is `!Sync`.
+    // returns, `<output_dir>/<content_sha>.{pack,idx}` exist. `tip_sha`
+    // may be unpeeled (tag OID for tag refs, tree/blob OID for
+    // bare-tree / bare-blob refs); peel through the tag chain inside
+    // the blocking task and dispatch on the leaf kind so the rebuilt
+    // baseline carries the right closure. `gix::Repository` is `!Sync`,
+    // hence the blocking-task wrap.
     let new_pack = {
         let repo_dir = repo_dir.clone();
         let output_dir = output_dir.clone();
         tokio::task::spawn_blocking(move || -> Result<_, PackchainError> {
             let repo = gix::open(&repo_dir).map_err(crate::git::GitError::from)?;
-            let (tip_commit, tag_chain) = crate::git::peel_to_commit_with_tag_chain(&repo, tip_sha)
-                .map_err(PackchainError::Git)?;
+            let peeled = crate::git::peel_tag_chain(&repo, tip_sha).map_err(PackchainError::Git)?;
             drop(repo);
-            build_baseline_pack(&repo_dir, tip_commit, &tag_chain, &output_dir)
+            build_baseline_pack(&repo_dir, peeled, &output_dir)
         })
         .await??
     };
 
-    // Compute fresh path-index.
+    // Compute fresh path-index. Returns `None` for blob-tipped
+    // chains — compaction skips writing path-index in that case.
     let path_index = {
         let repo_dir = repo_dir.clone();
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || -> Result<_, PackchainError> {
             let repo = gix::open(&repo_dir).map_err(crate::git::GitError::from)?;
-            super::git::extract_path_index(&repo, tip_sha)
+            let peeled = crate::git::peel_tag_chain(&repo, tip_sha).map_err(PackchainError::Git)?;
+            super::git::extract_path_index(&repo, &peeled, tip_sha)
         })
         .await??
     };
@@ -341,7 +342,9 @@ async fn compact_under_lock(
     )
     .await?;
     upload_bundle(store, &new_bundle_key, &bundle_path).await?;
-    write_path_index(store, prefix, ref_name, &path_index).await?;
+    if let Some(ref index) = path_index {
+        write_path_index(store, prefix, ref_name, index).await?;
+    }
 
     let new_segment = ChainSegment {
         sha: chain.tip.clone(),
@@ -598,7 +601,15 @@ mod tests {
 
         // Baseline pack at c1, plus incremental packs for c2 and c3.
         let out_dir = TempDir::new().unwrap();
-        let baseline = build_baseline_pack(repo_dir.path(), c1, &[], out_dir.path()).unwrap();
+        let baseline = build_baseline_pack(
+            repo_dir.path(),
+            crate::git::PeeledTip::Commit {
+                commit: c1,
+                tag_chain: Vec::new(),
+            },
+            out_dir.path(),
+        )
+        .unwrap();
         let inc2 = build_incremental_pack(repo_dir.path(), c1, c2, &[], out_dir.path()).unwrap();
         let inc3 = build_incremental_pack(repo_dir.path(), c2, c3, &[], out_dir.path()).unwrap();
 
@@ -657,7 +668,10 @@ mod tests {
         // it. Build it from the source repo before we drop the handle.
         let path_index = {
             let repo = gix::open(repo_dir.path()).unwrap();
-            crate::packchain::git::extract_path_index(&repo, c3).unwrap()
+            let peeled = crate::git::peel_tag_chain(&repo, c3).unwrap();
+            crate::packchain::git::extract_path_index(&repo, &peeled, c3)
+                .unwrap()
+                .expect("commit-tipped fixture must produce a path-index")
         };
         crate::packchain::manifest::write_path_index(store, Some(prefix), &ref_main(), &path_index)
             .await

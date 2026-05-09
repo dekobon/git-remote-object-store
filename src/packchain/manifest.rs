@@ -296,7 +296,7 @@ mod tests {
         let store = MockStore::new();
         let index = PathIndex {
             v: PathIndex::SCHEMA_VERSION,
-            commit: sha40(SHA_A),
+            tip: sha40(SHA_A),
             tree: std::collections::BTreeMap::new(),
         };
         write_path_index(&store, None, &ref_main(), &index)

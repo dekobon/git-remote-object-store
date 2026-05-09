@@ -43,7 +43,13 @@ fn read_chain_for(store: &MockStore, prefix: &str, ref_name: &str) -> Value {
 
 /// Sanity-check that `path-index.json` exists and parses.
 fn read_path_index(store: &MockStore, prefix: &str) -> Value {
-    let key = format!("{prefix}/refs/heads/main/path-index.json");
+    read_path_index_for(store, prefix, "refs/heads/main")
+}
+
+/// Generalisation of [`read_path_index`] for tests that push to refs
+/// other than `refs/heads/main` (tag refs, notes refs, ...).
+fn read_path_index_for(store: &MockStore, prefix: &str, ref_name: &str) -> Value {
+    let key = format!("{prefix}/{ref_name}/path-index.json");
     let bytes =
         futures::executor::block_on(store.get_bytes(&key)).expect("path-index.json must exist");
     serde_json::from_slice(&bytes).expect("path-index.json must be valid JSON")
@@ -124,8 +130,8 @@ async fn first_push_writes_pack_idx_baseline_chain_path_index_format_head() {
     // produced an empty tree (e.g. extract_path_index skipping the
     // walk) would let `tree.is_object()` alone pass vacuously.
     let path_index = read_path_index(&store, "repo");
-    assert_eq!(path_index["v"], 1);
-    assert_eq!(path_index["commit"], *tip);
+    assert_eq!(path_index["v"], 2);
+    assert_eq!(path_index["tip"], *tip);
     let tree = path_index["tree"]
         .as_object()
         .expect("tree must be a JSON object");
@@ -216,7 +222,7 @@ async fn incremental_push_appends_segment_newest_first() {
 
     // Path-index reflects new tip.
     let path_index = read_path_index(&store, "repo");
-    assert_eq!(path_index["commit"], tip_2);
+    assert_eq!(path_index["tip"], tip_2);
 }
 
 #[tokio::test]
@@ -943,50 +949,34 @@ async fn repushing_same_annotated_tag_is_idempotent() {
     );
 }
 
-#[tokio::test]
-async fn tag_pointing_to_blob_emits_error_outcome() {
-    // E6: a tag whose target is a blob is not yet supported. The push
-    // must surface `error refs/tags/blob-tag "..."` containing the
-    // `TagTargetUnsupported` text — not a panic, not a malformed pack
-    // upload.
+/// `git mktag` shim: build a raw tag-object body pointing at `target`
+/// of `kind`, write it via `git mktag`, and return the tag's OID. The
+/// only CLI-friendly way to forge a tag-of-blob (porcelain `git tag -a
+/// <name> <blob>` peels through the blob's surrounding tree if any
+/// exists; `mktag` writes the bytes verbatim).
+fn mktag_pointing_at(seed_dir: &Path, target_oid: &str, kind: &str, tag_name: &str) -> String {
     use std::io::Write as _;
-    if !git_available() {
-        eprintln!("skipping: git not on PATH");
-        return;
-    }
-    let (seed, _shas) = make_seed_repo(1, "primary");
-    // Create a blob (file-backed; `git hash-object -w <file>` writes
-    // it into the ODB), then build a tag object pointing at it via
-    // `git mktag` — the only CLI-friendly way to forge a tag-of-blob.
-    std::fs::write(seed.path().join("blob-target"), b"data\n").unwrap();
-    let blob_oid = git_capture(&["hash-object", "-w", "blob-target"], seed.path())
-        .trim()
-        .to_owned();
-
-    // Build a raw tag-object body and write it via `git mktag`.
-    let tag_body = format!(
-        "object {blob_oid}\n\
-         type blob\n\
-         tag blob-tag\n\
+    let body = format!(
+        "object {target_oid}\n\
+         type {kind}\n\
+         tag {tag_name}\n\
          tagger Test <test@example.com> 0 +0000\n\
          \n\
-         pointing-at-blob\n",
+         pointing-at-{kind}\n",
     );
-    let tag_path = seed.path().join("tag-body.txt");
-    std::fs::write(&tag_path, &tag_body).unwrap();
-    // `git mktag` reads from stdin and writes the object, returning OID.
     let mktag = std::process::Command::new("git")
         .args(["mktag"])
-        .current_dir(seed.path())
+        .current_dir(seed_dir)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn git mktag");
     mktag
         .stdin
         .as_ref()
         .unwrap()
-        .write_all(tag_body.as_bytes())
+        .write_all(body.as_bytes())
         .unwrap();
     let out = mktag.wait_with_output().expect("git mktag");
     assert!(
@@ -994,8 +984,24 @@ async fn tag_pointing_to_blob_emits_error_outcome() {
         "git mktag failed: {}",
         String::from_utf8_lossy(&out.stderr),
     );
-    let tag_sha = String::from_utf8(out.stdout).unwrap().trim().to_owned();
-    // Create the ref pointing at the tag object.
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+#[tokio::test]
+async fn first_push_of_tag_pointing_to_blob_lands_pack_with_tag_and_blob() {
+    // #80: tag-of-blob is supported. The push lands the tag and the
+    // leaf blob in segment-0's pack and writes chain.tip = tag OID.
+    // Path-index is omitted because there is no tree to index.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, _shas) = make_seed_repo(1, "primary");
+    std::fs::write(seed.path().join("blob-target"), b"data\n").unwrap();
+    let blob_oid = git_capture(&["hash-object", "-w", "blob-target"], seed.path())
+        .trim()
+        .to_owned();
+    let tag_sha = mktag_pointing_at(seed.path(), &blob_oid, "blob", "blob-tag");
     git(&["update-ref", "refs/tags/blob-tag", &tag_sha], seed.path());
 
     let store = Arc::new(MockStore::new());
@@ -1006,14 +1012,203 @@ async fn tag_pointing_to_blob_emits_error_outcome() {
         seed.path().to_path_buf(),
     )
     .await;
-    result.expect("push must complete (per-ref error, not protocol error)");
-    let wire = std::str::from_utf8(&out).unwrap();
-    assert!(
-        wire.starts_with("error refs/tags/blob-tag "),
-        "expected error line, got {wire:?}",
+    result.expect("blob-tag push must succeed");
+    assert_eq!(
+        std::str::from_utf8(&out).unwrap(),
+        "ok refs/tags/blob-tag\n\n",
+        "wire output: ok line for blob-tag ref + terminator",
+    );
+
+    // chain.tip is the unpeeled tag OID.
+    let chain = read_chain_for(&store, "repo", "refs/tags/blob-tag");
+    assert_eq!(
+        chain["tip"], tag_sha,
+        "chain.tip must be the tag OID, not the blob",
+    );
+
+    // Segment-0 pack contains the tag + the blob (and nothing else —
+    // blob-tipped chains have no commit/tree closure). Pin the exact
+    // count so a regression that walked the seed repo's commit graph
+    // would be caught.
+    let segments = chain["segments"].as_array().unwrap();
+    let pack_path = segments[0]["pack"].as_str().unwrap();
+    let oids = pack_idx_oids(&store, "repo", pack_path);
+    assert_eq!(
+        oids.len(),
+        2,
+        "blob-tipped pack must contain exactly the blob + the tag; got {oids:?}",
     );
     assert!(
-        wire.contains("only commit targets are supported"),
-        "expected TagTargetUnsupported text, got {wire:?}",
+        oids.iter().any(|o| o == &tag_sha),
+        "pack must include the tag {tag_sha}; got {oids:?}",
+    );
+    assert!(
+        oids.iter().any(|o| o == &blob_oid),
+        "pack must include the leaf blob {blob_oid}; got {oids:?}",
+    );
+
+    // No path-index for blob-tipped chains.
+    let path_index_key = "repo/refs/tags/blob-tag/path-index.json";
+    assert!(
+        !store.contains(path_index_key),
+        "blob-tipped chains must not write a path-index.json",
+    );
+}
+
+#[tokio::test]
+async fn first_push_of_tag_pointing_to_tree_lands_pack_with_tree_closure() {
+    // #80: tag-of-tree is supported. The push must land the tag, the
+    // leaf tree, and every blob in the tree closure. Path-index is
+    // present and indexed under field `tip`.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, _shas) = make_seed_repo(1, "primary");
+    let tree_oid = git_capture(&["rev-parse", "HEAD^{tree}"], seed.path())
+        .trim()
+        .to_owned();
+    let tag_sha = mktag_pointing_at(seed.path(), &tree_oid, "tree", "tree-tag");
+    git(&["update-ref", "refs/tags/tree-tag", &tag_sha], seed.path());
+
+    let store = Arc::new(MockStore::new());
+    let (out, result) = drive_in(
+        s3_url_packchain(Some("repo")),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push refs/tags/tree-tag:refs/tags/tree-tag\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    result.expect("tree-tag push must succeed");
+    assert_eq!(
+        std::str::from_utf8(&out).unwrap(),
+        "ok refs/tags/tree-tag\n\n",
+    );
+
+    let chain = read_chain_for(&store, "repo", "refs/tags/tree-tag");
+    assert_eq!(chain["tip"], tag_sha);
+
+    // Pack contains tag + tree + every blob the seed repo wrote.
+    let segments = chain["segments"].as_array().unwrap();
+    let pack_path = segments[0]["pack"].as_str().unwrap();
+    let oids = pack_idx_oids(&store, "repo", pack_path);
+    assert!(oids.iter().any(|o| o == &tag_sha), "tag must be in pack");
+    assert!(oids.iter().any(|o| o == &tree_oid), "tree must be in pack");
+    let blob_oid = git_capture(&["rev-parse", "HEAD:f0.txt"], seed.path())
+        .trim()
+        .to_owned();
+    assert!(
+        oids.iter().any(|o| o == &blob_oid),
+        "tree blob f0.txt {blob_oid} must be in pack; got {oids:?}",
+    );
+
+    // Path-index is present and tagged under `tip`, not `commit`.
+    let path_index = read_path_index_for(&store, "repo", "refs/tags/tree-tag");
+    assert_eq!(path_index["v"], 2);
+    assert_eq!(path_index["tip"], tag_sha);
+    let tree = path_index["tree"]
+        .as_object()
+        .expect("path-index tree must be a JSON object");
+    assert!(
+        tree.contains_key("f0.txt"),
+        "tree-tip path-index must include the seed file",
+    );
+}
+
+#[tokio::test]
+async fn first_push_of_tag_of_tag_of_tree_round_trips_full_chain() {
+    // Multi-level tag chain ending at a tree. Both tag OIDs land in
+    // the pack alongside the tree closure.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, _shas) = make_seed_repo(1, "primary");
+    let tree_oid = git_capture(&["rev-parse", "HEAD^{tree}"], seed.path())
+        .trim()
+        .to_owned();
+    let inner_tag = mktag_pointing_at(seed.path(), &tree_oid, "tree", "inner");
+    let outer_tag = mktag_pointing_at(seed.path(), &inner_tag, "tag", "outer");
+    git(&["update-ref", "refs/tags/outer", &outer_tag], seed.path());
+
+    let store = Arc::new(MockStore::new());
+    let (out, result) = drive_in(
+        s3_url_packchain(Some("repo")),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push refs/tags/outer:refs/tags/outer\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    result.expect("tag-of-tag-of-tree push must succeed");
+    assert_eq!(std::str::from_utf8(&out).unwrap(), "ok refs/tags/outer\n\n");
+
+    let chain = read_chain_for(&store, "repo", "refs/tags/outer");
+    assert_eq!(chain["tip"], outer_tag);
+    let pack_path = chain["segments"].as_array().unwrap()[0]["pack"]
+        .as_str()
+        .unwrap();
+    let oids = pack_idx_oids(&store, "repo", pack_path);
+    // Both tags + the leaf tree + every blob in the tree closure. The
+    // leaf-blob check pins that the tag-of-tag chain still triggers
+    // tree-closure walking — without it, a regression that emitted
+    // only the chain (no tree descent) would still pass the three
+    // tag/tree-OID checks below.
+    let blob_oid = git_capture(&["rev-parse", "HEAD:f0.txt"], seed.path())
+        .trim()
+        .to_owned();
+    for needed in [&outer_tag, &inner_tag, &tree_oid, &blob_oid] {
+        assert!(
+            oids.iter().any(|o| o == needed),
+            "pack must contain {needed}; got {oids:?}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn first_push_of_bare_blob_ref_lands_pack_with_blob_only() {
+    // A ref pointing directly at a blob (no tag wrapper) is legal.
+    // Pack contains exactly the blob; chain.tip is the blob OID.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, _shas) = make_seed_repo(1, "primary");
+    std::fs::write(seed.path().join("bare-blob"), b"bare\n").unwrap();
+    let blob_oid = git_capture(&["hash-object", "-w", "bare-blob"], seed.path())
+        .trim()
+        .to_owned();
+    git(
+        &["update-ref", "refs/notes/special", &blob_oid],
+        seed.path(),
+    );
+
+    let store = Arc::new(MockStore::new());
+    let (out, result) = drive_in(
+        s3_url_packchain(Some("repo")),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push refs/notes/special:refs/notes/special\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    result.expect("bare-blob push must succeed");
+    assert_eq!(
+        std::str::from_utf8(&out).unwrap(),
+        "ok refs/notes/special\n\n",
+    );
+    let chain = read_chain_for(&store, "repo", "refs/notes/special");
+    assert_eq!(chain["tip"], blob_oid);
+    let pack_path = chain["segments"].as_array().unwrap()[0]["pack"]
+        .as_str()
+        .unwrap();
+    let oids = pack_idx_oids(&store, "repo", pack_path);
+    assert_eq!(
+        oids.len(),
+        1,
+        "bare-blob pack must contain exactly the blob; got {oids:?}",
+    );
+    assert_eq!(oids[0], blob_oid);
+    assert!(
+        !store.contains("repo/refs/notes/special/path-index.json"),
+        "blob-tipped chains must not write path-index.json",
     );
 }

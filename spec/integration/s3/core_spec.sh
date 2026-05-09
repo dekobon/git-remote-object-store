@@ -169,6 +169,86 @@ Describe "S3 helper: core git operations against rustfs"
 		End
 	End
 
+	Describe "annotated tag pointing at a tree (#80)"
+		setup() {
+			BUCKET=$(rustfs_unique_bucket)
+			PREFIX="myrepo"
+			rustfs_make_bucket "$BUCKET"
+			URL=$(rustfs_url "$BUCKET" "$PREFIX")
+			SRC="$SHELLSPEC_TMPDIR/src-$$-$RANDOM"
+			DST="$SHELLSPEC_TMPDIR/dst-$$-$RANDOM"
+			mk_local_repo "$SRC"
+			commit_in_repo "$SRC" hello.txt "hi" "first" >/dev/null
+			SHA_TREE=$(git -C "$SRC" rev-parse "HEAD^{tree}")
+			SHA_TREE_TAG=$(mktag_in_repo "$SRC" refs/tags/tree-tag "$SHA_TREE" tree)
+			add_remote "$SRC" origin "$URL"
+			# Push the branch first (so the bucket is initialised), then
+			# the tag. The tag push is the change-under-test.
+			push_branch "$SRC" origin refs/heads/main:refs/heads/main
+		}
+		BeforeEach 'setup'
+
+		It "round-trips a tag whose target is a tree"
+			When call push_branch "$SRC" origin refs/tags/tree-tag:refs/tags/tree-tag
+			The status should equal 0
+
+			# Fetch into a fresh clone and confirm the tag resolves to a
+			# tag object whose ^{} peels to a tree.
+			git clone -q "$URL" "$DST"
+			git -C "$DST" fetch -q origin "refs/tags/tree-tag:refs/tags/tree-tag"
+			local kind peel_kind
+			kind=$(git -C "$DST" cat-file -t tree-tag)
+			[[ "$kind" == "tag" ]] || {
+				echo "expected tag, got $kind" >&2
+				return 1
+			}
+			peel_kind=$(git -C "$DST" cat-file -t 'tree-tag^{}')
+			[[ "$peel_kind" == "tree" ]] || {
+				echo "expected tree-tag^{} to peel to a tree, got $peel_kind" >&2
+				return 1
+			}
+		End
+	End
+
+	Describe "annotated tag pointing at a blob (#80)"
+		setup() {
+			BUCKET=$(rustfs_unique_bucket)
+			PREFIX="myrepo"
+			rustfs_make_bucket "$BUCKET"
+			URL=$(rustfs_url "$BUCKET" "$PREFIX")
+			SRC="$SHELLSPEC_TMPDIR/src-$$-$RANDOM"
+			DST="$SHELLSPEC_TMPDIR/dst-$$-$RANDOM"
+			mk_local_repo "$SRC"
+			commit_in_repo "$SRC" hello.txt "hi" "first" >/dev/null
+			# Write a free-standing blob (not committed) and tag it.
+			echo "leaf-blob" > "$SRC/leaf"
+			SHA_BLOB=$(git -C "$SRC" hash-object -w "$SRC/leaf")
+			SHA_BLOB_TAG=$(mktag_in_repo "$SRC" refs/tags/blob-tag "$SHA_BLOB" blob)
+			add_remote "$SRC" origin "$URL"
+			push_branch "$SRC" origin refs/heads/main:refs/heads/main
+		}
+		BeforeEach 'setup'
+
+		It "round-trips a tag whose target is a blob"
+			When call push_branch "$SRC" origin refs/tags/blob-tag:refs/tags/blob-tag
+			The status should equal 0
+
+			git clone -q "$URL" "$DST"
+			git -C "$DST" fetch -q origin "refs/tags/blob-tag:refs/tags/blob-tag"
+			local kind peel_kind
+			kind=$(git -C "$DST" cat-file -t blob-tag)
+			[[ "$kind" == "tag" ]] || {
+				echo "expected tag, got $kind" >&2
+				return 1
+			}
+			peel_kind=$(git -C "$DST" cat-file -t 'blob-tag^{}')
+			[[ "$peel_kind" == "blob" ]] || {
+				echo "expected blob-tag^{} to peel to a blob, got $peel_kind" >&2
+				return 1
+			}
+		End
+	End
+
 	Describe "delete branch via empty-source push"
 		setup() {
 			BUCKET=$(rustfs_unique_bucket)
