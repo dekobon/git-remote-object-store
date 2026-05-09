@@ -143,8 +143,8 @@ enum Command {
         /// Lock TTL for compact's per-ref lock, in seconds. Compact
         /// holds the lock from chain read through chain.json commit;
         /// large repos may need a TTL well above the push default.
-        /// Default reads `GIT_REMOTE_S3_LOCK_TTL_SECONDS` (falling
-        /// back to the upstream 60s).
+        /// Default reads `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` (falling
+        /// back to 60s).
         #[arg(long, value_name = "SECONDS")]
         lock_ttl_seconds: Option<u64>,
 

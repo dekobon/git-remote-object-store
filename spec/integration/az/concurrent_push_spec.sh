@@ -154,7 +154,7 @@ Describe "Azure helper: concurrent push and stale-lock recovery"
 		BeforeEach 'setup_with_stale_lock'
 
 		quiet_push() {
-			GIT_REMOTE_S3_LOCK_TTL_SECONDS=2 \
+			GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS=2 \
 				git -C "$SRC" push origin refs/heads/main:refs/heads/main \
 				>/dev/null 2>&1
 		}

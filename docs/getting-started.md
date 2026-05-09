@@ -376,7 +376,7 @@ git-remote-object-store unprotect origin main
 
 - `--lock-ttl <SECS>` — seconds after which a `*.lock` file is
   considered stale (default `60`). Also configurable via the
-  upstream-compat env var `GIT_REMOTE_S3_LOCK_TTL_SECONDS`.
+  `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` env var.
 - `--delete-stale-locks` — actually remove stale locks (otherwise
   doctor only reports them).
 - `--delete-bundle` — delete losing bundles outright instead of
