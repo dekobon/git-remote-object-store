@@ -579,6 +579,13 @@ pub(crate) fn peel_tag_chain(repo: &Repository, tip: Sha) -> Result<PeeledTip, G
 /// returned vector is empty — the repo is fully cloned and no shallow
 /// marker should be written.
 ///
+/// **Non-commit tips**: shallow only applies to commit history. For a
+/// tag-of-tree / tag-of-blob / bare-tree / bare-blob ref the leaf has
+/// no parents in the commit graph and `--depth=N` has no semantic
+/// meaning; the function logs a warning and returns an empty vector
+/// (the outer fetch loop then installs everything, equivalent to a
+/// full fetch with no shallow markers).
+///
 /// # Errors
 ///
 /// Returns [`GitError::FindObject`] if `tip` or any of its ancestors
@@ -591,7 +598,20 @@ pub(crate) fn shallow_boundaries(
     max_depth: NonZeroU32,
 ) -> Result<Vec<ObjectId>, GitError> {
     let max_depth = max_depth.get();
-    let tip_oid = *tip.as_object_id();
+    // Peel through any annotated-tag chain. Shallow has no meaning for
+    // tree- or blob-tipped refs; short-circuit to "no boundaries" so
+    // the outer fetch loop falls back to installing the full chain.
+    let tip_oid = match peel_tag_chain(repo, tip)? {
+        PeeledTip::Commit { commit, .. } => *commit.as_object_id(),
+        PeeledTip::Tree { .. } | PeeledTip::Blob { .. } => {
+            tracing::warn!(
+                tip = %tip,
+                "shallow fetch (--depth=N) is not meaningful for non-commit-tipped refs; \
+                 falling back to full fetch (no .git/shallow markers written)",
+            );
+            return Ok(Vec::new());
+        }
+    };
 
     // BFS from `tip`. `seen` deduplicates; `frontier` accumulates the
     // commits at exactly max_depth — the boundary written to .git/shallow.

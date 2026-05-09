@@ -56,11 +56,20 @@ pub(crate) async fn write_chain(
 
 /// Read `<prefix>/<ref_name>/path-index.json` and parse it.
 ///
-/// Returns `Ok(None)` when the key does not exist (the bucket has a
-/// chain.json but no path-index, e.g. a partially crashed first push
-/// that committed before path-index was rewritten — see the engine's
-/// crash-recovery analysis). Every other failure surfaces as
-/// [`PackchainError`].
+/// Returns `Ok(None)` when:
+///
+/// - the key does not exist (the bucket has a chain.json but no
+///   path-index, e.g. a partially crashed first push that committed
+///   before path-index was rewritten — see the engine's crash-recovery
+///   analysis), or
+/// - the on-bucket file uses an older schema version (greenfield rule:
+///   stale `path-index.json` files in older buckets are treated as
+///   absent and the next push re-emits in the current schema). A
+///   `tracing::warn!` event is logged so operators see the stale-file
+///   event without it surfacing as a hard error to the read path.
+///
+/// Every other failure (transport, malformed JSON, invalid sha)
+/// surfaces as [`PackchainError`].
 pub(crate) async fn load_path_index(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
@@ -68,7 +77,20 @@ pub(crate) async fn load_path_index(
 ) -> Result<Option<PathIndex>, PackchainError> {
     let key = path_index_key(prefix, remote_ref);
     match store.get_bytes(&key).await {
-        Ok(bytes) => Ok(Some(PathIndex::from_json_bytes(&bytes)?)),
+        Ok(bytes) => match PathIndex::from_json_bytes(&bytes) {
+            Ok(parsed) => Ok(Some(parsed)),
+            Err(PackchainError::UnsupportedSchemaVersion { found, expected }) => {
+                tracing::warn!(
+                    key = %key,
+                    found_version = found,
+                    expected_version = expected,
+                    "stale path-index.json schema version; treating as absent — re-push the \
+                     ref to regenerate it",
+                );
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        },
         Err(ObjectStoreError::NotFound(_)) => Ok(None),
         Err(e) => Err(PackchainError::Store(e)),
     }
@@ -286,6 +308,26 @@ mod tests {
         );
         let err = load_chain(&store, None, &ref_main()).await.unwrap_err();
         assert!(matches!(err, PackchainError::ParseJson(_)));
+    }
+
+    #[tokio::test]
+    async fn load_path_index_treats_stale_v1_file_as_absent() {
+        // Greenfield rule: stale `path-index.json` files written under an
+        // older schema version are treated as absent. Surfacing them as
+        // a hard read error would break `read_blob` against any bucket
+        // that wasn't re-pushed after the schema bump.
+        let store = MockStore::new();
+        store.insert(
+            path_index_key(None, ref_main()),
+            Bytes::from_static(
+                br#"{"v":1,"commit":"0000000000000000000000000000000000000001","tree":{}}"#,
+            ),
+        );
+        let result = load_path_index(&store, None, &ref_main()).await.unwrap();
+        assert!(
+            result.is_none(),
+            "stale v=1 path-index must be treated as absent; got {result:?}",
+        );
     }
 
     #[tokio::test]
