@@ -61,6 +61,10 @@ use super::schema::{PathIndex, PathNode, Sha40};
 ///   missing, decode error, walk error).
 /// - [`PackchainError::InvalidPath`]: a tree entry's filename is not
 ///   valid UTF-8.
+/// - [`PackchainError::TreeCycle`]: a tree references itself directly
+///   or transitively on the current descent. Impossible in a healthy
+///   ODB (content-addressing rules out cycles); fires on corrupted or
+///   adversarial repositories so the walk cannot run unbounded.
 pub(crate) fn extract_path_index(
     repo: &Repository,
     peeled: &PeeledTip,
@@ -80,7 +84,8 @@ pub(crate) fn extract_path_index(
         PeeledTip::Blob { .. } => return Ok(None),
     };
     let mut root: BTreeMap<String, PathNode> = BTreeMap::new();
-    walk_tree(repo, tree_id, &mut root)?;
+    let mut ancestors: HashSet<ObjectId> = HashSet::new();
+    walk_tree(repo, tree_id, &mut root, &mut ancestors)?;
     Ok(Some(PathIndex {
         v: PathIndex::SCHEMA_VERSION,
         tip: Sha40::try_new(unpeeled_tip.to_string())?,
@@ -162,13 +167,27 @@ pub(crate) fn enumerate_tree_closure(
 
 /// Recursive worker. Inserts an entry into `out` for every blob /
 /// symlink at this tree level, and recurses into subtrees.
+///
+/// `ancestors` is the set of tree OIDs on the current descent path —
+/// pushed on entry, popped before return. If `tree_id` is already in
+/// the set the descent has hit a cycle and aborts with
+/// [`PackchainError::TreeCycle`]. The set is per-descent rather than
+/// global because shared subtrees at distinct paths (`src/foo/` and
+/// `vendor/foo/` with identical content) are legitimate and must each
+/// be walked — only re-entry on the active path is a cycle.
 fn walk_tree(
     repo: &Repository,
     tree_id: ObjectId,
     out: &mut BTreeMap<String, PathNode>,
+    ancestors: &mut HashSet<ObjectId>,
 ) -> Result<(), PackchainError> {
     use gix::objs::tree::EntryKind;
 
+    if !ancestors.insert(tree_id) {
+        return Err(PackchainError::TreeCycle {
+            oid: tree_id.to_string(),
+        });
+    }
     let tree = repo
         .find_object(tree_id)
         .map_err(crate::git::GitError::from)?
@@ -186,7 +205,7 @@ fn walk_tree(
         match entry.kind() {
             EntryKind::Tree => {
                 let mut subtree: BTreeMap<String, PathNode> = BTreeMap::new();
-                walk_tree(repo, entry.oid().to_owned(), &mut subtree)?;
+                walk_tree(repo, entry.oid().to_owned(), &mut subtree, ancestors)?;
                 out.insert(name.to_owned(), PathNode::Tree(subtree));
             }
             EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
@@ -200,6 +219,7 @@ fn walk_tree(
             }
         }
     }
+    ancestors.remove(&tree_id);
     Ok(())
 }
 
@@ -660,5 +680,184 @@ mod tests {
             oids.contains(&target),
             "symlink target blob must be included"
         );
+    }
+
+    // --- walk_tree cycle / shared-subtree hardening (issue #81) -------
+
+    /// Write a corrupted loose tree object directly under
+    /// `.git/objects/`. The filename's hash is `oid`, the contents are
+    /// the supplied tree entries — the two need not agree, mirroring an
+    /// adversarial or corrupted ODB. gix's loose-object reader does not
+    /// verify hash-vs-content on read.
+    ///
+    /// Returns when the file has been zlib-compressed and persisted.
+    fn write_corrupt_loose_tree(
+        repo_path: &std::path::Path,
+        oid: ObjectId,
+        entries: &[(EntryKind, &str, ObjectId)],
+    ) {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write as _;
+
+        // Build the raw tree body: each entry is
+        //   `<octal-mode> <name>\0<20-byte-binary-oid>`
+        // concatenated with no separator.
+        let mut body: Vec<u8> = Vec::new();
+        for (kind, name, entry_oid) in entries {
+            let mode: u32 = match kind {
+                EntryKind::Tree => 0o040_000,
+                EntryKind::Blob => 0o100_644,
+                EntryKind::BlobExecutable => 0o100_755,
+                EntryKind::Link => 0o120_000,
+                EntryKind::Commit => 0o160_000,
+            };
+            body.extend_from_slice(format!("{mode:o}").as_bytes());
+            body.push(b' ');
+            body.extend_from_slice(name.as_bytes());
+            body.push(0);
+            body.extend_from_slice(entry_oid.as_slice());
+        }
+
+        // Loose-object format is `tree <decimal-len>\0<body>` then zlib-compressed.
+        let mut full: Vec<u8> = Vec::new();
+        full.extend_from_slice(format!("tree {}", body.len()).as_bytes());
+        full.push(0);
+        full.extend_from_slice(&body);
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&full).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let hex = oid.to_string();
+        let dir = repo_path.join(".git/objects").join(&hex[..2]);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&hex[2..]), compressed).unwrap();
+    }
+
+    #[test]
+    fn extract_path_index_detects_direct_self_cycle() {
+        // A tree T whose only entry references T itself. Impossible in
+        // a healthy ODB (content-addressing), but a corrupted loose
+        // object can carry it. The walker must abort with `TreeCycle`
+        // and surface the offending OID rather than recurse forever.
+        let tmp = TempDir::new().unwrap();
+        let repo = gix::init(tmp.path()).unwrap();
+
+        // Pick an arbitrary 40-hex OID for the cyclic tree. Its hash
+        // need not match its content — the loose-object reader resolves
+        // by filename.
+        let cyclic = ObjectId::from_hex(b"1111111111111111111111111111111111111111").unwrap();
+        write_corrupt_loose_tree(tmp.path(), cyclic, &[(EntryKind::Tree, "self", cyclic)]);
+
+        let peeled = PeeledTip::Tree {
+            tree: cyclic,
+            tag_chain: Vec::new(),
+        };
+        let unpeeled = Sha::from_object_id(cyclic);
+        let err = extract_path_index(&repo, &peeled, unpeeled)
+            .expect_err("self-referential tree must be rejected as a cycle");
+        match err {
+            PackchainError::TreeCycle { oid } => {
+                assert_eq!(oid, cyclic.to_string());
+            }
+            other => panic!("expected TreeCycle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_path_index_detects_indirect_cycle() {
+        // T1 → T2 → T1. Both trees are corrupted loose objects whose
+        // referenced OID is the other tree's OID. The walker's ancestor
+        // set must catch this on the second descent into T1.
+        let tmp = TempDir::new().unwrap();
+        let repo = gix::init(tmp.path()).unwrap();
+
+        let t1 = ObjectId::from_hex(b"2222222222222222222222222222222222222222").unwrap();
+        let t2 = ObjectId::from_hex(b"3333333333333333333333333333333333333333").unwrap();
+        write_corrupt_loose_tree(tmp.path(), t1, &[(EntryKind::Tree, "down", t2)]);
+        write_corrupt_loose_tree(tmp.path(), t2, &[(EntryKind::Tree, "back", t1)]);
+
+        let peeled = PeeledTip::Tree {
+            tree: t1,
+            tag_chain: Vec::new(),
+        };
+        let unpeeled = Sha::from_object_id(t1);
+        let err = extract_path_index(&repo, &peeled, unpeeled)
+            .expect_err("indirect tree cycle must be rejected");
+        match err {
+            PackchainError::TreeCycle { oid } => {
+                // The second visit hits T1 again — that's the OID we
+                // re-saw in the ancestor set.
+                assert_eq!(oid, t1.to_string());
+            }
+            other => panic!("expected TreeCycle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_path_index_walks_shared_subtree_at_distinct_paths() {
+        // Regression guard: a flat visited-set would have over-pruned
+        // here. The same subtree OID referenced at two distinct paths
+        // is NOT a cycle — the walker must descend at both paths and
+        // emit identical sub-maps.
+        let tmp = TempDir::new().unwrap();
+        let repo = gix::init(tmp.path()).unwrap();
+
+        let leaf = repo.write_blob(b"hello").unwrap().detach();
+        let shared = repo
+            .write_object(&gix::objs::Tree {
+                entries: vec![Entry {
+                    mode: EntryKind::Blob.into(),
+                    filename: "leaf.txt".into(),
+                    oid: leaf,
+                }],
+            })
+            .unwrap()
+            .detach();
+        let root = repo
+            .write_object(&gix::objs::Tree {
+                entries: vec![
+                    Entry {
+                        mode: EntryKind::Tree.into(),
+                        filename: "src".into(),
+                        oid: shared,
+                    },
+                    Entry {
+                        mode: EntryKind::Tree.into(),
+                        filename: "vendor".into(),
+                        oid: shared,
+                    },
+                ],
+            })
+            .unwrap()
+            .detach();
+
+        let peeled = PeeledTip::Tree {
+            tree: root,
+            tag_chain: Vec::new(),
+        };
+        let unpeeled = Sha::from_object_id(root);
+        let index = extract_path_index(&repo, &peeled, unpeeled)
+            .expect("shared-subtree walk must succeed")
+            .expect("tree-tip path-index must be present");
+
+        // Both paths must be present and must each carry the leaf blob.
+        let src = index.tree.get("src").expect("src present");
+        let vendor = index.tree.get("vendor").expect("vendor present");
+        let PathNode::Tree(src_children) = src else {
+            panic!("src must be a Tree, got {src:?}");
+        };
+        let PathNode::Tree(vendor_children) = vendor else {
+            panic!("vendor must be a Tree, got {vendor:?}");
+        };
+        assert_eq!(
+            src_children, vendor_children,
+            "shared subtree must yield identical child maps at both paths",
+        );
+        assert!(matches!(
+            src_children.get("leaf.txt"),
+            Some(PathNode::Blob(_)),
+        ));
     }
 }

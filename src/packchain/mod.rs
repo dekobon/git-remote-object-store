@@ -290,6 +290,17 @@ pub enum PackchainError {
         /// The ref name the caller passed.
         name: String,
     },
+
+    /// Tree closure walk encountered a cycle: a tree references itself
+    /// directly or transitively via an ancestor on the current descent.
+    /// Content-addressing makes cycles impossible in a healthy ODB, so
+    /// this surfaces a corrupted or adversarial repository rather than
+    /// looping unbounded and exhausting the call stack.
+    #[error("tree {oid} forms a cycle in the path-index walk")]
+    TreeCycle {
+        /// The tree OID whose presence in the ancestor set was detected.
+        oid: String,
+    },
 }
 
 impl From<gix_pack::bundle::write::Error> for PackchainError {
