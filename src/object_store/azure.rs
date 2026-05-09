@@ -68,9 +68,8 @@
 //! bundles. Zero-byte lock files (the original §5.2 consumer) still
 //! round-trip fast: `get_to_file` short-circuits the GET on `size == 0`
 //! and `put_path` issues a single zero-byte `Put Blob`. Body is
-//! preserved; user metadata is not propagated, mirroring upstream
-//! `git-remote-s3`'s S3 `CopyObject` and Python lock-copy paths which
-//! similarly only carry body bytes.
+//! preserved; user metadata is not propagated, matching the S3 backend's
+//! `CopyObject` path which similarly carries only body bytes.
 //!
 //! This is asymmetric with the S3 backend, which uses `CopyObject` for
 //! a true server-side copy — Azure's equivalent (`Copy Blob`,

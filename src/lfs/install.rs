@@ -4,9 +4,7 @@
 //! Each rewrites the local repository's `.git/config` in-process via
 //! [`crate::git::config_add`] / [`crate::git::config_unset`] (which use
 //! `gix-config` for parsing and `gix-lock` for the atomic-rename write)
-//! to wire the LFS agent into the repository. Mirrors
-//! `git_remote_s3/lfs.py:install` and the `enable-debug` /
-//! `disable-debug` branches of its `main`.
+//! to wire the LFS agent into the repository.
 
 use std::path::Path;
 
@@ -37,8 +35,6 @@ pub enum InstallError {
 /// - `lfs.customtransfer.git-lfs-object-store.path` → the binary name.
 /// - `lfs.standalonetransferagent` → `git-lfs-object-store`, telling
 ///   LFS to bypass the HTTP transfer queue and call us directly.
-///
-/// Mirrors `../git-remote-s3/git_remote_s3/lfs.py:install`.
 ///
 /// # Errors
 ///

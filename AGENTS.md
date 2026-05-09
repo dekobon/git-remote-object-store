@@ -6,15 +6,11 @@ Universal project instructions for AI coding assistants.
 
 `git-remote-object-store` is a Rust crate that exposes AWS S3 and Azure Blob Storage as git remote backends. It ships the helper-protocol binaries (`git-remote-s3+https`, `git-remote-az+https`, etc.), an LFS custom-transfer agent, and a management CLI (`doctor`, `delete-branch`, `protect`, `unprotect`).
 
-### Relationship to `awslabs/git-remote-s3`
+### Standalone project — no external compatibility contracts
 
-This project was originally seeded as a Rust port of [`awslabs/git-remote-s3`](https://github.com/awslabs/git-remote-s3) (Python) and now stands on its own. The on-bucket object layout — `<prefix>/<ref>/<sha>.bundle`, `HEAD`, `PROTECTED#`, lock files, `lfs/<oid>` — is preserved so that buckets written by the upstream Python tool remain readable here. That layout is the only shared contract.
+This crate stands on its own. It is **not** a port of, and does not maintain any compatibility contract with, any other project — at the URL, CLI-flag, config-file, on-bucket layout, wire-format, or error-wording level. Behavior, locking semantics, error wording, the URL grammar, the on-bucket key layout, and the management-CLI shape are all this project's own decisions and are free to evolve.
 
-Behavior, locking semantics, error wording, the URL grammar, and the management-CLI shape are all this project's own decisions. The upstream Python implementation, checked out as a sibling at `../git-remote-s3`, remains a useful reference when porting or debugging wire-format-sensitive code (helper-protocol stdout bytes, on-bucket key shapes, LFS JSON events) — but it is not authoritative. Behavioral differences that matter to a user (broken bucket compatibility, surprising CLI output, broken LFS interop) are filed as GitHub issues like any other bug; differences that don't matter aren't tracked.
-
-### Greenfield project — no backwards compatibility
-
-There are **no backwards-compatibility concerns** with `git-remote-s3` at the URL, CLI-flag, or config-file level. Users will re-create their remotes against the new grammar; that cost is paid once. Do not introduce shims, aliases, deprecated-form parsers, or `--legacy-*` flags to accommodate upstream's surface.
+Do not introduce shims, aliases, deprecated-form parsers, `--legacy-*` flags, or "matches X" doc comments aimed at accommodating any external surface. Do not cite outside implementations as authoritative references in code comments — the spec, the source itself, and tests are the contract. The helper-protocol spec, the LFS spec, and the cloud-provider API specs are the only external authorities.
 
 Coding conventions for the project live in `.claude/rules/`:
 

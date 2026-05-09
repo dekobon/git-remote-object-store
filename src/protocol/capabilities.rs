@@ -1,14 +1,11 @@
 //! `capabilities` command handler.
 //!
-//! Mirrors `cmd_capabilities` in `../git-remote-s3/git_remote_s3/remote.py`,
-//! plus a packchain-only `bundle-uri` extension (issue #71) that opts an
-//! operator into advertising baseline-bundle URLs the client can fetch
-//! before the helper protocol negotiates the incremental tail.
-//!
-//! Output is the same line-by-line block the upstream Python emits —
-//! `*push`, `*fetch`, `option`, optionally `bundle-uri`, then a blank
-//! terminator. See the git remote-helper protocol docs
-//! (`git help gitremote-helpers`) for the format.
+//! Emits `*push`, `*fetch`, `option`, optionally `bundle-uri`, then a
+//! blank terminator. The `bundle-uri` line is a packchain-only
+//! extension (issue #71) that opts an operator into advertising
+//! baseline-bundle URLs the client can fetch before the helper
+//! protocol negotiates the incremental tail. See the git remote-helper
+//! protocol docs (`git help gitremote-helpers`) for the format.
 
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 

@@ -5,13 +5,11 @@
 //!
 //! # Eager probe and categorical error mapping
 //!
-//! Mirrors upstream's `S3Remote.__init__` (`../git-remote-s3/git_remote_s3/remote.py:78-85`):
-//! after constructing the SDK client, [`build`] runs a single low-cost listing
-//! call (`max_keys=1` for S3, `maxresults=1` for Azure) and folds well-known
-//! failures into categorical [`BackendError`] variants. Helper
+//! After constructing the SDK client, [`build`] runs a single low-cost
+//! listing call (`max_keys=1` for S3, `maxresults=1` for Azure) and folds
+//! well-known failures into categorical [`BackendError`] variants. Helper
 //! binaries pattern-match on these variants via [`fatal_message`] to emit
-//! single-line `fatal:` diagnostics that match upstream's wording at
-//! `remote.py:574-593`.
+//! single-line `fatal:` diagnostics.
 //!
 //! The probe runs **once** at backend construction. Per-call errors during
 //! `fetch` / `push` continue to flow through their existing typed paths.
@@ -26,14 +24,11 @@ use crate::url::{RemoteUrl, StorageEngine};
 
 pub use crate::url::BackendKind;
 
-/// Errors surfaced by [`build`]. The three variants line up with the
-/// three categorical fatal lines upstream's Python helper emits at
-/// `../git-remote-s3/git_remote_s3/remote.py:574-593`.
+/// Errors surfaced by [`build`].
 ///
-/// The `Display` strings deliberately match upstream's wording (no
-/// colons, "user" prefix on `NotAuthorized`) and are the single
-/// source of truth for the operator-facing wording rendered by
-/// [`fatal_message`].
+/// The `Display` strings (no colons, "user" prefix on `NotAuthorized`)
+/// are the single source of truth for the operator-facing wording
+/// rendered by [`fatal_message`].
 ///
 /// # Invariant for `fatal_message`
 ///
@@ -100,9 +95,6 @@ pub enum BackendError {
 
     /// Catch-all for credential acquisition failures (missing AWS
     /// profile, expired creds, missing Azure credential alias, ...).
-    /// Mirrors upstream's `(ClientError, ProfileNotFound,
-    /// CredentialRetrievalError, NoCredentialsError, UnknownCredentialError)`
-    /// arm at `remote.py:586-593`.
     #[error("invalid credentials {source}")]
     InvalidCredentials {
         /// The underlying [`ObjectStoreError`] preserved as `#[source]`.
@@ -143,14 +135,12 @@ const fn container_word(kind: BackendKind) -> &'static str {
     }
 }
 
-/// Render `err` as the upstream-style single-line `fatal:` diagnostic
-/// helper binaries write to stderr.
+/// Render `err` as a single-line `fatal:` diagnostic helper binaries
+/// write to stderr.
 ///
-/// The S3 wording matches `../git-remote-s3/git_remote_s3/remote.py:584-593`
-/// byte-for-byte; the Azure wording substitutes "container" for "bucket"
-/// (no upstream Python equivalent — Azure support is Rust-port-only). The
-/// upstream wording lives in [`BackendError`]'s `Display` derive — see the
-/// type-level doc comment.
+/// The Azure wording substitutes "container" for "bucket". The wording
+/// lives in [`BackendError`]'s `Display` derive — see the type-level
+/// doc comment.
 ///
 /// Variants like [`BackendError::InvalidCredentials`] and
 /// [`BackendError::Network`] inline their immediate source via
@@ -419,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn fatal_message_s3_bucket_not_found_matches_upstream() {
+    fn fatal_message_s3_bucket_not_found_renders_expected_wording() {
         let err = BackendError::BucketNotFound {
             kind: BackendKind::S3,
             name: "mybucket".into(),
@@ -440,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn fatal_message_not_authorized_matches_upstream() {
+    fn fatal_message_not_authorized_renders_expected_wording() {
         let err = BackendError::NotAuthorized {
             kind: BackendKind::S3,
             action: "ListObjectsV2".into(),

@@ -16,15 +16,12 @@ use git_remote_object_store::protocol::{self, backend, tracing_init};
 /// Shared `main` for every `git-remote-{s3,az}-{http,https}` binary.
 ///
 /// Git always invokes a remote helper as `git-remote-<scheme> <remote-name>
-/// <url>` — see `git help gitremote-helpers`. We read the URL from
-/// `argv[2]`, matching the upstream Python helper exactly.
+/// <url>` — see `git help gitremote-helpers`. We read the URL from `argv[2]`.
 ///
 /// Returns [`ExitCode`] rather than `anyhow::Result` so that
 /// credential / missing-bucket / authorization failures from
 /// [`backend::build`] can be rendered as a single-line `fatal:` message
-/// (matching upstream `git-remote-s3` at
-/// `../git-remote-s3/git_remote_s3/remote.py:574-593`) without
-/// `anyhow`'s `Display` chain layering on top.
+/// without `anyhow`'s `Display` chain layering on top.
 pub async fn run_main() -> ExitCode {
     let remote = match parse_remote_arg(std::env::args()) {
         Ok(r) => r,

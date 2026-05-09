@@ -1,9 +1,7 @@
 //! `doctor` analyzer + fixers.
 //!
-//! Mirrors `Doctor` in upstream
-//! `../git-remote-s3/git_remote_s3/manage.py`. The flow is:
-//! analyze → write report → fix duplicate bundles per ref → fix invalid
-//! HEAD → list and (optionally) delete stale locks.
+//! The flow is: analyze → write report → fix duplicate bundles per ref
+//! → fix invalid HEAD → list and (optionally) delete stale locks.
 //!
 //! The `Doctor` value is constructed once per CLI invocation; all
 //! interaction goes through the injected [`Prompter`] so the same code
@@ -35,8 +33,7 @@ use crate::object_store::{ObjectMeta, ObjectStore, PutOpts};
 use crate::packchain::audit::{self, AuditReport, BranchAuditRow};
 use crate::url::StorageEngine;
 
-/// Tunables for [`Doctor::run`]. Field names match the equivalent
-/// upstream Python `argparse` flags.
+/// Tunables for [`Doctor::run`].
 #[derive(Debug, Clone, Copy)]
 pub struct DoctorOpts {
     /// When `true`, `fix_multiple_bundles` deletes the losing bundles
@@ -117,8 +114,8 @@ impl<'a> Doctor<'a> {
     /// `out`.
     ///
     /// Errors short-circuit the run — partial fixes are committed
-    /// immediately (each `delete` / `copy` / `put` is its own request),
-    /// matching upstream's "best-effort" stance.
+    /// immediately (each `delete` / `copy` / `put` is its own request).
+    /// This is a "best-effort" stance.
     ///
     /// # Errors
     ///
@@ -310,8 +307,7 @@ impl<'a> Doctor<'a> {
         } else {
             // `Uuid::Simple`'s `Display` impl does NOT honor the
             // precision specifier (`{:.8}`), so encode into a stack
-            // buffer and slice to 8 chars — mirroring upstream's
-            // `str(uuid.uuid4())[:8]` to produce the `<ref>_<uuid8>`
+            // buffer and slice to 8 chars to produce the `<ref>_<uuid8>`
             // quarantine ref name.
             let mut buf = [0u8; uuid::fmt::Simple::LENGTH];
             let suffix = &Uuid::new_v4().simple().encode_lower(&mut buf)[..8];
@@ -417,7 +413,7 @@ impl<'a> Doctor<'a> {
                         info!(key, "deleted stale lock");
                     }
                     Err(e) => {
-                        // Match upstream: report each failure but keep going.
+                        // Best-effort: report each failure but keep going.
                         writeln!(out, "Failed to delete {key}: {e}")?;
                     }
                 }

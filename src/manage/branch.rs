@@ -3,8 +3,7 @@
 //! Each operation is anchored at `<prefix>/refs/heads/<branch>/`, the same
 //! key space the protocol REPL writes bundles into. When the URL has no
 //! repository prefix (root-of-bucket repos, `<prefix>` is empty), keys
-//! collapse to `refs/heads/<branch>/...` with no leading slash. Mirrors
-//! upstream `ManageBranch` in `../git-remote-s3/git_remote_s3/manage.py`.
+//! collapse to `refs/heads/<branch>/...` with no leading slash.
 
 // User-facing output is owned by the management CLI; see the matching
 // note in `doctor.rs` for the rationale behind the lint exception.
@@ -332,8 +331,7 @@ mod tests {
             .await
             .expect("open at root");
         mb.protect().await.expect("protect at root");
-        // Exactly the upstream layout for a root-of-bucket repo: no
-        // leading slash, no synthetic prefix.
+        // Root-of-bucket layout: no leading slash, no synthetic prefix.
         assert!(mock.contains("refs/heads/main/PROTECTED#"));
         assert!(!mock.contains("/refs/heads/main/PROTECTED#"));
     }

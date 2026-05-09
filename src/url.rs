@@ -91,9 +91,7 @@ pub enum AzureAddressing {
 pub enum StorageEngine {
     /// Git bundle v2 — a text header followed by a PACK file.
     ///
-    /// This is the original format, compatible with the upstream Python
-    /// `awslabs/git-remote-s3` implementation. Key layout:
-    /// `<prefix>/refs/heads/<branch>/<sha>.bundle`.
+    /// Key layout: `<prefix>/refs/heads/<branch>/<sha>.bundle`.
     Bundle,
     /// Incremental pack-chain engine (issue #52).
     ///

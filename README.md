@@ -41,36 +41,29 @@ Use cases that fit naturally:
 - Air-gapped or sovereign-cloud environments where SaaS Git hosts are
   not an option.
 
-## How does it compare to `awslabs/git-remote-s3`?
+## What you get
 
-This is a Rust rewrite of the upstream Python tool
-[`awslabs/git-remote-s3`](https://github.com/awslabs/git-remote-s3).
-The on-bucket object layout is preserved byte-for-byte (existing
-buckets remain readable in either direction), but the URL grammar,
-distribution model, and a number of correctness and performance
-details are intentional improvements.
-
-|                                | `awslabs/git-remote-s3`           | `git-remote-object-store`                                                            |
-| ------------------------------ | --------------------------------- | ------------------------------------------------------------------------------------ |
-| **Backends**                   | S3 only                           | **S3 + Azure Blob Storage**, behind one shared `ObjectStore` trait                   |
-| **URL grammar**                | `s3://profile@bucket/key`         | RFC 3986 HTTPS-native: `s3+https://<host>/<bucket>/<prefix>` — works with any host   |
-| **S3-compatible endpoints**    | Untested, address-style guessing  | First-class: MinIO, Cloudflare R2, Wasabi, Backblaze B2, RustFS, on-prem appliances  |
-| **Distribution**               | `pip install`, Python ≥ 3.9       | One static binary per platform, no runtime                                           |
-| **Bundle uploads**             | Buffered in process memory        | **Streamed** end-to-end — no OOM on large repos, no 5 GiB single-PUT ceiling         |
-| **Multipart download**         | boto3 `TransferConfig` defaults   | Hand-rolled parallel ranged GETs, **`If-Match`-guarded** against concurrent overwrites |
-| **Push-batch error handling**  | First failure aborts the batch    | Per-ref errors continue the batch; failed refs report a reason without losing peers  |
-| **Bucket-name validation**     | Surfaces as cryptic SDK errors    | Validates AWS-reserved prefixes/suffixes, IPv4 dotted-quads, etc. up front           |
-| **TLS stack**                  | Whatever Python's `ssl` resolves  | Modern `rustls 0.23`; deliberately opts out of AWS SDK's legacy `rustls 0.21` chain  |
-| **Locking**                    | `If-None-Match: *` (S3)           | Same on S3, mirrored on Azure; same TTL semantics; tested across both backends       |
-| **Cleartext HTTP**             | n/a                               | Loopback-only by default; `s3+http`/`az+http` exist for MinIO and Azurite            |
-
-What we deliberately did **not** carry over from upstream:
-
-- The `s3+zip://` scheme. Use `?zip=1` on the URL — same artefact,
-  cleaner grammar.
-- The `s3://profile@bucket/path` userinfo form. Use `?profile=NAME`.
-- Backwards-compatibility shims for the old URL forms. This is a
-  greenfield 0.1.0 — pay the one-time cost of `git remote set-url`.
+- **Two backends behind one trait.** AWS S3 and Azure Blob Storage,
+  plus any S3-compatible endpoint (MinIO, Cloudflare R2, Wasabi,
+  Backblaze B2, RustFS, on-prem appliances).
+- **RFC 3986 HTTPS-native URL grammar.** `s3+https://<host>/<bucket>/<prefix>`
+  and `az+https://<account>.blob.<endpoint>/<container>/<prefix>`.
+  Cleartext `*+http://` is loopback-only by default for MinIO /
+  Azurite work.
+- **Streaming uploads end-to-end.** No in-memory buffering of bundles,
+  no 5 GiB single-PUT ceiling — multipart upload is wired into both
+  backends.
+- **Hand-rolled parallel ranged GETs**, `If-Match`-guarded against
+  concurrent overwrites.
+- **Per-ref push-batch error handling.** A single failed ref reports
+  a reason without aborting the rest of the batch.
+- **Up-front bucket-name validation.** AWS-reserved prefixes/suffixes,
+  IPv4 dotted-quads, and the rest of the rule set are checked before
+  the SDK can return a cryptic error.
+- **Modern TLS stack.** `rustls 0.23`, with deliberate opt-out of the
+  AWS SDK's legacy `rustls 0.21` chain.
+- **Locking parity across backends.** `If-None-Match: *` on S3,
+  mirrored on Azure; same TTL semantics; tested across both.
 
 ## Quick install
 

@@ -1,10 +1,8 @@
 //! LFS custom-transfer agent (line-oriented JSON protocol).
 //!
 //! Implementation of `git-lfs-object-store`, the LFS custom-transfer
-//! agent for the S3 and Azure Blob backends. The shape of the agent
-//! and the on-bucket layout (`<prefix>/lfs/<oid>`) follow upstream's
-//! `../git-remote-s3/git_remote_s3/lfs.py` so existing buckets remain
-//! readable.
+//! agent for the S3 and Azure Blob backends. The on-bucket layout is
+//! `<prefix>/lfs/<oid>`.
 //!
 //! The agent has two modes:
 //!

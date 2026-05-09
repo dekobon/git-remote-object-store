@@ -20,8 +20,7 @@
 //! [`put_if_absent`][super::ObjectStore::put_if_absent] uses
 //! `If-None-Match: "*"`. S3 returns either 412 (`PreconditionFailed`)
 //! when the key already exists or 409 (`ConditionalRequestConflict`)
-//! when two PUTs race. Both collapse to `Ok(false)`; only 412 is in
-//! upstream Python's path.
+//! when two PUTs race. Both collapse to `Ok(false)`.
 //!
 //! ## Size limits
 //!
@@ -128,8 +127,7 @@ use super::{
 };
 
 /// Object-size cutoff above which `get_to_file` switches from a single
-/// streaming GET to parallel ranged GETs. Matches upstream
-/// `boto3.s3.transfer.TransferConfig` (`../git-remote-s3/git_remote_s3/remote.py:143-148`).
+/// streaming GET to parallel ranged GETs.
 pub(crate) const MULTIPART_THRESHOLD: u64 = 25 * 1024 * 1024;
 /// Range size for each ranged GET in the multipart download path.
 pub(crate) const MULTIPART_CHUNK_SIZE: u64 = 16 * 1024 * 1024;
@@ -290,9 +288,7 @@ impl S3Store {
     /// [`crate::protocol::backend::build`] to fold credential / missing-bucket /
     /// authorization failures into categorical
     /// [`crate::protocol::backend::BackendError`] variants before the
-    /// helper REPL runs its first command. Mirrors upstream's
-    /// `S3Remote.__init__` probe at
-    /// `../git-remote-s3/git_remote_s3/remote.py:78-85`.
+    /// helper REPL runs its first command.
     pub(crate) async fn probe(&self, prefix: &str) -> Result<(), ObjectStoreError> {
         self.client
             .list_objects_v2()
@@ -1922,7 +1918,7 @@ mod tests {
 
     #[test]
     fn encode_copy_source_encodes_hash_in_lock_keys() {
-        // LOCK#.lock from upstream's locking scheme — # is reserved.
+        // LOCK#.lock from the per-ref locking scheme — # is reserved.
         let out = encode_copy_source("my-bucket", "refs/heads/main/LOCK#.lock");
         assert_eq!(out, "my-bucket/refs/heads/main/LOCK%23.lock");
     }

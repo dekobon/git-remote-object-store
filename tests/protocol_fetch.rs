@@ -2,11 +2,10 @@
 //! batch against a [`MockStore`] seeded with real git bundles, and
 //! verify the bundles end up applied in a destination repository.
 //!
-//! Ports the assertions from upstream
-//! `../git-remote-s3/test/parallel_fetch_test.py` to the Rust REPL:
-//! empty batch is a no-op, single fetch round-trips, multiple fetches
-//! all complete, duplicate SHAs are deduped without loss, and the
-//! `<prefix>=None` URL form omits the leading slash from the bundle key.
+//! Covers: empty batch is a no-op, single fetch round-trips, multiple
+//! fetches all complete, duplicate SHAs are deduped without loss, and
+//! the `<prefix>=None` URL form omits the leading slash from the bundle
+//! key.
 
 #![cfg(feature = "test-util")]
 

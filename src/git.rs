@@ -1,11 +1,10 @@
 //! Native git operations layered on top of [`gix`][gix].
 //!
-//! Mirrors the surface of upstream `git_remote_s3/git.py`. Operations that
-//! `gix` 0.82 exposes go through `gix` natively; config reads/writes go
-//! through `gix-config` + `gix-lock` for atomic edits parity with
-//! `git config`. Bundle creation and consumption use the native
-//! `gix-pack`-based implementation in [`crate::bundle`]; no `git`
-//! subprocess is spawned at runtime.
+//! Operations that `gix` 0.82 exposes go through `gix` natively; config
+//! reads/writes go through `gix-config` + `gix-lock` for atomic edits
+//! parity with `git config`. Bundle creation and consumption use the
+//! native `gix-pack`-based implementation in [`crate::bundle`]; no
+//! `git` subprocess is spawned at runtime.
 //!
 //! [gix]: https://docs.rs/gix
 
@@ -161,9 +160,9 @@ pub enum RefNameError {
 /// Permissive ref-name predicate.
 ///
 /// Returns `true` iff `name` passes `gix_validate::reference::name_partial`.
-/// The partial form accepts single-component names like `HEAD`, matching the
-/// upstream Python regex's permissiveness; for the strict, fully-qualified
-/// form used when constructing a [`RefName`], use [`RefName::new`] instead.
+/// The partial form accepts single-component names like `HEAD`; for the
+/// strict, fully-qualified form used when constructing a [`RefName`], use
+/// [`RefName::new`] instead.
 #[must_use]
 pub fn is_valid_ref_name(name: &str) -> bool {
     gix_validate::reference::name_partial(BStr::new(name)).is_ok()
@@ -1283,9 +1282,8 @@ mod tests {
 
     #[test]
     fn is_valid_ref_name_partial_accepts_single_component_head() {
-        // The partial validator accepts `HEAD`, matching the upstream
-        // permissive regex; the strict `RefName::new` would reject it
-        // because it isn't fully qualified.
+        // The partial validator accepts `HEAD`; the strict `RefName::new`
+        // would reject it because it isn't fully qualified.
         assert!(is_valid_ref_name("HEAD"));
     }
 

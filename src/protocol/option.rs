@@ -1,6 +1,5 @@
 //! Handler for the `option` remote-helper command.
 //!
-//! Mirrors `cmd_option` in `../git-remote-s3/git_remote_s3/remote.py`.
 //! Recognised options are `verbosity` and `depth`; everything else (and
 //! any malformed `option ...` line) responds `unsupported\n`. Git
 //! requires an exact `ok\n` / `unsupported\n` per option line — silence
@@ -75,7 +74,7 @@ fn parse_option(args: &str) -> Option<OptionRequest> {
     let key = parts.next()?;
     let value = parts.next()?;
     if parts.next().is_some() {
-        // Extra tokens — match upstream's `split(" ")[1:]` strictness.
+        // Extra tokens — strictly reject malformed `option` lines.
         return None;
     }
     match key {

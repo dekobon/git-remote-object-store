@@ -1,12 +1,10 @@
 //! `push` handler with per-ref locking via conditional writes.
 //!
-//! Mirrors `cmd_push` in `../git-remote-s3/git_remote_s3/remote.py:198-305`
-//! and shares its sequential-batch semantics: every `push <refspec>`
-//! line in a batch is processed in order under its own per-ref lock,
-//! and one outcome line is emitted per push (`ok <ref>\n` or
-//! `error <ref> "msg"\n`). `gix::Repository` is `!Sync` so the handler
-//! holds the repo handle on a single task — pushes never run in
-//! parallel within one client.
+//! Sequential-batch semantics: every `push <refspec>` line in a batch
+//! is processed in order under its own per-ref lock, and one outcome
+//! line is emitted per push (`ok <ref>\n` or `error <ref> "msg"\n`).
+//! `gix::Repository` is `!Sync` so the handler holds the repo handle
+//! on a single task — pushes never run in parallel within one client.
 //!
 //! Stdout discipline: this module returns [`PushOutcome`] values and
 //! never writes to the protocol stream itself. The REPL renders each
@@ -27,9 +25,7 @@ use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, ProgressSink, PutOpts};
 use crate::url::StorageEngine;
 
-/// Default per-ref lock TTL, in seconds. Matches upstream
-/// (`DEFAULT_LOCK_TTL_SECONDS = 60`,
-/// `../git-remote-s3/git_remote_s3/remote.py:45`).
+/// Default per-ref lock TTL, in seconds.
 pub(crate) const DEFAULT_LOCK_TTL_SECONDS: u64 = 60;
 
 /// Push configuration that is constant across an entire batch.
@@ -45,8 +41,7 @@ struct PushConfig {
     ttl: Duration,
 }
 
-/// Environment override for the lock TTL, in seconds. Name is preserved
-/// from upstream for cross-implementation parity.
+/// Environment override for the lock TTL, in seconds.
 pub(crate) const ENV_LOCK_TTL_SECONDS: &str = "GIT_REMOTE_S3_LOCK_TTL_SECONDS";
 
 /// Stable substring embedded in the rejection message returned when the
@@ -200,11 +195,10 @@ pub(crate) fn head_key(prefix: Option<&str>) -> String {
     keys::join(prefix.unwrap_or(""), "HEAD")
 }
 
-/// Mirror upstream's `get_bundles_for_ref` filter:
-/// drop any key containing `PROTECTED#`, `.zip`, `/LOCKS/`, or ending in
-/// `.lock` (`../git-remote-s3/git_remote_s3/remote.py:323-344`). The
-/// case-sensitive `.lock` suffix is deliberate — bucket keys are
-/// case-sensitive and the lock filename is hard-coded.
+/// Bundle-candidate filter: drop any key containing `PROTECTED#`,
+/// `.zip`, `/LOCKS/`, or ending in `.lock`. The case-sensitive `.lock`
+/// suffix is deliberate — bucket keys are case-sensitive and the lock
+/// filename is hard-coded.
 #[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn is_bundle_candidate(key: &str) -> bool {
     !key.contains("PROTECTED#")
@@ -214,8 +208,8 @@ fn is_bundle_candidate(key: &str) -> bool {
 }
 
 /// Returns every bundle object currently stored under `remote_ref`,
-/// filtered like upstream's `get_bundles_for_ref`. The store's listing
-/// prefix is `<prefix>/<ref>/` so sibling-ref keys don't leak in.
+/// filtered by [`is_bundle_candidate`]. The store's listing prefix is
+/// `<prefix>/<ref>/` so sibling-ref keys don't leak in.
 async fn bundles_for_ref(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
@@ -300,9 +294,7 @@ pub(crate) async fn acquire_lock(
 
 /// Release a previously acquired per-ref lock. `NotFound` is mapped to
 /// `Ok(())` (another client or the TTL may have already cleaned it up);
-/// every other delete failure is propagated so the caller can surface
-/// it. Mirrors upstream `release_lock`
-/// (`../git-remote-s3/git_remote_s3/remote.py:408-416`).
+/// every other delete failure is propagated so the caller can surface it.
 pub(crate) async fn release_lock(
     store: &dyn ObjectStore,
     lock_key: &str,
@@ -367,12 +359,10 @@ pub(crate) async fn push_batch(
             Ok(o) => o,
             // Per-push operational failures (transport, local git, local I/O,
             // malformed remote bundle SHA) become `error <ref>` lines so the
-            // batch can continue, mirroring upstream `cmd_push`'s try/except
-            // shape (`../git-remote-s3/git_remote_s3/remote.py:286-296`).
-            // Without this, a single 5xx blip in the middle of a multi-ref
-            // push would silently drop the outcome lines for already-completed
-            // pushes and leave git's local ref-tracking inconsistent with the
-            // remote.
+            // batch can continue. Without this, a single 5xx blip in the
+            // middle of a multi-ref push would silently drop the outcome
+            // lines for already-completed pushes and leave git's local
+            // ref-tracking inconsistent with the remote.
             Err(e)
                 if matches!(
                     e,
@@ -625,8 +615,7 @@ async fn prepare_push(
     }))
 }
 
-/// Execute one push: prepare, lock, upload, release. Mirrors the
-/// upstream `cmd_push` body except where typed errors replace stringy ones.
+/// Execute one push: prepare, lock, upload, release.
 async fn push_one(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
@@ -654,16 +643,16 @@ async fn push_one(
     }
 
     // Run the lock-protected work, then release the lock unconditionally
-    // before propagating the result. Mirrors upstream's `try/finally` so a
-    // mid-push error never leaves the lock dangling for the full TTL.
+    // before propagating the result. The `try/finally`-style release
+    // ensures a mid-push error never leaves the lock dangling for the
+    // full TTL.
     let result = perform_push_under_lock(store, prefix, state).await;
     let release_result = release_lock(store, &lock).await;
 
-    // Upstream `cmd_push` (`../git-remote-s3/git_remote_s3/remote.py:297-303`)
-    // overrides a successful push with an error when the lock release
-    // fails, so the operator is alerted and concurrent pushers are not
-    // left hitting a dangling lock for the full TTL. A genuine push
-    // error takes priority — do not mask it with the release failure.
+    // A failed lock release overrides a successful push outcome so the
+    // operator is alerted and concurrent pushers are not left hitting a
+    // dangling lock for the full TTL. A genuine push error takes
+    // priority — do not mask it with the release failure.
     match (&result, release_result) {
         (Ok(PushOutcome::Ok { .. }), Err(e)) => {
             warn!(key = %lock, error = %e, "failed to release lock");
@@ -894,21 +883,20 @@ const DELETE_EXPECTED_NO_ZIP: usize = 1;
 /// Expected key count for a zip ref: one bundle + one archive object.
 const DELETE_EXPECTED_WITH_ZIP: usize = 2;
 
-/// Handle a delete refspec (`:<remote_ref>`). Mirrors upstream
-/// `remove_remote_ref`: list `<prefix>/<ref>/`, expect 1 (or 2 with zip)
-/// keys, delete them all, emit `ok` or the appropriate error.
+/// Handle a delete refspec (`:<remote_ref>`): list `<prefix>/<ref>/`,
+/// expect 1 (or 2 with zip) keys, delete them all, emit `ok` or the
+/// appropriate error.
 ///
 /// The listing is **unfiltered** on purpose — it counts `LOCK#.lock`,
 /// `PROTECTED#`, and `repo.zip` against the expected total. Two
-/// upstream behaviours fall out:
+/// behaviours fall out:
 ///
 /// 1. A protected ref (`PROTECTED#` marker) cannot be deleted via
 ///    `git push :ref`: the marker inflates the count past `expected`,
 ///    triggering the multi-bundle error. Removing the marker first
 ///    (via the management CLI's `unprotect`) is required.
 /// 2. A ref whose only object is a stale `LOCK#.lock` deletes that
-///    lock as if it were the bundle and returns `ok`. This matches
-///    upstream `remove_remote_ref` (`../git-remote-s3/git_remote_s3/remote.py:172-196`).
+///    lock as if it were the bundle and returns `ok`.
 async fn delete_remote_ref(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
@@ -1299,9 +1287,9 @@ mod tests {
 
     #[tokio::test]
     async fn delete_remote_ref_rejects_protected_marker() {
-        // PROTECTED# is unfiltered for the delete-path count, mirroring
-        // upstream's bug-as-feature: protected refs cannot be deleted
-        // via `git push :ref` because the marker inflates the count.
+        // PROTECTED# is unfiltered for the delete-path count: protected
+        // refs cannot be deleted via `git push :ref` because the marker
+        // inflates the count.
         let store = MockStore::new();
         let r = rn("refs/heads/main");
         let bundle = format!("repo/refs/heads/main/{SHA}.bundle");
@@ -1375,9 +1363,7 @@ mod tests {
     /// at ~line 600) must produce wire output ending in `"?\n`. The `?`
     /// suffix is the project-wide Rust convention for `error <ref> "..."`
     /// messages — git treats `"..."?` as recoverable and `"..."` as
-    /// fatal. Upstream Python omits the `?` on the under-lock branch
-    /// (`../git-remote-s3/git_remote_s3/remote.py:245`); this is a
-    /// deliberate normalization in this crate.
+    /// fatal. Both branches normalize to the recoverable form.
     #[test]
     fn duplicate_bundle_errors_use_consistent_wire_format() {
         let pre_lock_line = PushOutcome::Error {
@@ -1718,8 +1704,7 @@ mod tests {
 
     /// A ref whose only remaining object is a stale `LOCK#.lock` deletes
     /// that lock as if it were the bundle and returns `ok` — the
-    /// listing is unfiltered on purpose. Mirrors upstream
-    /// `git_remote_s3/remote.py:172-196`.
+    /// listing is unfiltered on purpose.
     ///
     /// A regression that filtered `LOCK#.lock` out of the listing (e.g.
     /// reusing `bundles_for_ref` here) would silently turn this into
