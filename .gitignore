@@ -20,4 +20,5 @@ Cargo.lock
 # End of https://www.toptal.com/developers/gitignore/api/rust
 
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
 spec/live/.env
