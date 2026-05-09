@@ -89,7 +89,7 @@ pub const DEFAULT_GRACE_HOURS: u64 = 24;
 /// Environment variable that overrides [`DEFAULT_GRACE_HOURS`] when
 /// set to a positive integer. Mirrors the shape of
 /// `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` used by the protocol REPL.
-pub const ENV_GC_GRACE_HOURS: &str = "GIT_REMOTE_S3_GC_GRACE_HOURS";
+pub const ENV_GC_GRACE_HOURS: &str = "GIT_REMOTE_OBJECT_STORE_GC_GRACE_HOURS";
 
 /// On-bucket schema version this build reads and writes.
 pub const TOMBSTONE_SCHEMA_VERSION: u32 = 1;

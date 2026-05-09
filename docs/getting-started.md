@@ -495,8 +495,8 @@ its packs are eligible for sweep. Default is 24 hours.
 # Override per invocation:
 git-remote-object-store gc origin --grace-hours 168    # 7 days
 
-# Or via env var (also picks up upstream-compat name):
-export GIT_REMOTE_S3_GC_GRACE_HOURS=168
+# Or via env var:
+export GIT_REMOTE_OBJECT_STORE_GC_GRACE_HOURS=168
 git-remote-object-store gc origin
 ```
 
