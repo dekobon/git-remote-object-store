@@ -38,7 +38,7 @@ pub struct ManageCompactOpts {
     pub with_gc: bool,
     /// Lock TTL for compact's per-ref lock. When `None`, falls back
     /// to [`crate::protocol::push::lock_ttl_from_env`] which honours
-    /// `GIT_REMOTE_S3_LOCK_TTL_SECONDS`.
+    /// `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`.
     pub lock_ttl_seconds: Option<u64>,
     /// Grace hours forwarded to `gc::sweep` when `with_gc` is set.
     pub gc_grace_hours: u64,

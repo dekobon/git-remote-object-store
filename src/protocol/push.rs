@@ -42,7 +42,7 @@ struct PushConfig {
 }
 
 /// Environment override for the lock TTL, in seconds.
-pub(crate) const ENV_LOCK_TTL_SECONDS: &str = "GIT_REMOTE_S3_LOCK_TTL_SECONDS";
+pub(crate) const ENV_LOCK_TTL_SECONDS: &str = "GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS";
 
 /// Stable substring embedded in the rejection message returned when the
 /// remote ref is not an ancestor of the pushed local ref. Treated as a
@@ -245,7 +245,7 @@ fn parse_remote_sha_from_key(key: &str) -> Option<Sha> {
     Sha::from_hex(stem).ok()
 }
 
-/// Read the lock TTL from `GIT_REMOTE_S3_LOCK_TTL_SECONDS`, falling back
+/// Read the lock TTL from `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`, falling back
 /// to [`DEFAULT_LOCK_TTL_SECONDS`] if the env var is unset or unparseable.
 pub(crate) fn lock_ttl_from_env() -> Duration {
     let secs = env::var(ENV_LOCK_TTL_SECONDS)
