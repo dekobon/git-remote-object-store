@@ -1,162 +1,1187 @@
 name: Release
 
+# Triggered by `v*` tags. `workflow_dispatch` is available for rehearsal
+# against an existing tag; the pre-release gate keeps tap and crates.io
+# updates from leaking during rehearsal.
 on:
   push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (e.g. v0.1.0 or v0.0.0-test1)"
+        required: true
+        type: string
 
-permissions:
-  contents: write
-
+# Never cancel an in-flight release — external publishes must be atomic.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+# Default to read-only; jobs escalate explicitly.
+permissions:
+  contents: read
+
+# All `uses:` below are pinned to commit SHAs to eliminate supply-chain
+# risk from action-release spoofing. Bump via Dependabot (see
+# .github/dependabot.yml), which rewrites the SHA + version comment.
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  RUSTFLAGS: "-D warnings"
+  # Pinned toolchain for deterministic release builds. Matches the
+  # MSRV declared in Cargo.toml (rust-version = "1.94").
+  RUST_TOOLCHAIN: "1.94.0"
+  CROSS_VERSION: "0.2.5"
+  # cargo-deb 3.x and cargo-generate-rpm 0.20+ are the first releases
+  # that parse Cargo.toml `resolver = "3"` (stabilised in Rust 1.84).
+  CARGO_DEB_VERSION: "3.6.3"
+  CARGO_GENERATE_RPM_VERSION: "0.20.0"
+  CARGO_CYCLONEDX_VERSION: "0.5.7"
+  CARGO_ABOUT_VERSION: "0.8.4"
 
 jobs:
+  # ─── Stage 0 — preflight gate ────────────────────────────────────────
+  preflight:
+    name: preflight
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.classify.outputs.version }}
+      tag: ${{ steps.classify.outputs.tag }}
+      prerelease: ${{ steps.classify.outputs.prerelease }}
+      ref: ${{ steps.classify.outputs.ref }}
+    steps:
+      - name: Resolve tag
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="$REF_NAME"
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
+            echo "::error::Tag '$TAG' is not a valid semver release tag"
+            exit 1
+          fi
+          # abuild's pkgver grammar accepts only `_<alpha|beta|pre|rc|cvs|svn|git|hg|p><digits>`
+          # with no dots in the suffix. The render step maps the semver
+          # hyphen to abuild's underscore, but `1.0.0-rc.2` would still
+          # emit `1.0.0_rc.2` which apk rejects mid-pipeline. Fail here
+          # instead, so tag-format mistakes cost 30 s in preflight rather
+          # than 2+ min across the apk arches.
+          if [[ "$TAG" == *-*.* ]]; then
+            echo "::error::Pre-release suffix in '$TAG' contains a dot. abuild does not accept dotted suffixes (e.g. 'rc.2'); use 'rc2' instead."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # Always check out the tag ref, not the event SHA. Critical for
+      # workflow_dispatch where github.sha points at the branch HEAD.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable tip
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Verify tag ↔ Cargo.toml version parity
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -eu
+          # The version appears in three places that must agree, and
+          # each one fails differently if it drifts:
+          #
+          #   1. root Cargo.toml [package].version  → library's
+          #      published version on crates.io.
+          #   2. cli/Cargo.toml  [package].version  → CLI's published
+          #      version + driver for cargo-deb / cargo-generate-rpm
+          #      filename and metadata.
+          #   3. cli/Cargo.toml  [dependencies].git-remote-object-store
+          #      .version             → version requirement applied to
+          #      the library when the CLI is built from crates.io. A
+          #      drift here passes every preceding stage and fails
+          #      only at `publish-crates`, after the GitHub Release is
+          #      already cut and irreversible.
+          # Single source of truth: `cargo metadata`. jq pulls each
+          # version from the resolved tree without our own TOML parser.
+          META=$(cargo metadata --format-version 1 --no-deps)
+          LIB_VER=$(jq -r '.packages[] | select(.name=="git-remote-object-store") | .version' <<<"$META")
+          CLI_VER=$(jq -r '.packages[] | select(.name=="git-remote-object-store-cli") | .version' <<<"$META")
+          DEP_REQ=$(jq -r '.packages[] | select(.name=="git-remote-object-store-cli") | .dependencies[] | select(.name=="git-remote-object-store") | .req' <<<"$META")
+          # Strip the cargo requirement-prefix (`^`, `~`, `=`) so we
+          # compare bare versions.
+          DEP_REQ_STRIPPED="${DEP_REQ#[\^~=]}"
+          fail=0
+          if [[ "$LIB_VER" != "$VERSION" ]]; then
+            echo "::error::root Cargo.toml version is $LIB_VER, tag is $VERSION"
+            fail=1
+          fi
+          if [[ "$CLI_VER" != "$VERSION" ]]; then
+            echo "::error::cli/Cargo.toml [package].version is $CLI_VER, tag is $VERSION"
+            fail=1
+          fi
+          if [[ "$DEP_REQ_STRIPPED" != "$VERSION" ]]; then
+            # Catches the third drift: the CLI manifest pins the library
+            # via `version = "..."` for crates.io publish. A drift here
+            # passes every preceding stage and fails only at
+            # `publish-crates`, after the GitHub Release is irreversible.
+            echo "::error::cli/Cargo.toml [dependencies].git-remote-object-store version is '$DEP_REQ', tag is $VERSION — bump it in lockstep"
+            fail=1
+          fi
+          [[ $fail -eq 0 ]] || exit 1
+
+      - name: Verify minisign.pub is not the placeholder
+        run: |
+          set -eu
+          # Anchored match against the exact committed placeholder comment.
+          # A real public key file's `untrusted comment:` line won't start with this.
+          if grep -q '^untrusted comment: placeholder' minisign.pub; then
+            echo "::error::minisign.pub is still the committed placeholder. Rotate the key before tagging a release."
+            exit 1
+          fi
+
+      # Package-level dry-run for the library. Catches metadata errors
+      # (missing description/license, non-packageable files, path-dep
+      # version drift) before any external publish fires. We do not
+      # dry-run git-remote-object-store-cli here because its
+      # `git-remote-object-store` dependency is not yet on crates.io
+      # on a first publish; the real `publish-crates` job handles the
+      # ordered upload.
+      - name: Dry-run cargo publish for git-remote-object-store
+        run: cargo publish -p git-remote-object-store --dry-run --locked
+
+      - name: Extract release notes from CHANGELOG
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -eu
+          if ! grep -Fq "## [${VERSION}]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no section for [${VERSION}]"
+            exit 1
+          fi
+          # Forward-looking check: every release should leave a fresh
+          # `[Unreleased]` heading at the top so future commits have a
+          # place to land. Forgetting to re-add it after promoting it
+          # to a version section is silent — the *next* release would
+          # have nowhere to record changes — so fail-fast here instead.
+          if ! grep -q '^## \[Unreleased\]' CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no [Unreleased] section. After promoting [Unreleased] to [${VERSION}], add a fresh empty [Unreleased] heading above it."
+            exit 1
+          fi
+          # Fixed-string match on the section header — avoids treating
+          # dots in the version as regex wildcards.
+          awk -v header="## [${VERSION}]" '
+            index($0, header) == 1 { capture=1; next }
+            capture && /^## \[/ { exit }
+            capture { print }
+          ' CHANGELOG.md > release-notes.md
+          if [[ ! -s release-notes.md ]]; then
+            echo "::error::Extracted release notes are empty"
+            exit 1
+          fi
+
+      - name: Classify release
+        id: classify
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -eu
+          PRERELEASE=false
+          if [[ "$TAG" == *-* ]]; then PRERELEASE=true; fi
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "prerelease=$PRERELEASE"
+            echo "ref=$TAG"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+
+  # ─── Stage 1 — build matrix (per OS / arch) ──────────────────────────
   build:
-    name: Build ${{ matrix.target }}
+    name: build ${{ matrix.target }}
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            split-tool: objcopy
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            split-tool: dsymutil
-
-    runs-on: ${{ matrix.os }}
+          - { target: x86_64-unknown-linux-gnu,   runner: ubuntu-22.04,   cross: false }
+          - { target: aarch64-unknown-linux-gnu,  runner: ubuntu-22.04,   cross: true  }
+          - { target: x86_64-unknown-linux-musl,  runner: ubuntu-latest,  cross: true  }
+          - { target: aarch64-unknown-linux-musl, runner: ubuntu-latest,  cross: true  }
+          - { target: x86_64-unknown-freebsd,     runner: ubuntu-latest,  cross: true  }
+          - { target: aarch64-apple-darwin,       runner: macos-latest,   cross: false }
+          - { target: x86_64-pc-windows-msvc,     runner: windows-latest, cross: false }
+          - { target: aarch64-pc-windows-msvc,    runner: windows-latest, cross: false }
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable tip
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross (Linux / FreeBSD cross-compile)
+        if: matrix.cross
+        uses: taiki-e/install-action@9ca1734d8940023f074414ee621fd530c4ce10f2 # v2.62.23
+        with:
+          tool: cross@${{ env.CROSS_VERSION }}
+
+      - name: Install cargo-about
+        uses: taiki-e/install-action@9ca1734d8940023f074414ee621fd530c4ce10f2 # v2.62.23
+        with:
+          tool: cargo-about@${{ env.CARGO_ABOUT_VERSION }}
 
       - name: Build release binaries
-        run: cargo build --workspace --release --locked --target ${{ matrix.target }} --bins
-
-      - name: Resolve release metadata
-        id: meta
         shell: bash
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          PACKAGE="git-remote-object-store-${VERSION}-${{ matrix.target }}"
-          DEBUG_PACKAGE="${PACKAGE}-debug"
-          STAGE="$(mktemp -d)/stage"
-          DEBUG_STAGE="$(mktemp -d)/stage-debug"
-          mkdir -p "${STAGE}" "${DEBUG_STAGE}"
-          {
-            echo "version=${VERSION}"
-            echo "package=${PACKAGE}"
-            echo "debug_package=${DEBUG_PACKAGE}"
-            echo "stage=${STAGE}"
-            echo "debug_stage=${DEBUG_STAGE}"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Split debug info and strip (Linux)
-        if: matrix.split-tool == 'objcopy'
-        shell: bash
-        run: |
-          set -euo pipefail
-          BIN_DIR="target/${{ matrix.target }}/release"
-          STAGE="${{ steps.meta.outputs.stage }}"
-          DEBUG_STAGE="${{ steps.meta.outputs.debug_stage }}"
-          for bin in git-remote-s3-https git-remote-s3-http \
-                     git-remote-az-https git-remote-az-http \
-                     git-remote-object-store git-lfs-object-store; do
-              cp "${BIN_DIR}/${bin}" "${STAGE}/${bin}"
-              objcopy --only-keep-debug "${STAGE}/${bin}" "${DEBUG_STAGE}/${bin}.debug"
-              objcopy --strip-debug "${STAGE}/${bin}"
-              objcopy --add-gnu-debuglink="${DEBUG_STAGE}/${bin}.debug" "${STAGE}/${bin}"
-              chmod 0644 "${DEBUG_STAGE}/${bin}.debug"
-          done
-
-      - name: Split debug info and strip (macOS)
-        if: matrix.split-tool == 'dsymutil'
-        shell: bash
-        run: |
-          set -euo pipefail
-          BIN_DIR="target/${{ matrix.target }}/release"
-          STAGE="${{ steps.meta.outputs.stage }}"
-          DEBUG_STAGE="${{ steps.meta.outputs.debug_stage }}"
-          for bin in git-remote-s3-https git-remote-s3-http \
-                     git-remote-az-https git-remote-az-http \
-                     git-remote-object-store git-lfs-object-store; do
-              cp "${BIN_DIR}/${bin}" "${STAGE}/${bin}"
-              dsymutil "${STAGE}/${bin}" -o "${DEBUG_STAGE}/${bin}.dSYM"
-              strip -S "${STAGE}/${bin}"
-          done
-
-      - name: Package release artifacts
-        id: package
-        shell: bash
-        run: |
-          set -euo pipefail
-          PACKAGE="${{ steps.meta.outputs.package }}"
-          DEBUG_PACKAGE="${{ steps.meta.outputs.debug_package }}"
-          STAGE="${{ steps.meta.outputs.stage }}"
-          DEBUG_STAGE="${{ steps.meta.outputs.debug_stage }}"
-          OUT="$(pwd)/dist"
-          mkdir -p "${OUT}"
-          tar -C "${STAGE}" -czf "${OUT}/${PACKAGE}.tar.gz" .
-          tar -C "${DEBUG_STAGE}" -czf "${OUT}/${DEBUG_PACKAGE}.tar.gz" .
-          (cd "${OUT}" && shasum -a 256 "${PACKAGE}.tar.gz" "${DEBUG_PACKAGE}.tar.gz" > "${PACKAGE}.sha256")
-          echo "out=${OUT}" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-${{ matrix.target }}
-          path: ${{ steps.package.outputs.out }}/*
-          if-no-files-found: error
-          retention-days: 7
-
-  publish:
-    name: Publish GitHub Release
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-      - name: Extract release notes from CHANGELOG
-        id: notes
-        shell: bash
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          NOTES_FILE="$(pwd)/release-notes.md"
-          awk -v ver="${VERSION}" '
-              $0 ~ "^## \\[" ver "\\]" { found = 1; next }
-              found && $0 ~ "^## \\[" { exit }
-              found { print }
-          ' CHANGELOG.md > "${NOTES_FILE}"
-          if ! [ -s "${NOTES_FILE}" ]; then
-              echo "no release notes for ${VERSION} in CHANGELOG.md" >&2
-              exit 1
-          fi
-          echo "file=${NOTES_FILE}" >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub Release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ matrix.target }}
+          USE_CROSS: ${{ matrix.cross }}
+        run: |
+          set -eu
+          if [[ "$USE_CROSS" == "true" ]]; then
+            cross build --release --locked --target "$TARGET" -p git-remote-object-store-cli
+          else
+            cargo build --release --locked --target "$TARGET" -p git-remote-object-store-cli
+          fi
+
+      - name: Stage archive contents
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          STAGE="git-remote-object-store-${VERSION}-${TARGET}"
+          mkdir -p "dist/${STAGE}"
+          BIN_SUFFIX=""
+          if [[ "$TARGET" == *windows* ]]; then BIN_SUFFIX=".exe"; fi
+          for bin in git-remote-s3-https git-remote-s3-http \
+                     git-remote-az-https git-remote-az-http \
+                     git-remote-object-store git-lfs-object-store; do
+            cp "target/${TARGET}/release/${bin}${BIN_SUFFIX}" "dist/${STAGE}/${bin}${BIN_SUFFIX}"
+          done
+          cp README.md LICENSE CHANGELOG.md "dist/${STAGE}/"
+          # Transitive-dependency attributions. Apache-2.0 §4(d) and
+          # ring's `Apache-2.0 AND ISC` compound license require us to
+          # ship these alongside the binary.
+          cargo about generate --locked \
+            --config about.toml \
+            --target "$TARGET" \
+            --manifest-path cli/Cargo.toml \
+            about.hbs \
+            > "dist/${STAGE}/THIRD-PARTY-LICENSES.md"
+          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
+
+      # Debug symbols are staged under dist/debug/ so the archive-upload
+      # glob (`dist/*.tar.gz`, `dist/*.zip`) cannot accidentally scoop
+      # them into the primary-archive artefact.
+      # Cross-arch binaries (e.g. aarch64 on an x86_64 runner) cannot be
+      # processed by the host binutils — `objcopy` fails with "Unable to
+      # recognise the format of the input file". `llvm-objcopy` and
+      # `llvm-strip` are architecture-agnostic over ELF and handle every
+      # Rust Linux/FreeBSD target from any runner.
+      - name: Install llvm-objcopy (ELF-agnostic strip/objcopy)
+        if: ${{ !contains(matrix.target, 'windows') && !contains(matrix.target, 'apple') }}
+        run: |
+          set -eu
+          if ! command -v llvm-objcopy >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends llvm
+          fi
+          llvm-objcopy --version | head -n1
+
+      - name: Strip binaries and extract debug symbols (Unix)
+        if: ${{ !contains(matrix.target, 'windows') }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          mkdir -p dist/debug
+          for bin in git-remote-s3-https git-remote-s3-http \
+                     git-remote-az-https git-remote-az-http \
+                     git-remote-object-store git-lfs-object-store; do
+            BIN="dist/${STAGE}/${bin}"
+            if [[ "$TARGET" == *apple* ]]; then
+              dsymutil "$BIN" -o "dist/${STAGE}/${bin}.dSYM"
+              strip -x "$BIN"
+              tar -czf "dist/debug/${STAGE}-${bin}.dSYM.tar.gz" -C "dist/${STAGE}" "${bin}.dSYM"
+              rm -rf "dist/${STAGE}/${bin}.dSYM"
+            else
+              llvm-objcopy --only-keep-debug "$BIN" "dist/debug/${STAGE}-${bin}.debug"
+              llvm-strip --strip-unneeded "$BIN"
+              llvm-objcopy --add-gnu-debuglink="dist/debug/${STAGE}-${bin}.debug" "$BIN"
+            fi
+          done
+
+      - name: Collect PDB debug symbols (Windows)
+        if: contains(matrix.target, 'windows')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          mkdir -p dist/debug
+          for bin in git-remote-s3-https git-remote-s3-http \
+                     git-remote-az-https git-remote-az-http \
+                     git-remote-object-store git-lfs-object-store; do
+            PDB="target/${TARGET}/release/${bin}.pdb"
+            if [[ -f "$PDB" ]]; then
+              cp "$PDB" "dist/debug/${STAGE}-${bin}.pdb"
+            fi
+          done
+
+      - name: Create archive (Unix)
+        if: ${{ !contains(matrix.target, 'windows') }}
         shell: bash
         run: |
-          set -euo pipefail
-          shopt -s nullglob
-          VERSION="${GITHUB_REF_NAME#v}"
-          ASSETS=( dist/*/*.tar.gz dist/*/*.sha256 )
-          if [ "${#ASSETS[@]}" -eq 0 ]; then
-              echo "no release artifacts found under dist/" >&2
-              exit 1
+          set -eu
+          cd dist
+          tar -czf "${STAGE}.tar.gz" "${STAGE}"
+          rm -rf "${STAGE}"
+
+      - name: Create archive (Windows)
+        if: contains(matrix.target, 'windows')
+        shell: pwsh
+        run: |
+          Set-Location dist
+          Compress-Archive -Path $env:STAGE -DestinationPath "$env:STAGE.zip"
+          Remove-Item -Recurse -Force $env:STAGE
+
+      # Archive (primary artefact). Uploading from a single flat dir
+      # ensures the downloaded layout at Stage 4 is predictable:
+      # merge-multiple leaves every file at the top of `release/`.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: archive-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: debug-${{ matrix.target }}
+          path: dist/debug/
+          if-no-files-found: ignore
+
+  # ─── Stage 2 — native packages ───────────────────────────────────────
+  package-deb:
+    name: package .deb (${{ matrix.deb_arch }})
+    needs: [preflight, build]
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu,  deb_arch: amd64 }
+          - { target: aarch64-unknown-linux-gnu, deb_arch: arm64 }
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable tip
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - uses: taiki-e/install-action@9ca1734d8940023f074414ee621fd530c4ce10f2 # v2.62.23
+        with:
+          tool: cargo-deb@${{ env.CARGO_DEB_VERSION }}
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist
+
+      - name: Unpack archive into cargo-deb target layout
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          STAGE="git-remote-object-store-${VERSION}-${TARGET}"
+          tar -xzf "dist/${STAGE}.tar.gz" -C dist
+          # cargo-deb with --target looks in target/<triple>/release/.
+          mkdir -p "target/${TARGET}/release"
+          for bin in git-remote-s3-https git-remote-s3-http \
+                     git-remote-az-https git-remote-az-http \
+                     git-remote-object-store git-lfs-object-store; do
+            cp "dist/${STAGE}/${bin}" "target/${TARGET}/release/${bin}"
+            chmod 755 "target/${TARGET}/release/${bin}"
+          done
+          cp "dist/${STAGE}/THIRD-PARTY-LICENSES.md" THIRD-PARTY-LICENSES.md
+
+      - name: Build .deb
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          mkdir -p out
+          cargo deb --no-build --no-strip \
+            -p git-remote-object-store-cli \
+            --target "$TARGET" \
+            --output "out/"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deb-${{ matrix.deb_arch }}
+          path: out/*.deb
+          if-no-files-found: error
+
+  package-rpm:
+    name: package .rpm (${{ matrix.rpm_arch }})
+    needs: [preflight, build]
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu,  rpm_arch: x86_64 }
+          - { target: aarch64-unknown-linux-gnu, rpm_arch: aarch64 }
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable tip
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - uses: taiki-e/install-action@9ca1734d8940023f074414ee621fd530c4ce10f2 # v2.62.23
+        with:
+          tool: cargo-generate-rpm@${{ env.CARGO_GENERATE_RPM_VERSION }}
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist
+
+      - name: Unpack archive into cargo-generate-rpm layout
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          STAGE="git-remote-object-store-${VERSION}-${TARGET}"
+          tar -xzf "dist/${STAGE}.tar.gz" -C dist
+          # cargo-generate-rpm looks up `target/release/<bin>` assets
+          # relative to the workspace. When cross-building, the
+          # real binary lives under target/<triple>/release/. Populate
+          # both paths so the tool finds the binary regardless of
+          # whether its --target handling rewrites the asset path.
+          mkdir -p "target/${TARGET}/release" target/release
+          for bin in git-remote-s3-https git-remote-s3-http \
+                     git-remote-az-https git-remote-az-http \
+                     git-remote-object-store git-lfs-object-store; do
+            cp "dist/${STAGE}/${bin}" "target/${TARGET}/release/${bin}"
+            cp "dist/${STAGE}/${bin}" "target/release/${bin}"
+          done
+          cp "dist/${STAGE}/THIRD-PARTY-LICENSES.md" THIRD-PARTY-LICENSES.md
+
+      - name: Build .rpm
+        env:
+          TARGET: ${{ matrix.target }}
+          RPM_ARCH: ${{ matrix.rpm_arch }}
+        run: |
+          set -eu
+          mkdir -p out
+          # `cargo generate-rpm -p` takes a path to the crate
+          # directory (the CLI package lives at `cli/`), not the
+          # crate name. Cf. host-identity's
+          # `-p crates/host-identity-cli` invocation.
+          cargo generate-rpm \
+            -p cli \
+            --target "$TARGET" \
+            --arch "$RPM_ARCH" \
+            --payload-compress zstd \
+            --output "out/"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rpm-${{ matrix.rpm_arch }}
+          path: out/*.rpm
+          if-no-files-found: error
+
+  # Run abuild via `docker run alpine …` from an ubuntu host to avoid the
+  # glibc-Node-on-musl-container trap that breaks `actions/checkout` and
+  # most JavaScript actions when jobs.container is set to an alpine image.
+  package-apk:
+    name: package .apk (${{ matrix.apk_arch }})
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl,  apk_arch: x86_64 }
+          - { target: aarch64-unknown-linux-musl, apk_arch: aarch64 }
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.ref }}
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist
+
+      - name: Render APKBUILD
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          APK_ARCH: ${{ matrix.apk_arch }}
+        run: |
+          set -eu
+          STAGE="git-remote-object-store-${VERSION}-${TARGET}"
+          SHA512=$(sha512sum "dist/${STAGE}.tar.gz" | awk '{print $1}')
+          # Hyphen→underscore for abuild pkgver; see APKBUILD.in for rationale.
+          APK_PKGVER="${VERSION//-/_}"
+          mkdir -p build/git-remote-object-store
+          cp "dist/${STAGE}.tar.gz" "build/git-remote-object-store/"
+          sed -e "s|@@VERSION@@|${VERSION}|g" \
+              -e "s|@@APK_PKGVER@@|${APK_PKGVER}|g" \
+              -e "s|@@TARGET@@|${TARGET}|g" \
+              -e "s|@@ARCH@@|${APK_ARCH}|g" \
+              -e "s|@@SHA512@@|${SHA512}|g" \
+              packaging/alpine/APKBUILD.in > build/git-remote-object-store/APKBUILD
+
+      # abuild refuses to build when its own CARCH (read from the
+      # container's `uname -m`) doesn't match `arch=` in APKBUILD. For
+      # cross-arch builds (aarch64 on an x86_64 runner), run the Alpine
+      # container under qemu for the target architecture so abuild's
+      # CARCH matches.
+      - uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+        if: matrix.apk_arch != 'x86_64'
+
+      - name: Build .apk inside alpine:3.20 container
+        env:
+          APK_ARCH: ${{ matrix.apk_arch }}
+          ABUILD_PRIV: ${{ secrets.ALPINE_ABUILD_KEY_PRIV }}
+          ABUILD_PUB: ${{ secrets.ALPINE_ABUILD_KEY_PUB }}
+        run: |
+          set -eu
+          mkdir -p out/apk
+          DOCKER_PLATFORM=$([[ "$APK_ARCH" == "aarch64" ]] && echo linux/arm64 || echo linux/amd64)
+          # Pass secrets via mounted files, not env — keeps them out of
+          # `docker inspect` and `ps` for the container.
+          SECRETS_DIR=$(mktemp -d)
+          trap 'rm -rf "$SECRETS_DIR"' EXIT
+          if [[ -n "${ABUILD_PRIV:-}" && -n "${ABUILD_PUB:-}" ]]; then
+            printf '%s' "$ABUILD_PRIV" > "$SECRETS_DIR/git-remote-object-store.rsa"
+            printf '%s' "$ABUILD_PUB"  > "$SECRETS_DIR/git-remote-object-store.rsa.pub"
+            SIGNED=1
+          else
+            echo "::warning::ALPINE_ABUILD_KEY_* secrets not set; abuild will generate an ephemeral key"
+            SIGNED=0
           fi
-          gh release create "${GITHUB_REF_NAME}" \
-              --title "v${VERSION}" \
-              --notes-file "${{ steps.notes.outputs.file }}" \
-              "${ASSETS[@]}"
+          # Pass SIGNED and APK_ARCH with explicit values. The value-less
+          # `-e FOO` form reads from the current process's exported
+          # environment, but these are plain shell locals, not exports.
+          docker run --rm --platform "$DOCKER_PLATFORM" \
+            -v "$PWD/build:/build" \
+            -v "$PWD/out/apk:/out" \
+            -v "$SECRETS_DIR:/keys:ro" \
+            -e APK_ARCH="$APK_ARCH" \
+            -e SIGNED="$SIGNED" \
+            alpine:3.20 sh -eu -c '
+              apk add --no-cache alpine-sdk
+              adduser -D -G abuild builder
+              if [ "$SIGNED" = "1" ]; then
+                mkdir -p /home/builder/.abuild /etc/apk/keys
+                install -m 600 -o builder -g abuild /keys/git-remote-object-store.rsa /home/builder/.abuild/git-remote-object-store.rsa
+                install -m 644 /keys/git-remote-object-store.rsa.pub /etc/apk/keys/git-remote-object-store.rsa.pub
+                install -m 644 -o builder -g abuild /keys/git-remote-object-store.rsa.pub /home/builder/.abuild/git-remote-object-store.rsa.pub
+                echo "PACKAGER_PRIVKEY=/home/builder/.abuild/git-remote-object-store.rsa" > /home/builder/.abuild/abuild.conf
+                chown builder:abuild /home/builder/.abuild/abuild.conf
+              else
+                su builder -c "abuild-keygen -a -n"
+              fi
+              chown -R builder:abuild /build
+              cp -r /build/git-remote-object-store /home/builder/git-remote-object-store
+              chown -R builder:abuild /home/builder/git-remote-object-store
+              # abuild defaults SRCDEST to /var/cache/distfiles and will
+              # wget from the `source=` URL when the tarball is not there.
+              # The GitHub Release for the tag does not exist yet at this
+              # stage — `publish` runs later — so the fetch 404s. Point
+              # SRCDEST at the pre-copied tarball alongside the APKBUILD.
+              su builder -c "cd /home/builder/git-remote-object-store && SRCDEST=/home/builder/git-remote-object-store abuild -F -r"
+              # Inside `sh -c '...'` (single-quoted), `*` is already
+              # literal — escaping the quotes around `*.apk` would pass
+              # the literal string `"*.apk"` to find, which would match
+              # nothing and silently leave /out empty.
+              find /home/builder/packages -name "*.apk" -exec cp {} /out/ \;
+              cp /home/builder/git-remote-object-store/APKBUILD /out/APKBUILD.${APK_ARCH}
+            '
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: apk-${{ matrix.apk_arch }}
+          path: out/apk/**
+          if-no-files-found: error
+
+  # ─── Stage 3 — smoke test (install + run each package) ───────────────
+  # aarch64 smoke tests use QEMU user-mode emulation to install/run the
+  # arm64 package inside an aarch64 container image.
+  smoke-deb:
+    name: smoke .deb (${{ matrix.image }} / ${{ matrix.arch }})
+    needs: [preflight, package-deb]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu:22.04, ubuntu:24.04, debian:12]
+        arch: [amd64, arm64]
+    steps:
+      - uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+        if: matrix.arch == 'arm64'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deb-${{ matrix.arch }}
+          path: dist
+      - name: Install and run inside ${{ matrix.image }} (${{ matrix.arch }})
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          IMAGE: ${{ matrix.image }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          docker run --rm --platform "linux/${ARCH}" \
+            -v "$PWD/dist:/w" -e VERSION -e DEBIAN_FRONTEND=noninteractive \
+            "$IMAGE" bash -eux -c '
+              # Docker Ubuntu images ship /etc/dpkg/dpkg.cfg.d/docker-clean
+              # (and sometimes /excludes) with path-exclude= lines that
+              # block /usr/share/doc and /usr/share/man from being written
+              # on install. Remove those configs so dpkg ships the full
+              # payload.
+              rm -f /etc/dpkg/dpkg.cfg.d/docker-clean /etc/dpkg/dpkg.cfg.d/excludes
+              apt-get update -qq
+              apt-get install -y -qq /w/*.deb
+              git-remote-object-store --version | grep -F "$VERSION"
+              # Verify all six binaries landed and the `+`-form symlinks
+              # were created by the postinst script.
+              for bin in git-remote-s3-https git-remote-s3-http \
+                         git-remote-az-https git-remote-az-http \
+                         git-remote-object-store git-lfs-object-store \
+                         git-remote-s3+https git-remote-s3+http \
+                         git-remote-az+https git-remote-az+http; do
+                test -e "/usr/bin/$bin" || { echo "missing /usr/bin/$bin"; exit 1; }
+              done
+              # Content regression guard: ring ships `Apache-2.0 AND
+              # ISC`, both texts mandatory. If either drops out, the
+              # bundle is non-compliant. Run in one lane only — deb.
+              #
+              # The two `^### <name>` greps couple to cargo-about's
+              # display-name strings (rendered via about.hbs as
+              # `### {{name}}` per license group). If a future
+              # cargo-about bump renames either ("ISC License" →
+              # "ISC", "Apache License 2.0" → "Apache-2.0"), update
+              # these regexes in lockstep. The crate-name grep
+              # (`ring`) is the stable cross-version anchor — it
+              # would survive a template rename and still catch the
+              # absence of the dep entirely.
+              TPL=/usr/share/doc/git-remote-object-store/THIRD-PARTY-LICENSES.md
+              test -s "$TPL"
+              grep -qF "ring" "$TPL"
+              # Section-header assertions — both license texts must
+              # appear at minimum as named groups in the rendered file.
+              grep -qE "^### (ISC( License)?|ISC)$" "$TPL" || {
+                echo "::error::THIRD-PARTY-LICENSES.md missing ISC license group" >&2
+                grep -E "^### " "$TPL" >&2 || true
+                exit 1
+              }
+              grep -qE "^### (Apache( License)?[- ]?2\.0|Apache-2\.0)$" "$TPL" || {
+                echo "::error::THIRD-PARTY-LICENSES.md missing Apache-2.0 license group" >&2
+                grep -E "^### " "$TPL" >&2 || true
+                exit 1
+              }
+            '
+
+  smoke-rpm:
+    name: smoke .rpm (${{ matrix.image }} / ${{ matrix.arch }})
+    needs: [preflight, package-rpm]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [rockylinux:9, fedora:latest, amazonlinux:2023]
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+        if: matrix.arch == 'aarch64'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rpm-${{ matrix.arch }}
+          path: dist
+      - name: Install and run inside ${{ matrix.image }} (${{ matrix.arch }})
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          IMAGE: ${{ matrix.image }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          DOCKER_ARCH=$([[ "$ARCH" == "aarch64" ]] && echo arm64 || echo amd64)
+          docker run --rm --platform "linux/${DOCKER_ARCH}" \
+            -v "$PWD/dist:/w" -e VERSION \
+            "$IMAGE" bash -eu -c '
+              if command -v dnf >/dev/null; then PKG=dnf; else PKG=yum; fi
+              $PKG install -y git
+              $PKG install -y /w/*.rpm
+              git-remote-object-store --version | grep -F "$VERSION"
+              for bin in git-remote-s3-https git-remote-s3-http \
+                         git-remote-az-https git-remote-az-http \
+                         git-remote-object-store git-lfs-object-store \
+                         git-remote-s3+https git-remote-s3+http \
+                         git-remote-az+https git-remote-az+http; do
+                test -e "/usr/bin/$bin" || { echo "missing /usr/bin/$bin"; exit 1; }
+              done
+              test -s /usr/share/doc/git-remote-object-store/THIRD-PARTY-LICENSES.md
+            '
+
+  smoke-apk:
+    name: smoke .apk (${{ matrix.arch }})
+    needs: [preflight, package-apk]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+        if: matrix.arch == 'aarch64'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: apk-${{ matrix.arch }}
+          path: dist
+      - name: Install and run inside alpine:3.20 (${{ matrix.arch }})
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          DOCKER_ARCH=$([[ "$ARCH" == "aarch64" ]] && echo arm64 || echo amd64)
+          docker run --rm --platform "linux/${DOCKER_ARCH}" \
+            -v "$PWD/dist:/w" -e VERSION \
+            alpine:3.20 sh -eux -c '
+              # `path: out/apk/**` upload preserves the artifact directory
+              # structure, so the .apk may land at /w/*.apk or /w/apk/*.apk
+              # depending on upload-artifact version. Locate it instead of
+              # relying on a fixed glob.
+              APK=$(find /w -name "*.apk" | head -n1)
+              test -n "$APK" || { echo "no .apk found under /w"; find /w; exit 1; }
+              apk add --no-cache git
+              apk add --no-cache --allow-untrusted "$APK"
+              git-remote-object-store --version | grep -F "$VERSION"
+              test -s /usr/share/licenses/git-remote-object-store/THIRD-PARTY-LICENSES.md
+            '
+
+  smoke-macos:
+    name: smoke macOS tarball (${{ matrix.runner }})
+    needs: [preflight, build]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-latest, target: aarch64-apple-darwin }
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist
+      - name: Extract and run
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          STAGE="git-remote-object-store-${VERSION}-${TARGET}"
+          tar -xzf "dist/${STAGE}.tar.gz" -C dist
+          "dist/${STAGE}/git-remote-object-store" --version | grep -F "$VERSION"
+          test -s "dist/${STAGE}/THIRD-PARTY-LICENSES.md"
+
+  smoke-windows:
+    name: smoke Windows zip
+    needs: [preflight, build]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: archive-x86_64-pc-windows-msvc
+          path: dist
+      - shell: pwsh
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          Set-Location dist
+          $zip = Get-ChildItem *.zip | Select-Object -First 1
+          Expand-Archive $zip.FullName -DestinationPath extracted
+          $exe = Get-ChildItem -Recurse extracted -Filter git-remote-object-store.exe | Select-Object -First 1
+          $out = & $exe.FullName --version
+          if ($out -notmatch [regex]::Escape($env:VERSION)) {
+            throw "version mismatch: $out"
+          }
+          # $tpl is a FileInfo; .Length on FileInfo is file size in bytes.
+          $tpl = Get-ChildItem -Recurse extracted -Filter THIRD-PARTY-LICENSES.md | Select-Object -First 1
+          if (-not $tpl -or $tpl.Length -eq 0) {
+            throw "THIRD-PARTY-LICENSES.md missing or empty in zip"
+          }
+
+  # ─── Stage 4 — sign, attest, SBOM ────────────────────────────────────
+  # All artefacts are pulled into a single flat `release/` directory so
+  # downstream globs (SHA256SUMS, publish, verify) are trivial.
+  sign-attest:
+    name: sign + attest
+    needs:
+      - preflight
+      - build
+      - package-deb
+      - package-rpm
+      - package-apk
+      - smoke-deb
+      - smoke-rpm
+      - smoke-apk
+      - smoke-macos
+      - smoke-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.ref }}
+
+      - name: Gather all artefacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: "*"
+          path: incoming
+
+      - name: Flatten into release/
+        run: |
+          set -eu
+          mkdir -p release
+          # Every artefact's contents move to the top of release/. Duplicate
+          # file names across artefacts would collide, but our naming
+          # scheme (`git-remote-object-store-<ver>-<target>.<ext>`,
+          # APKBUILD.<arch>) is collision-free by construction.
+          # release-notes.md is explicitly excluded — it's consumed by the
+          # publish step as `body_path` and must not appear in SHA256SUMS
+          # (it isn't attached as a release asset, so verifiers running
+          # `sha256sum -c SHA256SUMS` would fail on a missing file).
+          find incoming -type f ! -name 'release-notes.md' \
+            -exec cp -n {} release/ \;
+          ls -la release/
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable tip
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: taiki-e/install-action@9ca1734d8940023f074414ee621fd530c4ce10f2 # v2.62.23
+        with:
+          tool: cargo-cyclonedx@${{ env.CARGO_CYCLONEDX_VERSION }}
+
+      - name: Generate CycloneDX SBOMs
+        run: |
+          set -eu
+          cargo cyclonedx --format json --all --describe crate --spec-version 1.5
+          cp git-remote-object-store.cdx.json release/
+          cp cli/git-remote-object-store-cli.cdx.json release/
+
+      - name: Compute SHA256SUMS
+        working-directory: release
+        run: |
+          set -eu
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS
+
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+
+      - name: Sign SHA256SUMS with minisign
+        env:
+          MINISIGN_SECRET: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          set -eu
+          if [[ -z "${MINISIGN_SECRET:-}" ]]; then
+            echo "::error::MINISIGN_SECRET_KEY not configured"
+            exit 1
+          fi
+          KEYFILE=$(mktemp)
+          trap 'rm -f "$KEYFILE"' EXIT
+          printf '%s' "$MINISIGN_SECRET" > "$KEYFILE"
+          chmod 600 "$KEYFILE"
+          printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s "$KEYFILE" \
+            -m release/SHA256SUMS -x release/SHA256SUMS.minisig
+
+      - name: SLSA build provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: |
+            release/*.tar.gz
+            release/*.zip
+            release/*.deb
+            release/*.rpm
+            release/*.apk
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-bundle
+          path: release/
+          if-no-files-found: error
+
+  # ─── Stage 5 — publish (only job that mutates the world) ─────────────
+  publish:
+    name: publish
+    needs: [preflight, sign-attest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.ref }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-bundle
+          path: release
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-notes
+          path: .
+
+      - name: Attach artefacts to GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          body_path: release-notes.md
+          prerelease: ${{ needs.preflight.outputs.prerelease == 'true' }}
+          fail_on_unmatched_files: false
+          files: |
+            release/*.tar.gz
+            release/*.zip
+            release/*.deb
+            release/*.rpm
+            release/*.apk
+            release/*.debug
+            release/*.pdb
+            release/*.cdx.json
+            release/SHA256SUMS
+            release/SHA256SUMS.minisig
+            release/APKBUILD.*
+
+      - name: Compute Homebrew SHA-256
+        if: needs.preflight.outputs.prerelease != 'true'
+        id: hashes
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -eu
+          SHA=$(sha256sum "release/git-remote-object-store-${VERSION}-aarch64-apple-darwin.tar.gz" | awk '{print $1}')
+          echo "macos_aarch64=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Render Homebrew formula
+        if: needs.preflight.outputs.prerelease != 'true'
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          MACOS_AARCH64: ${{ steps.hashes.outputs.macos_aarch64 }}
+        run: |
+          set -eu
+          sed -e "s|@@VERSION@@|${VERSION}|g" \
+              -e "s|@@SHA256_AARCH64@@|${MACOS_AARCH64}|g" \
+              packaging/homebrew/git-remote-object-store.rb.tmpl > git-remote-object-store.rb
+
+      # Git clone with token header rather than embedded URL credential —
+      # keeps the PAT out of the clone's .git/config.
+      - name: Push Homebrew formula to tap repo
+        if: needs.preflight.outputs.prerelease != 'true'
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -eu
+          if [[ -z "${HOMEBREW_TAP_TOKEN:-}" ]]; then
+            echo "HOMEBREW_TAP_TOKEN not set — skipping tap push"
+            exit 0
+          fi
+          REPO="https://github.com/dekobon/homebrew-git-remote-object-store.git"
+          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$HOMEBREW_TAP_TOKEN" | base64 -w0)"
+          if ! git -c "http.extraheader=$AUTH_HEADER" ls-remote "$REPO" &>/dev/null; then
+            echo "::warning::tap repo $REPO not reachable — skipping tap push"
+            exit 0
+          fi
+          git -c "http.extraheader=$AUTH_HEADER" clone "$REPO" tap
+          mkdir -p tap/Formula
+          cp git-remote-object-store.rb tap/Formula/git-remote-object-store.rb
+          cd tap
+          git config user.name "git-remote-object-store release bot"
+          git config user.email "release-bot@git-remote-object-store"
+          git add Formula/git-remote-object-store.rb
+          if git diff --cached --quiet; then
+            echo "Formula unchanged — skipping push"
+          else
+            git commit -m "git-remote-object-store ${VERSION}"
+            git -c "http.extraheader=$AUTH_HEADER" push origin HEAD
+          fi
+
+  # ─── Stage 5b — crates.io publish ────────────────────────────────────
+  # Uploads the library first, then the CLI. The pinned toolchain's
+  # `cargo publish` waits for the new version to appear in the sparse
+  # index before returning, so the CLI publish step can resolve
+  # `git-remote-object-store` from the registry without an explicit sleep.
+  #
+  # Skipped for pre-release tags (matches Homebrew gating) — a `-rc.1`
+  # upload is irrevocable on crates.io, and throwaway rehearsal tags
+  # would burn crate-name real estate. Every run still exercises the
+  # library dry-run in `preflight`.
+  #
+  # Each step short-circuits if the version is already on crates.io,
+  # keeping `workflow_dispatch` re-runs on the same tag idempotent (the
+  # tap step has the same property).
+  #
+  # Authentication is via crates.io Trusted Publishing (OIDC): the
+  # `auth` step exchanges the runner's GitHub-minted ID token for a
+  # short-lived registry token scoped to this run, which the
+  # subsequent publish steps pass to `cargo publish` via
+  # `CARGO_REGISTRY_TOKEN`. The token auto-revokes when the job ends.
+  # A missing or misconfigured trusted publisher on crates.io (wrong
+  # owner/repo/workflow/environment claims) fails the `auth` step
+  # fast and loud; there is no static secret to be absent.
+  publish-crates:
+    name: publish to crates.io
+    needs: [preflight, sign-attest]
+    if: ${{ needs.preflight.outputs.prerelease != 'true' }}
+    runs-on: ubuntu-latest
+    # Binds the OIDC `environment` claim so the crates.io trusted
+    # publisher only accepts JWTs minted while this job runs in the
+    # `release` environment. Must exist on the repo before merge.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable tip
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      # Trusted Publishing: exchange the runner's OIDC ID token for a
+      # short-lived (30-minute) crates.io token authorizing every
+      # crate whose TP config matches `(owner, repo, workflow,
+      # environment)` in the JWT — so a single exchange covers both
+      # `git-remote-object-store` and `git-remote-object-store-cli`.
+      # The action's post-hook revokes the token when the job ends.
+      - name: Authenticate to crates.io via Trusted Publishing
+        id: auth
+        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
+
+      # Each publish step sets `CARGO_REGISTRY_TOKEN` in its own env
+      # because job-level `env:` cannot reference step outputs.
+      - name: Publish git-remote-object-store
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -eu
+          # Query the sparse index (CDN-backed, no UA policing) rather
+          # than the HTML API, which has rate-limited and UA-gated CI
+          # runners in the past. Each line is one published version.
+          INDEX="https://index.crates.io/gi/t-/git-remote-object-store"
+          if curl -sfL "$INDEX" 2>/dev/null | grep -q "\"vers\":\"${VERSION}\""; then
+            echo "git-remote-object-store ${VERSION} already on crates.io — skipping"
+          else
+            cargo publish -p git-remote-object-store --locked
+          fi
+
+      - name: Publish git-remote-object-store-cli
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -eu
+          INDEX="https://index.crates.io/gi/t-/git-remote-object-store-cli"
+          if curl -sfL "$INDEX" 2>/dev/null | grep -q "\"vers\":\"${VERSION}\""; then
+            echo "git-remote-object-store-cli ${VERSION} already on crates.io — skipping"
+          else
+            cargo publish -p git-remote-object-store-cli --locked
+          fi
+
+  # ─── Stage 6 — post-publish verification ─────────────────────────────
+  verify:
+    name: post-publish verify
+    needs: [preflight, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.ref }}
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Download artefact + signature from published release
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          mkdir verify && cd verify
+          ART="git-remote-object-store-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          gh release download "$TAG" -R "${{ github.repository }}" \
+            -p "$ART" -p SHA256SUMS -p SHA256SUMS.minisig
+      - name: Verify minisign signature and checksum
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -eu
+          cd verify
+          minisign -Vm SHA256SUMS -p ../minisign.pub
+          grep "git-remote-object-store-${VERSION}-x86_64-unknown-linux-musl.tar.gz" SHA256SUMS \
+            | sha256sum -c
+      - name: Verify SLSA provenance
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          cd verify
+          gh attestation verify "git-remote-object-store-${VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            -R "${{ github.repository }}"
