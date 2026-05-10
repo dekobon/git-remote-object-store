@@ -15,13 +15,15 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
 
-# Cancel in-progress runs for the same branch/PR. Prevents duplicate work
-# when a push event and pull_request event both fire for the same commit.
+# Cancel in-progress runs for the same ref (e.g. PR pushes) but not on
+# main or tag builds — those should always complete.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 
 # Default to read-only for the workflow; jobs that need to post check runs
 # (dorny/test-reporter) opt in to `checks: write` per-job below.
@@ -60,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0 # Full history for commit validation
 
@@ -89,7 +91,7 @@ jobs:
   # Wires up `make _ci-*` targets so local `make ci` matches the CI
   # pipeline byte-for-byte.
   # -------------------------------------------------------------------
-  ci:
+  build-test:
     name: Build & Test
     runs-on: ubuntu-latest
     # `dorny/test-reporter` posts a check run with the shellspec results.
@@ -99,7 +101,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install Ubuntu dependencies
         run: |
@@ -256,7 +258,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1
@@ -280,7 +282,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1
@@ -293,3 +295,71 @@ jobs:
 
       - name: Run packchain live Azure tests
         run: cargo test --workspace --features integration-azure --test packchain_live_azure
+
+  # -------------------------------------------------------------------
+  # Job 5: rustdoc — fails on broken doclinks and missing-docs warnings.
+  # -------------------------------------------------------------------
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          cache-key: docs
+
+      - name: Build rustdoc
+        run: cargo doc --no-deps --workspace --locked
+
+  # -------------------------------------------------------------------
+  # Job 6: MSRV — build-only on the declared minimum Rust version.
+  #
+  # Test is intentionally not run; dev-deps may legitimately require a
+  # newer toolchain. MSRV is a compile-time promise about consumers,
+  # not the test suite.
+  # -------------------------------------------------------------------
+  msrv:
+    name: msrv (${{ env.RUST_TOOLCHAIN }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          cache-key: msrv
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+  # -------------------------------------------------------------------
+  # Aggregate gate — single required check for branch protection.
+  #
+  # Branch-protection rules in GitHub track checks by name; depending
+  # on every leaf job means we never have to update protection when
+  # the matrix changes. Failing or cancelled dependencies fail this
+  # job; skipped dependencies are treated as success.
+  # -------------------------------------------------------------------
+  ci:
+    name: ci
+    if: always()
+    needs:
+      - commitsar
+      - build-test
+      - integration-s3
+      - integration-azure
+      - docs
+      - msrv
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any dependency failed or was cancelled
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
