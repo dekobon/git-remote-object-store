@@ -88,7 +88,7 @@ pub(crate) fn extract_path_index(
     walk_tree(repo, tree_id, &mut root, &mut ancestors)?;
     Ok(Some(PathIndex {
         v: PathIndex::SCHEMA_VERSION,
-        tip: Sha40::try_new(unpeeled_tip.to_string())?,
+        tip: Sha40::from_oid(unpeeled_tip.as_object_id())?,
         tree: root,
     }))
 }
@@ -209,8 +209,6 @@ fn walk_tree(
         let name = str::from_utf8(filename).map_err(|_| PackchainError::InvalidPath {
             bytes: filename.to_vec(),
         })?;
-        // `gix_hash::oid` and `ObjectId` both render as 40-lowercase-hex
-        // via `Display`; `Sha40::try_new` accepts that shape directly.
         match entry.kind() {
             EntryKind::Tree => {
                 let mut subtree: BTreeMap<String, PathNode> = BTreeMap::new();
@@ -218,7 +216,7 @@ fn walk_tree(
                 out.insert(name.to_owned(), PathNode::Tree(subtree));
             }
             EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
-                let sha = Sha40::try_new(entry.oid().to_string())?;
+                let sha = Sha40::from_oid(entry.oid())?;
                 out.insert(name.to_owned(), PathNode::Blob(sha));
             }
             EntryKind::Commit => {

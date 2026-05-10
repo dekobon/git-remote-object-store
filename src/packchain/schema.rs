@@ -51,6 +51,29 @@ impl Sha40 {
         Ok(Self(s))
     }
 
+    /// Construct from a `gix_hash::oid` without re-validating.
+    ///
+    /// Avoids the intermediate `String` allocation that
+    /// `Sha40::try_new(oid.to_string())` incurs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PackchainError::InvalidSha`] for any oid whose raw
+    /// byte length is not 20 (i.e., not SHA-1). `gix` always renders
+    /// SHA-1 oids as 40 lowercase-hex characters by construction, so
+    /// the lowercase-hex shape itself does not need re-validation.
+    pub(crate) fn from_oid(oid: &gix_hash::oid) -> Result<Self, PackchainError> {
+        use std::fmt::Write;
+        if oid.as_bytes().len() != 20 {
+            return Err(PackchainError::InvalidSha {
+                found: oid.to_string(),
+            });
+        }
+        let mut s = String::with_capacity(40);
+        write!(&mut s, "{}", oid.to_hex()).expect("writing to String never fails");
+        Ok(Self(s))
+    }
+
     /// Borrow as a plain `&str` (always 40 lowercase hex characters).
     #[must_use]
     pub(crate) fn as_str(&self) -> &str {
@@ -290,6 +313,46 @@ mod tests {
         // 40 chars, last is `g` (non-hex).
         let err = Sha40::try_new("0123456789abcdef0123456789abcdef0123456g").unwrap_err();
         assert!(matches!(err, PackchainError::InvalidSha { .. }));
+    }
+
+    #[test]
+    fn from_oid_round_trips_sha1() {
+        // Bytes chosen so the hex output exercises every nibble (0..f).
+        let bytes: [u8; 20] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
+        ];
+        let oid = gix_hash::ObjectId::from(bytes);
+        let sha = Sha40::from_oid(&oid).unwrap();
+        assert_eq!(sha.as_str(), "0123456789abcdef0123456789abcdef01234567");
+    }
+
+    #[test]
+    fn from_oid_emits_lowercase_hex() {
+        // Uppercase-hex output would silently break the on-bucket
+        // lowercase invariant; pin it here so a future {byte:02X}
+        // typo fails this test rather than corrupting fixtures. The
+        // expected literal is all-lowercase, so byte-for-byte equality
+        // is a sufficient lowercase check on its own.
+        let bytes = [0xab_u8; 20];
+        let oid = gix_hash::ObjectId::from(bytes);
+        let sha = Sha40::from_oid(&oid).unwrap();
+        assert_eq!(sha.as_str(), "abababababababababababababababababababab");
+    }
+
+    #[test]
+    fn from_oid_matches_try_new() {
+        // Both constructors must produce equal Sha40 values for the
+        // same oid — keeps the fast path semantically pinned to the
+        // validated path.
+        let bytes: [u8; 20] = [
+            0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+            0x32, 0x10, 0xfe, 0xdc, 0xba, 0x98,
+        ];
+        let oid = gix_hash::ObjectId::from(bytes);
+        let via_oid = Sha40::from_oid(&oid).unwrap();
+        let via_string = Sha40::try_new(oid.to_string()).unwrap();
+        assert_eq!(via_oid, via_string);
     }
 
     #[test]

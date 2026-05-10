@@ -93,6 +93,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README dependency status text drops the hardcoded `gix 0.82`
   reference in favour of version-neutral wording, so future
   bumps do not require documentation churn (#88).
+- `Sha40` gains a `from_oid(&gix_hash::oid)` constructor that pre-sizes
+  the buffer and skips the lowercase-hex re-validation that
+  `Sha40::try_new(oid.to_string())` performed. Used on the `walk_tree`
+  blob path (once per tree entry on every push), the `path-index.json`
+  tip, the pack-trailer SHA, and the push local-tip — every production
+  call site that already had an oid in hand. Test fixtures still build
+  from `&str` literals via `try_new`. (#95)
 
 ### Fixed
 

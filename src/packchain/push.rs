@@ -298,7 +298,8 @@ async fn prepare_push(
         }
     };
 
-    let local_sha40 = Sha40::try_new(local.local_sha.to_string()).map_err(PushError::Packchain)?;
+    let local_sha40 =
+        Sha40::from_oid(local.local_sha.as_object_id()).map_err(PushError::Packchain)?;
 
     // Idempotency short-circuit: same tip means no bucket changes.
     // Bundle engine's `same-bundle no-op` analogue.
