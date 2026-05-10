@@ -181,6 +181,29 @@ knowing about before you start:
   default block size). Repositories whose individual bundles
   approach those limits are outside what either backend can store.
 
+## Verifying releases
+
+Every `v*` tag publishes signed, attested artefacts to
+[GitHub Releases](https://github.com/dekobon/git-remote-object-store/releases).
+
+```bash
+gh release download vX.Y.Z -p '*x86_64-unknown-linux-musl.tar.gz' \
+                          -p SHA256SUMS -p SHA256SUMS.minisig
+minisign -Vm SHA256SUMS -p minisign.pub
+grep musl SHA256SUMS | sha256sum -c
+gh attestation verify git-remote-object-store-X.Y.Z-x86_64-unknown-linux-musl.tar.gz \
+                     -R dekobon/git-remote-object-store
+```
+
+`SHA256SUMS` is signed with [minisign](https://jedisct1.github.io/minisign/)
+against the committed [`minisign.pub`](minisign.pub); each archive
+also carries a [SLSA build provenance](https://slsa.dev/) attestation
+signed by the runner's GitHub OIDC identity. CycloneDX SBOMs
+(`*.cdx.json`) ship in every release for both the library and the
+CLI. See [`docs/development/cutting-a-release.md`](docs/development/cutting-a-release.md)
+for the full release pipeline and [`SECURITY.md`](SECURITY.md) for
+the vulnerability-reporting flow.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
