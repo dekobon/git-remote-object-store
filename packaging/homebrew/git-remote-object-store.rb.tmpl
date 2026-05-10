@@ -1,0 +1,45 @@
+# typed: false
+# frozen_string_literal: true
+
+# Rendered by .github/workflows/release.yml on each v* tag.
+# Tokens substituted: @@VERSION@@, @@SHA256_AARCH64@@.
+class GitRemoteObjectStore < Formula
+  desc "Git remote helper backed by cloud object stores (S3, Azure Blob)"
+  homepage "https://github.com/dekobon/git-remote-object-store"
+  version "@@VERSION@@"
+  license "Apache-2.0"
+  depends_on "git"
+
+  # Apple-silicon-only. Intel Macs install via `cargo install
+  # git-remote-object-store-cli` or run the aarch64 build under
+  # Rosetta 2.
+  on_macos do
+    on_arm do
+      url "https://github.com/dekobon/git-remote-object-store/releases/download/v#{version}/git-remote-object-store-#{version}-aarch64-apple-darwin.tar.gz"
+      sha256 "@@SHA256_AARCH64@@"
+    end
+  end
+
+  def install
+    # Six binaries; install the hyphenated names cargo built and
+    # hardlink the `+`-form names git invokes directly.
+    %w[
+      git-remote-s3-https git-remote-s3-http
+      git-remote-az-https git-remote-az-http
+      git-remote-object-store git-lfs-object-store
+    ].each { |b| bin.install b }
+    {
+      "git-remote-s3-https" => "git-remote-s3+https",
+      "git-remote-s3-http"  => "git-remote-s3+http",
+      "git-remote-az-https" => "git-remote-az+https",
+      "git-remote-az-http"  => "git-remote-az+http",
+    }.each do |src, dst|
+      ln bin/src, bin/dst
+    end
+    doc.install "README.md", "LICENSE", "THIRD-PARTY-LICENSES.md", "CHANGELOG.md"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/git-remote-object-store --version")
+  end
+end

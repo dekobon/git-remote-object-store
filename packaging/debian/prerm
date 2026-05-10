@@ -1,0 +1,25 @@
+#!/bin/sh
+# prerm script for git-remote-object-store. Tears down the `+`-form
+# symlinks created by postinst before the package is removed, so the
+# install set is fully reversible.
+
+set -eu
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        rm -f /usr/bin/git-remote-s3+https
+        rm -f /usr/bin/git-remote-s3+http
+        rm -f /usr/bin/git-remote-az+https
+        rm -f /usr/bin/git-remote-az+http
+        ;;
+    failed-upgrade)
+        ;;
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

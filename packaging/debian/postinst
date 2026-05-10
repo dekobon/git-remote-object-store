@@ -1,0 +1,27 @@
+#!/bin/sh
+# postinst script for git-remote-object-store. Creates the `+`-form
+# symlinks git invokes directly (`git-remote-s3+https`, etc.). The
+# cargo-built binary names cannot contain `+` because cargo rejects
+# crate-name characters outside `[A-Za-z0-9_-]`; the package ships
+# the hyphenated form and we link to the `+` form here.
+
+set -eu
+
+case "$1" in
+    configure)
+        ln -sf /usr/bin/git-remote-s3-https /usr/bin/git-remote-s3+https
+        ln -sf /usr/bin/git-remote-s3-http  /usr/bin/git-remote-s3+http
+        ln -sf /usr/bin/git-remote-az-https /usr/bin/git-remote-az+https
+        ln -sf /usr/bin/git-remote-az-http  /usr/bin/git-remote-az+http
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
