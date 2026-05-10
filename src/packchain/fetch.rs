@@ -664,7 +664,7 @@ mod tests {
             )
             .unwrap()
             .detach();
-        let c1_sha40 = Sha40::try_new(c1_oid.to_string()).unwrap();
+        let c1_sha40 = Sha40::from_oid(&c1_oid).unwrap();
         // segments[0] is a fictional newer commit (NOT in ODB).
         let newer = Sha40::try_new("ffffffffffffffffffffffffffffffffffffffff").unwrap();
 

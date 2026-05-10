@@ -292,7 +292,7 @@ fn build_pack(
         .seek(SeekFrom::Start(pack_bytes - PACK_TRAILER_LEN as u64))?;
     pack_tmp.as_file_mut().read_exact(&mut trailer)?;
     let trailer_oid = ObjectId::from(trailer);
-    let content_sha = Sha40::try_new(trailer_oid.to_string())?;
+    let content_sha = Sha40::from_oid(&trailer_oid)?;
 
     // Persist the pack at <out_dir>/<sha>.pack. `NamedTempFile::persist`
     // is atomic (rename(2)).
