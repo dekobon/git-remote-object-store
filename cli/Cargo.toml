@@ -4,7 +4,12 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
-publish = false
+description = "Git remote helper binaries (git-remote-s3+https, git-remote-az+https, …) and LFS custom-transfer agent backed by cloud object stores"
+repository = "https://github.com/dekobon/git-remote-object-store"
+homepage = "https://github.com/dekobon/git-remote-object-store"
+readme = "../README.md"
+keywords = ["git", "remote-helper", "s3", "azure", "lfs"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lints.rust]
 missing_docs = "warn"
@@ -60,7 +65,11 @@ integration-s3 = []
 integration-azure = []
 
 [dependencies]
-git-remote-object-store = { path = ".." }
+# `version` is required for crates.io publish — `cargo publish` rewrites
+# the path dep to use the registry version, but it refuses to package
+# unless the manifest declares one. Local builds still resolve via
+# `path`; the version is consulted only by the registry.
+git-remote-object-store = { path = "..", version = "0.1.0" }
 
 # Async runtime — needed for #[tokio::main] macro resolution and for
 # tokio::io (BufReader, stdin, stdout) in the LFS binary. `signal` is
@@ -146,3 +155,133 @@ testcontainers = { version = "0.27", features = [
   "blocking",
   "http_wait_plain",
 ] }
+
+# ---------------------------------------------------------------------
+# Native-package metadata (rendered into .deb / .rpm at release time).
+# ---------------------------------------------------------------------
+#
+# Asset paths are byte-identical to where smoke tests under the same
+# OS family look, so a packaging change can never silently desync the
+# install layout from the verification step.
+#
+# `name` is overridden to drop the `-cli` suffix — the package surface
+# users `apt install` / `dnf install` is just `git-remote-object-store`.
+# Every binary the CLI builds ships in the same package; the hyphenated
+# `git-remote-s3-https` etc. names are what cargo emits, and the
+# `+`-form names git invokes are produced by post-install hardlinks
+# (see `maintainer-scripts`).
+
+[package.metadata.deb]
+name = "git-remote-object-store"
+maintainer = "Elijah Zupancic <e.zupancic@f5.com>"
+copyright = "2026 Elijah Zupancic; Apache-2.0"
+license-file = ["../LICENSE", "0"]
+extended-description = """\
+Git remote helper that exposes AWS S3 and Azure Blob Storage as git \
+remotes. Push, fetch, and clone Git repositories straight against a \
+bucket or container — no server, no SaaS, no managed runner. Ships \
+the helper-protocol binaries (git-remote-s3+https, git-remote-az+https, \
+…), an LFS custom-transfer agent, and a management CLI for bucket \
+inspection and ref protection.\
+"""
+section = "vcs"
+priority = "optional"
+depends = "git"
+assets = [
+  [
+    "target/release/git-remote-s3-https",
+    "usr/bin/",
+    "755",
+  ],
+  [
+    "target/release/git-remote-s3-http",
+    "usr/bin/",
+    "755",
+  ],
+  [
+    "target/release/git-remote-az-https",
+    "usr/bin/",
+    "755",
+  ],
+  [
+    "target/release/git-remote-az-http",
+    "usr/bin/",
+    "755",
+  ],
+  [
+    "target/release/git-remote-object-store",
+    "usr/bin/",
+    "755",
+  ],
+  [
+    "target/release/git-lfs-object-store",
+    "usr/bin/",
+    "755",
+  ],
+  [
+    "../README.md",
+    "usr/share/doc/git-remote-object-store/README.md",
+    "644",
+  ],
+  [
+    "../CHANGELOG.md",
+    "usr/share/doc/git-remote-object-store/CHANGELOG.md",
+    "644",
+  ],
+  [
+    "../THIRD-PARTY-LICENSES.md",
+    "usr/share/doc/git-remote-object-store/THIRD-PARTY-LICENSES.md",
+    "644",
+  ],
+]
+maintainer-scripts = "../packaging/debian/"
+
+[package.metadata.generate-rpm]
+name = "git-remote-object-store"
+license = "Apache-2.0"
+summary = "Git remote helper backed by cloud object stores (S3, Azure Blob)"
+assets = [
+  { source = "target/release/git-remote-s3-https", dest = "/usr/bin/git-remote-s3-https", mode = "755" },
+  { source = "target/release/git-remote-s3-http", dest = "/usr/bin/git-remote-s3-http", mode = "755" },
+  { source = "target/release/git-remote-az-https", dest = "/usr/bin/git-remote-az-https", mode = "755" },
+  { source = "target/release/git-remote-az-http", dest = "/usr/bin/git-remote-az-http", mode = "755" },
+  { source = "target/release/git-remote-object-store", dest = "/usr/bin/git-remote-object-store", mode = "755" },
+  { source = "target/release/git-lfs-object-store", dest = "/usr/bin/git-lfs-object-store", mode = "755" },
+  { source = "../README.md", dest = "/usr/share/doc/git-remote-object-store/README.md", mode = "644", doc = true },
+  { source = "../CHANGELOG.md", dest = "/usr/share/doc/git-remote-object-store/CHANGELOG.md", mode = "644", doc = true },
+  { source = "../THIRD-PARTY-LICENSES.md", dest = "/usr/share/doc/git-remote-object-store/THIRD-PARTY-LICENSES.md", mode = "644", doc = true },
+  { source = "../LICENSE", dest = "/usr/share/licenses/git-remote-object-store/LICENSE", mode = "644", doc = true },
+]
+# `auto-req = "no"` disables `%find-requires` ldd-based scanning of the
+# packaged binaries. Our binaries are static rust ELFs (no dynamic
+# system libraries beyond glibc, which is implicit on every supported
+# RHEL-family target), so the `Requires:` set is fully captured by
+# the explicit `[..requires]` table below. If a future contributor
+# adds a runtime C dep (e.g. a libssl or libpcre system call), revisit
+# this — auto-req would have caught it and suggested an explicit
+# Requires:.
+auto-req = "no"
+
+# Symlink the `+`-form remote-helper names that git invokes directly.
+# Cargo cannot ship a binary whose name contains `+`, so the package
+# installs the hyphenated names and creates the `+`-form symlinks
+# post-install (and removes them on uninstall).
+#
+# Keep this list in sync with:
+#   packaging/debian/postinst         (deb post-install)
+#   packaging/debian/prerm            (deb pre-remove)
+#   packaging/alpine/APKBUILD.in      (Alpine package() hardlinks)
+#   packaging/homebrew/git-remote-object-store.rb.tmpl (Homebrew install)
+post_install_script = '''
+ln -sf /usr/bin/git-remote-s3-https /usr/bin/git-remote-s3+https
+ln -sf /usr/bin/git-remote-s3-http  /usr/bin/git-remote-s3+http
+ln -sf /usr/bin/git-remote-az-https /usr/bin/git-remote-az+https
+ln -sf /usr/bin/git-remote-az-http  /usr/bin/git-remote-az+http
+'''
+post_uninstall_script = '''
+rm -f /usr/bin/git-remote-s3+https /usr/bin/git-remote-s3+http \
+      /usr/bin/git-remote-az+https /usr/bin/git-remote-az+http
+'''
+
+[package.metadata.generate-rpm.requires]
+git = "*"

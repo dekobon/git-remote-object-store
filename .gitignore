@@ -22,3 +22,18 @@ Cargo.lock
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 spec/live/.env
+
+# CycloneDX SBOMs are generated at release time by `cargo cyclonedx`
+# (see .github/workflows/release.yml). Local invocations of the same
+# command should not commit them.
+*.cdx.json
+
+# THIRD-PARTY-LICENSES.md is generated at release time by `cargo about`
+# from about.toml + about.hbs. Per-target output should not be committed.
+THIRD-PARTY-LICENSES.md
+
+# Local-only output dirs from hand-running `cargo deb` /
+# `cargo generate-rpm` against the workspace. The release pipeline
+# uses its own ephemeral runner workspace; these are scratch space.
+out-deb/
+out-rpm/

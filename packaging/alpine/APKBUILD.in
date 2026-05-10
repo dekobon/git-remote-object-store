@@ -1,0 +1,44 @@
+# Maintainer: Elijah Zupancic <e.zupancic@f5.com>
+pkgname=git-remote-object-store
+# abuild rejects semver pre-release hyphens (e.g. 1.0.0-rc1) with
+# "not a valid version" and expects the underscore form (1.0.0_rc1).
+# `@@APK_PKGVER@@` is `@@VERSION@@` with `-` replaced by `_` by the
+# release workflow; the upstream tag/filename still uses the hyphen
+# form via `@@VERSION@@`.
+pkgver=@@APK_PKGVER@@
+pkgrel=0
+pkgdesc="Git remote helper backed by cloud object stores (S3, Azure Blob Storage)"
+url="https://github.com/dekobon/git-remote-object-store"
+arch="@@ARCH@@"
+license="Apache-2.0"
+depends="git"
+source="git-remote-object-store-@@VERSION@@-@@TARGET@@.tar.gz::https://github.com/dekobon/git-remote-object-store/releases/download/v@@VERSION@@/git-remote-object-store-@@VERSION@@-@@TARGET@@.tar.gz"
+options="!check"
+builddir="$srcdir/git-remote-object-store-@@VERSION@@-@@TARGET@@"
+
+package() {
+	# Six binaries: four scheme-specific git remote helpers, the
+	# management CLI, and the LFS custom-transfer agent. Names with `+`
+	# (e.g. `git-remote-s3+https`) are produced by hardlinking after
+	# install; cargo bin names cannot contain `+` so the archive ships
+	# the hyphenated form and the postinstall script renames in place.
+	for bin in git-remote-s3-https git-remote-s3-http \
+	           git-remote-az-https git-remote-az-http \
+	           git-remote-object-store git-lfs-object-store; do
+		install -Dm755 "$builddir/$bin" "$pkgdir/usr/bin/$bin"
+	done
+	# Hardlink the `+`-form remote-helper names that git invokes
+	# directly. Hardlinks (not symlinks) so a `pkg list` enumerates
+	# both names and the package contents are self-contained.
+	ln "$pkgdir/usr/bin/git-remote-s3-https" "$pkgdir/usr/bin/git-remote-s3+https"
+	ln "$pkgdir/usr/bin/git-remote-s3-http" "$pkgdir/usr/bin/git-remote-s3+http"
+	ln "$pkgdir/usr/bin/git-remote-az-https" "$pkgdir/usr/bin/git-remote-az+https"
+	ln "$pkgdir/usr/bin/git-remote-az-http" "$pkgdir/usr/bin/git-remote-az+http"
+
+	install -Dm644 "$builddir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	install -Dm644 "$builddir/THIRD-PARTY-LICENSES.md" "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-LICENSES.md"
+	install -Dm644 "$builddir/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+	install -Dm644 "$builddir/CHANGELOG.md" "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
+}
+
+sha512sums="@@SHA512@@  git-remote-object-store-@@VERSION@@-@@TARGET@@.tar.gz"
