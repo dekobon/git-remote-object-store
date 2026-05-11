@@ -208,24 +208,19 @@ pub(crate) fn head_key(prefix: Option<&str>) -> String {
     keys::join(prefix.unwrap_or(""), "HEAD")
 }
 
-/// Bundle-candidate filter: drop any protected-marker key, `.zip`,
-/// `/LOCKS/`, or any `.lock` key. The case-sensitive `.lock`
-/// suffix is deliberate — bucket keys are case-sensitive and the lock
-/// filename is hard-coded.
+/// Bundle-candidate filter: positive predicate — the final path segment
+/// must be `<sha>.bundle` (40 lower-hex chars + `.bundle`). All other
+/// per-ref siblings (`repo.zip`, `LOCK#.lock`, `PROTECTED#`, any
+/// hypothetical future artefact) are rejected by construction.
 ///
-/// The protection check uses last-segment equality via
-/// [`keys::is_protected_marker_segment`] — substring matching against
-/// the full key would false-match any future schema artefact whose
-/// path happened to contain the marker literal.
-#[allow(clippy::case_sensitive_file_extension_comparisons)]
+/// Earlier revisions filtered by full-key substring (`.zip`, `/LOCKS/`,
+/// `.lock`), which false-positively dropped real bundle keys whose ref
+/// name happened to contain those substrings — e.g.
+/// `refs/heads/v1.zip-rc1/<sha>.bundle` or
+/// `refs/heads/LOCKS-feature/x/<sha>.bundle`. A positive check on the
+/// final segment cannot misfire on ref-name content.
 fn is_bundle_candidate(key: &str) -> bool {
-    let last_is_protected_marker = key
-        .rsplit_once('/')
-        .is_some_and(|(_, last)| keys::is_protected_marker_segment(last));
-    !last_is_protected_marker
-        && !key.contains(".zip")
-        && !key.contains("/LOCKS/")
-        && !key.ends_with(".lock")
+    parse_remote_sha_from_key(key).is_some()
 }
 
 /// Returns every bundle object currently stored under `remote_ref`,
@@ -1139,8 +1134,12 @@ mod tests {
 
     #[test]
     fn is_bundle_candidate_keeps_real_bundles() {
-        assert!(is_bundle_candidate("repo/refs/heads/main/abc.bundle"));
-        assert!(is_bundle_candidate("refs/heads/main/abc"));
+        assert!(is_bundle_candidate(&format!(
+            "repo/refs/heads/main/{SHA}.bundle"
+        )));
+        assert!(is_bundle_candidate(&format!(
+            "refs/heads/main/{SHA}.bundle"
+        )));
     }
 
     #[test]
@@ -1150,6 +1149,43 @@ mod tests {
         assert!(!is_bundle_candidate("repo/refs/heads/main/LOCK#.lock"));
         assert!(!is_bundle_candidate("repo/refs/heads/main/file.lock"));
         assert!(!is_bundle_candidate("repo/refs/heads/main/LOCKS/x"));
+    }
+
+    /// Regression: refs whose names embed `.zip` as a substring must
+    /// not be filtered out. Previously the predicate rejected any key
+    /// containing `.zip` anywhere in the byte sequence.
+    #[test]
+    fn is_bundle_candidate_keeps_refs_containing_zip_substring() {
+        assert!(is_bundle_candidate(&format!(
+            "repo/refs/heads/v1.zip-rc1/{SHA}.bundle"
+        )));
+        assert!(is_bundle_candidate(&format!(
+            "refs/heads/myrelease.zip-v1/{SHA}.bundle"
+        )));
+    }
+
+    /// Regression: refs whose names embed `LOCKS` as a substring must
+    /// not be filtered out. Previously the predicate rejected any key
+    /// containing `/LOCKS/` anywhere in the byte sequence.
+    #[test]
+    fn is_bundle_candidate_keeps_refs_containing_locks_substring() {
+        assert!(is_bundle_candidate(&format!(
+            "repo/refs/heads/LOCKS-feature/x/{SHA}.bundle"
+        )));
+        assert!(is_bundle_candidate(&format!(
+            "refs/heads/LOCKS/sub/{SHA}.bundle"
+        )));
+    }
+
+    /// Regression: a ref-name segment ending in `.lock` is permitted by
+    /// `gix_validate`; bundle keys under such refs must still match.
+    /// The unwanted `.lock` sibling is `<ref>/LOCK#.lock`, where the
+    /// final segment is `LOCK#.lock`, not `<sha>.bundle`.
+    #[test]
+    fn is_bundle_candidate_keeps_refs_containing_lock_substring() {
+        assert!(is_bundle_candidate(&format!(
+            "refs/heads/feature.lock-rc/{SHA}.bundle"
+        )));
     }
 
     // --- parse_remote_sha_from_key ------------------------------------
@@ -1194,6 +1230,32 @@ mod tests {
         let bundles = bundles_for_ref(&store, Some("repo"), &r).await.unwrap();
         assert_eq!(bundles.len(), 1);
         assert!(bundles[0].key.ends_with(".bundle"));
+    }
+
+    /// Regression for #109: a ref whose name contains `.zip` must
+    /// not have its bundle silently filtered out.
+    #[tokio::test]
+    async fn bundles_for_ref_keeps_bundle_when_ref_name_contains_zip() {
+        let store = MockStore::new();
+        let r = rn("refs/heads/v1.zip-rc1");
+        let bundle_key = format!("repo/refs/heads/v1.zip-rc1/{SHA}.bundle");
+        store.insert(bundle_key.clone(), Bytes::from_static(b"b"));
+        let bundles = bundles_for_ref(&store, Some("repo"), &r).await.unwrap();
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].key, bundle_key);
+    }
+
+    /// Regression for #109: a ref whose name contains `LOCKS` must
+    /// not have its bundle silently filtered out.
+    #[tokio::test]
+    async fn bundles_for_ref_keeps_bundle_when_ref_name_contains_locks() {
+        let store = MockStore::new();
+        let r = rn("refs/heads/LOCKS-feature/x");
+        let bundle_key = format!("repo/refs/heads/LOCKS-feature/x/{SHA}.bundle");
+        store.insert(bundle_key.clone(), Bytes::from_static(b"b"));
+        let bundles = bundles_for_ref(&store, Some("repo"), &r).await.unwrap();
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].key, bundle_key);
     }
 
     #[tokio::test]

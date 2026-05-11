@@ -714,11 +714,15 @@ async fn pre_lock_multi_bundle_rejection_surfaces_unchanged() {
 }
 
 #[tokio::test]
-async fn pre_existing_malformed_bundle_key_surfaces_parse_error() {
-    // When the pre-lock listing finds exactly one bundle whose stem is
-    // not a 40-hex SHA, `parse_remote_sha_from_key` returns None and
-    // push.rs:490-498 emits a `PushOutcome::Error` advising the user to
-    // run `doctor`. Exercises the otherwise-untested malformed-key arm.
+async fn pre_existing_malformed_bundle_key_is_ignored_by_push() {
+    // After issue #109, `is_bundle_candidate` is a positive predicate
+    // (final segment must be `<40-hex-sha>.bundle`). A pre-existing
+    // bucket object whose stem is not 40 hex chars therefore no longer
+    // looks like a bundle to the pre-lock listing: push treats the ref
+    // as fresh, uploads a new bundle, and leaves the malformed object
+    // untouched. The "unable to parse remote bundle key" diagnostic
+    // that this test previously exercised is now unreachable from the
+    // push path — surfacing malformed-key state is `doctor`'s job.
     if !git_available() {
         eprintln!("skipping: git not on PATH");
         return;
@@ -726,10 +730,6 @@ async fn pre_existing_malformed_bundle_key_surfaces_parse_error() {
     let (seed, _shas) = make_seed_repo(1, "primary");
     let store = Arc::new(MockStore::new());
 
-    // `not-a-valid-sha.bundle` passes `is_bundle_candidate` (no
-    // PROTECTED#, no .zip, no /LOCKS/, doesn't end in .lock) but the
-    // stem is not 40 hex chars, so `parse_remote_sha_from_key` returns
-    // None and the malformed-key error path fires.
     let bad_key = "repo/refs/heads/main/not-a-valid-sha.bundle";
     store.insert(bad_key, Bytes::from_static(b"junk"));
 
@@ -740,25 +740,14 @@ async fn pre_existing_malformed_bundle_key_surfaces_parse_error() {
         seed.path().to_path_buf(),
     )
     .await;
-    result.expect("push should produce an error outcome, not abort");
+    result.expect("push should succeed; malformed key is filtered, not parsed");
 
-    // Wire format: `error <ref> "<msg>"?\n` — see PushOutcome::to_protocol_line
-    // and push.rs:494-499. The message embeds `{key:?}`, which renders
-    // the key with surrounding literal quote bytes (no escaping needed
-    // because the key contains no `"` characters).
+    // Push reports success per the wire format — the malformed key did
+    // not enter the bundle set, so the ref looks empty to the writer.
     let text = std::str::from_utf8(&out).expect("stdout utf-8");
-    let expected = format!(
-        "error refs/heads/main \"unable to parse remote bundle key \"{bad_key}\"; \
-         run git-remote-object-store doctor to fix.\"?\n\n",
-    );
-    assert_eq!(text, expected, "exact wire bytes for malformed-key error");
+    assert_eq!(text, "ok refs/heads/main\n\n");
 
-    // The lock was never acquired — the pre-lock check returned early.
-    assert!(
-        !store.contains("repo/refs/heads/main/LOCK#.lock"),
-        "lock must not be acquired when the pre-lock check rejects",
-    );
-    // The malformed bundle is still present — push did not delete it.
+    // The malformed bundle is still present — push did not touch it.
     assert!(
         store.contains(bad_key),
         "malformed bundle must remain untouched (doctor's job to clean up)",
