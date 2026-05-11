@@ -266,46 +266,45 @@ pub async fn mark(
         .collect();
 
     let run_id = Uuid::new_v4().to_string();
-    let now = OffsetDateTime::now_utc();
-    let marked_at = now.format(&Rfc3339).map_err(|e| {
+    let marked_at = OffsetDateTime::now_utc().format(&Rfc3339).map_err(|e| {
         PackchainError::Io(std::io::Error::other(format!("rfc3339 format failed: {e}")))
     })?;
     let tombstone_key = tombstone_key(prefix, &run_id, &marked_at);
+    let orphan_count = orphans.len();
     let tombstone = Tombstone {
         v: TOMBSTONE_SCHEMA_VERSION,
         run_id: run_id.clone(),
         marked_at,
-        orphan_packs: orphans.clone(),
+        orphan_packs: orphans,
     };
-
     let outcome = MarkOutcome {
-        run_id: run_id.clone(),
-        orphan_count: orphans.len(),
-        tombstone_key: tombstone_key.clone(),
+        run_id,
+        orphan_count,
+        tombstone_key,
     };
 
     if opts.dry_run {
         debug!(
-            run_id = %run_id,
-            orphans = orphans.len(),
+            run_id = %outcome.run_id,
+            orphans = outcome.orphan_count,
             "gc mark: dry-run, not writing tombstone",
         );
         return Ok(outcome);
     }
 
-    if orphans.is_empty() {
-        info!(run_id = %run_id, "gc mark: no orphans; skipping tombstone");
+    if outcome.orphan_count == 0 {
+        info!(run_id = %outcome.run_id, "gc mark: no orphans; skipping tombstone");
         return Ok(outcome);
     }
 
     let body = Bytes::from(tombstone.to_json_pretty()?);
     store
-        .put_bytes(&tombstone_key, body, PutOpts::default())
+        .put_bytes(&outcome.tombstone_key, body, PutOpts::default())
         .await?;
     info!(
-        run_id = %run_id,
-        orphans = orphans.len(),
-        key = %tombstone_key,
+        run_id = %outcome.run_id,
+        orphans = outcome.orphan_count,
+        key = %outcome.tombstone_key,
         "gc mark: tombstone written",
     );
     Ok(outcome)
@@ -537,8 +536,11 @@ async fn list_referenced_packs(
             // gc fails closed on a malformed pack key (vs read.rs's
             // MalformedPackEntry path) — the chain is corrupt and
             // tombstoning live packs based on it would be unsafe.
+            // `serde::de::Error::custom` is the canonical way to mint
+            // a `serde_json::Error` with a custom message — the type
+            // has no public direct constructor.
             let sha = super::keys::parse_pack_key_sha(&segment.pack).ok_or_else(|| {
-                PackchainError::ParseJson(serde_json::Error::custom(format!(
+                PackchainError::ParseJson(serde::de::Error::custom(format!(
                     "chain segment pack key `{}` lacks `.pack` suffix",
                     segment.pack,
                 )))
@@ -572,20 +574,6 @@ async fn list_pack_shas(
         }
     }
     Ok(shas)
-}
-
-/// `serde_json::Error` constructor — extension trait so we can produce
-/// custom-message errors that thread through `PackchainError::ParseJson`.
-trait JsonErrorCustom {
-    fn custom(msg: String) -> serde_json::Error;
-}
-impl JsonErrorCustom for serde_json::Error {
-    fn custom(msg: String) -> serde_json::Error {
-        // Round-trip through serde_json::from_str to manufacture an
-        // `Error` with our message — `serde_json` does not expose a
-        // public `Error::custom` constructor.
-        serde::de::Error::custom(msg)
-    }
 }
 
 /// Best-effort delete: returns `Ok(true)` on a real delete, `Ok(false)`
