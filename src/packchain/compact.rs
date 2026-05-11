@@ -1162,10 +1162,21 @@ mod tests {
         .await;
         match result {
             Err(PackchainError::MalformedPackEntry { offset: 0, reason }) => {
+                // The shared `segment_pack_sha` helper always reports
+                // the canonical "not of the form …" wording, so this
+                // assertion holds for every malformed input — including
+                // the empty-pack-key case where naming the input would
+                // be vacuous.
                 assert!(
-                    reason.contains(pack) || pack.is_empty(),
-                    "reason should name the malformed pack key, got: {reason}",
+                    reason.contains("is not of the form"),
+                    "reason should describe the expected shape, got: {reason}",
                 );
+                if !pack.is_empty() {
+                    assert!(
+                        reason.contains(pack),
+                        "reason should also name the offending key, got: {reason}",
+                    );
+                }
             }
             other => panic!("expected MalformedPackEntry for pack `{pack}`, got {other:?}"),
         }

@@ -1000,19 +1000,19 @@ mod tests {
         );
     }
 
-    /// Regression for #125: the `chain.json` existence probe must run
-    /// INSIDE the lock window. We simulate the TOCTOU window by
-    /// pre-seeding `chain.json` and arranging for `head` to observe
-    /// only the post-lock state: the lock is acquired, the probe
-    /// fires under the lock, the chain is present, and the sweep
-    /// runs to completion. If the probe ever moved back outside the
-    /// lock, a concurrent deleter could erase `chain.json` between
-    /// probe and lock, and the sweep would walk an empty listing
-    /// while still returning Ok — masking the documented "not found"
-    /// wire error. Here we assert the happy path the new ordering
-    /// preserves.
+    /// Happy-path coverage for the #125 ordering refactor: a
+    /// pre-existing `chain.json` is swept successfully when the
+    /// probe runs inside the lock window. The actual TOCTOU
+    /// regression (probe outside the lock racing a concurrent
+    /// deleter) is structurally impossible to construct against a
+    /// synchronous mock store — closing the race relies on the
+    /// ordering itself, not a runtime check. This test pins the
+    /// post-refactor success path so a future regression that
+    /// breaks the sweep step is caught here; the "not found" wire
+    /// path under the lock is covered by
+    /// `delete_returns_not_found_when_chain_absent`.
     #[tokio::test]
-    async fn delete_probes_chain_under_lock() {
+    async fn delete_under_lock_completes_when_chain_present() {
         let store = Arc::new(MockStore::new());
         let prefix = Some("repo");
         let remote = rn("refs/heads/main");

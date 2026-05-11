@@ -785,9 +785,15 @@ mod tests {
                 reason,
             })) => {
                 assert!(
-                    reason.contains(pack) || pack.is_empty(),
-                    "reason should name the malformed pack key, got: {reason}",
+                    reason.contains("is not of the form"),
+                    "reason should describe the expected shape, got: {reason}",
                 );
+                if !pack.is_empty() {
+                    assert!(
+                        reason.contains(pack),
+                        "reason should also name the offending key, got: {reason}",
+                    );
+                }
             }
             other => panic!("expected MalformedPackEntry for pack `{pack}`, got {other:?}"),
         }
@@ -822,9 +828,15 @@ mod tests {
                 reason,
             })) => {
                 assert!(
-                    reason.contains(pack) || pack.is_empty(),
-                    "reason should name the malformed pack key, got: {reason}",
+                    reason.contains("is not of the form"),
+                    "reason should describe the expected shape, got: {reason}",
                 );
+                if !pack.is_empty() {
+                    assert!(
+                        reason.contains(pack),
+                        "reason should also name the offending key, got: {reason}",
+                    );
+                }
             }
             other => panic!("expected MalformedPackEntry for pack `{pack}`, got {other:?}"),
         }
