@@ -306,3 +306,162 @@ part of the pre-merge gate. If CI runs `cargo test` without
 `--all-features`, it cannot be the sole correctness check.
 
 ---
+
+## 9. Recursion bounds belong at the chokepoint, not the entry path
+
+A recursion-depth or cycle bound that lives in only one of several
+re-entry paths is no bound at all: a sibling edge that bypasses the
+guarded function consumes none of the budget and recurses freely.
+The fix shape is to move the guard down to the single chokepoint
+every recursive path traverses — typically the function that
+*dispatches* on the recursive shape — rather than scattering checks
+across each call site that re-enters the recursion.
+
+**`OFS_DELTA` chains bypassed `MAX_DELTA_DEPTH`** (#83, 9383408).
+`MAX_DELTA_DEPTH` was checked-and-incremented in
+`read_object_from_chain`. The `REF_DELTA` branch re-entered through
+that function and stayed bounded, but the `OFS_DELTA` branch called
+`decode_entry` directly with the same mutable counter, never
+checking it. A long pure-`OFS_DELTA` chain in a malformed or
+attacker-controlled pack could stack-overflow the reader. The fix
+moves the guard to the top of `decode_entry` — the single
+chokepoint every recursive resolution path traverses — so both
+delta forms share the same budget. The regression test
+(`ofs_delta_recursion_consumes_depth_budget`) exercises the
+previously bypassed path with a synthetic in-memory pack.
+
+**Lesson**: When a recursive routine has more than one re-entry
+edge, put the bound at the dispatcher that every edge funnels
+through, not at any one caller of it. If the bound *must* live at
+the caller (e.g. to capture call-site context), enumerate every
+caller in the same review and add the guard at each — and add a
+regression test that exercises the path you suspect of bypassing
+the guard. This pattern generalises beyond delta decoders to any
+tree walker, interpreter, or expression evaluator with more than
+one recursive edge.
+
+---
+
+## 10. Multi-file manifest writes need ordered durability and a typed mismatch error
+
+When a logical "commit" spans more than one bucket object, the
+durable-write order determines what concurrent readers and
+post-crash readers observe. The invariant-holder — the file whose
+presence defines "the commit happened" — must be written *last*,
+and the reader path must surface the observable in-flight mismatch
+as a typed transient error, not as the misleading downstream
+failure that happens to fall out first. Both halves matter:
+ordering alone leaves readers without a way to distinguish
+"crashed-in-flight" from "genuinely corrupt", and a typed-error
+without the ordering means corruption gets misclassified as
+transient.
+
+**`path-index.json` could become newer than `chain.json` across a
+crash window** (#114, 7a480e0). Packchain push wrote
+`path-index.json` before `chain.json`. A crash between the two
+left a bucket state where the new path-index pointed at a tip in
+the *new* tree while the chain manifest still listed only the
+*old* segments. `read_blob` resolved a blob SHA from the new
+path-index, then failed to find it in the segments named by the
+old chain, and surfaced `BlobNotInChain` — indistinguishable from
+genuine corruption. The fix flips the order (`chain.json` first,
+`path-index.json` second) so a mid-flight crash leaves the bucket
+in a state the reader can recognise: the path-index references a
+tip not in `chain.json`. That recognised state now maps to the
+new typed `TransientChainPathIndexMismatch`, distinct from
+`BlobNotInChain`.
+
+**Lesson**: For any composite on-bucket write, write the
+invariant-holder last and document the ordering at the call site.
+Then walk the read paths: every observable in-flight state must
+either be invisible (overwritten atomically) or surface as a
+typed transient error that callers can distinguish from
+corruption. Compact, future engines, and any new manifest format
+will face the same question — answer it before shipping, not
+after the first crash report.
+
+---
+
+## 11. `--force` skips one named safety check, never accidentally bundles others
+
+A `--force` flag is a single token but accumulates meaning over
+time: each new safety check added to the surrounding code path
+either explicitly tests `!force` (and gets skipped) or
+unconditionally runs (and stays a safety). The flag's name
+documents what the user thinks they are bypassing, and silently
+expanding it bundles independent safeties under a single switch.
+The right shape is one flag per named safety, or the new check
+runs unconditionally and the flag documents only what its name
+says.
+
+**`gc sweep --force` deleted live packs from stale tombstones**
+(#117, 1baa452). `--force` was introduced to skip the grace-window
+wait so an operator could finalise a sweep without waiting hours.
+Later, `sweep()` grew a live-pack re-check that compared the
+tombstone list against a *fresh* `list_referenced_packs()` — a
+defence against the race where `mark()` snapshotted before a
+concurrent push committed `chain.json`. The re-check was guarded
+by `if !opts.force && referenced.contains(sha)`, folding "skip
+grace" and "skip the live re-check" under the same flag. A stale
+tombstone with `--force` could then delete pack/idx objects that
+a committed `chain.json` still referenced — data-loss-class. The
+fix isolates `--force` to grace-window skip only; the live
+re-check always runs.
+
+**Lesson**: When adding a new safety check to a code path that
+already has a `--force`-style flag, default to running the check
+unconditionally. If the user really might need to bypass it, give
+the bypass its own named flag (`--skip-live-recheck`) — not a
+reuse of `--force`. Audit each existing `!force` guard during
+review: does the flag's *name* tell the user they are bypassing
+that specific check? If not, the guard is wrong.
+
+---
+
+## 12. Marker-key existence is HEAD + segment-equality, never LIST or substring
+
+Object-store `list(prefix)` is a *byte-prefix* scan, not a
+path-segment match: `list("a/PROTECTED#")` returns every key
+whose byte sequence starts with that string, including hypothetical
+future `PROTECTED#v2`, `PROTECTED#audit`, or any sibling artefact
+that shares the prefix. Likewise, `last_segment.starts_with(MARKER)`
+and `key.contains(MARKER)` are not equivalent to
+`last_segment == MARKER`. For a *singleton* marker key whose
+purpose is "this exact key exists or it doesn't", the only safe
+shape is `head(exact_key)` + map `NotFound` to `false`, and the
+only safe segment test is byte-equality on the final path segment.
+The current bucket layout is no defence — it is correct by
+accident the moment the marker becomes a family.
+
+**Three sites used substring/prefix/LIST for `PROTECTED#`**
+(#94, 81028d0; #111, e8fa6c4; #119, 2ed0c1e). `is_protected` in
+`src/protocol/push.rs` used `store.list()` to test for the marker —
+byte-prefix, plus a needlessly expensive `ListObjectsV2`/`ListBlobs`
+round-trip on every protected-push attempt. `delete_remote_ref`
+used a substring `contains(PROTECTED_MARKER_SEGMENT)`.
+`snapshot::push_into_snapshot` used
+`last.starts_with(PROTECTED_MARKER_SEGMENT)`. Each happened to be
+correct only because exactly one literal (`PROTECTED#`) is ever
+written under that segment today; every site was a future-schema
+trap that would have silently flipped protection on for unrelated
+`PROTECTED#`-prefixed keys. The fixes consolidate on
+`keys::is_protected_marker_segment(last)` (equality helper) and
+`store.head(exact_key)` (existence check).
+
+**Lesson**: For singleton-marker keys, write one helper that
+returns the exact key and one helper that tests segment equality,
+and route every call site through them. Reviewing a new
+marker-check site: if it calls `list()`, reaches for
+`starts_with`, or open-codes `contains(MARKER)`, reject it — the
+correct shape is `head(exact)` and `segment == MARKER`. Related to
+lesson #3 (one helper for cross-cutting key transforms): #94
+consolidated the three sites onto `keys::PROTECTED_MARKER_SEGMENT`
+and `is_protected_marker_segment` — #3 covers the
+helper-consolidation half; this lesson covers the API-choice half
+(HEAD vs LIST, equality vs substring). Also related to lesson #4
+(byte-exact protocol output): that lesson covers test assertions
+on wire bytes; this one covers production-code existence and
+equality checks on bucket keys. Same family of trap, different
+surface.
+
+---
