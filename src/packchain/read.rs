@@ -63,11 +63,13 @@ pub const MAX_DELTA_DEPTH: u32 = 50;
 /// large packs without thrashing.
 pub const DEFAULT_CACHE_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Upper safety bound when expanding the fallback range for very
-/// large blobs. Past this point we surface a typed error rather than
-/// pulling unbounded bytes — a single multi-GiB blob in a code repo
-/// is overwhelmingly likely to be a misuse (git-LFS material) rather
-/// than a legitimate `read_blob` target.
+/// Upper safety bound on the bytes a single ranged GET may request,
+/// covering both the terminal-entry path in [`fetch_entry_bytes`] and
+/// the fallback widening in [`inflate_with_retry`]. Past this point
+/// we surface a typed error rather than pulling unbounded bytes — a
+/// single multi-GiB blob in a code repo is overwhelmingly likely to
+/// be a misuse (git-LFS material) rather than a legitimate
+/// `read_blob` target.
 const MAX_RANGE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Hard cap on a single decompressed pack object (1 GiB), enforced
@@ -596,11 +598,13 @@ async fn load_index(
 /// trip. Strategy:
 ///
 /// 1. If `next_offset` is known, range-GET `[pack_offset, next_offset)`.
-/// 2. Otherwise, fetch the whole pack and slice from `pack_offset`.
-///    Only the last entry in any pack pays this cost; the rest hit
-///    the cheap ranged-GET path. For typical packs (<10 MiB) the
-///    full-fetch cost is negligible; for large packs the same code
-///    path is exercised at most once per pack per process.
+/// 2. Otherwise, `HEAD` the pack to learn its length, then range-GET
+///    `[pack_offset, pack_len)`. The HEAD round-trip only fires for
+///    the very last entry in a pack — every other entry's bound is
+///    already in `sorted_offsets`. Both branches enforce
+///    [`MAX_RANGE_BYTES`]; a terminal-entry tail above the cap is
+///    rejected as [`PackchainError::MalformedPackEntry`] rather than
+///    pulled in full.
 async fn fetch_entry_bytes(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
@@ -614,36 +618,38 @@ async fn fetch_entry_bytes(
         .iter()
         .copied()
         .find(|&o| o > pack_offset);
-    if let Some(end) = next_offset {
-        let range = pack_offset..end;
-        return match store.get_bytes_range(&pack, range).await {
-            Ok(b) => Ok(b),
-            Err(ObjectStoreError::NotFound(_)) => Err(PackchainError::PackMissing { key: pack }),
-            Err(e) => Err(PackchainError::Store(e)),
+    let end = if let Some(end) = next_offset {
+        end
+    } else {
+        // Last entry in the pack — learn pack length via HEAD so the
+        // range can be bounded the same way as non-terminal entries.
+        let meta = match store.head(&pack).await {
+            Ok(m) => m,
+            Err(ObjectStoreError::NotFound(_)) => {
+                return Err(PackchainError::PackMissing { key: pack });
+            }
+            Err(e) => return Err(PackchainError::Store(e)),
         };
-    }
-    // Last entry in the pack — fetch the whole pack and slice. The
-    // cost amortises through the index cache: subsequent calls for
-    // earlier entries take the cheap ranged-GET path.
-    let full = match store.get_bytes(&pack).await {
-        Ok(b) => b,
-        Err(ObjectStoreError::NotFound(_)) => {
-            return Err(PackchainError::PackMissing { key: pack });
+        if pack_offset >= meta.size {
+            return Err(PackchainError::MalformedPackEntry {
+                offset: pack_offset,
+                reason: "entry offset beyond pack EOF".to_owned(),
+            });
         }
-        Err(e) => return Err(PackchainError::Store(e)),
+        meta.size
     };
-    let pack_len = full.len() as u64;
-    if pack_offset >= pack_len {
+    let span = end.saturating_sub(pack_offset);
+    if span > MAX_RANGE_BYTES {
         return Err(PackchainError::MalformedPackEntry {
             offset: pack_offset,
-            reason: "entry offset beyond pack EOF".to_owned(),
+            reason: format!("entry range {span} bytes exceeds {MAX_RANGE_BYTES}-byte cap"),
         });
     }
-    let start = usize::try_from(pack_offset).map_err(|_| PackchainError::MalformedPackEntry {
-        offset: pack_offset,
-        reason: "pack offset exceeds usize".to_owned(),
-    })?;
-    Ok(full.slice(start..))
+    match store.get_bytes_range(&pack, pack_offset..end).await {
+        Ok(b) => Ok(b),
+        Err(ObjectStoreError::NotFound(_)) => Err(PackchainError::PackMissing { key: pack }),
+        Err(e) => Err(PackchainError::Store(e)),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1767,6 +1773,173 @@ mod tests {
         assert!(
             matches!(err, PackchainError::DeltaTooDeep { max } if max == MAX_DELTA_DEPTH),
             "expected DeltaTooDeep from OFS_DELTA recursion, got {err:?}",
+        );
+    }
+
+    // --- terminal-entry size cap (issue #115) ------------------------------
+    //
+    // `fetch_entry_bytes` previously fell back to `get_bytes(&pack)` for
+    // the last entry in a pack — unbounded by `MAX_RANGE_BYTES`. The fix
+    // routes the terminal entry through a `HEAD` + ranged GET, enforcing
+    // the same cap as non-terminal entries.
+
+    /// Delegates everything to an inner `MockStore` except `head`, which
+    /// returns a synthetic `size` chosen by the test. Lets us exercise
+    /// the `> MAX_RANGE_BYTES` branch without actually allocating a
+    /// multi-GiB body.
+    struct FakeSizeStore {
+        inner: MockStore,
+        fake_size: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FakeSizeStore {
+        async fn list(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<crate::object_store::ObjectMeta>, ObjectStoreError> {
+            self.inner.list(prefix).await
+        }
+        async fn get_to_file(
+            &self,
+            key: &str,
+            dest: &std::path::Path,
+            opts: crate::object_store::GetOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.get_to_file(key, dest, opts).await
+        }
+        async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+            self.inner.get_bytes(key).await
+        }
+        async fn get_bytes_range(
+            &self,
+            key: &str,
+            range: std::ops::Range<u64>,
+        ) -> Result<Bytes, ObjectStoreError> {
+            self.inner.get_bytes_range(key, range).await
+        }
+        async fn put_bytes(
+            &self,
+            key: &str,
+            body: Bytes,
+            opts: crate::object_store::PutOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.put_bytes(key, body, opts).await
+        }
+        async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
+            self.inner.put_if_absent(key, body).await
+        }
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<crate::object_store::ObjectMeta, ObjectStoreError> {
+            // Forward NotFound from the inner store, but report
+            // `fake_size` on success regardless of the real body length.
+            let meta = self.inner.head(key).await?;
+            Ok(crate::object_store::ObjectMeta {
+                size: self.fake_size,
+                ..meta
+            })
+        }
+        async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
+            self.inner.copy(src, dst).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Happy path: the last entry's span fits under the cap, so
+    /// `fetch_entry_bytes` issues a single bounded ranged GET and
+    /// returns the tail of the pack starting at `pack_offset`.
+    #[tokio::test]
+    async fn fetch_entry_bytes_terminal_entry_under_cap_succeeds() {
+        let store = MockStore::new();
+        let cache = PackIndexCache::default();
+        let content_sha = sha40(SHA_A);
+
+        // Plant a tiny pack body. The entry shape doesn't matter — we
+        // only assert on the bytes `fetch_entry_bytes` returns.
+        let body: &[u8] = b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09";
+        store.insert(pack_key(None, &content_sha), Bytes::from(body.to_vec()));
+        // Pretend the only entry starts at offset 2 — sorted_offsets
+        // contains it and nothing greater, so `next_offset` is `None`
+        // and the terminal-entry branch fires.
+        install_cached_index(&cache, "", &content_sha, vec![2]);
+        let idx = cache
+            .get(&(String::new(), content_sha.clone()))
+            .expect("cache hit");
+
+        let got = fetch_entry_bytes(&store, None, &content_sha, 2, &idx)
+            .await
+            .expect("terminal entry under cap must succeed");
+        assert_eq!(got.as_ref(), &body[2..]);
+    }
+
+    /// Security regression for issue #115: when the implied terminal
+    /// range exceeds `MAX_RANGE_BYTES`, the fetcher must fail with a
+    /// typed error rather than allocate a multi-GiB buffer.
+    #[tokio::test]
+    async fn fetch_entry_bytes_terminal_entry_over_cap_rejected() {
+        let inner = MockStore::new();
+        let cache = PackIndexCache::default();
+        let content_sha = sha40(SHA_A);
+
+        // The wrapper's `head` will report `MAX_RANGE_BYTES + 1`, so the
+        // implied span `(end - pack_offset)` with `pack_offset = 0`
+        // exceeds the cap. The body is a stub — `get_bytes_range` must
+        // never be called.
+        inner.insert(pack_key(None, &content_sha), Bytes::from_static(b"stub"));
+        install_cached_index(&cache, "", &content_sha, vec![0]);
+        let idx = cache
+            .get(&(String::new(), content_sha.clone()))
+            .expect("cache hit");
+
+        let store = FakeSizeStore {
+            inner,
+            fake_size: MAX_RANGE_BYTES + 1,
+        };
+
+        let err = fetch_entry_bytes(&store, None, &content_sha, 0, &idx)
+            .await
+            .expect_err("terminal entry above cap must be rejected");
+        assert!(
+            matches!(
+                err,
+                PackchainError::MalformedPackEntry { offset: 0, ref reason }
+                    if reason.contains("exceeds") && reason.contains("cap")
+            ),
+            "expected MalformedPackEntry size-cap error, got {err:?}",
+        );
+    }
+
+    /// `pack_offset >= pack_len` on the terminal branch is an
+    /// out-of-bounds index. The fetcher must report it as
+    /// `MalformedPackEntry` rather than issue a zero-length range GET.
+    #[tokio::test]
+    async fn fetch_entry_bytes_terminal_entry_offset_past_eof_rejected() {
+        let store = MockStore::new();
+        let cache = PackIndexCache::default();
+        let content_sha = sha40(SHA_A);
+
+        store.insert(pack_key(None, &content_sha), Bytes::from_static(b"abc"));
+        // `sorted_offsets` contains an offset at/past the body length,
+        // so `next_offset` is `None` and the terminal branch fires.
+        install_cached_index(&cache, "", &content_sha, vec![100]);
+        let idx = cache
+            .get(&(String::new(), content_sha.clone()))
+            .expect("cache hit");
+
+        let err = fetch_entry_bytes(&store, None, &content_sha, 100, &idx)
+            .await
+            .expect_err("offset beyond EOF must be rejected");
+        assert!(
+            matches!(
+                err,
+                PackchainError::MalformedPackEntry { offset: 100, ref reason }
+                    if reason.contains("beyond pack EOF")
+            ),
+            "expected MalformedPackEntry EOF error, got {err:?}",
         );
     }
 
