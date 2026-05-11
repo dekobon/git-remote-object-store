@@ -30,6 +30,10 @@ package() {
 	# Hardlink the `+`-form remote-helper names that git invokes
 	# directly. Hardlinks (not symlinks) so a `pkg list` enumerates
 	# both names and the package contents are self-contained.
+	#
+	# Source of truth for the (cargo-name, plus-name) pairs is the
+	# `HELPER_PAIRS` const in `xtask/src/install.rs`. The
+	# `packaging_sync` unit tests there will fail on drift.
 	ln "$pkgdir/usr/bin/git-remote-s3-https" "$pkgdir/usr/bin/git-remote-s3+https"
 	ln "$pkgdir/usr/bin/git-remote-s3-http" "$pkgdir/usr/bin/git-remote-s3+http"
 	ln "$pkgdir/usr/bin/git-remote-az-https" "$pkgdir/usr/bin/git-remote-az+https"

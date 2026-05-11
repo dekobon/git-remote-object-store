@@ -23,6 +23,10 @@ class GitRemoteObjectStore < Formula
   def install
     # Six binaries; install the hyphenated names cargo built and
     # hardlink the `+`-form names git invokes directly.
+    #
+    # Source of truth for the (cargo-name, plus-name) pairs is the
+    # `HELPER_PAIRS` const in `xtask/src/install.rs`. The
+    # `packaging_sync` unit tests there will fail on drift.
     %w[
       git-remote-s3-https git-remote-s3-http
       git-remote-az-https git-remote-az-http

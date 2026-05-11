@@ -1,0 +1,6 @@
+[alias]
+# `cargo xtask <subcommand>` — workspace automation. Today the only
+# subcommand is `install`, which runs `cargo install --path cli` and
+# creates the `+`-form helper-binary symlinks git invokes by scheme
+# (see xtask/src/install.rs and README §Quick install).
+xtask = "run --package xtask --quiet --"
