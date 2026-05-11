@@ -91,14 +91,14 @@ mktag_in_repo() {
 		echo "mktag_in_repo: requires <dir> <ref-name> <target-oid> <target-kind>" >&2
 		return 1
 	fi
-	local tag_basename="${ref_name##*/}"
-	local body
-	body=$(printf 'object %s\ntype %s\ntag %s\ntagger Test <test@example.com> 0 +0000\n\nintegration-test tag\n' \
-		"$target_oid" "$target_kind" "$tag_basename")
-	local tag_sha
-	tag_sha=$(printf '%s' "$body" | git -C "$dir" mktag) || return 1
-	git -C "$dir" update-ref "$ref_name" "$tag_sha" || return 1
-	echo "$tag_sha"
+	local TAG_BASENAME="${ref_name##*/}"
+	local BODY
+	BODY=$(printf 'object %s\ntype %s\ntag %s\ntagger Test <test@example.com> 0 +0000\n\nintegration-test tag\n' \
+		"$target_oid" "$target_kind" "$TAG_BASENAME")
+	local TAG_SHA
+	TAG_SHA=$(printf '%s' "$BODY" | git -C "$dir" mktag) || return 1
+	git -C "$dir" update-ref "$ref_name" "$TAG_SHA" || return 1
+	echo "$TAG_SHA"
 }
 
 # add_remote <dir> <name> <url>

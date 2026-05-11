@@ -49,14 +49,14 @@ live_s3_url() {
 		echo "live_s3_url: requires <prefix>" >&2
 		return 1
 	fi
-	local host="${LIVE_S3_BUCKET}.s3.${LIVE_S3_REGION}.amazonaws.com"
-	local engine
-	engine=$(live_engine)
-	local query="engine=${engine}"
+	local HOST="${LIVE_S3_BUCKET}.s3.${LIVE_S3_REGION}.amazonaws.com"
+	local ENGINE
+	ENGINE=$(live_engine)
+	local QUERY="engine=${ENGINE}"
 	if [[ -n "${LIVE_S3_PROFILE:-}" ]]; then
-		query+="&profile=${LIVE_S3_PROFILE}"
+		QUERY+="&profile=${LIVE_S3_PROFILE}"
 	fi
-	printf 's3+https://%s/%s?%s' "$host" "$prefix" "$query"
+	printf 's3+https://%s/%s?%s' "$HOST" "$prefix" "$QUERY"
 }
 
 # live_s3_unique_prefix
@@ -67,9 +67,9 @@ live_s3_url() {
 # prefixes within a single run.
 live_s3_unique_prefix() {
 	live_assert_safe_prefix || return 1
-	local rand
-	rand=$(head -c 3 /dev/urandom | od -An -tx1 | tr -d ' \n') || return 1
-	printf '%s/spec-%s-%s' "$LIVE_RUN_PREFIX" "$$" "$rand"
+	local RAND
+	RAND=$(head -c 3 /dev/urandom | od -An -tx1 | tr -d ' \n') || return 1
+	printf '%s/spec-%s-%s' "$LIVE_RUN_PREFIX" "$$" "$RAND"
 }
 
 # live_s3_list <bucket> <prefix>
@@ -168,18 +168,18 @@ live_s3_clear_prefix() {
 # knows which IAM action is missing.
 live_s3_preflight() {
 	live_assert_safe_prefix || return 1
-	local key="${LIVE_RUN_PREFIX}/.preflight"
-	local body downloaded
-	body=$(mktemp -t live-preflight.XXXXXX) || {
+	local KEY="${LIVE_RUN_PREFIX}/.preflight"
+	local BODY DOWNLOADED
+	BODY=$(mktemp -t live-preflight.XXXXXX) || {
 		echo "live_s3_preflight: mktemp failed" >&2
 		return 1
 	}
-	downloaded=$(mktemp -t live-preflight-dl.XXXXXX) || {
-		rm -f "$body"
+	DOWNLOADED=$(mktemp -t live-preflight-dl.XXXXXX) || {
+		rm -f "$BODY"
 		echo "live_s3_preflight: mktemp failed" >&2
 		return 1
 	}
-	echo "preflight" >"$body"
+	echo "preflight" >"$BODY"
 
 	# Pre-flight is the operator's diagnostic surface for auth /
 	# permission / region / endpoint issues. Let aws-cli's stderr
@@ -187,30 +187,30 @@ live_s3_preflight() {
 	# summary, not a substitute for the underlying error message
 	# (e.g. "Your session has expired", "AccessDenied: ... is not
 	# authorized to perform: s3:PutObject", "InvalidLocationConstraint").
-	if ! live_s3_put_object "$LIVE_S3_BUCKET" "$key" "$body"; then
+	if ! live_s3_put_object "$LIVE_S3_BUCKET" "$KEY" "$BODY"; then
 		echo "live_s3_preflight: PUT failed (s3:PutObject)" >&2
-		rm -f "$body" "$downloaded"
+		rm -f "$BODY" "$DOWNLOADED"
 		return 1
 	fi
-	if ! live_s3_get_object "$LIVE_S3_BUCKET" "$key" "$downloaded"; then
+	if ! live_s3_get_object "$LIVE_S3_BUCKET" "$KEY" "$DOWNLOADED"; then
 		echo "live_s3_preflight: GET failed (s3:GetObject)" >&2
-		live_s3_delete_object "$LIVE_S3_BUCKET" "$key"
-		rm -f "$body" "$downloaded"
+		live_s3_delete_object "$LIVE_S3_BUCKET" "$KEY"
+		rm -f "$BODY" "$DOWNLOADED"
 		return 1
 	fi
-	if ! cmp -s "$body" "$downloaded"; then
+	if ! cmp -s "$BODY" "$DOWNLOADED"; then
 		echo "live_s3_preflight: round-trip body mismatch" >&2
-		live_s3_delete_object "$LIVE_S3_BUCKET" "$key"
-		rm -f "$body" "$downloaded"
+		live_s3_delete_object "$LIVE_S3_BUCKET" "$KEY"
+		rm -f "$BODY" "$DOWNLOADED"
 		return 1
 	fi
 	if ! live_s3_aws s3api delete-object \
-		--bucket "$LIVE_S3_BUCKET" --key "$key" >/dev/null; then
+		--bucket "$LIVE_S3_BUCKET" --key "$KEY" >/dev/null; then
 		echo "live_s3_preflight: DELETE failed (s3:DeleteObject)" >&2
-		rm -f "$body" "$downloaded"
+		rm -f "$BODY" "$DOWNLOADED"
 		return 1
 	fi
-	rm -f "$body" "$downloaded"
+	rm -f "$BODY" "$DOWNLOADED"
 }
 
 # live_s3_setup

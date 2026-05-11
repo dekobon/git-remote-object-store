@@ -43,23 +43,23 @@ live_az_credential_env_value() {
 	# alias (see resolve_alias() in src/object_store/azure/auth.rs).
 	# Aliases are constrained to `[A-Za-z0-9_]+` upstream, so locale-
 	# sensitive uppercasing differences cannot apply.
-	local upper="${LIVE_AZ_CREDENTIAL_NAME^^}"
-	local key_var="AZSTORE_${upper}_KEY"
-	local conn_var="AZSTORE_${upper}_CONNECTION_STRING"
-	local sas_var="AZSTORE_${upper}_SAS"
-	if [[ -n "${!key_var:-}" ]]; then
-		printf 'KEY\t%s' "${!key_var}"
+	local UPPER="${LIVE_AZ_CREDENTIAL_NAME^^}"
+	local KEY_VAR="AZSTORE_${UPPER}_KEY"
+	local CONN_VAR="AZSTORE_${UPPER}_CONNECTION_STRING"
+	local SAS_VAR="AZSTORE_${UPPER}_SAS"
+	if [[ -n "${!KEY_VAR:-}" ]]; then
+		printf 'KEY\t%s' "${!KEY_VAR}"
 		return 0
 	fi
-	if [[ -n "${!conn_var:-}" ]]; then
-		printf 'CONN\t%s' "${!conn_var}"
+	if [[ -n "${!CONN_VAR:-}" ]]; then
+		printf 'CONN\t%s' "${!CONN_VAR}"
 		return 0
 	fi
-	if [[ -n "${!sas_var:-}" ]]; then
-		printf 'SAS\t%s' "${!sas_var}"
+	if [[ -n "${!SAS_VAR:-}" ]]; then
+		printf 'SAS\t%s' "${!SAS_VAR}"
 		return 0
 	fi
-	echo "live_az_credential_env_value: none of $key_var / $conn_var / $sas_var is set" >&2
+	echo "live_az_credential_env_value: none of $KEY_VAR / $CONN_VAR / $SAS_VAR is set" >&2
 	return 1
 }
 
@@ -83,28 +83,28 @@ live_az_credential_env_value() {
 # Usage: live_az <storage-subcommand> [args...]
 #   e.g. live_az blob list --container-name foo --prefix bar
 live_az() {
-	local cred
-	cred=$(live_az_credential_env_value) || return 1
-	local kind="${cred%%$'\t'*}"
-	local value="${cred#*$'\t'}"
-	local auth_args=()
-	case "$kind" in
+	local CRED
+	CRED=$(live_az_credential_env_value) || return 1
+	local KIND="${CRED%%$'\t'*}"
+	local VALUE="${CRED#*$'\t'}"
+	local AUTH_ARGS=()
+	case "$KIND" in
 		KEY)
-			auth_args=(--account-name "$LIVE_AZ_ACCOUNT" --account-key "$value")
+			AUTH_ARGS=(--account-name "$LIVE_AZ_ACCOUNT" --account-key "$VALUE")
 			;;
 		CONN)
-			auth_args=(--connection-string "$value")
+			AUTH_ARGS=(--connection-string "$VALUE")
 			;;
 		SAS)
 			# `--sas-token` accepts the raw token (no leading `?`).
-			auth_args=(--account-name "$LIVE_AZ_ACCOUNT" --sas-token "${value#\?}")
+			AUTH_ARGS=(--account-name "$LIVE_AZ_ACCOUNT" --sas-token "${VALUE#\?}")
 			;;
 		*)
-			echo "live_az: unrecognised credential kind '$kind'" >&2
+			echo "live_az: unrecognised credential kind '$KIND'" >&2
 			return 1
 			;;
 	esac
-	az storage "$@" "${auth_args[@]}"
+	az storage "$@" "${AUTH_ARGS[@]}"
 }
 
 # live_az_url <prefix>
@@ -124,14 +124,14 @@ live_az_url() {
 		echo "live_az_url: requires <prefix>" >&2
 		return 1
 	fi
-	local suffix
-	suffix=$(live_az_endpoint_suffix)
-	local host="${LIVE_AZ_ACCOUNT}.${suffix}"
-	local engine
-	engine=$(live_engine)
+	local SUFFIX
+	SUFFIX=$(live_az_endpoint_suffix)
+	local HOST="${LIVE_AZ_ACCOUNT}.${SUFFIX}"
+	local ENGINE
+	ENGINE=$(live_engine)
 	printf 'az+https://%s/%s/%s?credential=%s&engine=%s' \
-		"$host" "$LIVE_AZ_CONTAINER" "$prefix" \
-		"$LIVE_AZ_CREDENTIAL_NAME" "$engine"
+		"$HOST" "$LIVE_AZ_CONTAINER" "$prefix" \
+		"$LIVE_AZ_CREDENTIAL_NAME" "$ENGINE"
 }
 
 # live_az_unique_prefix
@@ -142,9 +142,9 @@ live_az_url() {
 # prefixes within a single run.
 live_az_unique_prefix() {
 	live_assert_safe_prefix || return 1
-	local rand
-	rand=$(head -c 3 /dev/urandom | od -An -tx1 | tr -d ' \n') || return 1
-	printf '%s/spec-%s-%s' "$LIVE_RUN_PREFIX" "$$" "$rand"
+	local RAND
+	RAND=$(head -c 3 /dev/urandom | od -An -tx1 | tr -d ' \n') || return 1
+	printf '%s/spec-%s-%s' "$LIVE_RUN_PREFIX" "$$" "$RAND"
 }
 
 # live_az_list <container> <prefix>
@@ -243,18 +243,18 @@ live_az_clear_prefix() {
 # knows which RBAC role action is missing.
 live_az_preflight() {
 	live_assert_safe_prefix || return 1
-	local key="${LIVE_RUN_PREFIX}/.preflight"
-	local body downloaded
-	body=$(mktemp -t live-preflight.XXXXXX) || {
+	local KEY="${LIVE_RUN_PREFIX}/.preflight"
+	local BODY DOWNLOADED
+	BODY=$(mktemp -t live-preflight.XXXXXX) || {
 		echo "live_az_preflight: mktemp failed" >&2
 		return 1
 	}
-	downloaded=$(mktemp -t live-preflight-dl.XXXXXX) || {
-		rm -f "$body"
+	DOWNLOADED=$(mktemp -t live-preflight-dl.XXXXXX) || {
+		rm -f "$BODY"
 		echo "live_az_preflight: mktemp failed" >&2
 		return 1
 	}
-	echo "preflight" >"$body"
+	echo "preflight" >"$BODY"
 
 	# Pre-flight is the operator's diagnostic surface for auth /
 	# permission / endpoint issues. Let az-cli's stderr through verbatim
@@ -262,30 +262,30 @@ live_az_preflight() {
 	# substitute for the underlying error message (e.g.
 	# "AuthorizationPermissionMismatch", "AuthenticationFailed",
 	# "ContainerNotFound").
-	if ! live_az_put_object "$LIVE_AZ_CONTAINER" "$key" "$body"; then
+	if ! live_az_put_object "$LIVE_AZ_CONTAINER" "$KEY" "$BODY"; then
 		echo "live_az_preflight: PUT failed (Microsoft.Storage/.../blobs/write)" >&2
-		rm -f "$body" "$downloaded"
+		rm -f "$BODY" "$DOWNLOADED"
 		return 1
 	fi
-	if ! live_az_get_object "$LIVE_AZ_CONTAINER" "$key" "$downloaded"; then
+	if ! live_az_get_object "$LIVE_AZ_CONTAINER" "$KEY" "$DOWNLOADED"; then
 		echo "live_az_preflight: GET failed (Microsoft.Storage/.../blobs/read)" >&2
-		live_az_delete_object "$LIVE_AZ_CONTAINER" "$key"
-		rm -f "$body" "$downloaded"
+		live_az_delete_object "$LIVE_AZ_CONTAINER" "$KEY"
+		rm -f "$BODY" "$DOWNLOADED"
 		return 1
 	fi
-	if ! cmp -s "$body" "$downloaded"; then
+	if ! cmp -s "$BODY" "$DOWNLOADED"; then
 		echo "live_az_preflight: round-trip body mismatch" >&2
-		live_az_delete_object "$LIVE_AZ_CONTAINER" "$key"
-		rm -f "$body" "$downloaded"
+		live_az_delete_object "$LIVE_AZ_CONTAINER" "$KEY"
+		rm -f "$BODY" "$DOWNLOADED"
 		return 1
 	fi
 	if ! live_az blob delete --container-name "$LIVE_AZ_CONTAINER" \
-		--name "$key" >/dev/null; then
+		--name "$KEY" >/dev/null; then
 		echo "live_az_preflight: DELETE failed (Microsoft.Storage/.../blobs/delete)" >&2
-		rm -f "$body" "$downloaded"
+		rm -f "$BODY" "$DOWNLOADED"
 		return 1
 	fi
-	rm -f "$body" "$downloaded"
+	rm -f "$BODY" "$DOWNLOADED"
 }
 
 # live_az_setup

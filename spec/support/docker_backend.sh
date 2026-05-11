@@ -36,23 +36,23 @@ docker_run_detached() {
 		return 1
 	fi
 
-	local docker_args=()
-	local container_cmd=()
-	local saw_separator=0
-	local arg
-	for arg in "$@"; do
-		if [[ "$saw_separator" == "0" && "$arg" == "--" ]]; then
-			saw_separator=1
+	local DOCKER_ARGS=()
+	local CONTAINER_CMD=()
+	local SAW_SEPARATOR=0
+	local ARG
+	for ARG in "$@"; do
+		if [[ "$SAW_SEPARATOR" == "0" && "$ARG" == "--" ]]; then
+			SAW_SEPARATOR=1
 			continue
 		fi
-		if ((saw_separator)); then
-			container_cmd+=("$arg")
+		if ((SAW_SEPARATOR)); then
+			CONTAINER_CMD+=("$ARG")
 		else
-			docker_args+=("$arg")
+			DOCKER_ARGS+=("$ARG")
 		fi
 	done
 
-	docker run -d -P "${docker_args[@]}" "$ref" "${container_cmd[@]}"
+	docker run -d -P "${DOCKER_ARGS[@]}" "$ref" "${CONTAINER_CMD[@]}"
 }
 
 # docker_host_port <container_id> <container_port>
@@ -65,15 +65,15 @@ docker_host_port() {
 		echo "docker_host_port: requires <container_id> <container_port>" >&2
 		return 1
 	fi
-	local mapping
-	mapping=$(docker port "$cid" "$cport/tcp" 2>/dev/null | head -n1)
-	if [[ -z "$mapping" ]]; then
+	local MAPPING
+	MAPPING=$(docker port "$cid" "$cport/tcp" 2>/dev/null | head -n1)
+	if [[ -z "$MAPPING" ]]; then
 		echo "docker_host_port: no mapping for $cport/tcp on $cid" >&2
 		return 1
 	fi
 	# `docker port` prints `0.0.0.0:NNNN` (or `[::]:NNNN`); take the
 	# trailing port digits.
-	echo "${mapping##*:}"
+	echo "${MAPPING##*:}"
 }
 
 # docker_wait_http <host> <port> <expected_code> [timeout_seconds]
@@ -86,16 +86,16 @@ docker_wait_http() {
 	local expected="$3"
 	local timeout="${4:-30}"
 	local cid="${5:-}"
-	local start now code
-	start=$SECONDS
+	local START NOW CODE
+	START=$SECONDS
 	while :; do
-		code=$(curl -s -o /dev/null -w '%{http_code}' "http://${host}:${port}/" 2>/dev/null || echo "000")
-		if [[ "$code" == "$expected" ]]; then
+		CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://${host}:${port}/" 2>/dev/null || echo "000")
+		if [[ "$CODE" == "$expected" ]]; then
 			return 0
 		fi
-		now=$SECONDS
-		if ((now - start > timeout)); then
-			echo "docker_wait_http: timed out after ${timeout}s waiting for ${host}:${port} to return ${expected} (last=${code})" >&2
+		NOW=$SECONDS
+		if ((NOW - START > timeout)); then
+			echo "docker_wait_http: timed out after ${timeout}s waiting for ${host}:${port} to return ${expected} (last=${CODE})" >&2
 			return 1
 		fi
 		if [[ -n "$cid" ]] && ! docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null | grep -q true; then

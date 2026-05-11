@@ -51,10 +51,10 @@ if [[ "${LIVE_AZ:-0}" != "1" ]]; then
 		AZURE_STORAGE_SAS_TOKEN AZURE_STORAGE_AUTH_MODE
 	# AZSTORE_<NAME>_{KEY,CONNECTION_STRING,SAS} is the helper's credential
 	# alias surface (see src/object_store/azure.rs); strip every variant.
-	while IFS= read -r _var; do
-		unset "$_var"
+	while IFS= read -r VAR; do
+		unset "$VAR"
 	done < <(env | awk -F= '/^AZSTORE_/{print $1}')
-	unset _var
+	unset VAR
 fi
 
 # Per-run scratch directory; the runtime cleans this up by way of the OS.
@@ -78,13 +78,13 @@ mkdir -p "${XDG_CONFIG_HOME}" "${XDG_DATA_HOME}"
 # docs/development/lessons_learned.md §8.
 SHELLSPEC_HELPER_BIN="${SHELLSPEC_TMP_HOME}/bin"
 mkdir -p "${SHELLSPEC_HELPER_BIN}"
-for _scheme in s3+https s3+http az+https az+http; do
-	_target="${BASE_DIR}/target/debug/git-remote-${_scheme//+/-}"
-	if [[ -x "${_target}" ]]; then
-		ln -sf "${_target}" "${SHELLSPEC_HELPER_BIN}/git-remote-${_scheme}"
+for SCHEME in s3+https s3+http az+https az+http; do
+	TARGET="${BASE_DIR}/target/debug/git-remote-${SCHEME//+/-}"
+	if [[ -x "${TARGET}" ]]; then
+		ln -sf "${TARGET}" "${SHELLSPEC_HELPER_BIN}/git-remote-${SCHEME}"
 	fi
 done
-unset _scheme _target
+unset SCHEME TARGET
 export PATH="${SHELLSPEC_HELPER_BIN}:${PATH}"
 
 # Helpers used by `Skip if`: shellspec parses the condition expression

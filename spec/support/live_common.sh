@@ -99,13 +99,13 @@ live_require_cmd() {
 # `shellspec-live-sweep` target compares strings). PID + 4 random hex
 # bytes guard against same-second collisions across parallel runners.
 live_run_id() {
-	local stamp pid rand
-	stamp=$(date -u +%Y%m%dT%H%M%SZ) || return 1
-	pid=$$
+	local STAMP PID RAND
+	STAMP=$(date -u +%Y%m%dT%H%M%SZ) || return 1
+	PID=$$
 	# /dev/urandom is ubiquitous on Linux/macOS; openssl is not strictly
 	# required and `od` is part of POSIX. Hex-encode 4 bytes → 8 chars.
-	rand=$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n') || return 1
-	printf '%s-%s-%s' "$stamp" "$pid" "$rand"
+	RAND=$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n') || return 1
+	printf '%s-%s-%s' "$STAMP" "$PID" "$RAND"
 }
 
 # live_init_run_prefix
@@ -114,9 +114,9 @@ live_run_id() {
 # rely on a stable value across hooks.
 live_init_run_prefix() {
 	if [[ -z "${LIVE_RUN_PREFIX:-}" ]]; then
-		local id
-		id=$(live_run_id) || return 1
-		export LIVE_RUN_PREFIX="${LIVE_TOP_PREFIX}/${id}"
+		local ID
+		ID=$(live_run_id) || return 1
+		export LIVE_RUN_PREFIX="${LIVE_TOP_PREFIX}/${ID}"
 	fi
 }
 

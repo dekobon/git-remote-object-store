@@ -22,8 +22,8 @@ RUSTFS_CONTAINER_PORT="9000"
 rustfs_start() {
 	docker_pull "$RUSTFS_IMAGE:$RUSTFS_TAG" || return 1
 
-	local cid
-	cid=$(docker_run_detached "$RUSTFS_IMAGE:$RUSTFS_TAG" \
+	local CID
+	CID=$(docker_run_detached "$RUSTFS_IMAGE:$RUSTFS_TAG" \
 		-e "RUSTFS_ROOT_USER=$RUSTFS_USER" \
 		-e "RUSTFS_ROOT_PASSWORD=$RUSTFS_PASSWORD" \
 		-e "RUSTFS_ACCESS_KEY=$RUSTFS_USER" \
@@ -31,32 +31,32 @@ rustfs_start() {
 		-e "RUSTFS_ADDRESS=:$RUSTFS_CONTAINER_PORT" \
 		-e "RUSTFS_CONSOLE_ENABLE=false" \
 		-e "RUSTFS_OBS_LOG_DIRECTORY=") || return 1
-	cid="${cid//$'\n'/}"
-	export RUSTFS_CONTAINER="$cid"
+	CID="${CID//$'\n'/}"
+	export RUSTFS_CONTAINER="$CID"
 
-	local port
+	local PORT
 	# rustfs's first cold start can take a couple of seconds before the
 	# port mapping is published; retry briefly.
-	local tries=0
-	while ((tries < 50)); do
-		if port=$(docker_host_port "$cid" "$RUSTFS_CONTAINER_PORT" 2>/dev/null); then
+	local TRIES=0
+	while ((TRIES < 50)); do
+		if PORT=$(docker_host_port "$CID" "$RUSTFS_CONTAINER_PORT" 2>/dev/null); then
 			break
 		fi
 		sleep 0.1
-		tries=$((tries + 1))
+		TRIES=$((TRIES + 1))
 	done
-	if [[ -z "${port:-}" ]]; then
-		echo "rustfs_start: failed to discover host port for $cid" >&2
-		docker_stop_rm "$cid"
+	if [[ -z "${PORT:-}" ]]; then
+		echo "rustfs_start: failed to discover host port for $CID" >&2
+		docker_stop_rm "$CID"
 		return 1
 	fi
-	export RUSTFS_PORT="$port"
+	export RUSTFS_PORT="$PORT"
 	export RUSTFS_ENDPOINT="http://127.0.0.1:${RUSTFS_PORT}"
 
 	# Readiness: an unauthenticated `GET /` returns 403 once rustfs is
 	# serving (matches `tests/s3_store_integration.rs` wait strategy).
-	if ! docker_wait_http 127.0.0.1 "$RUSTFS_PORT" 403 30 "$cid"; then
-		docker_stop_rm "$cid"
+	if ! docker_wait_http 127.0.0.1 "$RUSTFS_PORT" 403 30 "$CID"; then
+		docker_stop_rm "$CID"
 		return 1
 	fi
 
