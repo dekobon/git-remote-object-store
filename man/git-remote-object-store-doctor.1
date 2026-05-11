@@ -1,0 +1,25 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH GIT-REMOTE-OBJECT-STORE-DOCTOR 1  "git-remote-object-store 0.1.0" "git-remote-object-store Manual"
+.SH NAME
+git\-remote\-object\-store\-doctor \- Analyze a remote and offer to fix duplicate bundles, invalid HEAD, and stale locks
+.SH SYNOPSIS
+\fBgit\-remote\-object\-store\-doctor\fR [\fB\-d\fR|\fB\-\-delete\-bundle\fR] [\fB\-\-lock\-ttl\fR] [\fB\-\-delete\-stale\-locks\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREMOTE\fR> 
+.SH DESCRIPTION
+Analyze a remote and offer to fix duplicate bundles, invalid HEAD, and stale locks
+.SH OPTIONS
+.TP
+\fB\-d\fR, \fB\-\-delete\-bundle\fR
+Delete losing bundles outright instead of moving them to a `<ref>_<uuid8>` quarantine ref
+.TP
+\fB\-\-lock\-ttl\fR \fI<SECONDS>\fR [default: 60]
+Seconds after which a lock is considered stale
+.TP
+\fB\-\-delete\-stale\-locks\fR
+Delete stale locks found during the scan
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIREMOTE\fR>
+A remote URL (`s3+https://…`, `az+https://…`) or the name of a git remote configured in the current repository

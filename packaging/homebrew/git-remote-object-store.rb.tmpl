@@ -41,6 +41,9 @@ class GitRemoteObjectStore < Formula
       ln bin/src, bin/dst
     end
     doc.install "README.md", "LICENSE", "THIRD-PARTY-LICENSES.md", "CHANGELOG.md"
+    # Manpages — clap-derived for the management CLI and its subcommands,
+    # hand-authored stubs for the helper-protocol binaries and LFS agent.
+    man1.install Dir["man/*.1"] if Dir.exist?("man")
   end
 
   test do

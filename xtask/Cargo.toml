@@ -23,6 +23,24 @@ unreachable = "deny"
 # crates would match on).
 anyhow = "1"
 
+# `xtask man` builds the clap `Command` for the management CLI and walks
+# its subcommands. `string` enables `impl From<String> for clap::builder::Str`
+# so freshly-formatted subcommand names (e.g. `git-remote-object-store-doctor`)
+# can be fed to `Command::name` without leaking a `'static` string.
+clap = { version = "4", features = ["derive", "string"] }
+clap_mangen = "0.2"
+
+# Source of truth for the management-CLI clap definition. Reusing the
+# same `Cli` type the binary parses guarantees `xtask man` cannot drift
+# from the binary's option surface.
+git-remote-object-store-cli = { path = "../cli" }
+
+# `xtask man --check` renders into a scratch directory and diffs the
+# result against the checked-in `man/` tree. tempfile is the dev-dep
+# the install module already pulled in for its unit tests; promoting
+# it to a regular dependency lets the `man` runtime use it too.
+tempfile = "3"
+
 [dev-dependencies]
 # Scratch directories for the symlink-refresh unit tests.
 tempfile = "3"

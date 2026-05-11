@@ -43,6 +43,15 @@ package() {
 	install -Dm644 "$builddir/THIRD-PARTY-LICENSES.md" "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-LICENSES.md"
 	install -Dm644 "$builddir/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
 	install -Dm644 "$builddir/CHANGELOG.md" "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
+
+	# Manpages — clap-derived for the management CLI and its subcommands,
+	# hand-authored stubs for the helper-protocol binaries and LFS agent.
+	# The release tarball ships the `man/` directory next to the binaries.
+	if [ -d "$builddir/man" ]; then
+		for page in "$builddir"/man/*.1; do
+			install -Dm644 "$page" "$pkgdir/usr/share/man/man1/$(basename "$page")"
+		done
+	fi
 }
 
 sha512sums="@@SHA512@@  git-remote-object-store-@@VERSION@@-@@TARGET@@.tar.gz"

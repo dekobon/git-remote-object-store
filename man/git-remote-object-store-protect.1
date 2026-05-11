@@ -1,0 +1,19 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH GIT-REMOTE-OBJECT-STORE-PROTECT 1  "git-remote-object-store 0.1.0" "git-remote-object-store Manual"
+.SH NAME
+git\-remote\-object\-store\-protect \- Mark a branch as protected by writing the `PROTECTED#` sentinel
+.SH SYNOPSIS
+\fBgit\-remote\-object\-store\-protect\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIREMOTE\fR> <\fIBRANCH\fR> 
+.SH DESCRIPTION
+Mark a branch as protected by writing the `PROTECTED#` sentinel
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIREMOTE\fR>
+A remote URL (`s3+https://…`, `az+https://…`) or the name of a git remote configured in the current repository
+.TP
+<\fIBRANCH\fR>
+Branch name, without the `refs/heads/` prefix

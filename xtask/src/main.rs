@@ -4,10 +4,10 @@
 //!
 //! ```text
 //! cargo xtask install [--bin-dir <DIR>] [--no-install] [--dry-run]
+//! cargo xtask man     [--check]
 //! ```
 //!
-//! The only subcommand today is `install`. New automations belong here as
-//! sibling modules (e.g. `man`, `bench`).
+//! New automations belong here as sibling modules (e.g. `bench`).
 
 // xtask is an ordinary CLI, not a wire-protocol binary, so it follows the
 // standard Unix convention: `--help` to stdout, errors and progress to
@@ -23,12 +23,14 @@ use std::process::ExitCode;
 use anyhow::{Result, bail};
 
 mod install;
+mod man;
 
 const USAGE: &str = "\
 cargo xtask <subcommand> [options]
 
 Subcommands:
   install     Install helper binaries and create `+`-form symlinks
+  man         Render manpages for every shipped binary into `man/`
 
 Run `cargo xtask <subcommand> --help` for subcommand-specific options.
 ";
@@ -49,11 +51,26 @@ Options:
   -h, --help         Show this message.
 ";
 
+const MAN_USAGE: &str = "\
+cargo xtask man [options]
+
+Renders the workspace's manpages into the top-level `man/` directory:
+the management CLI (`git-remote-object-store`) and its subcommands are
+generated from the clap definition; the four `git-remote-{s3,az}-{http,
+https}` helper binaries and `git-lfs-object-store` ship hand-authored
+stubs.
+
+Options:
+  --check     Regenerate into a scratch dir and exit non-zero if the
+              result differs from the checked-in `man/` tree.
+  -h, --help  Show this message.
+";
+
 /// Outcome of parsing a subcommand's arguments. The `HelpRequested` arm
 /// keeps the help path free of `process::exit` so flow control stays
 /// inside `main()` and the function remains unit-testable.
 #[derive(Debug)]
-enum ParseOutcome<T> {
+pub(crate) enum ParseOutcome<T> {
     Run(T),
     HelpRequested,
 }
@@ -80,6 +97,13 @@ fn run() -> Result<()> {
             ParseOutcome::Run(options) => install::run(&options),
             ParseOutcome::HelpRequested => {
                 print!("{INSTALL_USAGE}");
+                Ok(())
+            }
+        },
+        "man" => match man::parse(args)? {
+            ParseOutcome::Run(options) => man::run(&options),
+            ParseOutcome::HelpRequested => {
+                print!("{MAN_USAGE}");
                 Ok(())
             }
         },

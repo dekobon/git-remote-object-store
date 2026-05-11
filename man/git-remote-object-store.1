@@ -1,0 +1,37 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH GIT-REMOTE-OBJECT-STORE 1  "git-remote-object-store 0.1.0" "git-remote-object-store Manual"
+.SH NAME
+git\-remote\-object\-store \- Manage git remotes backed by S3 or Azure Blob Storage
+.SH SYNOPSIS
+\fBgit\-remote\-object\-store\fR [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Manage git remotes backed by S3 or Azure Blob Storage
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+git\-remote\-object\-store\-doctor(1)
+Analyze a remote and offer to fix duplicate bundles, invalid HEAD, and stale locks
+.TP
+git\-remote\-object\-store\-delete\-branch(1)
+Delete every object under `refs/heads/<branch>/` after a y/N confirmation
+.TP
+git\-remote\-object\-store\-protect(1)
+Mark a branch as protected by writing the `PROTECTED#` sentinel
+.TP
+git\-remote\-object\-store\-unprotect(1)
+Remove the `PROTECTED#` sentinel from a branch
+.TP
+git\-remote\-object\-store\-gc(1)
+Two\-phase mark\-and\-sweep garbage collection of orphan packs on a packchain bucket. Default flow is mark + sweep; `\-\-mark\-only` and `\-\-sweep\-only` separate the phases for cron\-style scheduling
+.TP
+git\-remote\-object\-store\-compact(1)
+Compact a packchain ref\*(Aqs chain.json down to a single segment at the current tip. The default scans every ref and prompts for confirmation; `\-\-ref` targets a single branch. Old segment packs become orphans for `gc` to reap
+.SH VERSION
+v0.1.0

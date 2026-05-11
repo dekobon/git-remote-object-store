@@ -1,0 +1,28 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH GIT-REMOTE-OBJECT-STORE-GC 1  "git-remote-object-store 0.1.0" "git-remote-object-store Manual"
+.SH NAME
+git\-remote\-object\-store\-gc \- Two\-phase mark\-and\-sweep garbage collection of orphan packs on a packchain bucket. Default flow is mark + sweep; `\-\-mark\-only` and `\-\-sweep\-only` separate the phases for cron\-style scheduling
+.SH SYNOPSIS
+\fBgit\-remote\-object\-store\-gc\fR [\fB\-\-mark\-only\fR] [\fB\-\-sweep\-only\fR] [\fB\-\-force\fR] [\fB\-\-grace\-hours\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREMOTE\fR> 
+.SH DESCRIPTION
+Two\-phase mark\-and\-sweep garbage collection of orphan packs on a packchain bucket. Default flow is mark + sweep; `\-\-mark\-only` and `\-\-sweep\-only` separate the phases for cron\-style scheduling
+.SH OPTIONS
+.TP
+\fB\-\-mark\-only\fR
+Run the mark phase only (write a tombstone, do not delete)
+.TP
+\fB\-\-sweep\-only\fR
+Run the sweep phase only (process pre\-existing tombstones)
+.TP
+\fB\-\-force\fR
+Bypass the grace window and the orphan re\-check. Operator\-asserted safe (no concurrent reads)
+.TP
+\fB\-\-grace\-hours\fR \fI<HOURS>\fR
+Hours a tombstone must age before its packs are eligible for sweep. Default reads the `GIT_REMOTE_OBJECT_STORE_GC_GRACE_HOURS` environment variable (falling back to 24)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIREMOTE\fR>
+A remote URL (`s3+https://…`, `az+https://…`) or the name of a git remote configured in the current repository

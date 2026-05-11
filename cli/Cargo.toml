@@ -236,6 +236,15 @@ assets = [
     "usr/share/doc/git-remote-object-store/THIRD-PARTY-LICENSES.md",
     "644",
   ],
+  # Manpages — clap-derived for the management CLI + its subcommands,
+  # hand-authored stubs for the helper-protocol and LFS binaries. The
+  # glob keeps the asset list stable as subcommands come and go; CI
+  # enforces that `man/` matches `cargo xtask man --check`.
+  [
+    "../man/*.1",
+    "usr/share/man/man1/",
+    "644",
+  ],
 ]
 maintainer-scripts = "../packaging/debian/"
 
@@ -254,6 +263,8 @@ assets = [
   { source = "../CHANGELOG.md", dest = "/usr/share/doc/git-remote-object-store/CHANGELOG.md", mode = "644", doc = true },
   { source = "../THIRD-PARTY-LICENSES.md", dest = "/usr/share/doc/git-remote-object-store/THIRD-PARTY-LICENSES.md", mode = "644", doc = true },
   { source = "../LICENSE", dest = "/usr/share/licenses/git-remote-object-store/LICENSE", mode = "644", doc = true },
+  # Manpages — see the matching block under `[package.metadata.deb]`.
+  { source = "../man/*.1", dest = "/usr/share/man/man1/", mode = "644", doc = true },
 ]
 # `auto-req = "no"` disables `%find-requires` ldd-based scanning of the
 # packaged binaries. Our binaries are static rust ELFs (no dynamic

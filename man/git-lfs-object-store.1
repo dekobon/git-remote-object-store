@@ -1,0 +1,52 @@
+.TH GIT-LFS-OBJECT-STORE 1 "" "git-remote-object-store Manual"
+.SH NAME
+git\-lfs\-object\-store \- Git LFS custom\-transfer agent backed by S3 or Azure Blob
+.SH SYNOPSIS
+\fBgit\-lfs\-object\-store\fR install
+.br
+\fBgit\-lfs\-object\-store\fR enable\-debug
+.br
+\fBgit\-lfs\-object\-store\fR disable\-debug
+.br
+\fBgit\-lfs\-object\-store\fR [debug]
+.SH DESCRIPTION
+Git LFS custom\-transfer agent that uploads and downloads LFS objects
+through the same S3 / Azure Blob credentials and URL grammar used by
+the remote\-helper binaries (\fBgit-remote-s3+https\fR(1),
+\fBgit-remote-az+https\fR(1)). The repository's git remote URL drives
+backend selection; the agent stores LFS objects under an \fBlfs/\fR
+subprefix of the same bucket/container/prefix the remote helper writes
+to.
+.PP
+With no positional argument (or with \fBdebug\fR), the binary enters
+the LFS custom\-transfer REPL on stdin/stdout — that mode is only ever
+invoked by \fBgit\-lfs\fR itself, not by hand.
+.SH COMMANDS
+.TP
+\fBinstall\fR
+Configure the current repository's \fIgit config\fR to route LFS
+transfers through this agent. Idempotent.
+.TP
+\fBenable\-debug\fR
+Switch this repository to \fBdebug\fR mode: future invocations of the
+agent log to \fI<git\-dir>/lfs/tmp/git\-lfs\-object\-store.log\fR at
+\fIdebug\fR level. Stderr stays quiet.
+.TP
+\fBdisable\-debug\fR
+Revert \fBenable\-debug\fR; later invocations log errors to stderr only.
+.TP
+\fBdebug\fR
+Internal: started by \fBgit\-lfs\fR when \fBenable\-debug\fR has been
+run. Same REPL as the no\-argument invocation, plus debug logging.
+.SH NOTES
+Standard output is reserved for the LFS custom\-transfer protocol
+(newline\-delimited JSON). The \fBinstall\fR / \fBenable\-debug\fR /
+\fBdisable\-debug\fR commands print a single confirmation line and exit
+\(em they never enter the REPL.
+.PP
+The agent uses the same credentials and lock TTL environment variables
+as the remote helpers. See \fBgit-remote-s3+https\fR(1) and
+\fBgit-remote-az+https\fR(1).
+.SH SEE ALSO
+\fBgit-remote-object-store\fR(1), \fBgit-remote-s3+https\fR(1),
+\fBgit-remote-az+https\fR(1), \fBgit\-lfs\fR(1).

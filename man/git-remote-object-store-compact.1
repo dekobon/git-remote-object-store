@@ -1,0 +1,31 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH GIT-REMOTE-OBJECT-STORE-COMPACT 1  "git-remote-object-store 0.1.0" "git-remote-object-store Manual"
+.SH NAME
+git\-remote\-object\-store\-compact \- Compact a packchain ref\*(Aqs chain.json down to a single segment at the current tip. The default scans every ref and prompts for confirmation; `\-\-ref` targets a single branch. Old segment packs become orphans for `gc` to reap
+.SH SYNOPSIS
+\fBgit\-remote\-object\-store\-compact\fR [\fB\-\-ref\-name\fR] [\fB\-\-force\fR] [\fB\-\-with\-gc\fR] [\fB\-\-lock\-ttl\-seconds\fR] [\fB\-\-gc\-grace\-hours\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREMOTE\fR> 
+.SH DESCRIPTION
+Compact a packchain ref\*(Aqs chain.json down to a single segment at the current tip. The default scans every ref and prompts for confirmation; `\-\-ref` targets a single branch. Old segment packs become orphans for `gc` to reap
+.SH OPTIONS
+.TP
+\fB\-\-ref\-name\fR \fI<REF>\fR
+Compact only this ref. Accepts a fully\-qualified path (`refs/heads/main`)
+.TP
+\fB\-\-force\fR
+Bypass the segments\-/bytes\-since\-`full_at` heuristic and compact unconditionally. Useful after a force push when segments are below threshold but the operator still wants a baseline rewrite
+.TP
+\fB\-\-with\-gc\fR
+Run `gc` mark+sweep against the same bucket after a successful compact. Convenience for one\-command cleanup
+.TP
+\fB\-\-lock\-ttl\-seconds\fR \fI<SECONDS>\fR
+Lock TTL for compact\*(Aqs per\-ref lock, in seconds. Compact holds the lock from chain read through chain.json commit; large repos may need a TTL well above the push default. Default reads `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` (falling back to 60s)
+.TP
+\fB\-\-gc\-grace\-hours\fR \fI<HOURS>\fR
+Grace hours for the optional `\-\-with\-gc` sweep; ignored without `\-\-with\-gc`. Default reads `GIT_REMOTE_OBJECT_STORE_GC_GRACE_HOURS` (falling back to 24)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIREMOTE\fR>
+A remote URL (`s3+https://…`, `az+https://…`) or the name of a git remote configured in the current repository

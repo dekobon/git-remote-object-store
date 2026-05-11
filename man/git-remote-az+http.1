@@ -1,0 +1,20 @@
+.TH GIT-REMOTE-AZ+HTTP 1 "" "git-remote-object-store Manual"
+.SH NAME
+git\-remote\-az+http \- Git remote helper for Azure\-compatible blob endpoints over HTTP
+.SH SYNOPSIS
+\fBgit\-remote\-az+http\fR \fIREMOTE\fR \fIURL\fR
+.SH DESCRIPTION
+Plain\-HTTP variant of \fBgit-remote-az+https\fR(1) for talking to
+Azure\-compatible endpoints that do not (or cannot) terminate TLS — e.g.
+local Azurite containers in development.
+.PP
+Use \fBaz+https://\fR for production Azure Storage. \fBaz+http://\fR
+sends credentials and ref content over an unencrypted channel.
+.SH URL GRAMMAR
+\fBaz+http://\fIhost\fR[:\fIport\fR]/\fIaccount\fR/\fIcontainer\fR\fR[/\fIprefix\fR]
+.PP
+See \fBgit-remote-az+https\fR(1) for environment variables and credential
+resolution; everything applies identically.
+.SH SEE ALSO
+\fBgit-remote-object-store\fR(1), \fBgit-remote-az+https\fR(1),
+\fBgitremote-helpers\fR(7).

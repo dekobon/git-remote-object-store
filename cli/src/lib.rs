@@ -1,8 +1,25 @@
-//! Shared entry-point for the `git-remote-{s3,az}-{http,https}` shims.
+//! Library entry-point for the `cli` crate.
+//!
+//! The crate's binaries are thin shims; the substantive types live here
+//! so they can be re-used by `xtask` (notably `xtask man`, which needs
+//! the management-CLI clap `Command` to render manpages).
+//!
+//! Two submodules:
+//!
+//! * The unnamed top-level functions (`run_main`, `parse_remote_arg`, …)
+//!   back the four `git-remote-{s3,az}-{http,https}` helper binaries.
+//! * [`management`] hosts the clap `Cli` definition for
+//!   `git-remote-object-store` (the operator-facing management CLI).
 //!
 //! Stdout is reserved for the git remote-helper wire protocol — see
 //! `.claude/rules/protocol-stdout.md`. All diagnostics go to stderr via
 //! `tracing`.
+
+pub mod management;
+
+/// Crate version, exposed so `xtask man` can stamp it into manpages
+/// without re-declaring the `CARGO_PKG_VERSION` constant.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

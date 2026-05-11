@@ -31,7 +31,7 @@ FIND_EXCLUDE   := $(foreach dir,$(EXCLUDE_DIRS),! -path "./$(dir)/*")
 # --warn-undefined-variables warnings, e.g. $(call find-by-ext,md,,).
 find-by-ext = $(if $(FD),$(FD) --extension $(1) $(FD_EXCLUDE) $(2),find . -name "*.$(1)" -type f $(FIND_EXCLUDE) $(3))
 
-.PHONY: help check-tools build build-release test test-all test-integration-s3 test-integration-azure fmt fmt-check markdown-fmt markdown-check markdown-lint shellcheck sh-fmt sh-fmt-check toml-fmt toml-fmt-check toml-lint makefile-check lint check deny shellspec shellspec-integration shellspec-integration-s3 shellspec-integration-azure shellspec-live shellspec-live-s3 shellspec-live-azure shellspec-live-sweep image-pin-check clean install doc doc-open bench all pre-commit ci _pc-fmt _pc-clippy _pc-test _pc-build _pc-shellspec _pc-shellcheck _pc-markdown-lint _pc-toml-lint _pc-makefile-check _pc-deny _ci-fmt-check _ci-clippy _ci-test _ci-build _ci-shellspec _ci-shellcheck _ci-markdown-check _ci-toml-lint _ci-makefile-check _ci-deny _ci-cargo-pipeline
+.PHONY: help check-tools build build-release test test-all test-integration-s3 test-integration-azure fmt fmt-check markdown-fmt markdown-check markdown-lint shellcheck sh-fmt sh-fmt-check toml-fmt toml-fmt-check toml-lint makefile-check lint check deny shellspec shellspec-integration shellspec-integration-s3 shellspec-integration-azure shellspec-live shellspec-live-s3 shellspec-live-azure shellspec-live-sweep image-pin-check clean install install-man man man-check doc doc-open bench all pre-commit ci _pc-fmt _pc-clippy _pc-test _pc-build _pc-shellspec _pc-shellcheck _pc-markdown-lint _pc-toml-lint _pc-makefile-check _pc-deny _pc-man-check _ci-fmt-check _ci-clippy _ci-test _ci-build _ci-shellspec _ci-shellcheck _ci-markdown-check _ci-toml-lint _ci-makefile-check _ci-deny _ci-man-check _ci-cargo-pipeline
 
 # Default target
 help:
@@ -77,6 +77,9 @@ help:
 	@echo "Maintenance:"
 	@echo "  clean                                Remove build artifacts"
 	@echo "  install                              Build and install binaries"
+	@echo "  install-man                          Install manpages under \$$DESTDIR\$$MANDIR/man1/"
+	@echo "  man                                  Regenerate manpages (cargo xtask man)"
+	@echo "  man-check                            Verify man/ matches the generators"
 	@echo ""
 	@echo "Documentation:"
 	@echo "  doc                                  Generate documentation"
@@ -302,6 +305,36 @@ install: build-release
 	cargo install --path cli
 
 # ---------------------------------------------------------------------------
+# Manpages
+# ---------------------------------------------------------------------------
+# `man` regenerates the troff under `man/` (clap-derived pages for the
+# management CLI + hand-authored stubs for the helper-protocol binaries).
+# `man-check` is the CI gate: fails non-zero when the tree drifts from
+# what `xtask man` would emit. Treat any failure as "run `make man` and
+# commit the diff."
+#
+# `install-man` ships the `.1` files under the operator-configured prefix.
+# `DESTDIR` is the staged install root (used by packagers); `PREFIX` is the
+# final on-disk prefix (typically `/usr/local` for `make install`, `/usr`
+# for distro packages). `MANDIR` defaults to `$(PREFIX)/share/man` but can
+# be overridden for distros that use `/usr/share/man` regardless of prefix.
+PREFIX  ?= /usr/local
+MANDIR  ?= $(PREFIX)/share/man
+
+man:
+	cargo xtask man
+
+man-check:
+	cargo xtask man --check
+
+install-man:
+	@install -d "$(DESTDIR)$(MANDIR)/man1"
+	@for page in $(BASE_DIR)man/*.1; do \
+	  install -m 0644 "$$page" "$(DESTDIR)$(MANDIR)/man1/"; \
+	done
+	@echo "Installed manpages to $(DESTDIR)$(MANDIR)/man1/"
+
+# ---------------------------------------------------------------------------
 # Documentation
 # ---------------------------------------------------------------------------
 doc:
@@ -324,14 +357,16 @@ all: check test build-release
 pre-commit:
 	$(MAKE) -j --output-sync=target \
 	  _pc-test _pc-shellspec \
-	  _pc-shellcheck _pc-markdown-lint _pc-toml-lint _pc-makefile-check _pc-deny
+	  _pc-shellcheck _pc-markdown-lint _pc-toml-lint _pc-makefile-check _pc-deny \
+	  _pc-man-check
 	@echo "Pre-commit checks passed"
 
 ci:
 	$(MAKE) _ci-fmt-check
 	$(MAKE) -j --output-sync=target \
 	  _ci-cargo-pipeline \
-	  _ci-shellcheck _ci-markdown-check _ci-toml-lint _ci-makefile-check _ci-deny
+	  _ci-shellcheck _ci-markdown-check _ci-toml-lint _ci-makefile-check _ci-deny \
+	  _ci-man-check
 	@echo "CI checks passed"
 
 # ---------------------------------------------------------------------------
@@ -390,6 +425,9 @@ _pc-makefile-check: _pc-fmt
 _pc-deny: _pc-fmt
 	$(MAKE) deny
 
+_pc-man-check: _pc-fmt
+	$(MAKE) man-check
+
 # ---------------------------------------------------------------------------
 # CI validation targets (no auto-formatting)
 #
@@ -437,6 +475,9 @@ _ci-makefile-check:
 
 _ci-deny:
 	$(MAKE) deny
+
+_ci-man-check:
+	$(MAKE) man-check
 
 # Sequential cargo pipeline for local `make ci`
 _ci-cargo-pipeline:

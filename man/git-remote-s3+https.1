@@ -1,0 +1,51 @@
+.TH GIT-REMOTE-S3+HTTPS 1 "" "git-remote-object-store Manual"
+.SH NAME
+git\-remote\-s3+https \- Git remote helper for AWS S3 buckets over HTTPS
+.SH SYNOPSIS
+\fBgit\-remote\-s3+https\fR \fIREMOTE\fR \fIURL\fR
+.SH DESCRIPTION
+Git invokes this helper automatically when it encounters a remote whose
+URL begins with \fBs3+https://\fR. The helper speaks the git
+remote\-helper protocol on stdin/stdout and translates push, fetch,
+clone, and ref\-listing operations into S3 GET/PUT/LIST/DELETE calls.
+.PP
+This binary is not normally run directly. Configure a remote with one of
+the URL forms in \fIURL GRAMMAR\fR below and let \fBgit fetch\fR /
+\fBgit push\fR / \fBgit clone\fR pick it up.
+.SH URL GRAMMAR
+.TP
+\fBs3+https://\fIbucket\fR.s3.\fIregion\fR.amazonaws.com\fR[/\fIprefix\fR]
+Virtual\-hosted bucket against AWS S3. Region is parsed from the host.
+.TP
+\fBs3+https://s3.\fIregion\fR.amazonaws.com/\fIbucket\fR\fR[/\fIprefix\fR]
+Path\-style bucket against AWS S3.
+.TP
+\fBs3+https://\fIhost\fR[:\fIport\fR]/\fIbucket\fR\fR[/\fIprefix\fR]
+S3\-compatible endpoint (MinIO, RustFS, Cloudflare R2, …).
+.PP
+\fIprefix\fR is an optional repository subpath under the bucket; multiple
+repositories can share a bucket by giving each its own prefix.
+.SH ENVIRONMENT
+.TP
+\fBAWS_ACCESS_KEY_ID\fR, \fBAWS_SECRET_ACCESS_KEY\fR, \fBAWS_SESSION_TOKEN\fR
+Static credentials. The helper otherwise uses the default AWS provider
+chain (instance metadata, IAM Identity Center, web\-identity, profile).
+.TP
+\fBAWS_REGION\fR
+Override the region parsed from the URL.
+.TP
+\fBAWS_PROFILE\fR
+Select a non\-default profile from \fI~/.aws/credentials\fR.
+.TP
+\fBGIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS\fR
+Per\-ref lock TTL. Default 60.
+.TP
+\fBRUST_LOG\fR
+Verbosity for the helper's stderr log. Defaults to \fBwarn\fR.
+.SH NOTES
+Standard output is reserved for the remote\-helper wire protocol. Every
+diagnostic, including credential errors and lock contention messages,
+goes to standard error.
+.SH SEE ALSO
+\fBgit-remote-object-store\fR(1), \fBgitremote-helpers\fR(7),
+\fBgit-remote-s3+http\fR(1).

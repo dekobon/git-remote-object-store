@@ -212,6 +212,9 @@ jobs:
       - name: cargo-deny
         run: make _ci-deny
 
+      - name: Man pages up to date
+        run: make _ci-man-check
+
       - name: Run Rust tests
         id: rust-tests
         continue-on-error: true

@@ -1,0 +1,23 @@
+.TH GIT-REMOTE-S3+HTTP 1 "" "git-remote-object-store Manual"
+.SH NAME
+git\-remote\-s3+http \- Git remote helper for S3\-compatible buckets over HTTP
+.SH SYNOPSIS
+\fBgit\-remote\-s3+http\fR \fIREMOTE\fR \fIURL\fR
+.SH DESCRIPTION
+Plain\-HTTP variant of \fBgit-remote-s3+https\fR(1) for talking to
+S3\-compatible endpoints that do not (or cannot) terminate TLS — e.g.
+local MinIO / RustFS containers in development or air\-gapped on\-prem
+deployments.
+.PP
+Use \fBs3+https://\fR in production. \fBs3+http://\fR sends credentials
+and ref content over an unencrypted channel.
+.SH URL GRAMMAR
+\fBs3+http://\fIhost\fR[:\fIport\fR]/\fIbucket\fR\fR[/\fIprefix\fR]
+.PP
+The virtual\-hosted form is not supported on plain HTTP; use the
+path\-style host/bucket form. See \fBgit-remote-s3+https\fR(1) for
+the rest of the URL grammar and environment variables; everything
+applies identically.
+.SH SEE ALSO
+\fBgit-remote-object-store\fR(1), \fBgit-remote-s3+https\fR(1),
+\fBgitremote-helpers\fR(7).
