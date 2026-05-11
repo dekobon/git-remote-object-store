@@ -1,5 +1,6 @@
-//! Azure Blob Storage backend for the [`ObjectStore`][super::ObjectStore]
-//! trait.
+//! Azure Blob Storage backend for the [`ObjectStore`] trait.
+//!
+//! [`ObjectStore`]: super::ObjectStore
 //!
 //! `AzureStore` wraps `azure_storage_blob`. Like the S3 backend, this
 //! module owns the URL → SDK config translation, the error-code
@@ -665,7 +666,7 @@ impl ObjectStore for AzureStore {
 
     /// Stream a local file to `key` without buffering its full body.
     ///
-    /// Above [`MULTIPART_PUT_THRESHOLD`] this routes through explicit
+    /// Above [`super::multipart::MULTIPART_PUT_THRESHOLD`] this routes through explicit
     /// `stage_block` + `commit_block_list`, paralleling the S3 backend
     /// (issue #53). Below the threshold the single `Put Blob` path
     /// preserves the one-round-trip cost for small bundles and lock

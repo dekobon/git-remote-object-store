@@ -82,8 +82,8 @@ pub enum ManageError {
 /// Interactive UI surface used by [`doctor`] and [`branch`].
 ///
 /// Production binaries inject [`DialoguerPrompter`]; tests inject
-/// [`ScriptedPrompter`] so prompt-driven flows can be exercised
-/// deterministically without spawning the binary.
+/// `ScriptedPrompter` (gated on `test-util`) so prompt-driven flows
+/// can be exercised deterministically without spawning the binary.
 pub trait Prompter: Send + Sync {
     /// Ask the user to pick one of `options` by index. `prompt` is the
     /// short headline shown above the choices.

@@ -156,7 +156,7 @@ impl fmt::Display for StorageEngine {
 
 /// Which backend a URL (or error) refers to.
 ///
-/// Used as a discriminant in [`protocol::backend::BackendError`] to select
+/// Used as a discriminant in [`crate::protocol::backend::BackendError`] to select
 /// S3 vs Azure error wording, and internally in `url::parse` to route the
 /// URL to the right parsing path.
 ///
