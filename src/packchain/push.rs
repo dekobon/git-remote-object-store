@@ -202,7 +202,7 @@ async fn push_one(
     now: OffsetDateTime,
     spec: PushSpec,
 ) -> Result<PushOutcome, PushError> {
-    let state = match prepare_push(store, prefix, repo_dir, spec).await? {
+    let state = match prepare_push(store, prefix, repo_dir, config, now, spec).await? {
         PrepareOutcome::Done(o) => return Ok(o),
         PrepareOutcome::Ready(s) => s,
     };
@@ -249,6 +249,8 @@ async fn prepare_push(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
     repo_dir: &Path,
+    config: &PushConfig,
+    now: OffsetDateTime,
     spec: PushSpec,
 ) -> Result<PrepareOutcome, PushError> {
     let PushSpec {
@@ -259,9 +261,11 @@ async fn prepare_push(
     let remote_ref_str = remote_ref.as_str().to_owned();
 
     // Delete refspec → packchain-specific cleanup (no .bundle counting,
-    // no `repo.zip`).
+    // no `repo.zip`). Delete takes the per-ref lock so a concurrent push
+    // cannot lose mutual exclusion via the sweep removing `LOCK#.lock`
+    // (#116).
     if local_spec.is_empty() {
-        let outcome = delete_remote_ref_packchain(store, prefix, &remote_ref).await?;
+        let outcome = delete_remote_ref_packchain(store, prefix, &remote_ref, config, now).await?;
         return Ok(PrepareOutcome::Done(outcome));
     }
 
@@ -835,10 +839,19 @@ async fn force_push_baseline_cleanup(
 /// Returns `Ok(PushOutcome::Error{ "not found"? })` when no chain.json
 /// exists; `Ok(PushOutcome::Ok)` when the chain is removed (other
 /// keys are best-effort).
+///
+/// Lock semantics (#116): delete acquires the per-ref `LOCK#.lock` BEFORE
+/// listing/deleting so it cannot race a concurrent push. The sweep
+/// excludes the lock key during iteration; `release_lock` deletes it
+/// last. Without this, the sweep would erase the lock held by a
+/// concurrent push, letting a third client's `put_if_absent` succeed
+/// and break mutual exclusion.
 async fn delete_remote_ref_packchain(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
     remote_ref: &RefName,
+    config: &PushConfig,
+    now: OffsetDateTime,
 ) -> Result<PushOutcome, PushError> {
     let chain = chain_key(prefix, remote_ref);
     let remote_ref_str = remote_ref.as_str().to_owned();
@@ -855,18 +868,58 @@ async fn delete_remote_ref_packchain(
         Err(e) => return Err(PushError::Store(e)),
     }
 
-    // Listing under the ref prefix may include the baseline bundle and
-    // other per-ref artifacts; sweep them all. Pack files live under
-    // a sibling `packs/` prefix and are intentionally not touched.
-    let listing = ref_listing_prefix(prefix, remote_ref);
-    let entries = store.list(&listing).await?;
-    for entry in &entries {
-        delete_idempotent(store, &entry.key).await?;
+    let lock = lock_key(prefix, remote_ref);
+    let acquired = acquire_lock(store, &lock, config.ttl, now).await?;
+    if !acquired {
+        return Ok(PushOutcome::Error {
+            remote_ref: remote_ref_str,
+            message: format!(
+                r#""failed to acquire ref lock at {lock}. Another client may be pushing or deleting. If this persists beyond {}s, run git-remote-object-store doctor to inspect and optionally clear stale locks."?"#,
+                config.ttl.whole_seconds(),
+            ),
+        });
     }
 
-    Ok(PushOutcome::Ok {
-        remote_ref: remote_ref_str,
-    })
+    // Listing under the ref prefix may include the baseline bundle and
+    // other per-ref artifacts; sweep them all EXCEPT the lock key.
+    // Pack files live under a sibling `packs/` prefix and are
+    // intentionally not touched. The lock is released LAST via
+    // `release_lock` so concurrent pushes cannot slip into the critical
+    // section while we are still sweeping.
+    let listing = ref_listing_prefix(prefix, remote_ref);
+    let sweep_result: Result<(), PushError> = async {
+        let entries = store.list(&listing).await?;
+        for entry in &entries {
+            if entry.key == lock {
+                continue;
+            }
+            delete_idempotent(store, &entry.key).await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    let release_result = bundle_push::release_lock(store, &lock).await;
+
+    match (sweep_result, release_result) {
+        (Ok(()), Ok(())) => Ok(PushOutcome::Ok {
+            remote_ref: remote_ref_str,
+        }),
+        (Ok(()), Err(e)) => {
+            warn!(key = %lock, error = %e, "packchain delete failed to release lock");
+            Ok(PushOutcome::Error {
+                remote_ref: remote_ref_str,
+                message: format!(
+                    r#""failed to release lock. You may need to manually remove the lock {lock} from the server or use git-remote-object-store doctor to fix."?"#,
+                ),
+            })
+        }
+        (Err(sweep_err), Err(rel_err)) => {
+            warn!(key = %lock, error = %rel_err, "packchain delete lock release failed (sweep already errored)");
+            Err(sweep_err)
+        }
+        (Err(sweep_err), Ok(())) => Err(sweep_err),
+    }
 }
 
 #[cfg(test)]
@@ -879,14 +932,28 @@ mod tests {
         RefName::new(s).unwrap()
     }
 
+    fn delete_test_config() -> PushConfig {
+        PushConfig {
+            engine: StorageEngine::Packchain,
+            ttl: time::Duration::seconds(60),
+        }
+    }
+
     // --- delete_remote_ref_packchain -----------------------------------
 
     #[tokio::test]
     async fn delete_returns_not_found_when_chain_absent() {
         let store = MockStore::new();
-        let outcome = delete_remote_ref_packchain(&store, None, &rn("refs/heads/main"))
-            .await
-            .unwrap();
+        let config = delete_test_config();
+        let outcome = delete_remote_ref_packchain(
+            &store,
+            None,
+            &rn("refs/heads/main"),
+            &config,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
         match outcome {
             PushOutcome::Error { message, .. } => {
                 assert!(message.contains("not found"), "got: {message}");
@@ -910,9 +977,16 @@ mod tests {
         store.insert(path_index_key(prefix, &remote), Bytes::from_static(b"{}"));
         store.insert(&baseline_key, Bytes::from_static(b"PACK"));
 
-        let outcome = delete_remote_ref_packchain(&store, prefix, &remote)
-            .await
-            .unwrap();
+        let config = delete_test_config();
+        let outcome = delete_remote_ref_packchain(
+            &store,
+            prefix,
+            &remote,
+            &config,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
         assert!(matches!(outcome, PushOutcome::Ok { .. }));
         assert!(!store.contains(&chain_key(prefix, &remote)));
         assert!(!store.contains(&path_index_key(prefix, &remote)));
@@ -923,5 +997,95 @@ mod tests {
             !store.contains(&baseline_key),
             "baseline bundle at {baseline_key} must also be deleted",
         );
+        // Lock must also be gone (release_lock deletes it after sweep).
+        assert!(
+            !store.contains(&lock_key(prefix, &remote)),
+            "lock key must be released after a successful delete",
+        );
+    }
+
+    /// Regression for #116: delete must take the per-ref lock first.
+    /// If another writer already holds the lock, delete returns a
+    /// contention error and leaves all per-ref keys (including the
+    /// foreign-held lock) intact.
+    #[tokio::test]
+    async fn delete_with_lock_held_reports_contention_and_preserves_keys() {
+        let store = MockStore::new();
+        let prefix = Some("repo");
+        let remote = rn("refs/heads/main");
+        let chain = chain_key(prefix, &remote);
+        let path_index = path_index_key(prefix, &remote);
+        let lock = lock_key(prefix, &remote);
+
+        // Seed chain + path-index, and pre-take the lock as if another
+        // writer were mid-push.
+        store.insert(&chain, Bytes::from_static(b"{}"));
+        store.insert(&path_index, Bytes::from_static(b"{}"));
+        store.insert(&lock, Bytes::new());
+
+        let config = delete_test_config();
+        // `now` close to the lock's insertion time → not stale, lock
+        // acquire returns false.
+        let outcome = delete_remote_ref_packchain(
+            &store,
+            prefix,
+            &remote,
+            &config,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        match &outcome {
+            PushOutcome::Error { message, .. } => {
+                assert!(
+                    message.contains("failed to acquire ref lock"),
+                    "got: {message}",
+                );
+            }
+            PushOutcome::Ok { .. } => panic!("expected contention Error, got {outcome:?}"),
+        }
+        // Critical: nothing was deleted. The foreign-held lock is
+        // intact, so the other writer still has mutual exclusion.
+        assert!(store.contains(&chain), "chain.json must NOT be deleted");
+        assert!(
+            store.contains(&path_index),
+            "path-index.json must NOT be deleted",
+        );
+        assert!(
+            store.contains(&lock),
+            "foreign-held LOCK#.lock must NOT be deleted by a contending delete (#116)",
+        );
+    }
+
+    /// Regression for #116: the sweep must skip the lock key, so a
+    /// concurrent `put_if_absent(LOCK#.lock)` between sweep and release
+    /// is impossible — the lock we hold is the only LOCK#.lock that
+    /// ever existed during the delete's critical section.
+    #[tokio::test]
+    async fn delete_sweep_excludes_lock_key() {
+        let store = MockStore::new();
+        let prefix = Some("repo");
+        let remote = rn("refs/heads/main");
+        let chain = chain_key(prefix, &remote);
+        let lock = lock_key(prefix, &remote);
+
+        store.insert(&chain, Bytes::from_static(b"{}"));
+
+        let config = delete_test_config();
+        let outcome = delete_remote_ref_packchain(
+            &store,
+            prefix,
+            &remote,
+            &config,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, PushOutcome::Ok { .. }));
+        // After a successful delete the lock is gone (release_lock did
+        // it), but during the sweep it was preserved. We assert the
+        // post-condition: chain gone, lock gone.
+        assert!(!store.contains(&chain));
+        assert!(!store.contains(&lock));
     }
 }
