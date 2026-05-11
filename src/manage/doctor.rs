@@ -25,7 +25,7 @@ use time::OffsetDateTime;
 use tracing::info;
 use uuid::Uuid;
 
-use super::snapshot::{BundleEntry, RepoSnapshot, analyze_objects};
+use super::snapshot::{BundleEntry, MalformedBundleKey, RepoSnapshot, analyze_objects};
 use super::{DEFAULT_LOCK_TTL_SECONDS, ManageError, Prompter};
 use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, PutOpts};
@@ -131,6 +131,20 @@ impl<'a> Doctor<'a> {
         let objects = self.store.list(&list_prefix).await?;
         let mut snapshot = analyze_objects(&objects, &list_prefix, &self.store).await?;
         write!(out, "{}", self.report(&snapshot))?;
+
+        // Surface malformed bundle keys that push silently filters
+        // (issue #124). Read-only: the doctor never deletes these, it
+        // points the operator at the keys and lets them decide. This
+        // sits between the snapshot report and the packchain section
+        // so a bundle-engine repo (which has no packchain section)
+        // still sees the warning right after its ref list.
+        if !snapshot.malformed_bundle_keys.is_empty() {
+            write!(
+                out,
+                "{}",
+                render_malformed_bundles_section(&snapshot.malformed_bundle_keys),
+            )?;
+        }
 
         // Engine-aware diagnostic. The packchain section is purely
         // read-only — no bucket mutations — so it runs before any of
@@ -441,6 +455,30 @@ fn short_branch_name(full: &str) -> &str {
     full.rsplit('/').next().unwrap_or(full)
 }
 
+/// Render the malformed-bundle-key section. Caller must check
+/// `entries.is_empty()` first — this function always emits a header.
+///
+/// Doctor does not auto-delete: the safe action is the operator's, not
+/// ours. Each row is the full key plus a `aws s3 rm` / `az storage blob
+/// delete`-style hint so an operator can act without re-deriving the
+/// path from the ref name.
+fn render_malformed_bundles_section(entries: &[MalformedBundleKey]) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "\nMalformed bundle keys (push silently ignores these):"
+    );
+    for entry in entries {
+        let _ = writeln!(out, "  - {} (ref {})", entry.key, entry.ref_path);
+    }
+    let _ = writeln!(
+        out,
+        "  Delete each key manually (`aws s3 rm` / `az storage blob delete`) and re-push the ref.",
+    );
+    out
+}
+
 /// Render the packchain audit section. The output ends with a trailing
 /// newline so callers can `print!` it without manual spacing. The shape
 /// is the one specified in #68: a header line, then four sub-sections
@@ -562,11 +600,22 @@ mod tests {
         Arc::new(mock.clone())
     }
 
+    // Valid 40-lower-hex stems used as bundle-key fixtures. Earlier
+    // doctor tests used short stems like "abc"; #124 added stem
+    // validation in the snapshot pass, so well-formed-bundle test
+    // fixtures must now carry real-length stems.
+    const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SHA_C: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
     #[tokio::test]
     async fn no_issues_round_trip_runs_clean() {
         let mock = MockStore::new();
         mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
-        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
         let initial_keys = mock.keys();
         let prompter = ScriptedPrompter::new([]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
@@ -586,11 +635,11 @@ mod tests {
         let mock = MockStore::new();
         mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
         mock.insert(
-            "myrepo/refs/heads/main/aaaaaaaa.bundle",
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
             Bytes::from("body-a"),
         );
         mock.insert(
-            "myrepo/refs/heads/main/bbbbbbbb.bundle",
+            format!("myrepo/refs/heads/main/{SHA_B}.bundle"),
             Bytes::from("body-b"),
         );
         let prompter = ScriptedPrompter::new([Answer::Select(0), Answer::Confirm(true)]);
@@ -601,20 +650,21 @@ mod tests {
             .expect("doctor.run");
 
         // Original bundle for the keeper is still present.
-        assert!(mock.contains("myrepo/refs/heads/main/aaaaaaaa.bundle"));
+        assert!(mock.contains(&format!("myrepo/refs/heads/main/{SHA_A}.bundle")));
         // Loser was moved off the main ref.
-        assert!(!mock.contains("myrepo/refs/heads/main/bbbbbbbb.bundle"));
+        assert!(!mock.contains(&format!("myrepo/refs/heads/main/{SHA_B}.bundle")));
         // The new quarantine ref has a key with the moved bundle, and
         // the suffix is exactly 8 lowercase hex characters
         // (`<ref>_<uuid8>`).
+        let loser_tail = format!("/{SHA_B}.bundle");
         let moved = mock
             .keys()
             .into_iter()
-            .find(|k| k.starts_with("myrepo/refs/heads/main_") && k.ends_with("/bbbbbbbb.bundle"))
+            .find(|k| k.starts_with("myrepo/refs/heads/main_") && k.ends_with(&loser_tail))
             .expect("quarantine key created");
         let suffix = moved
             .strip_prefix("myrepo/refs/heads/main_")
-            .and_then(|rest| rest.strip_suffix("/bbbbbbbb.bundle"))
+            .and_then(|rest| rest.strip_suffix(&loser_tail))
             .expect("quarantine key matches `<ref>_<suffix>/<sha>.bundle`");
         assert_eq!(suffix.len(), 8, "expected 8-char suffix, got {suffix:?}");
         assert!(
@@ -629,8 +679,14 @@ mod tests {
     async fn fix_multiple_bundles_delete_mode_removes_losers() {
         let mock = MockStore::new();
         mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
-        mock.insert("myrepo/refs/heads/main/aaa.bundle", Bytes::from("a"));
-        mock.insert("myrepo/refs/heads/main/bbb.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("a"),
+        );
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_B}.bundle"),
+            Bytes::from("b"),
+        );
         let prompter = ScriptedPrompter::new([Answer::Select(1), Answer::Confirm(true)]);
         let opts = DoctorOpts {
             delete_bundle: true,
@@ -641,16 +697,22 @@ mod tests {
             .run_into(&mut std::io::sink())
             .await
             .expect("doctor.run");
-        assert!(!mock.contains("myrepo/refs/heads/main/aaa.bundle"));
-        assert!(mock.contains("myrepo/refs/heads/main/bbb.bundle"));
+        assert!(!mock.contains(&format!("myrepo/refs/heads/main/{SHA_A}.bundle")));
+        assert!(mock.contains(&format!("myrepo/refs/heads/main/{SHA_B}.bundle")));
     }
 
     #[tokio::test]
     async fn fix_multiple_bundles_user_aborts_keeps_originals() {
         let mock = MockStore::new();
         mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
-        mock.insert("myrepo/refs/heads/main/aaa.bundle", Bytes::from("a"));
-        mock.insert("myrepo/refs/heads/main/bbb.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("a"),
+        );
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_B}.bundle"),
+            Bytes::from("b"),
+        );
         let prompter = ScriptedPrompter::new([Answer::Select(0), Answer::Confirm(false)]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
         // User-no on the confirmation declines this fix but is not an
@@ -660,8 +722,8 @@ mod tests {
             .run_into(&mut std::io::sink())
             .await
             .expect("user-no should not error");
-        assert!(mock.contains("myrepo/refs/heads/main/aaa.bundle"));
-        assert!(mock.contains("myrepo/refs/heads/main/bbb.bundle"));
+        assert!(mock.contains(&format!("myrepo/refs/heads/main/{SHA_A}.bundle")));
+        assert!(mock.contains(&format!("myrepo/refs/heads/main/{SHA_B}.bundle")));
     }
 
     #[tokio::test]
@@ -672,8 +734,14 @@ mod tests {
         // CLI can surface the bug without aborting (issue #33).
         let mock = MockStore::new();
         mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
-        mock.insert("myrepo/refs/heads/main/aaa.bundle", Bytes::from("a"));
-        mock.insert("myrepo/refs/heads/main/bbb.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("a"),
+        );
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_B}.bundle"),
+            Bytes::from("b"),
+        );
         // Two bundles → valid indices are 0 and 1; 99 is out of range.
         let prompter = ScriptedPrompter::new([Answer::Select(99)]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
@@ -697,8 +765,14 @@ mod tests {
         // `ManageError::Internal`, not panic the process.
         let mock = MockStore::new();
         // No HEAD object → snapshot.is_head_valid() is false.
-        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
-        mock.insert("myrepo/refs/heads/dev/def.bundle", Bytes::from("c"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
+        mock.insert(
+            format!("myrepo/refs/heads/dev/{SHA_C}.bundle"),
+            Bytes::from("c"),
+        );
         // Two HEAD candidates → valid indices are 0 and 1; 42 is out of
         // range. No prior bundle-fix prompts because no ref has > 1
         // bundle.
@@ -717,8 +791,14 @@ mod tests {
     #[tokio::test]
     async fn fix_head_writes_chosen_branch() {
         let mock = MockStore::new();
-        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
-        mock.insert("myrepo/refs/heads/dev/def.bundle", Bytes::from("c"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
+        mock.insert(
+            format!("myrepo/refs/heads/dev/{SHA_C}.bundle"),
+            Bytes::from("c"),
+        );
         // Refs are surfaced in BTreeMap order (lexicographic), so the
         // candidate list is `[refs/heads/dev, refs/heads/main]` and
         // index 1 is `main`.
@@ -737,7 +817,10 @@ mod tests {
     async fn stale_lock_listed_but_not_deleted_by_default() {
         let mock = MockStore::new();
         mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
-        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
         let stale = OffsetDateTime::now_utc() - time::Duration::seconds(120);
         mock.insert_with(
             "myrepo/refs/heads/main/LOCK#.lock",
@@ -761,7 +844,10 @@ mod tests {
     async fn stale_lock_deleted_when_flag_set() {
         let mock = MockStore::new();
         mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
-        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
         let stale = OffsetDateTime::now_utc() - time::Duration::seconds(120);
         mock.insert_with(
             "myrepo/refs/heads/main/LOCK#.lock",
@@ -786,7 +872,10 @@ mod tests {
     async fn fresh_lock_is_not_flagged_stale() {
         let mock = MockStore::new();
         mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
-        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
         // Stamped now → not stale.
         mock.insert("myrepo/refs/heads/main/LOCK#.lock", Bytes::new());
         let opts = DoctorOpts {
@@ -810,10 +899,19 @@ mod tests {
         // the trailing label reads `Invalid`.
         let mock = MockStore::new();
         mock.insert("myrepo/HEAD", Bytes::from("refs/heads/missing"));
-        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
         mock.insert("myrepo/refs/heads/main/PROTECTED#", Bytes::new());
-        mock.insert("myrepo/refs/heads/dev/aaa.bundle", Bytes::from("a"));
-        mock.insert("myrepo/refs/heads/dev/bbb.bundle", Bytes::from("a"));
+        mock.insert(
+            format!("myrepo/refs/heads/dev/{SHA_A}.bundle"),
+            Bytes::from("a"),
+        );
+        mock.insert(
+            format!("myrepo/refs/heads/dev/{SHA_B}.bundle"),
+            Bytes::from("a"),
+        );
         mock.insert("myrepo/refs/heads/empty/PROTECTED#", Bytes::new());
 
         let prompter = ScriptedPrompter::new([]);
@@ -841,7 +939,10 @@ mod tests {
     async fn report_renders_valid_head_as_ref_label() {
         let mock = MockStore::new();
         mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
-        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
         let prompter = ScriptedPrompter::new([]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
         let snapshot = super::analyze_objects(
@@ -870,7 +971,10 @@ mod tests {
         // doctor failing to identify the bundle by its relative path.
         let mock = MockStore::new();
         mock.insert("HEAD", Bytes::from("refs/heads/main"));
-        mock.insert("refs/heads/main/abc.bundle", Bytes::from("body"));
+        mock.insert(
+            format!("refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("body"),
+        );
         let initial_keys = mock.keys();
         let prompter = ScriptedPrompter::new([]);
         let doctor = Doctor::new(store_arc(&mock), "", DoctorOpts::default(), &prompter);
@@ -886,7 +990,7 @@ mod tests {
         // No HEAD object → fix_head writes one. The key must be the
         // bare `HEAD`, not `/HEAD`.
         let mock = MockStore::new();
-        mock.insert("refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert(format!("refs/heads/main/{SHA_A}.bundle"), Bytes::from("b"));
         let prompter = ScriptedPrompter::new([Answer::Select(0)]);
         let doctor = Doctor::new(store_arc(&mock), "", DoctorOpts::default(), &prompter);
         doctor
@@ -903,8 +1007,8 @@ mod tests {
     async fn root_prefix_fix_multiple_bundles_quarantines_at_root() {
         let mock = MockStore::new();
         mock.insert("HEAD", Bytes::from("refs/heads/main"));
-        mock.insert("refs/heads/main/aaa.bundle", Bytes::from("a"));
-        mock.insert("refs/heads/main/bbb.bundle", Bytes::from("b"));
+        mock.insert(format!("refs/heads/main/{SHA_A}.bundle"), Bytes::from("a"));
+        mock.insert(format!("refs/heads/main/{SHA_B}.bundle"), Bytes::from("b"));
         let prompter = ScriptedPrompter::new([Answer::Select(0), Answer::Confirm(true)]);
         let doctor = Doctor::new(store_arc(&mock), "", DoctorOpts::default(), &prompter);
         doctor
@@ -917,7 +1021,7 @@ mod tests {
         let moved = mock
             .keys()
             .into_iter()
-            .find(|k| k.starts_with("refs/heads/main_") && k.ends_with("/bbb.bundle"))
+            .find(|k| k.starts_with("refs/heads/main_") && k.ends_with(&format!("/{SHA_B}.bundle")))
             .expect("quarantine key created at root");
         assert!(
             !moved.starts_with('/'),
@@ -938,7 +1042,10 @@ mod tests {
         // test fail).
         let mock = MockStore::new();
         mock.insert("repo/HEAD", Bytes::from("refs/heads/main"));
-        mock.insert("repo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("repo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
         let initial_keys = mock.keys();
         let prompter = ScriptedPrompter::new([]);
         let doctor = Doctor::new(store_arc(&mock), "repo", DoctorOpts::default(), &prompter);
@@ -1182,7 +1289,10 @@ mod tests {
         // "Ok" for single-bundle refs, "Multiple bundles" for dup refs.
         let mock = MockStore::new();
         mock.insert("myrepo/HEAD", Bytes::from("refs/heads/missing"));
-        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
         mock.insert("myrepo/refs/heads/empty/PROTECTED#", Bytes::new());
         let prompter = ScriptedPrompter::new([]);
         let store = store_arc(&mock);
@@ -1216,8 +1326,14 @@ mod tests {
         let mock = MockStore::new();
         mock.insert("repo/HEAD", Bytes::from("refs/heads/main"));
         mock.insert("repo/refs/heads/main/chain.json", Bytes::from(r#"{"v":1}"#));
-        mock.insert("repo/refs/heads/main/aaa.bundle", Bytes::from("a"));
-        mock.insert("repo/refs/heads/main/bbb.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("repo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("a"),
+        );
+        mock.insert(
+            format!("repo/refs/heads/main/{SHA_B}.bundle"),
+            Bytes::from("b"),
+        );
         let prompter = ScriptedPrompter::new([]);
         let store = store_arc(&mock);
         let doctor = Doctor::new(Arc::clone(&store), "repo", DoctorOpts::default(), &prompter);
@@ -1239,7 +1355,10 @@ mod tests {
         let mock = MockStore::new();
         mock.insert("repo/HEAD", Bytes::from("refs/heads/main"));
         mock.insert("repo/refs/heads/main/chain.json", Bytes::from(r#"{"v":1}"#));
-        mock.insert("repo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("repo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
         let prompter = ScriptedPrompter::new([]);
         let store = store_arc(&mock);
         let doctor = Doctor::new(Arc::clone(&store), "repo", DoctorOpts::default(), &prompter);
@@ -1278,7 +1397,7 @@ mod tests {
         // prefix doesn't produce a bare `:` header.
         let mock = MockStore::new();
         mock.insert("HEAD", Bytes::from("refs/heads/main"));
-        mock.insert("refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert(format!("refs/heads/main/{SHA_A}.bundle"), Bytes::from("b"));
         let prompter = ScriptedPrompter::new([]);
         let doctor = Doctor::new(store_arc(&mock), "", DoctorOpts::default(), &prompter);
         let snapshot = super::analyze_objects(
@@ -1315,7 +1434,10 @@ mod tests {
         // the stale-lock trailer.
         let mock = MockStore::new();
         mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
-        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
         let prompter = ScriptedPrompter::new([]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
         let (result, output) = capture_run(&doctor).await;
@@ -1359,7 +1481,10 @@ mod tests {
         // section ordering that is only observable via captured output.
         let mock = MockStore::new();
         mock.insert("repo/HEAD", Bytes::from("refs/heads/main"));
-        mock.insert("repo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("repo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
         // A minimal packchain shape: chain.json + live pack.
         mock.insert(
             "repo/refs/heads/main/chain.json",
@@ -1407,11 +1532,11 @@ mod tests {
         let mock = MockStore::new();
         mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
         mock.insert(
-            "myrepo/refs/heads/main/aaaaaaaa.bundle",
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
             Bytes::from("body-a"),
         );
         mock.insert(
-            "myrepo/refs/heads/main/bbbbbbbb.bundle",
+            format!("myrepo/refs/heads/main/{SHA_B}.bundle"),
             Bytes::from("body-b"),
         );
         let prompter = ScriptedPrompter::new([Answer::Select(0), Answer::Confirm(true)]);
@@ -1424,11 +1549,11 @@ mod tests {
             "fixer header missing: {output:?}",
         );
         assert!(
-            output.contains("Keeping aaaaaaaa"),
+            output.contains(&format!("Keeping {SHA_A}")),
             "keeper announcement missing: {output:?}",
         );
         assert!(
-            output.contains("Moving bbbbbbbb to new branch"),
+            output.contains(&format!("Moving {SHA_B} to new branch")),
             "eviction line missing: {output:?}",
         );
     }
@@ -1437,7 +1562,10 @@ mod tests {
     async fn run_into_captures_fix_head_output() {
         // Exercises the HEAD-fixer path and pins its output lines.
         let mock = MockStore::new();
-        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
         let prompter = ScriptedPrompter::new([Answer::Select(0)]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
         let (result, output) = capture_run(&doctor).await;
@@ -1459,7 +1587,10 @@ mod tests {
         // the report lines in the capture buffer.
         let mock = MockStore::new();
         mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
-        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
         let stale = OffsetDateTime::now_utc() - time::Duration::seconds(120);
         mock.insert_with(
             "myrepo/refs/heads/main/LOCK#.lock",
@@ -1490,6 +1621,115 @@ mod tests {
         );
     }
 
+    // --- Malformed bundle keys (#124) ------------------------------------
+
+    #[tokio::test]
+    async fn malformed_bundle_key_surfaces_in_doctor_output() {
+        // Push silently filters keys whose stem fails the 40-hex
+        // check (#109 + #124). The doctor must surface them so an
+        // operator can clean them up.
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert(
+            "myrepo/refs/heads/main/0123456789abcdef0123456789abcdef01234567.bundle",
+            Bytes::from("body"),
+        );
+        mock.insert(
+            "myrepo/refs/heads/main/not-a-valid-sha.bundle",
+            Bytes::from("junk"),
+        );
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let (result, output) = capture_run(&doctor).await;
+        result.expect("doctor.run");
+
+        assert!(
+            output.contains("Malformed bundle keys"),
+            "section header missing: {output:?}",
+        );
+        assert!(
+            output.contains("myrepo/refs/heads/main/not-a-valid-sha.bundle"),
+            "malformed key not listed: {output:?}",
+        );
+        assert!(
+            output.contains("(ref refs/heads/main)"),
+            "ref-path context missing: {output:?}",
+        );
+        assert!(
+            output.contains("Delete each key manually"),
+            "remediation hint missing: {output:?}",
+        );
+
+        // Doctor must NOT delete the malformed key — operator's call.
+        assert!(
+            mock.contains("myrepo/refs/heads/main/not-a-valid-sha.bundle"),
+            "doctor must not auto-delete malformed bundle keys",
+        );
+        // The valid sibling is untouched as well.
+        assert!(mock.contains(
+            "myrepo/refs/heads/main/0123456789abcdef0123456789abcdef01234567.bundle",
+        ));
+    }
+
+    #[tokio::test]
+    async fn clean_bucket_emits_no_malformed_section() {
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert(
+            "myrepo/refs/heads/main/0123456789abcdef0123456789abcdef01234567.bundle",
+            Bytes::from("body"),
+        );
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let (result, output) = capture_run(&doctor).await;
+        result.expect("clean run");
+        assert!(
+            !output.contains("Malformed bundle keys"),
+            "no-malformed runs must not emit the section: {output:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn well_formed_stem_is_not_flagged_as_malformed() {
+        // Sanity test mirroring the snapshot-level check: a valid
+        // 40-hex stem must not end up in the doctor's malformed
+        // section.
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert(
+            "myrepo/refs/heads/main/0123456789abcdef0123456789abcdef01234567.bundle",
+            Bytes::from("body"),
+        );
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let (result, output) = capture_run(&doctor).await;
+        result.expect("clean run");
+        assert!(!output.contains("Malformed bundle keys"));
+        assert!(!output.contains("0123456789abcdef0123456789abcdef01234567.bundle (ref"));
+    }
+
+    #[test]
+    fn render_malformed_bundles_section_pins_format() {
+        let entries = vec![
+            MalformedBundleKey {
+                ref_path: "refs/heads/main".to_owned(),
+                key: "myrepo/refs/heads/main/not-a-valid-sha.bundle".to_owned(),
+            },
+            MalformedBundleKey {
+                ref_path: "refs/heads/dev".to_owned(),
+                key: "myrepo/refs/heads/dev/short.bundle".to_owned(),
+            },
+        ];
+        let rendered = super::render_malformed_bundles_section(&entries);
+        assert_eq!(
+            rendered,
+            "\nMalformed bundle keys (push silently ignores these):\n  \
+             - myrepo/refs/heads/main/not-a-valid-sha.bundle (ref refs/heads/main)\n  \
+             - myrepo/refs/heads/dev/short.bundle (ref refs/heads/dev)\n  \
+             Delete each key manually (`aws s3 rm` / `az storage blob delete`) and re-push the ref.\n",
+        );
+    }
+
     #[tokio::test]
     async fn run_into_captures_aborted_output() {
         // Exercises the user-decline path in fix_multiple_bundles and
@@ -1498,8 +1738,14 @@ mod tests {
         // output from appearing.
         let mock = MockStore::new();
         mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
-        mock.insert("myrepo/refs/heads/main/aaa.bundle", Bytes::from("a"));
-        mock.insert("myrepo/refs/heads/main/bbb.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("a"),
+        );
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_B}.bundle"),
+            Bytes::from("b"),
+        );
         let prompter = ScriptedPrompter::new([Answer::Select(0), Answer::Confirm(false)]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
         let (result, output) = capture_run(&doctor).await;

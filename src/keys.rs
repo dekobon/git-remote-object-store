@@ -56,6 +56,19 @@ pub(crate) fn join(prefix: Option<&str>, suffix: &str) -> String {
     }
 }
 
+/// Returns `true` iff `stem` is a syntactically valid bundle-file SHA:
+/// exactly 40 characters, all lowercase hex (`0-9`, `a-f`).
+///
+/// Used by the push pre-lock listing to reject malformed `<stem>.bundle`
+/// keys ([`is_bundle_candidate`](crate::protocol::push)) and by the
+/// `doctor` snapshot pass to flag those same keys for operator
+/// attention. Pinning the predicate here keeps the two sites in
+/// lockstep — push silently filters keys that this returns `false` for,
+/// and doctor surfaces them.
+pub(crate) fn is_valid_bundle_stem(stem: &str) -> bool {
+    stem.len() == 40 && stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Build the bundle key `<prefix>/<ref_name>/<sha>.bundle`, applying the
 /// same empty-prefix rule as [`join`].
 ///
@@ -85,7 +98,7 @@ pub(crate) fn bundle_key(
 
 #[cfg(test)]
 mod tests {
-    use super::{bundle_key, join};
+    use super::{bundle_key, is_valid_bundle_stem, join};
 
     #[test]
     fn joins_prefix_and_suffix_with_slash() {
@@ -132,6 +145,37 @@ mod tests {
             bundle_key(None, "refs/heads/main", sha),
             format!("refs/heads/main/{sha}.bundle"),
         );
+    }
+
+    #[test]
+    fn is_valid_bundle_stem_accepts_lower_hex_40() {
+        assert!(is_valid_bundle_stem(
+            "0123456789abcdef0123456789abcdef01234567"
+        ));
+        assert!(is_valid_bundle_stem(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+    }
+
+    #[test]
+    fn is_valid_bundle_stem_rejects_wrong_length_and_charset() {
+        // 39 chars
+        assert!(!is_valid_bundle_stem(
+            "0123456789abcdef0123456789abcdef0123456"
+        ));
+        // 41 chars
+        assert!(!is_valid_bundle_stem(
+            "0123456789abcdef0123456789abcdef012345670"
+        ));
+        // Uppercase hex is not accepted (mirrors `Sha::from_hex`).
+        assert!(!is_valid_bundle_stem(
+            "0123456789ABCDEF0123456789abcdef01234567"
+        ));
+        // Non-hex characters
+        assert!(!is_valid_bundle_stem(
+            "not-a-valid-sha-not-a-valid-sha-not-aval"
+        ));
+        assert!(!is_valid_bundle_stem(""));
     }
 
     #[test]

@@ -267,10 +267,18 @@ pub(crate) async fn is_protected(
 
 /// Extract the SHA from a `<…>/<sha>.bundle` key. Returns `None` if the
 /// trailing segment does not match `[0-9a-f]{40}\.bundle`.
+///
+/// Charset/length validation goes through [`keys::is_valid_bundle_stem`]
+/// so the doctor's malformed-key detector and this parser agree on
+/// what counts as a well-formed stem. The defensive parse-error arm in
+/// [`prepare_push`] still calls this — although push's pre-lock listing
+/// filters malformed stems via [`is_bundle_candidate`] before reaching
+/// the arm, the guard remains in place so a future caller that bypasses
+/// the filter cannot silently treat a malformed key as a bundle.
 fn parse_remote_sha_from_key(key: &str) -> Option<Sha> {
     let last = key.rsplit('/').next()?;
     let stem = last.strip_suffix(".bundle")?;
-    if stem.len() != 40 || !stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+    if !keys::is_valid_bundle_stem(stem) {
         return None;
     }
     Sha::from_hex(stem).ok()

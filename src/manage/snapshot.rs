@@ -26,6 +26,23 @@ pub(crate) struct BundleEntry {
     pub(crate) last_modified: OffsetDateTime,
 }
 
+/// A `<…>.bundle` object whose stem is not a valid 40-lowercase-hex
+/// SHA. Push's pre-lock listing silently filters these out (issue #109
+/// made `is_bundle_candidate` a positive predicate), so they can
+/// accumulate on a bucket with no operator-visible signal. `doctor`
+/// surfaces them so an operator can investigate and delete the key
+/// manually.
+#[derive(Debug, Clone)]
+pub(crate) struct MalformedBundleKey {
+    /// Ref path under which the malformed bundle was listed (e.g.
+    /// `refs/heads/main`). Useful for human-readable rendering — the
+    /// operator looks at the ref, not the raw key.
+    pub(crate) ref_path: String,
+    /// Full object key, ready to feed into `aws s3 rm` / `az storage
+    /// blob delete` so the operator never has to reconstruct it.
+    pub(crate) key: String,
+}
+
 /// Per-ref snapshot — protection state plus every bundle object.
 ///
 /// Constructed by [`analyze_objects`] and consumed only by the doctor.
@@ -59,6 +76,11 @@ pub(crate) struct RepoSnapshot {
     pub(crate) head: Option<String>,
     /// Refs keyed by their full ref-path (e.g. `refs/heads/main`).
     pub(crate) refs: BTreeMap<String, RefSnapshot>,
+    /// `<…>.bundle` objects whose stem fails the
+    /// [`crate::keys::is_valid_bundle_stem`] check. Push filters these
+    /// out before the pre-lock listing reaches `prepare_push`, so they
+    /// only surface here in the doctor's snapshot pass.
+    pub(crate) malformed_bundle_keys: Vec<MalformedBundleKey>,
 }
 
 impl RepoSnapshot {
@@ -175,17 +197,41 @@ async fn classify_into(
         return Ok(());
     }
 
-    let entry = snapshot.refs.entry(ref_path.to_owned()).or_default();
     if crate::keys::is_protected_marker_segment(last) {
-        entry.is_protected = true;
-    } else if let Some(sha) = last.strip_suffix(".bundle") {
-        entry.bundles.push(BundleEntry {
-            sha: sha.to_owned(),
-            key: object.key.clone(),
-            last_modified: object.last_modified,
-        });
+        snapshot
+            .refs
+            .entry(ref_path.to_owned())
+            .or_default()
+            .is_protected = true;
+    } else if let Some(stem) = last.strip_suffix(".bundle") {
+        // Push's `is_bundle_candidate` filters keys where the stem is
+        // not 40 lowercase hex chars (#109 + #124). Doctor must do the
+        // same split: well-formed stems go into the per-ref bundle
+        // set, malformed stems are surfaced to the operator as keys
+        // that push will never touch.
+        if crate::keys::is_valid_bundle_stem(stem) {
+            snapshot
+                .refs
+                .entry(ref_path.to_owned())
+                .or_default()
+                .bundles
+                .push(BundleEntry {
+                    sha: stem.to_owned(),
+                    key: object.key.clone(),
+                    last_modified: object.last_modified,
+                });
+        } else {
+            snapshot.malformed_bundle_keys.push(MalformedBundleKey {
+                ref_path: ref_path.to_owned(),
+                key: object.key.clone(),
+            });
+        }
     } else if last == "chain.json" {
-        entry.has_chain = true;
+        snapshot
+            .refs
+            .entry(ref_path.to_owned())
+            .or_default()
+            .has_chain = true;
     }
     Ok(())
 }
@@ -223,6 +269,14 @@ mod tests {
         Arc::new(MockStore::new())
     }
 
+    // Valid 40-lower-hex stems used as bundle-key fixtures. Earlier
+    // revisions used short stems like "abc"; #124 added stem
+    // validation, so the snapshot now distinguishes well-formed
+    // bundles from malformed-key keys. Tests that exercise the
+    // well-formed path must use real-length stems.
+    const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
     #[tokio::test]
     async fn empty_listing_yields_empty_snapshot() {
         let s = store();
@@ -235,13 +289,19 @@ mod tests {
     #[tokio::test]
     async fn single_ref_one_bundle() {
         let mock = MockStore::new();
-        mock.insert("myrepo/refs/heads/main/abc123.bundle", Bytes::from("body"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("body"),
+        );
         let s: Arc<dyn ObjectStore> = Arc::new(mock);
         let snap = analyze(&s, "myrepo").await.expect("analyze");
         let main = snap.refs.get("refs/heads/main").expect("main present");
         assert_eq!(main.bundles.len(), 1);
-        assert_eq!(main.bundles[0].sha, "abc123");
-        assert_eq!(main.bundles[0].key, "myrepo/refs/heads/main/abc123.bundle");
+        assert_eq!(main.bundles[0].sha, SHA_A);
+        assert_eq!(
+            main.bundles[0].key,
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle")
+        );
         assert!(!main.is_protected);
     }
 
@@ -260,25 +320,32 @@ mod tests {
         // The PROTECTED# marker is matched by exact equality on the
         // final segment — `PROTECTED#`-prefixed keys (e.g. a future
         // `PROTECTED#audit` sidecar) must NOT flip `is_protected`.
+        // Pin the strong post-condition: a sidecar that doesn't match
+        // any known segment shape leaves the snapshot empty (no phantom
+        // ref entry).
         let mock = MockStore::new();
         mock.insert("myrepo/refs/heads/main/PROTECTED#audit", Bytes::new());
         let s: Arc<dyn ObjectStore> = Arc::new(mock);
         let snap = analyze(&s, "myrepo").await.expect("analyze");
-        let entry = snap
-            .refs
-            .get("refs/heads/main")
-            .expect("ref entry recorded");
-        assert!(
-            !entry.is_protected,
-            "PROTECTED#-prefixed segment must not be classified as the marker",
-        );
+        // If the snapshot ever does record this ref (e.g. a future
+        // arm recognises `PROTECTED#`-prefixed sidecars), the
+        // entry MUST NOT have `is_protected` set.
+        if let Some(entry) = snap.refs.get("refs/heads/main") {
+            assert!(
+                !entry.is_protected,
+                "PROTECTED#-prefixed segment must not be classified as the marker",
+            );
+        }
     }
 
     #[tokio::test]
     async fn head_object_is_decoded_and_trimmed() {
         let mock = MockStore::new();
         mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main\n"));
-        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("body"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("body"),
+        );
         let s: Arc<dyn ObjectStore> = Arc::new(mock);
         let snap = analyze(&s, "myrepo").await.expect("analyze");
         assert_eq!(snap.head.as_deref(), Some("refs/heads/main"));
@@ -299,7 +366,10 @@ mod tests {
     async fn head_pointing_at_unknown_ref_is_invalid() {
         let mock = MockStore::new();
         mock.insert("myrepo/HEAD", Bytes::from("refs/heads/missing"));
-        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("body"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("body"),
+        );
         let s: Arc<dyn ObjectStore> = Arc::new(mock);
         let snap = analyze(&s, "myrepo").await.expect("analyze");
         assert_eq!(snap.head.as_deref(), Some("refs/heads/missing"));
@@ -309,8 +379,14 @@ mod tests {
     #[tokio::test]
     async fn multiple_bundles_under_one_ref() {
         let mock = MockStore::new();
-        mock.insert("myrepo/refs/heads/main/aaa.bundle", Bytes::from("a"));
-        mock.insert("myrepo/refs/heads/main/bbb.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("a"),
+        );
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_B}.bundle"),
+            Bytes::from("b"),
+        );
         let s: Arc<dyn ObjectStore> = Arc::new(mock);
         let snap = analyze(&s, "myrepo").await.expect("analyze");
         let shas: std::collections::BTreeSet<&str> = snap.refs["refs/heads/main"]
@@ -318,14 +394,17 @@ mod tests {
             .iter()
             .map(|b| b.sha.as_str())
             .collect();
-        assert_eq!(shas, ["aaa", "bbb"].into_iter().collect());
+        assert_eq!(shas, [SHA_A, SHA_B].into_iter().collect());
     }
 
     #[tokio::test]
     async fn lock_files_are_skipped_in_ref_grouping() {
         let mock = MockStore::new();
         mock.insert("myrepo/refs/heads/main/LOCK#.lock", Bytes::new());
-        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
         let s: Arc<dyn ObjectStore> = Arc::new(mock);
         let snap = analyze(&s, "myrepo").await.expect("analyze");
         assert_eq!(snap.refs["refs/heads/main"].bundles.len(), 1);
@@ -336,7 +415,10 @@ mod tests {
     async fn repo_zip_is_skipped_in_ref_grouping() {
         let mock = MockStore::new();
         mock.insert("myrepo/refs/heads/main/repo.zip", Bytes::from("zip"));
-        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
         let s: Arc<dyn ObjectStore> = Arc::new(mock);
         let snap = analyze(&s, "myrepo").await.expect("analyze");
         assert_eq!(snap.refs["refs/heads/main"].bundles.len(), 1);
@@ -345,7 +427,10 @@ mod tests {
     #[tokio::test]
     async fn nested_ref_path_is_preserved() {
         let mock = MockStore::new();
-        mock.insert("myrepo/refs/heads/feature/x/aaa.bundle", Bytes::from("a"));
+        mock.insert(
+            format!("myrepo/refs/heads/feature/x/{SHA_A}.bundle"),
+            Bytes::from("a"),
+        );
         let s: Arc<dyn ObjectStore> = Arc::new(mock);
         let snap = analyze(&s, "myrepo").await.expect("analyze");
         let entry = snap
@@ -353,10 +438,10 @@ mod tests {
             .get("refs/heads/feature/x")
             .expect("nested ref recorded");
         assert_eq!(entry.bundles.len(), 1);
-        assert_eq!(entry.bundles[0].sha, "aaa");
+        assert_eq!(entry.bundles[0].sha, SHA_A);
         assert_eq!(
             entry.bundles[0].key,
-            "myrepo/refs/heads/feature/x/aaa.bundle"
+            format!("myrepo/refs/heads/feature/x/{SHA_A}.bundle")
         );
     }
 
@@ -366,15 +451,21 @@ mod tests {
         // layout drops the leading `<prefix>/` segment entirely.
         let mock = MockStore::new();
         mock.insert("HEAD", Bytes::from("refs/heads/main"));
-        mock.insert("refs/heads/main/abc.bundle", Bytes::from("body"));
+        mock.insert(
+            format!("refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("body"),
+        );
         mock.insert("refs/heads/main/PROTECTED#", Bytes::new());
         let s: Arc<dyn ObjectStore> = Arc::new(mock);
         let snap = analyze(&s, "").await.expect("analyze at root");
         assert_eq!(snap.head.as_deref(), Some("refs/heads/main"));
         let main = snap.refs.get("refs/heads/main").expect("main present");
         assert_eq!(main.bundles.len(), 1);
-        assert_eq!(main.bundles[0].sha, "abc");
-        assert_eq!(main.bundles[0].key, "refs/heads/main/abc.bundle");
+        assert_eq!(main.bundles[0].sha, SHA_A);
+        assert_eq!(
+            main.bundles[0].key,
+            format!("refs/heads/main/{SHA_A}.bundle")
+        );
         assert!(main.is_protected);
     }
 
@@ -404,7 +495,10 @@ mod tests {
             Bytes::from("{}"),
         );
         mock.insert("myrepo/lfs/abcdef0123456789", Bytes::from("lfs-body"));
-        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("b"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
         let s: Arc<dyn ObjectStore> = Arc::new(mock);
         let snap = analyze(&s, "myrepo").await.expect("analyze");
 
@@ -444,13 +538,90 @@ mod tests {
             "myrepo/refs/heads/main/chain.json",
             Bytes::from(r#"{"v":1}"#),
         );
-        mock.insert("myrepo/refs/heads/main/abc123.bundle", Bytes::from("body"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("body"),
+        );
         let s: Arc<dyn ObjectStore> = Arc::new(mock);
         let snap = analyze(&s, "myrepo").await.expect("analyze");
         let main = snap.refs.get("refs/heads/main").expect("main present");
         assert!(main.has_chain);
         assert_eq!(main.bundles.len(), 1);
-        assert_eq!(main.bundles[0].sha, "abc123");
+        assert_eq!(main.bundles[0].sha, SHA_A);
+    }
+
+    // --- Malformed bundle keys (#124) ------------------------------------
+
+    #[tokio::test]
+    async fn malformed_bundle_stem_recorded_separately() {
+        // Push silently filters keys whose stem fails the 40-hex check;
+        // doctor must surface them. The valid sibling stays under the
+        // ref's bundle list, the malformed sibling does not.
+        let mock = MockStore::new();
+        mock.insert(
+            "myrepo/refs/heads/main/0123456789abcdef0123456789abcdef01234567.bundle",
+            Bytes::from("good"),
+        );
+        mock.insert(
+            "myrepo/refs/heads/main/not-a-valid-sha.bundle",
+            Bytes::from("junk"),
+        );
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+
+        // The valid bundle is the only entry on the ref.
+        let main = snap.refs.get("refs/heads/main").expect("ref recorded");
+        assert_eq!(main.bundles.len(), 1);
+        assert_eq!(
+            main.bundles[0].sha,
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+
+        // The malformed key surfaces in the top-level vec with both
+        // the ref path and the full key (so the operator's `aws s3 rm`
+        // command is one copy-paste away).
+        assert_eq!(snap.malformed_bundle_keys.len(), 1);
+        assert_eq!(snap.malformed_bundle_keys[0].ref_path, "refs/heads/main");
+        assert_eq!(
+            snap.malformed_bundle_keys[0].key,
+            "myrepo/refs/heads/main/not-a-valid-sha.bundle"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_only_bundle_does_not_create_phantom_ref_entry() {
+        // A ref directory whose only `.bundle` key is malformed must
+        // not get an empty `RefSnapshot` (which would render as
+        // "No bundles" in the doctor report and confuse the operator
+        // about whether anything is actually under the ref). The
+        // doctor's malformed-key section is the right place to
+        // surface it.
+        let mock = MockStore::new();
+        mock.insert(
+            "myrepo/refs/heads/junk/not-a-valid-sha.bundle",
+            Bytes::from("junk"),
+        );
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+
+        assert!(
+            !snap.refs.contains_key("refs/heads/junk"),
+            "malformed-only refs must not appear in snapshot.refs",
+        );
+        assert_eq!(snap.malformed_bundle_keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn well_formed_stems_are_never_flagged() {
+        // Sanity: the canonical 40-hex stem must NOT be flagged.
+        let mock = MockStore::new();
+        mock.insert(
+            "myrepo/refs/heads/main/0123456789abcdef0123456789abcdef01234567.bundle",
+            Bytes::from("body"),
+        );
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+        assert!(snap.malformed_bundle_keys.is_empty());
     }
 
     #[test]
