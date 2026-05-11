@@ -20,7 +20,7 @@ use tracing::{debug, warn};
 
 use crate::keys;
 use crate::lfs::oid::LfsOid;
-use crate::lfs::protocol::{CompleteEvent, EventError, ProgressEvent};
+use crate::lfs::protocol::{CompleteEvent, ErrorPayload, ProgressEvent};
 use crate::object_store::{GetOpts, ObjectStore, ObjectStoreError, ProgressSink, PutOpts};
 
 /// Generic error code surfaced in `complete` event payloads.
@@ -345,7 +345,7 @@ async fn write_complete<W: AsyncWrite + Unpin>(
             event: "complete",
             oid,
             path,
-            error: error_message.map(|message| EventError {
+            error: error_message.map(|message| ErrorPayload {
                 code: ERR_CODE_GENERIC,
                 message,
             }),

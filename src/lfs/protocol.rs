@@ -66,7 +66,7 @@ pub(crate) struct DownloadEvent {
 pub(crate) struct InitResponse<'a> {
     /// Populated on failure; absent on success (the empty-object form).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) error: Option<EventError<'a>>,
+    pub(crate) error: Option<ErrorPayload<'a>>,
 }
 
 /// Progress event emitted while an upload/download is running.
@@ -99,12 +99,12 @@ pub(crate) struct CompleteEvent<'a> {
     pub(crate) path: Option<&'a str>,
     /// Error payload. Only present on failure.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) error: Option<EventError<'a>>,
+    pub(crate) error: Option<ErrorPayload<'a>>,
 }
 
 /// `{code, message}` error object embedded in init / complete events.
 #[derive(Debug, Serialize)]
-pub(crate) struct EventError<'a> {
+pub(crate) struct ErrorPayload<'a> {
     /// Numeric error code. Mirrors upstream's choice of `2` for
     /// generic agent errors and `32` for malformed init.
     pub(crate) code: u32,
@@ -186,7 +186,7 @@ mod tests {
             event: "complete",
             oid: "abc",
             path: None,
-            error: Some(EventError {
+            error: Some(ErrorPayload {
                 code: 2,
                 message: "boom",
             }),

@@ -15,7 +15,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite};
 use tracing::{debug, error, warn};
 
 use crate::lfs::agent::{self, Agent, AgentError};
-use crate::lfs::protocol::{Event, EventError, InitEvent, InitResponse};
+use crate::lfs::protocol::{ErrorPayload, Event, InitEvent, InitResponse};
 use crate::object_store::ObjectStore;
 use crate::protocol::backend;
 use crate::url;
@@ -246,7 +246,7 @@ async fn write_init_ack<W: AsyncWrite + Unpin>(
     error_msg: Option<&str>,
 ) -> Result<(), RunError> {
     let resp = InitResponse {
-        error: error_msg.map(|m| EventError {
+        error: error_msg.map(|m| ErrorPayload {
             code: 32,
             message: m,
         }),
