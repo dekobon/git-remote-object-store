@@ -146,12 +146,16 @@ LRU, 64 MiB by default) amortises index downloads across many
 
 ### Accelerated clones (`bundle-uri`)
 
-When `?bundle_uri=1` is set, the helper advertises the baseline
-bundle's URL during `git clone` so git fetches it in parallel with
-the helper-protocol negotiation. The creation token is the chain's
-`full_at` SHA, so a cached baseline is reused across clones until the
-next force-push or compaction. See [Getting started §10](getting-started.md#10-bundle-uri-accelerated-clones)
-for public-bucket vs presigned-URL details.
+`bundle-uri` is a git protocol capability that lets the server tell
+`git clone` "fetch this baseline pack directly from <URL>" — git
+downloads it from object storage (or a CDN) in parallel with the
+helper-protocol negotiation, skipping the chain walk. With
+`?bundle_uri=1` set, the helper advertises the baseline pack's URL
+per ref; the creation token is the chain's `full_at` SHA, so a cached
+baseline is reused across clones until the next force-push or
+`compact`. See [Getting started §10](getting-started.md#10-bundle-uri--faster-git-clone-for-large-repos)
+for when to enable it, public-bucket vs private-bucket setup, and
+the security trade-offs of emitting presigned URLs.
 
 ## Switching engines
 

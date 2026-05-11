@@ -17,7 +17,7 @@ that skip cloud accounts entirely.
 - [7. Git LFS](#7-git-lfs)
 - [8. Management CLI](#8-management-cli)
 - [9. Garbage collection](#9-garbage-collection)
-- [10. Bundle URI (accelerated clones)](#10-bundle-uri-accelerated-clones)
+- [10. Bundle URI — faster `git clone` for large repos](#10-bundle-uri--faster-git-clone-for-large-repos)
 - [11. Troubleshooting](#11-troubleshooting)
 
 ## 1. Install
@@ -305,8 +305,8 @@ Query-string flags:
 | `region=<REGION>`          | S3       | Override SigV4 region                                   |
 | `addressing=path\|virtual` | Both     | Force the addressing style (auto-detected by default)   |
 | `zip=1`                    | Both     | Mirror each push as `repo.zip` (AWS CodePipeline input) |
-| `bundle_uri=1`             | Both     | Advertise the baseline bundle for accelerated clones (packchain only — see §10) |
-| `bundle_uri_presign_ttl=<SECONDS>` | Both | Sign `bundle_uri` URLs for private buckets (see §10) |
+| `bundle_uri=1`             | Both     | Tell `git clone` to download the baseline pack directly from the bucket/CDN in parallel with the helper, skipping the chain walk (packchain only — see §10) |
+| `bundle_uri_presign_ttl=<SECONDS>` | Both | Needed for `bundle_uri=1` to actually work on private buckets: TTL of the presigned per-ref URL the helper emits (see §10) |
 
 The complete grammar lives in the URL parser (`src/url.rs`); the
 table above and the scheme outline earlier in this section cover
@@ -592,22 +592,78 @@ Field meanings:
   expired. They remain on the bucket and will be considered on
   the next sweep.
 
-## 10. Bundle URI (accelerated clones)
+## 10. Bundle URI — faster `git clone` for large repos
 
-Packchain remotes (see [storage-engines.md](storage-engines.md))
-can advertise the git remote-helper `bundle-uri` capability so
-`git clone` fetches the baseline bundle directly from the bucket
-(or a CDN in front of it) in parallel with the helper protocol
-negotiating the incremental tail. The clone path takes one round
-trip per ref instead of walking the full chain. Issues #71 / #76.
+### What it is
 
-Opt in with `?bundle_uri=1`:
+`bundle-uri` is a [git protocol capability](https://git-scm.com/docs/bundle-uri):
+at the start of a clone, the server can tell git "before you ask me
+for objects, download these pre-packaged bundle files from this URL."
+Git fetches them in parallel with the normal protocol negotiation,
+unpacks them locally, and then asks the server only for whatever the
+bundles didn't already cover.
+
+This crate's `packchain` engine stores every push as an immutable
+content-addressed pack. Without `bundle-uri`, a fresh `git clone` has
+to walk the chain of `chain.json` links through the helper protocol
+to discover which packs to download. With `bundle-uri`, the helper
+tells git the direct URL of the baseline pack up front, git pulls it
+straight from object storage (or a CDN), and the helper protocol is
+left to negotiate only the incremental tail since the baseline.
+
+The "URI" in the name is literal: the helper emits one URL per ref
+on stdout, and git fetches them.
+
+### When to enable it
+
+Turn it on when **at least one** of these is true:
+
+- **The repo is large enough that the baseline pack is the
+  bottleneck.** Pulling hundreds of MB directly from S3 / Azure /
+  CDN — in parallel, with HTTP keep-alive, no per-object round
+  trip — is typically much faster than walking the chain over the
+  helper protocol.
+- **You clone often** (CI fleets, ephemeral dev environments). Each
+  runner caches the bundle by `creationToken` (the chain's `full_at`
+  SHA) and skips re-downloading it until the next force-push or
+  `compact` advances the baseline.
+- **The bucket is fronted by a CDN.** For public-read buckets the
+  helper emits the canonical bucket URL, so a CloudFront / Azure
+  Front Door / Fastly cache in front of the bucket transparently
+  absorbs the load.
+
+### When to leave it off (the default)
+
+- **Small repos.** The baseline fits in one or two round trips
+  anyway; the setup overhead won't pay for itself.
+- **`bundle`-engine remotes.** The baseline filename rotates on
+  every push, so there is no stable URL to advertise. The flag is
+  silently ignored — see [storage-engines.md](storage-engines.md).
+- **Private buckets where the helper's stdout could leak.** Enabling
+  it on a private bucket means emitting a time-limited presigned
+  URL on stdout. Anyone who reads the git transcript (verbose CI
+  logs, `git -c transfer.verbosity=2`, a captured `git remote -v`)
+  can fetch the baseline until the URL expires. See the security
+  notes below.
+- **Azure with Entra-ID-only credentials.** Per-blob presigning
+  requires a shared account key; the token-credential and
+  SAS-env-var paths cannot sign per-blob. The entry is warn-and-
+  skipped and the client falls back to the normal helper protocol
+  fetch (correct, just not accelerated).
+
+Enabling `bundle_uri=1` and failing to produce a URL is never fatal:
+the helper logs a warning, omits that ref's entry, and the client
+falls back to the regular helper-protocol fetch path.
+
+### Enabling it
+
+Opt in with `?bundle_uri=1` on a `packchain` remote:
 
 ```bash
 git clone 's3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=packchain&bundle_uri=1'
 ```
 
-The helper emits one entry per ref:
+The helper advertises one entry per ref:
 
 ```text
 bundle.<ref>.uri=<url>
@@ -642,14 +698,14 @@ AZSTORE_PROD_KEY=<base64-key> \
   git clone 'az+https://acme.blob.core.windows.net/repo?engine=packchain&bundle_uri=1&bundle_uri_presign_ttl=3600&credential=PROD'
 ```
 
-### Trade-offs and operator security notes
+### Security notes for private buckets
 
 - **URL leakage**: anyone who reads the helper's stdout (e.g.
   `git -c transfer.verbosity=2`, CI log captures, `git remote
   -v` after the clone if the URL is persisted) sees the
   presigned URL. Choose `presign_ttl` shorter than your log
   retention if that matters.
-- **Server-side signing only**: the helper signs the URL itself;
+- **No credentials on the wire**: the helper signs the URL itself;
   no credential material is emitted on stdout. The signed URL is
   derived from the credentials but does not contain them.
 - **Azure credentials**: presigning requires a shared account
