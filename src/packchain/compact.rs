@@ -195,7 +195,7 @@ pub(crate) async fn compact(
     // Mirror push.rs's "try / always release" pattern: run work, drop
     // the lock unconditionally, then surface either error. The
     // heartbeat task owned by `guard` (issue #118) refreshes the lock
-    // every `opts.lock_ttl / 2` so a long-running compact cannot be
+    // every `opts.lock_ttl / 3` so a long-running compact cannot be
     // stolen by a concurrent acquirer that wakes up after the original
     // TTL elapses.
     let result = compact_under_lock(store.as_ref(), prefix, ref_name).await;
@@ -224,12 +224,27 @@ pub(crate) async fn compact(
         }
         _ => {}
     }
-    let mut outcome = result?;
-    // Fill in pre-lock fields that compact_under_lock didn't have
-    // visibility into.
-    outcome.prior_segments = prior_segments;
-    outcome.prior_bytes = prior_bytes;
-    Ok(outcome)
+    let lock_outcome = result?;
+    // Join the pre-lock snapshot (prior_*) with the under-lock work
+    // result. `compact_under_lock` cannot observe `prior_*` without
+    // duplicating the pre-lock chain read, so it returns only the
+    // post-commit data and `compact` stitches the full outcome here.
+    Ok(CompactOutcome {
+        action: CompactAction::Compacted,
+        ref_path: ref_name.as_str().to_owned(),
+        prior_segments,
+        prior_bytes,
+        new_pack_sha: Some(lock_outcome.new_pack_sha),
+        new_pack_bytes: lock_outcome.new_pack_bytes,
+    })
+}
+
+/// Post-commit data produced by [`compact_under_lock`]. The pre-lock
+/// `prior_*` fields are joined in by [`compact`] which holds the
+/// pre-lock chain snapshot.
+struct CompactUnderLockOutcome {
+    new_pack_sha: String,
+    new_pack_bytes: u64,
 }
 
 /// Lock-protected body of [`compact`]: re-read chain, install
@@ -238,7 +253,7 @@ async fn compact_under_lock(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
     ref_name: &RefName,
-) -> Result<CompactOutcome, PackchainError> {
+) -> Result<CompactUnderLockOutcome, PackchainError> {
     // Re-read chain under lock. A pre-lock observation could be
     // stale (concurrent push between heuristic check and lock).
     let chain =
@@ -407,15 +422,8 @@ async fn compact_under_lock(
         "compact: chain rewritten to single segment",
     );
 
-    Ok(CompactOutcome {
-        action: CompactAction::Compacted,
-        ref_path: ref_name.as_str().to_owned(),
-        // prior_* are filled in by the public `compact` after this
-        // function returns (it has the snapshot from before the
-        // lock was taken).
-        prior_segments: 0,
-        prior_bytes: 0,
-        new_pack_sha: Some(new_pack.content_sha.as_str().to_owned()),
+    Ok(CompactUnderLockOutcome {
+        new_pack_sha: new_pack.content_sha.as_str().to_owned(),
         new_pack_bytes: new_pack.pack_bytes,
     })
 }

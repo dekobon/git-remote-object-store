@@ -274,7 +274,10 @@ async fn push_with_held_lock_returns_contention_error() {
     result.expect("push should produce a refusal");
     let text = std::str::from_utf8(&out).unwrap();
     assert!(text.contains("failed to acquire ref lock"), "got {text:?}");
-    // Lock untouched (not ours to release).
+    // Wire envelope: the trailing `"?` suffix is what git interprets
+    // as "stop pushing this ref but don't abort the helper" — a
+    // regression that drops it makes the error fatal (lessons #4-5).
+    assert!(text.ends_with("\"?\n\n"), "wire envelope dropped: {text:?}");
     assert!(store.contains("repo/refs/heads/main/LOCK#.lock"));
 }
 
@@ -435,6 +438,7 @@ async fn delete_missing_remote_ref_emits_not_found() {
     result.expect("delete should produce a refusal");
     let text = std::str::from_utf8(&out).unwrap();
     assert!(text.contains("not found"), "got {text:?}");
+    assert!(text.ends_with("\"?\n\n"), "wire envelope dropped: {text:?}");
 }
 
 #[tokio::test]
@@ -493,6 +497,7 @@ async fn nonexistent_local_ref_emits_error() {
     result.expect("missing local ref should produce a refusal, not abort");
     let text = std::str::from_utf8(&out).unwrap();
     assert!(text.contains("not found"), "got {text:?}");
+    assert!(text.ends_with("\"?\n\n"), "wire envelope dropped: {text:?}");
 }
 
 #[tokio::test]

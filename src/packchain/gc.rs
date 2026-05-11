@@ -509,6 +509,11 @@ fn tombstone_key(prefix: &str, run_id: &str, marked_at: &str) -> String {
 /// Robust check that `key` is a tombstone under our prefix. Guards
 /// against unrelated `.json` files in `<prefix>/gc/` and against a
 /// regression where a future schema rev moves the prefix.
+///
+/// Root-prefix (`prefix == ""`) case: `expected_prefix` is just
+/// `"gc/tombstones-"`, so every `gc/tombstones-*.json` key at the
+/// bucket root matches. That is the intended behaviour — a root
+/// repo owns the entire `gc/` namespace.
 fn is_tombstone_key(key: &str, prefix: &str) -> bool {
     let expected_prefix = keys::join(Some(prefix), "gc/tombstones-");
     key.starts_with(&expected_prefix)

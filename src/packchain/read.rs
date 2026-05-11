@@ -332,9 +332,12 @@ pub async fn read_blob(
     let remote_ref = RefName::new(ref_name).map_err(|_| PackchainError::InvalidRefName {
         name: ref_name.to_owned(),
     })?;
-    // `Remote::prefix()` borrows from `remote`, which outlives this
-    // function — no need to own the bytes.
-    let prefix_opt = Some(remote.prefix());
+    // `Remote::prefix()` returns `""` for bucket-root remotes; the
+    // engine-wide convention (post-#103) is `None` for "no prefix"
+    // and `Some(non-empty)` otherwise. Normalise here so cache keys
+    // and any downstream `Some(p) if !p.is_empty()` matches agree
+    // with the rest of the codebase.
+    let prefix_opt = (!remote.prefix().is_empty()).then(|| remote.prefix());
 
     let chain = load_chain(remote.store(), prefix_opt, &remote_ref)
         .await?
@@ -529,7 +532,7 @@ async fn read_object_from_chain(
     // `decode_entry` directly without coming back via this function
     // (issue #83).
     for segment in segments {
-        let content_sha = pack_content_sha(segment)?;
+        let content_sha = super::keys::segment_pack_sha(segment)?;
         let idx = load_index(store, prefix, &content_sha, cache).await?;
         let Some(entry_index) = idx.file.lookup(target_oid) else {
             continue;
@@ -555,13 +558,6 @@ async fn read_object_from_chain(
         sha: target_oid.to_string(),
         path: String::new(),
     })
-}
-
-/// Extract the content SHA from a chain segment. Thin wrapper over
-/// the shared [`super::keys::segment_pack_sha`] for the `read_blob`
-/// pack-decode path.
-fn pack_content_sha(segment: &ChainSegment) -> Result<Sha40, PackchainError> {
-    super::keys::segment_pack_sha(segment)
 }
 
 async fn load_index(
@@ -1126,42 +1122,6 @@ mod tests {
         let segs = parse_path("Cargo.toml/extra").unwrap();
         let err = walk_path(&tree, &segs, "refs/heads/main", "Cargo.toml/extra").unwrap_err();
         assert!(matches!(err, PackchainError::PathNotFound { .. }));
-    }
-
-    #[test]
-    fn pack_content_sha_strips_prefix_and_extension() {
-        let segment = ChainSegment {
-            sha: sha40(SHA_A),
-            parent_sha: None,
-            pack: format!("acme/repo/packs/{SHA_C}.pack"),
-            bytes: 4_096,
-        };
-        let sha = pack_content_sha(&segment).unwrap();
-        assert_eq!(sha.as_str(), SHA_C);
-    }
-
-    #[test]
-    fn pack_content_sha_handles_no_prefix() {
-        let segment = ChainSegment {
-            sha: sha40(SHA_A),
-            parent_sha: None,
-            pack: format!("packs/{SHA_C}.pack"),
-            bytes: 4_096,
-        };
-        let sha = pack_content_sha(&segment).unwrap();
-        assert_eq!(sha.as_str(), SHA_C);
-    }
-
-    #[test]
-    fn pack_content_sha_rejects_missing_extension() {
-        let segment = ChainSegment {
-            sha: sha40(SHA_A),
-            parent_sha: None,
-            pack: format!("packs/{SHA_C}"),
-            bytes: 4_096,
-        };
-        let err = pack_content_sha(&segment).unwrap_err();
-        assert!(matches!(err, PackchainError::MalformedPackEntry { .. }));
     }
 
     #[test]

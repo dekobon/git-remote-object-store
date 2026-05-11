@@ -259,4 +259,19 @@ mod tests {
         // Non-hex character in sha.
         assert!(sha_from_pack_key("packs/zbcdef0123456789abcdef0123456789abcdef01.pack").is_none());
     }
+
+    #[test]
+    fn segment_pack_sha_maps_malformed_to_malformed_pack_entry() {
+        let segment = super::super::schema::ChainSegment {
+            sha: Sha40::try_new(SHA).unwrap(),
+            parent_sha: None,
+            pack: format!("packs/{SHA}"),
+            bytes: 4_096,
+        };
+        let err = segment_pack_sha(&segment).unwrap_err();
+        assert!(
+            matches!(err, PackchainError::MalformedPackEntry { offset: 0, .. }),
+            "expected MalformedPackEntry, got {err:?}",
+        );
+    }
 }

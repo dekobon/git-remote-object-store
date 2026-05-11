@@ -345,6 +345,14 @@ impl LockGuard {
     /// raced a stale-recovery delete, or an operator may have cleared
     /// the lock manually); every other delete failure is propagated.
     pub(crate) async fn release(mut self) -> Result<(), ObjectStoreError> {
+        // ORDER IS LOAD-BEARING: abort the heartbeat BEFORE deleting
+        // the lock key. The reverse order would let the heartbeat tick
+        // between the delete and the abort (on multi-threaded runtimes
+        // or any future yield in `delete_idempotent`) and re-create the
+        // key after we removed it, leaving an orphaned lock. The single-
+        // threaded paused-clock test runtime makes this ordering
+        // invariant-by-construction, so it cannot be asserted at
+        // runtime — it is enforced here by the source order.
         self.stop_heartbeat();
         delete_idempotent(self.store.as_ref(), &self.lock_key).await
     }
