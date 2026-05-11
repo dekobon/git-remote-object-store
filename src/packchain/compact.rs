@@ -44,7 +44,7 @@ use crate::protocol::push::{acquire_lock, lock_key, release_lock};
 use super::PackchainError;
 use super::audit::{COMPACT_BYTES_THRESHOLD, COMPACT_SEGMENTS_THRESHOLD};
 use super::fetch::install_pack;
-use super::keys::{pack_idx_key, pack_key, packs_key_with_prefix};
+use super::keys::{pack_idx_key, pack_key, pack_key_from_relative};
 use super::manifest::{load_chain, write_chain, write_path_index};
 use super::pack::build_baseline_pack;
 use super::schema::{ChainManifest, ChainSegment};
@@ -430,17 +430,17 @@ async fn download_chain_artefacts(
     // Validate every segment's bucket-relative pack key before
     // composing GET keys. `ChainSegment::pack` deserialises as a
     // plain `String` with no format check, so a crafted chain.json
-    // could otherwise drive `packs_key_with_prefix` to request an
+    // could otherwise drive `pack_key_from_relative` to request an
     // arbitrary bucket key. Mirror the same guard `gc.rs`, `read.rs`,
     // and `fetch.rs` apply (issue #120). The local destination name
     // keeps `seg.sha` (commit SHA at the segment tip) to match the
-    // install step's filename convention — `parse_pack_key_sha`'s
+    // install step's filename convention — `sha_from_pack_key`'s
     // output is the pack content SHA, a different identifier.
     let mut tasks: Vec<DownloadTask> = chain
         .segments
         .iter()
         .map(|seg| {
-            super::keys::parse_pack_key_sha(&seg.pack).ok_or_else(|| {
+            super::keys::sha_from_pack_key(&seg.pack).ok_or_else(|| {
                 PackchainError::MalformedPackEntry {
                     offset: 0,
                     reason: format!(
@@ -450,7 +450,7 @@ async fn download_chain_artefacts(
                 }
             })?;
             Ok::<_, PackchainError>(DownloadTask {
-                key: packs_key_with_prefix(prefix, &seg.pack),
+                key: pack_key_from_relative(prefix, &seg.pack),
                 dest: download_dir.join(format!("{}.pack", seg.sha.as_str())),
                 kind: "pack",
             })

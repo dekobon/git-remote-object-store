@@ -69,12 +69,12 @@ impl<'a> ManageBranch<'a> {
     }
 
     fn branch_prefix(&self) -> String {
-        keys::join(&self.prefix, &format!("refs/heads/{}/", self.branch))
+        keys::join(Some(&self.prefix), &format!("refs/heads/{}/", self.branch))
     }
 
     fn protected_key(&self) -> String {
         keys::join(
-            &self.prefix,
+            Some(&self.prefix),
             &format!(
                 "refs/heads/{}/{}",
                 self.branch,

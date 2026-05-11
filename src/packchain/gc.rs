@@ -467,8 +467,8 @@ async fn sweep_one_tombstone(
             );
             continue;
         }
-        let pack_key = super::keys::pack_key(super::keys::optional_prefix(prefix), sha);
-        let idx_key = super::keys::pack_idx_key(super::keys::optional_prefix(prefix), sha);
+        let pack_key = super::keys::pack_key(Some(prefix), sha);
+        let idx_key = super::keys::pack_idx_key(Some(prefix), sha);
         if delete_idempotent(store, &pack_key).await? {
             deleted_objects += 1;
         }
@@ -494,20 +494,23 @@ async fn sweep_one_tombstone(
 /// `<prefix>/gc/` prefix for [`ObjectStore::list`]. Empty `prefix`
 /// drops the leading slash (matches the project's bucket-root rule).
 fn gc_listing_prefix(prefix: &str) -> String {
-    keys::join(prefix, "gc/")
+    keys::join(Some(prefix), "gc/")
 }
 
 /// Build a tombstone key. The `marked_at` segment may contain `:`
 /// characters; S3 / Azure both accept colons in keys.
 fn tombstone_key(prefix: &str, run_id: &str, marked_at: &str) -> String {
-    keys::join(prefix, &format!("gc/tombstones-{run_id}-{marked_at}.json"))
+    keys::join(
+        Some(prefix),
+        &format!("gc/tombstones-{run_id}-{marked_at}.json"),
+    )
 }
 
 /// Robust check that `key` is a tombstone under our prefix. Guards
 /// against unrelated `.json` files in `<prefix>/gc/` and against a
 /// regression where a future schema rev moves the prefix.
 fn is_tombstone_key(key: &str, prefix: &str) -> bool {
-    let expected_prefix = keys::join(prefix, "gc/tombstones-");
+    let expected_prefix = keys::join(Some(prefix), "gc/tombstones-");
     key.starts_with(&expected_prefix)
 }
 
@@ -519,7 +522,7 @@ async fn list_referenced_packs(
     store: &dyn ObjectStore,
     prefix: &str,
 ) -> Result<HashSet<Sha40>, PackchainError> {
-    let refs_prefix = keys::join(prefix, "refs/");
+    let refs_prefix = keys::join(Some(prefix), "refs/");
     let metas = store.list(&refs_prefix).await?;
 
     // Bounded-parallel `get_bytes` per chain.json, parse-as-fetched.
@@ -552,7 +555,7 @@ async fn list_referenced_packs(
             // `serde::de::Error::custom` is the canonical way to mint
             // a `serde_json::Error` with a custom message — the type
             // has no public direct constructor.
-            let sha = super::keys::parse_pack_key_sha(&segment.pack).ok_or_else(|| {
+            let sha = super::keys::sha_from_pack_key(&segment.pack).ok_or_else(|| {
                 PackchainError::ParseJson(serde::de::Error::custom(format!(
                     "chain segment pack key `{}` lacks `.pack` suffix",
                     segment.pack,
@@ -572,7 +575,7 @@ async fn list_pack_shas(
     store: &dyn ObjectStore,
     prefix: &str,
 ) -> Result<HashSet<Sha40>, PackchainError> {
-    let packs_prefix = keys::join(prefix, "packs/");
+    let packs_prefix = keys::join(Some(prefix), "packs/");
     let metas = store.list(&packs_prefix).await?;
     let mut shas: HashSet<Sha40> = HashSet::new();
     for meta in metas {

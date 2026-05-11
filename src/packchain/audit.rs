@@ -22,7 +22,7 @@ use crate::object_store::{ObjectMeta, ObjectStore};
 
 use super::PackchainError;
 use super::gc::Tombstone;
-use super::keys::{is_chain_json_key, parse_pack_key_sha, ref_path_from_chain_key};
+use super::keys::{is_chain_json_key, ref_path_from_chain_key, sha_from_pack_key};
 use super::schema::{ChainManifest, Sha40};
 
 /// Segment-count threshold above which a branch is flagged as a
@@ -147,7 +147,7 @@ pub(crate) async fn audit(
     let referenced: HashSet<Sha40> = chains
         .iter()
         .flat_map(|(_, chain)| chain.segments.iter())
-        .filter_map(|s| parse_pack_key_sha(&s.pack))
+        .filter_map(|s| sha_from_pack_key(&s.pack))
         .collect();
 
     let orphans = pack_metas
@@ -217,7 +217,7 @@ fn audit_branch(ref_path: &str, chain: &ChainManifest) -> BranchRow {
 /// keyed by the parsed [`Sha40`], not by the full bucket key, so
 /// each segment lookup is a single hash probe with no allocation.
 fn pack_present(pack_field: &str, pack_metas: &HashMap<Sha40, ObjectMeta>) -> bool {
-    parse_pack_key_sha(pack_field).is_some_and(|sha| pack_metas.contains_key(&sha))
+    sha_from_pack_key(pack_field).is_some_and(|sha| pack_metas.contains_key(&sha))
 }
 
 /// Filter the supplied listing for chain.json keys, fetch each
@@ -230,9 +230,7 @@ async fn load_chains(
 ) -> Result<Vec<(String, ChainManifest)>, PackchainError> {
     let mut out: Vec<(String, ChainManifest)> = Vec::new();
     for meta in objects.iter().filter(|m| is_chain_json_key(&m.key)) {
-        let Some(ref_path) =
-            ref_path_from_chain_key(super::keys::optional_prefix(prefix), &meta.key)
-        else {
+        let Some(ref_path) = ref_path_from_chain_key(Some(prefix), &meta.key) else {
             warn!(key = %meta.key, "audit: chain.json key has unexpected shape; skipping");
             continue;
         };
@@ -280,7 +278,7 @@ async fn load_chains(
 /// and malformed names are dropped silently. Returns a [`HashMap`]
 /// for cheap orphan-set derivation downstream.
 fn pack_metas_from_objects(prefix: &str, objects: &[ObjectMeta]) -> HashMap<Sha40, ObjectMeta> {
-    let packs_prefix = keys::join(prefix, "packs/");
+    let packs_prefix = keys::join(Some(prefix), "packs/");
     let mut out: HashMap<Sha40, ObjectMeta> = HashMap::new();
     for meta in objects {
         if !meta.key.starts_with(&packs_prefix) {
@@ -361,7 +359,7 @@ async fn load_tombstones(
 /// caller separately filters on `.json` before invoking the prefix
 /// check, so the two callers reach the same effective acceptance set.
 fn is_tombstone_key(key: &str, prefix: &str) -> bool {
-    let expected = keys::join(prefix, "gc/tombstones-");
+    let expected = keys::join(Some(prefix), "gc/tombstones-");
     key.starts_with(&expected) && key.as_bytes().ends_with(b".json")
 }
 
@@ -425,7 +423,7 @@ mod tests {
     /// `audit` against it. Mirrors the doctor's "list once, audit
     /// from listing" flow so tests exercise the same code path.
     async fn audit_test(store: &MockStore, prefix: &str) -> AuditReport {
-        let list_prefix = crate::keys::join(prefix, "");
+        let list_prefix = crate::keys::join(Some(prefix), "");
         let objects = store.list(&list_prefix).await.unwrap();
         audit(store, prefix, &objects).await.unwrap()
     }

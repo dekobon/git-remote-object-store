@@ -143,7 +143,7 @@ async fn read_remote_head(
 ) -> Result<Option<String>, ObjectStoreError> {
     // `Some("")` collapses to "no prefix" — same shape as `None` — so a
     // root-of-bucket repo lists `HEAD` rather than `/HEAD`.
-    let key = keys::join(prefix.unwrap_or(""), "HEAD");
+    let key = keys::join(prefix, "HEAD");
     let body = match store.get_bytes(&key).await {
         Ok(body) => body,
         Err(ObjectStoreError::NotFound(_)) => return Ok(None),

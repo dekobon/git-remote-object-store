@@ -69,7 +69,7 @@ pub(crate) async fn list_refs(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
 ) -> Result<Vec<ChainRef>, PackchainError> {
-    let refs_prefix = keys::join(prefix.unwrap_or(""), "refs/");
+    let refs_prefix = keys::join(prefix, "refs/");
     let metas = store.list(&refs_prefix).await?;
 
     // Two-phase: first filter and validate ref names synchronously,

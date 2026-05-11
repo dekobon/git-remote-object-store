@@ -127,7 +127,7 @@ impl<'a> Doctor<'a> {
         // audit, and stale-lock scanning so a doctor run is a single
         // bucket walk regardless of repo size. Empty `prefix`
         // (root-of-bucket repo) collapses to a bucket-wide list.
-        let list_prefix = keys::join(&self.prefix, "");
+        let list_prefix = keys::join(Some(&self.prefix), "");
         let objects = self.store.list(&list_prefix).await?;
         let mut snapshot = analyze_objects(&objects, &list_prefix, &self.store).await?;
         write!(out, "{}", self.report(&snapshot))?;
@@ -366,7 +366,7 @@ impl<'a> Doctor<'a> {
             })?
             .to_owned();
 
-        let head_key = keys::join(&self.prefix, "HEAD");
+        let head_key = keys::join(Some(&self.prefix), "HEAD");
         writeln!(out, "Setting {new_head} as HEAD")?;
         self.store
             .put_bytes(&head_key, Bytes::from(new_head.clone()), PutOpts::default())

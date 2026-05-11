@@ -190,7 +190,7 @@ pub(crate) fn parse_push_args(args: &str) -> Result<PushSpec, PushError> {
 /// Build the `<prefix>/<ref>/` listing prefix used by lock and bundle
 /// listings. Empty / absent prefix collapses to a bare `<ref>/`.
 pub(crate) fn ref_listing_prefix(prefix: Option<&str>, remote_ref: &RefName) -> String {
-    keys::join(prefix.unwrap_or(""), &format!("{remote_ref}/"))
+    keys::join(prefix, &format!("{remote_ref}/"))
 }
 
 /// Build the lock key: `<prefix>/<ref>/LOCK#.lock`.
@@ -205,7 +205,7 @@ fn archive_key(prefix: Option<&str>, remote_ref: &RefName) -> String {
 
 /// Build the HEAD key: `<prefix>/HEAD` (no slash when prefix is absent).
 pub(crate) fn head_key(prefix: Option<&str>) -> String {
-    keys::join(prefix.unwrap_or(""), "HEAD")
+    keys::join(prefix, "HEAD")
 }
 
 /// Bundle-candidate filter: positive predicate — the final path segment
@@ -793,7 +793,7 @@ async fn perform_push_under_lock(
     // so the one that loses is a no-op. The boolean result is intentionally
     // ignored: an existing FORMAT key was already validated at connect time by
     // `backend::build`.
-    let format_key = keys::join(prefix.unwrap_or(""), "FORMAT");
+    let format_key = keys::join(prefix, "FORMAT");
     store
         .put_if_absent(&format_key, Bytes::from_static(engine.as_str().as_bytes()))
         .await?;

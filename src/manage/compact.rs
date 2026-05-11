@@ -181,7 +181,7 @@ impl<'a> Compact<'a> {
     /// Walk the bucket once and derive the audit report we use for
     /// candidate selection. Mirrors the doctor's audit flow.
     async fn audit_for_compaction_candidates(&self) -> Result<AuditReport, ManageError> {
-        let list_prefix = keys::join(&self.prefix, "");
+        let list_prefix = keys::join(Some(&self.prefix), "");
         let objects = self.store.list(&list_prefix).await?;
         audit::audit(self.store.as_ref(), &self.prefix, &objects)
             .await

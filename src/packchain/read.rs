@@ -47,7 +47,7 @@ use crate::remote::Remote;
 use crate::url::StorageEngine;
 
 use super::PackchainError;
-use super::keys::{optional_prefix, pack_idx_key, pack_key, parse_pack_key_sha};
+use super::keys::{pack_idx_key, pack_key, sha_from_pack_key};
 use super::manifest::{load_chain, load_path_index};
 use super::schema::{ChainSegment, PathNode, Sha40};
 
@@ -334,7 +334,7 @@ pub async fn read_blob(
     })?;
     // `Remote::prefix()` borrows from `remote`, which outlives this
     // function — no need to own the bytes.
-    let prefix_opt = optional_prefix(remote.prefix());
+    let prefix_opt = Some(remote.prefix());
 
     let chain = load_chain(remote.store(), prefix_opt, &remote_ref)
         .await?
@@ -558,11 +558,11 @@ async fn read_object_from_chain(
 }
 
 /// Extract the content SHA from a chain segment, wrapping the
-/// shared [`parse_pack_key_sha`] result into the
+/// shared [`sha_from_pack_key`] result into the
 /// [`PackchainError::MalformedPackEntry`] variant `read_blob`'s
 /// error contract uses for pack-decode failures.
 fn pack_content_sha(segment: &ChainSegment) -> Result<Sha40, PackchainError> {
-    parse_pack_key_sha(&segment.pack).ok_or_else(|| PackchainError::MalformedPackEntry {
+    sha_from_pack_key(&segment.pack).ok_or_else(|| PackchainError::MalformedPackEntry {
         offset: 0,
         reason: format!(
             "chain segment pack key `{}` lacks `.pack` suffix",

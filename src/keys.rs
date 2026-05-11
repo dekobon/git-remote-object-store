@@ -34,22 +34,25 @@ pub(crate) fn is_protected_marker_segment(last_segment: &str) -> bool {
 }
 
 /// Join `prefix` and `suffix` with a single `/`, omitting both the
-/// separator and the prefix entirely when `prefix` is empty.
+/// separator and the prefix entirely when `prefix` is absent or empty.
 ///
 /// `suffix` is taken verbatim — pass `""` to obtain a `<prefix>/`
 /// listing prefix (or `""` for root), `"HEAD"` for the head object,
 /// `"refs/heads/<branch>/"` for a branch listing, and so on.
 ///
-/// Callers who carry the prefix as `Option<&str>` should pass
-/// `prefix.unwrap_or("")`. `Some("")` and `None` collapse to the same
-/// "no prefix" key shape.
-pub(crate) fn join(prefix: &str, suffix: &str) -> String {
-    if prefix.is_empty() {
-        suffix.to_owned()
-    } else if suffix.is_empty() {
-        format!("{prefix}/")
-    } else {
-        format!("{prefix}/{suffix}")
+/// `None` and `Some("")` collapse to the same "no prefix" key shape.
+/// Callers that hold the prefix as `&str` should pass `Some(prefix)`;
+/// the empty-string check inside keeps the bucket-root case working.
+pub(crate) fn join(prefix: Option<&str>, suffix: &str) -> String {
+    match prefix {
+        Some(p) if !p.is_empty() => {
+            if suffix.is_empty() {
+                format!("{p}/")
+            } else {
+                format!("{p}/{suffix}")
+            }
+        }
+        _ => suffix.to_owned(),
     }
 }
 
@@ -86,28 +89,31 @@ mod tests {
 
     #[test]
     fn joins_prefix_and_suffix_with_slash() {
-        assert_eq!(join("acme", "HEAD"), "acme/HEAD");
+        assert_eq!(join(Some("acme"), "HEAD"), "acme/HEAD");
         assert_eq!(
-            join("acme/repo", "refs/heads/main/"),
+            join(Some("acme/repo"), "refs/heads/main/"),
             "acme/repo/refs/heads/main/"
         );
     }
 
     #[test]
     fn empty_prefix_yields_suffix_verbatim() {
-        assert_eq!(join("", "HEAD"), "HEAD");
-        assert_eq!(join("", "refs/heads/main/"), "refs/heads/main/");
+        assert_eq!(join(Some(""), "HEAD"), "HEAD");
+        assert_eq!(join(None, "HEAD"), "HEAD");
+        assert_eq!(join(Some(""), "refs/heads/main/"), "refs/heads/main/");
+        assert_eq!(join(None, "refs/heads/main/"), "refs/heads/main/");
     }
 
     #[test]
     fn empty_suffix_yields_listing_prefix_with_trailing_slash() {
-        assert_eq!(join("acme", ""), "acme/");
+        assert_eq!(join(Some("acme"), ""), "acme/");
     }
 
     #[test]
     fn empty_prefix_and_suffix_yields_empty_string() {
         // Listing the bucket root with no prefix at all.
-        assert_eq!(join("", ""), "");
+        assert_eq!(join(Some(""), ""), "");
+        assert_eq!(join(None, ""), "");
     }
 
     #[test]

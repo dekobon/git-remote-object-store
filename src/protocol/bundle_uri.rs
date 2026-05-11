@@ -192,10 +192,10 @@ async fn collect_entries(
     store: &dyn ObjectStore,
     prefix: &str,
 ) -> Result<Vec<BundleEntry>, PackchainError> {
-    let refs_prefix = keys::join(prefix, "refs/heads/");
+    let refs_prefix = keys::join(Some(prefix), "refs/heads/");
     let metas = store.list(&refs_prefix).await?;
 
-    let prefix_opt = crate::packchain::keys::optional_prefix(prefix);
+    let prefix_opt = Some(prefix);
     // `metas.len()` is a tight upper bound: every kept entry is a
     // subset (chain.json keys after the `is_chain_json_key` filter).
     let mut out: Vec<BundleEntry> = Vec::with_capacity(metas.len());

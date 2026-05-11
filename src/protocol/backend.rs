@@ -217,7 +217,7 @@ pub async fn validate_format(
     prefix: &str,
     url_engine: Option<StorageEngine>,
 ) -> Result<StorageEngine, BackendError> {
-    let format_key = keys::join(prefix, "FORMAT");
+    let format_key = keys::join(Some(prefix), "FORMAT");
     let bytes = match store.get_bytes(&format_key).await {
         Ok(b) => b,
         // No FORMAT key — this is a new or legacy bucket. The engine

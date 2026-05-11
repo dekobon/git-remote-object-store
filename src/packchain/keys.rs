@@ -15,10 +15,9 @@
 //! [`crate::keys::join`] / [`crate::keys::bundle_key`]: an empty (or
 //! `None`) prefix yields a key with no leading slash.
 //!
-//! Inspectors ([`is_chain_json_key`], [`optional_prefix`],
-//! [`parse_pack_key_sha`]) live here too so callers across the
-//! engine (`gc`, `list`, `read`) don't grow drift between
-//! independent copies.
+//! Inspectors ([`is_chain_json_key`], [`sha_from_pack_key`]) live
+//! here too so callers across the engine (`gc`, `list`, `read`)
+//! don't grow drift between independent copies.
 
 use std::fmt;
 
@@ -37,26 +36,14 @@ pub(crate) fn is_chain_json_key(key: &str) -> bool {
     key.as_bytes().ends_with(CHAIN_JSON_SUFFIX)
 }
 
-/// Normalise a `&str` prefix into the `Option<&str>` shape every
-/// key builder in this module accepts. An empty string collapses
-/// to `None` (matching the bucket-root rule).
-#[must_use]
-pub(crate) fn optional_prefix(prefix: &str) -> Option<&str> {
-    if prefix.is_empty() {
-        None
-    } else {
-        Some(prefix)
-    }
-}
-
 /// Compose the full bucket key for a chain segment's pack from the
 /// prefix and the bucket-relative `pack` field stored in `chain.json`.
 /// `chain.json` records pack keys as `packs/<sha>.pack` (no leading
 /// prefix) so a chain authored with one prefix can be read with
 /// another after a `mv`-style rename.
 #[must_use]
-pub(crate) fn packs_key_with_prefix(prefix: Option<&str>, bucket_relative_pack: &str) -> String {
-    crate::keys::join(prefix.unwrap_or(""), bucket_relative_pack)
+pub(crate) fn pack_key_from_relative(prefix: Option<&str>, bucket_relative_pack: &str) -> String {
+    crate::keys::join(prefix, bucket_relative_pack)
 }
 
 /// Strip `<prefix>/` and `/chain.json` to derive the ref path.
@@ -88,7 +75,7 @@ pub(crate) fn ref_path_from_chain_key(prefix: Option<&str>, key: &str) -> Option
 /// `ParseJson` via `serde_json::Error::custom` for
 /// `gc::list_referenced_packs`).
 #[must_use]
-pub(crate) fn parse_pack_key_sha(pack: &str) -> Option<Sha40> {
+pub(crate) fn sha_from_pack_key(pack: &str) -> Option<Sha40> {
     let basename = pack.rsplit('/').next().unwrap_or(pack);
     let sha = basename.strip_suffix(".pack")?;
     Sha40::try_new(sha).ok()
@@ -240,28 +227,20 @@ mod tests {
     }
 
     #[test]
-    fn optional_prefix_collapses_empty_to_none() {
-        assert_eq!(optional_prefix(""), None);
-        assert_eq!(optional_prefix("repo"), Some("repo"));
-    }
-
-    #[test]
-    fn parse_pack_key_sha_handles_prefixed_and_unprefixed() {
-        let sha = parse_pack_key_sha(&format!("packs/{SHA}.pack")).expect("unprefixed");
+    fn sha_from_pack_key_handles_prefixed_and_unprefixed() {
+        let sha = sha_from_pack_key(&format!("packs/{SHA}.pack")).expect("unprefixed");
         assert_eq!(sha.as_str(), SHA);
-        let sha = parse_pack_key_sha(&format!("acme/repo/packs/{SHA}.pack")).expect("prefixed");
+        let sha = sha_from_pack_key(&format!("acme/repo/packs/{SHA}.pack")).expect("prefixed");
         assert_eq!(sha.as_str(), SHA);
     }
 
     #[test]
-    fn parse_pack_key_sha_returns_none_for_malformed() {
+    fn sha_from_pack_key_returns_none_for_malformed() {
         // Missing `.pack` suffix.
-        assert!(parse_pack_key_sha(&format!("packs/{SHA}")).is_none());
+        assert!(sha_from_pack_key(&format!("packs/{SHA}")).is_none());
         // Wrong-length sha (39 hex chars).
-        assert!(parse_pack_key_sha("packs/abcdef0123456789abcdef0123456789abcdef0.pack").is_none());
+        assert!(sha_from_pack_key("packs/abcdef0123456789abcdef0123456789abcdef0.pack").is_none());
         // Non-hex character in sha.
-        assert!(
-            parse_pack_key_sha("packs/zbcdef0123456789abcdef0123456789abcdef01.pack").is_none()
-        );
+        assert!(sha_from_pack_key("packs/zbcdef0123456789abcdef0123456789abcdef01.pack").is_none());
     }
 }

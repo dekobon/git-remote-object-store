@@ -72,7 +72,7 @@ impl Agent {
     /// Destination key for an LFS object: `<prefix>/lfs/<oid>` (or
     /// `lfs/<oid>` when there is no prefix).
     fn key(&self, oid: &LfsOid) -> String {
-        keys::join(&self.prefix, &format!("lfs/{oid}"))
+        keys::join(Some(&self.prefix), &format!("lfs/{oid}"))
     }
 
     /// Handle an `upload` event: skip when the key already exists,

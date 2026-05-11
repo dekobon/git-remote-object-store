@@ -116,7 +116,7 @@ impl Remote {
     /// - `remote.key("HEAD")` → `"HEAD"`
     #[must_use]
     pub fn key(&self, suffix: &str) -> String {
-        crate::keys::join(&self.prefix, suffix)
+        crate::keys::join(Some(&self.prefix), suffix)
     }
 
     /// The underlying [`ObjectStore`] for direct get/put operations.

@@ -675,7 +675,7 @@ async fn perform_push_under_lock(
 
     // 4. FORMAT bootstrap (idempotent — every push past the first is
     //    a no-op).
-    let format_key = keys::join(prefix.unwrap_or(""), "FORMAT");
+    let format_key = keys::join(prefix, "FORMAT");
     store
         .put_if_absent(&format_key, Bytes::from_static(engine.as_str().as_bytes()))
         .await?;

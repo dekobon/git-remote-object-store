@@ -96,7 +96,7 @@ pub(crate) async fn analyze(
     store: &dyn ObjectStore,
     prefix: &str,
 ) -> Result<RepoSnapshot, ManageError> {
-    let list_prefix = crate::keys::join(prefix, "");
+    let list_prefix = crate::keys::join(Some(prefix), "");
     let objects = store.list(&list_prefix).await?;
     analyze_objects(&objects, &list_prefix, store).await
 }
