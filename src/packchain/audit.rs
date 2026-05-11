@@ -40,12 +40,12 @@ pub(crate) const COMPACT_BYTES_THRESHOLD: u64 = 100 * 1_024 * 1_024;
 pub(crate) struct AuditReport {
     /// Pack files in `<prefix>/packs/` that no live chain.json
     /// references.
-    pub(crate) orphans: OrphanReport,
+    pub(crate) orphans: OrphanSummary,
     /// Tombstones currently sitting in `<prefix>/gc/`, sorted oldest
     /// first.
     pub(crate) tombstones: Vec<TombstoneRow>,
     /// Per-branch row, sorted by ref path.
-    pub(crate) branches: Vec<BranchAuditRow>,
+    pub(crate) branches: Vec<BranchRow>,
     /// chain.json segment-pack references that point at pack keys
     /// missing from the bucket. Sorted by ref path.
     pub(crate) dangling: Vec<DanglingRow>,
@@ -56,7 +56,7 @@ pub(crate) struct AuditReport {
 /// (the matching `.idx` is excluded so the total reflects
 /// recoverable storage rather than raw key count).
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct OrphanReport {
+pub(crate) struct OrphanSummary {
     /// Number of distinct orphan content-shas.
     pub(crate) pack_count: usize,
     /// Total bytes occupied by orphan `.pack` files.
@@ -86,7 +86,7 @@ pub(crate) struct TombstoneRow {
 /// distinction only matters in a corrupted chain whose `full_at` does
 /// not match any segment's `sha`.
 #[derive(Debug, Clone)]
-pub(crate) struct BranchAuditRow {
+pub(crate) struct BranchRow {
     /// Full ref path (e.g. `refs/heads/main`).
     pub(crate) ref_path: String,
     /// `chain.segments.len()`.
@@ -153,13 +153,13 @@ pub(crate) async fn audit(
     let orphans = pack_metas
         .iter()
         .filter(|(sha, _)| !referenced.contains(sha))
-        .fold(OrphanReport::default(), |mut acc, (_, meta)| {
+        .fold(OrphanSummary::default(), |mut acc, (_, meta)| {
             acc.pack_count += 1;
             acc.bytes = acc.bytes.saturating_add(meta.size);
             acc
         });
 
-    let mut branches: Vec<BranchAuditRow> = chains
+    let mut branches: Vec<BranchRow> = chains
         .iter()
         .map(|(ref_path, chain)| audit_branch(ref_path, chain))
         .collect();
@@ -192,8 +192,8 @@ pub(crate) async fn audit(
     })
 }
 
-/// Parse one branch's chain into a [`BranchAuditRow`].
-fn audit_branch(ref_path: &str, chain: &ChainManifest) -> BranchAuditRow {
+/// Parse one branch's chain into a [`BranchRow`].
+fn audit_branch(ref_path: &str, chain: &ChainManifest) -> BranchRow {
     let segments_total = chain.segments.len();
     let bytes_total = chain
         .segments
@@ -203,7 +203,7 @@ fn audit_branch(ref_path: &str, chain: &ChainManifest) -> BranchAuditRow {
     let recommend_compact =
         segments_total > COMPACT_SEGMENTS_THRESHOLD || bytes_total > COMPACT_BYTES_THRESHOLD;
     let has_full_at_segment = chain.segments.iter().any(|s| s.sha == chain.full_at);
-    BranchAuditRow {
+    BranchRow {
         ref_path: ref_path.to_owned(),
         segments_total,
         bytes_total,

@@ -29,7 +29,7 @@ use super::snapshot::{BundleEntry, RepoSnapshot, analyze_objects};
 use super::{DEFAULT_LOCK_TTL_SECONDS, ManageError, Prompter};
 use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, PutOpts};
-use crate::packchain::audit::{self, AuditReport, BranchAuditRow};
+use crate::packchain::audit::{self, AuditReport, BranchRow};
 use crate::url::StorageEngine;
 
 /// Tunables for [`Doctor::run`].
@@ -470,7 +470,7 @@ fn render_packchain_section(report: &AuditReport) -> String {
         }
     }
 
-    let candidates: Vec<&BranchAuditRow> = report
+    let candidates: Vec<&BranchRow> = report
         .branches
         .iter()
         .filter(|r| r.recommend_compact)
@@ -1037,7 +1037,7 @@ mod tests {
         // Hand-roll an `AuditReport` so the renderer's behaviour is
         // pinned without going through the live store.
         let report = AuditReport {
-            orphans: super::audit::OrphanReport::default(),
+            orphans: super::audit::OrphanSummary::default(),
             tombstones: Vec::new(),
             branches: Vec::new(),
             dangling: vec![super::audit::DanglingRow {
@@ -1089,9 +1089,9 @@ mod tests {
     #[test]
     fn render_packchain_section_compaction_candidate_is_flagged() {
         let report = AuditReport {
-            orphans: super::audit::OrphanReport::default(),
+            orphans: super::audit::OrphanSummary::default(),
             tombstones: Vec::new(),
-            branches: vec![BranchAuditRow {
+            branches: vec![BranchRow {
                 ref_path: "refs/heads/main".to_owned(),
                 segments_total: 27,
                 bytes_total: 142 * 1024 * 1024,

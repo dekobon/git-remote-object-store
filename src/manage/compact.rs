@@ -20,7 +20,7 @@ use super::{ManageError, Prompter};
 use crate::git::RefName;
 use crate::keys;
 use crate::object_store::ObjectStore;
-use crate::packchain::audit::{self, AuditReport, BranchAuditRow};
+use crate::packchain::audit::{self, AuditReport, BranchRow};
 use crate::packchain::compact::{self, CompactAction, CompactOpts, CompactOutcome};
 use crate::packchain::gc;
 use crate::protocol::push::lock_ttl_from_env;
@@ -146,7 +146,7 @@ impl<'a> Compact<'a> {
         }
 
         let report = self.audit_for_compaction_candidates().await?;
-        let candidates: Vec<&BranchAuditRow> = report
+        let candidates: Vec<&BranchRow> = report
             .branches
             .iter()
             .filter(|r| r.recommend_compact)
