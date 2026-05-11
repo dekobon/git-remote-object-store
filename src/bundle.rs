@@ -44,8 +44,8 @@ pub struct BundleHeader {
 }
 
 impl BundleHeader {
-    /// Parse the text header from the bundle file at `path`.
-    pub fn parse(path: &Path) -> Result<Self, BundleError> {
+    /// Read and parse the text header from the bundle file at `path`.
+    pub fn read(path: &Path) -> Result<Self, BundleError> {
         let mut file = BufReader::new(fs::File::open(path)?);
         let mut line = String::new();
 
@@ -363,7 +363,7 @@ pub fn unbundle(
     let folder = folder.canonicalize()?;
     let bundle_path = folder.join(format!("{sha}.bundle"));
 
-    let header = BundleHeader::parse(&bundle_path)?;
+    let header = BundleHeader::read(&bundle_path)?;
     let repo = gix::open(cwd)?;
 
     // Prerequisite check: all referenced base objects must already be present.
