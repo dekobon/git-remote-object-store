@@ -499,6 +499,35 @@ pub(crate) async fn delete_idempotent(
     }
 }
 
+/// Best-effort delete of the prior bundle once the new bundle is durable.
+///
+/// Issue #121: `perform_push_under_lock` writes the new bundle first
+/// (the durable commit) and then deletes the previous bundle. A
+/// non-`NotFound` error on the delete must NOT fail the push — the new
+/// bundle is already on the bucket, so reporting failure to the user
+/// is a lie about the remote state. The two-bundle state that results
+/// from the orphan trips the under-lock "multiple bundles" guard on
+/// the next push, which directs the operator to `doctor`; the warn
+/// log gives them the orphan key directly.
+///
+/// Mirrors `force_push_baseline_cleanup` in `packchain::push`
+/// (issue #113).
+async fn delete_prior_bundle_best_effort(
+    store: &dyn ObjectStore,
+    remote_ref: &RefName,
+    prior_key: &str,
+) {
+    if let Err(e) = delete_idempotent(store, prior_key).await {
+        warn!(
+            ref_path = %remote_ref.as_str(),
+            key = %prior_key,
+            error = %e,
+            "prior-bundle cleanup failed (new bundle already committed); \
+             orphan key left for manual cleanup",
+        );
+    }
+}
+
 /// Drive a batch of `push` commands sequentially.
 ///
 /// Each command is parsed, executed under its own per-ref lock, and
@@ -950,7 +979,7 @@ async fn perform_push_under_lock(
     if let Some(prev) = current_key
         && prev != bundle_dest
     {
-        delete_idempotent(store, &prev).await?;
+        delete_prior_bundle_best_effort(store, &remote_ref, &prev).await;
     }
 
     if let Some(artifacts) = zip_artifacts {
@@ -2230,6 +2259,48 @@ mod tests {
         assert!(
             store.contains("repo/HEAD"),
             "HEAD key must be written by the push",
+        );
+    }
+
+    /// Issue #121 regression: a non-NotFound delete error on the prior
+    /// bundle after the new bundle has been put must NOT fail the
+    /// push. The new bundle is already durable; reporting failure
+    /// misrepresents the remote state. Match the `compact` /
+    /// `force_push_baseline_cleanup` best-effort contract: log at warn
+    /// and report success. The two-bundle state remains on the bucket
+    /// so the next push's under-lock multi-bundle guard surfaces it
+    /// to the operator.
+    #[tokio::test]
+    async fn perform_push_under_lock_succeeds_when_prior_delete_fails() {
+        use crate::object_store::mock::Fault;
+        let store = MockStore::new();
+        let pre_key = format!("repo/refs/heads/main/{OTHER_SHA}.bundle");
+        store.insert(&pre_key, Bytes::from_static(b"old bundle"));
+        store.arm(Fault::NetworkOnDelete {
+            key: pre_key.clone(),
+        });
+
+        let state = push_state_with_pre_existing(Some(pre_key.clone()));
+        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+            .await
+            .expect("push must succeed even when prior-bundle delete fails");
+        assert!(
+            matches!(&outcome, PushOutcome::Ok { remote_ref } if remote_ref == "refs/heads/main"),
+            "expected Ok(refs/heads/main), got {outcome:?}",
+        );
+
+        let bundle_dest = format!("repo/refs/heads/main/{SHA}.bundle");
+        assert!(
+            store.contains(&bundle_dest),
+            "new bundle must be uploaded at bundle_dest",
+        );
+        // The fault armed against the delete fired exactly once.
+        assert_eq!(store.pending_faults(), 0);
+        // Orphan remains on the bucket — operator sees the warn log and
+        // the next push's multi-bundle guard will direct them to doctor.
+        assert!(
+            store.contains(&pre_key),
+            "delete fault must leave the prior bundle in place",
         );
     }
 

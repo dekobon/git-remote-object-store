@@ -138,6 +138,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bundle delete fails after `chain.json` is already durable; the cleanup
   is best-effort and orphan keys are logged at WARN for manual cleanup
   (#113).
+- Bundle-engine `perform_push_under_lock` no longer reports failure when
+  the prior-bundle delete fails after the new bundle is already durable;
+  the cleanup is best-effort and the orphan key is logged at WARN for
+  manual cleanup, matching the `compact` / `force_push_baseline_cleanup`
+  pattern (#121).
 - Management `delete-branch` now refuses to delete a branch that has a
   `PROTECTED#` marker, matching the helper-protocol delete path (#110).
 - `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS=0` no longer silently
