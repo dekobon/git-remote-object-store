@@ -57,6 +57,11 @@
 //! helper-protocol, the LFS protocol, and the cloud-provider HTTP
 //! APIs.
 
+// Public docs intentionally cross-reference pub(crate) items as
+// cues for crate-internal readers; rendering broken in public rustdoc
+// is acceptable.
+#![allow(rustdoc::private_intra_doc_links)]
+
 pub(crate) mod bundle;
 pub mod git;
 pub(crate) mod keys;

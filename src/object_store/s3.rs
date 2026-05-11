@@ -1,4 +1,4 @@
-//! S3 backend for the [`ObjectStore`][super::ObjectStore] trait.
+//! S3 backend for the [`ObjectStore`] trait.
 //!
 //! `S3Store` wraps `aws-sdk-s3`. The SDK owns `SigV4`, retries, connection
 //! pooling, and timeout policy; this module owns the URL → SDK config
@@ -10,7 +10,7 @@
 //!
 //! `S3Store` does **not** auto-prepend the [`RemoteUrl`] `prefix`. Trait
 //! keys are byte-prefix per the contract on
-//! [`ObjectStore::list`][super::ObjectStore::list]
+//! [`ObjectStore::list`]
 //! (`mod.rs:65-67`); the URL `prefix` is a repository concern and is
 //! composed by callers that build keys like
 //! `<prefix>/refs/.../<sha>.bundle`.

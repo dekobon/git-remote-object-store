@@ -6,7 +6,7 @@
 //! The `Doctor` value is constructed once per CLI invocation; all
 //! interaction goes through the injected [`Prompter`] so the same code
 //! path drives both the binary (via [`DialoguerPrompter`]) and unit
-//! tests (via [`ScriptedPrompter`]).
+//! tests (via `ScriptedPrompter`, gated on `test-util`).
 //!
 //! All human-readable output flows through [`Doctor::run_into`]'s
 //! `impl Write` parameter so tests can capture exact bytes without
@@ -15,7 +15,6 @@
 //! locking, keeping the future `Send`).
 //!
 //! [`DialoguerPrompter`]: super::DialoguerPrompter
-//! [`ScriptedPrompter`]: super::ScriptedPrompter
 
 use std::io::Write;
 use std::sync::Arc;
