@@ -34,9 +34,10 @@ pub(crate) struct BundleEntry {
 /// inside `Doctor::run` and the doctor itself owns all rendering.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RefSnapshot {
-    /// `true` iff at least one `<ref>/PROTECTED#…` marker is present.
-    /// The marker is matched by **prefix**, so any key under `<ref>/`
-    /// whose final segment starts with `PROTECTED#` counts.
+    /// `true` iff a `<ref>/PROTECTED#` marker is present. The marker
+    /// is matched by **exact equality** on the final segment via
+    /// [`crate::keys::is_protected_marker_segment`]; future
+    /// `PROTECTED#`-prefixed keys (e.g. `PROTECTED#audit`) do NOT count.
     pub(crate) is_protected: bool,
     /// Bundle objects under this ref, in listing order. The doctor's
     /// "multiple bundles" check fires when this is longer than one.
@@ -175,7 +176,7 @@ async fn classify_into(
     }
 
     let entry = snapshot.refs.entry(ref_path.to_owned()).or_default();
-    if last.starts_with(crate::keys::PROTECTED_MARKER_SEGMENT) {
+    if crate::keys::is_protected_marker_segment(last) {
         entry.is_protected = true;
     } else if let Some(sha) = last.strip_suffix(".bundle") {
         entry.bundles.push(BundleEntry {
@@ -255,13 +256,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protected_marker_prefix_match() {
-        // §1.1: PROTECTED# is matched by prefix, not exact equality.
+    async fn protected_marker_requires_exact_match() {
+        // The PROTECTED# marker is matched by exact equality on the
+        // final segment — `PROTECTED#`-prefixed keys (e.g. a future
+        // `PROTECTED#audit` sidecar) must NOT flip `is_protected`.
         let mock = MockStore::new();
-        mock.insert("myrepo/refs/heads/main/PROTECTED#tag", Bytes::new());
+        mock.insert("myrepo/refs/heads/main/PROTECTED#audit", Bytes::new());
         let s: Arc<dyn ObjectStore> = Arc::new(mock);
         let snap = analyze(&s, "myrepo").await.expect("analyze");
-        assert!(snap.refs["refs/heads/main"].is_protected);
+        let entry = snap
+            .refs
+            .get("refs/heads/main")
+            .expect("ref entry recorded");
+        assert!(
+            !entry.is_protected,
+            "PROTECTED#-prefixed segment must not be classified as the marker",
+        );
     }
 
     #[tokio::test]
