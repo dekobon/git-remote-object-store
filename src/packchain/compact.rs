@@ -436,24 +436,16 @@ async fn download_chain_artefacts(
     // composing GET keys. `ChainSegment::pack` deserialises as a
     // plain `String` with no format check, so a crafted chain.json
     // could otherwise drive `pack_key_from_relative` to request an
-    // arbitrary bucket key. Mirror the same guard `gc.rs`, `read.rs`,
-    // and `fetch.rs` apply (issue #120). The local destination name
-    // keeps `seg.sha` (commit SHA at the segment tip) to match the
-    // install step's filename convention — `sha_from_pack_key`'s
-    // output is the pack content SHA, a different identifier.
+    // arbitrary bucket key (issue #120). Shared with read/fetch/gc via
+    // `segment_pack_sha`; the returned content SHA is dropped here —
+    // the local destination keeps `seg.sha` (commit SHA at the segment
+    // tip) to match the install step's filename convention, which is
+    // a different identifier.
     let mut tasks: Vec<DownloadTask> = chain
         .segments
         .iter()
         .map(|seg| {
-            super::keys::sha_from_pack_key(&seg.pack).ok_or_else(|| {
-                PackchainError::MalformedPackEntry {
-                    offset: 0,
-                    reason: format!(
-                        "chain segment pack key `{}` is not of the form `[<prefix>/]packs/<sha>.pack`",
-                        seg.pack,
-                    ),
-                }
-            })?;
+            super::keys::segment_pack_sha(seg)?;
             Ok::<_, PackchainError>(DownloadTask {
                 key: pack_key_from_relative(prefix, &seg.pack),
                 dest: download_dir.join(format!("{}.pack", seg.sha.as_str())),

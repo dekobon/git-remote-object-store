@@ -47,7 +47,7 @@ use crate::remote::Remote;
 use crate::url::StorageEngine;
 
 use super::PackchainError;
-use super::keys::{pack_idx_key, pack_key, sha_from_pack_key};
+use super::keys::{pack_idx_key, pack_key};
 use super::manifest::{load_chain, load_path_index};
 use super::schema::{ChainSegment, PathNode, Sha40};
 
@@ -557,18 +557,11 @@ async fn read_object_from_chain(
     })
 }
 
-/// Extract the content SHA from a chain segment, wrapping the
-/// shared [`sha_from_pack_key`] result into the
-/// [`PackchainError::MalformedPackEntry`] variant `read_blob`'s
-/// error contract uses for pack-decode failures.
+/// Extract the content SHA from a chain segment. Thin wrapper over
+/// the shared [`super::keys::segment_pack_sha`] for the `read_blob`
+/// pack-decode path.
 fn pack_content_sha(segment: &ChainSegment) -> Result<Sha40, PackchainError> {
-    sha_from_pack_key(&segment.pack).ok_or_else(|| PackchainError::MalformedPackEntry {
-        offset: 0,
-        reason: format!(
-            "chain segment pack key `{}` lacks `.pack` suffix",
-            segment.pack,
-        ),
-    })
+    super::keys::segment_pack_sha(segment)
 }
 
 async fn load_index(

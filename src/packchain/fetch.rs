@@ -345,20 +345,12 @@ async fn fetch_full(
     // applies across refs.
     let mut downloads: JoinSet<Result<DownloadedArtifact, FetchError>> = JoinSet::new();
     for segment in needed {
-        // `ChainSegment::pack` is a plain `String` after serde, with
-        // no format check at deserialise time — a crafted chain.json
-        // could otherwise drive `pack_key_from_relative` to request
-        // an arbitrary bucket key. Mirror the same guard `gc.rs` and
-        // `read.rs` already apply (issue #120).
-        let content_sha = super::keys::sha_from_pack_key(&segment.pack).ok_or_else(|| {
-            FetchError::Packchain(PackchainError::MalformedPackEntry {
-                offset: 0,
-                reason: format!(
-                    "chain segment pack key `{}` is not of the form `[<prefix>/]packs/<sha>.pack`",
-                    segment.pack,
-                ),
-            })
-        })?;
+        // Validate `segment.pack` before deriving a bucket key — a
+        // crafted chain.json could otherwise drive
+        // `pack_key_from_relative` to request an arbitrary bucket key
+        // (issue #120). Shared with read/compact/gc via
+        // `segment_pack_sha`.
+        let content_sha = super::keys::segment_pack_sha(segment).map_err(FetchError::Packchain)?;
         let store = Arc::clone(store);
         let permit_pool = Arc::clone(semaphore);
         let key = super::keys::pack_key_from_relative(prefix, &segment.pack);
@@ -466,15 +458,7 @@ async fn fetch_shallow(
     for segment in needed {
         // Validate the bucket-relative pack key before composing the
         // GET key; see the matching guard in `fetch_full` and issue #120.
-        let content_sha = super::keys::sha_from_pack_key(&segment.pack).ok_or_else(|| {
-            FetchError::Packchain(PackchainError::MalformedPackEntry {
-                offset: 0,
-                reason: format!(
-                    "chain segment pack key `{}` is not of the form `[<prefix>/]packs/<sha>.pack`",
-                    segment.pack,
-                ),
-            })
-        })?;
+        let content_sha = super::keys::segment_pack_sha(segment).map_err(FetchError::Packchain)?;
         let key = super::keys::pack_key_from_relative(prefix, &segment.pack);
         let dest = temp_path.join(format!("{}.pack", content_sha.as_str()));
         download_pack(store, &key, &dest).await?;

@@ -21,7 +21,8 @@
 
 use std::fmt;
 
-use super::schema::Sha40;
+use super::PackchainError;
+use super::schema::{ChainSegment, Sha40};
 
 /// Suffix bytes that mark a [`chain_key`] in a listing. Defined
 /// once so `gc::list_referenced_packs` and `list::list_refs` can't
@@ -79,6 +80,21 @@ pub(crate) fn sha_from_pack_key(pack: &str) -> Option<Sha40> {
     let basename = pack.rsplit('/').next().unwrap_or(pack);
     let sha = basename.strip_suffix(".pack")?;
     Sha40::try_new(sha).ok()
+}
+
+/// Validate `segment.pack` and return its content SHA, or surface a
+/// [`PackchainError::MalformedPackEntry`] when the key is malformed.
+/// One helper used by every code path that needs to derive a bucket
+/// key (or just validate the format) from a chain segment — keeps the
+/// error wording aligned across `fetch`, `compact`, `read`, and `gc`.
+pub(crate) fn segment_pack_sha(segment: &ChainSegment) -> Result<Sha40, PackchainError> {
+    sha_from_pack_key(&segment.pack).ok_or_else(|| PackchainError::MalformedPackEntry {
+        offset: 0,
+        reason: format!(
+            "chain segment pack key `{}` is not of the form `[<prefix>/]packs/<sha>.pack`",
+            segment.pack,
+        ),
+    })
 }
 
 /// `<prefix>/<ref_name>/chain.json` — newest-first chain manifest for

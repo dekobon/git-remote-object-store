@@ -549,18 +549,12 @@ async fn list_referenced_packs(
     .try_fold(HashSet::<Sha40>::new(), |mut acc, body| async move {
         let chain = ChainManifest::from_json_bytes(&body)?;
         for segment in chain.segments {
-            // gc fails closed on a malformed pack key (vs read.rs's
-            // MalformedPackEntry path) — the chain is corrupt and
-            // tombstoning live packs based on it would be unsafe.
-            // `serde::de::Error::custom` is the canonical way to mint
-            // a `serde_json::Error` with a custom message — the type
-            // has no public direct constructor.
-            let sha = super::keys::sha_from_pack_key(&segment.pack).ok_or_else(|| {
-                PackchainError::ParseJson(serde::de::Error::custom(format!(
-                    "chain segment pack key `{}` lacks `.pack` suffix",
-                    segment.pack,
-                )))
-            })?;
+            // gc fails closed on a malformed pack key — the chain is
+            // corrupt and tombstoning live packs based on it would be
+            // unsafe. Uses the same `MalformedPackEntry` variant as
+            // every other consumer (read, fetch, compact) so error
+            // wording stays aligned across the engine.
+            let sha = super::keys::segment_pack_sha(&segment)?;
             acc.insert(sha);
         }
         Ok(acc)

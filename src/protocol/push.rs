@@ -375,11 +375,8 @@ pub(crate) fn heartbeat_interval(ttl: Duration) -> std::time::Duration {
     let secs = ttl.whole_seconds().max(3) / 3;
     // `try_from` rather than `as`: we just clamped to ≥ 1, but
     // `clippy::cast_sign_loss` insists on the explicit fallible cast.
-    // The `unwrap_or(1)` branch is provably unreachable given the
-    // clamp above; keep a small positive fallback instead of `expect`
-    // to avoid panicking on a misuse pattern that callers should
-    // already have ruled out.
-    let secs_u64 = u64::try_from(secs).unwrap_or(1);
+    let secs_u64 =
+        u64::try_from(secs).expect("ttl.whole_seconds().max(3) / 3 is always >= 1 (non-negative)");
     std::time::Duration::from_secs(secs_u64)
 }
 
