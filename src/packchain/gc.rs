@@ -53,8 +53,13 @@
 //!
 //! ### `--force`
 //!
-//! Skips both grace and re-check. Operator-asserted safe. A `tracing::warn!`
-//! line records the choice.
+//! Skips ONLY the grace window. The live-pack re-check still runs:
+//! a tombstone whose SHA appears in the current chain set is left
+//! alone. This closes the race where `mark()` snapshots packs after a
+//! concurrent push has uploaded `packs/<sha>.{pack,idx}` but has not
+//! yet committed `chain.json` — by sweep time the chain has landed
+//! and the pack is live, so the stale tombstone must not delete it.
+//! A `tracing::warn!` line records the operator's choice.
 //!
 //! ## Concurrency
 //!
@@ -194,8 +199,12 @@ pub struct SweepOpts {
     /// Grace duration in hours. Tombstones with `marked_at` younger
     /// than this stay deferred. Ignored when `force` is `true`.
     pub grace_hours: u64,
-    /// When `true`, skip both the grace check AND the re-derive of
-    /// the orphan set. Operator-asserted safe (no concurrent reads).
+    /// When `true`, skip the grace check. The live-pack re-derive
+    /// still runs — a tombstone whose SHA is now referenced by a
+    /// committed chain is left alone (closes the mark/commit race
+    /// from #117). The grace window is the only safety check this
+    /// flag suppresses; concurrent fetches that still hold a SHA in
+    /// flight are NOT protected by either path.
     pub force: bool,
 }
 
@@ -354,18 +363,20 @@ pub async fn sweep(
     let mut outcome = SweepOutcome::default();
 
     if opts.force {
-        warn!("gc sweep: --force in effect; skipping grace and re-check");
+        warn!("gc sweep: --force in effect; skipping grace window");
     }
 
     // Re-derive the live referenced set once per sweep, not per
     // tombstone — sweeping many tombstones at once is the dominant
     // case and the chain set doesn't change between iterations of
     // the same `sweep` call.
-    let referenced = if opts.force {
-        HashSet::new()
-    } else {
-        list_referenced_packs(store, prefix).await?
-    };
+    //
+    // ALWAYS recompute, even under --force: mark() can record a pack
+    // as orphan during the window where a concurrent push has uploaded
+    // packs/<sha>.{pack,idx} but has not yet committed chain.json. By
+    // sweep time the chain has landed and the pack is live. --force
+    // suppresses the grace window only, NOT this guard (issue #117).
+    let referenced = list_referenced_packs(store, prefix).await?;
 
     for meta in metas {
         if !meta.key.as_bytes().ends_with(b".json") || !is_tombstone_key(&meta.key, prefix) {
@@ -446,7 +457,9 @@ async fn sweep_one_tombstone(
     let mut deleted_objects = 0usize;
     let mut skipped_repointed_packs = 0usize;
     for sha in &tombstone.orphan_packs {
-        if !opts.force && referenced.contains(sha) {
+        // Always honour the live-pack guard, including under --force.
+        // See the recompute comment in `sweep` and issue #117 for why.
+        if referenced.contains(sha) {
             skipped_repointed_packs += 1;
             debug!(
                 sha = %sha.as_str(),
@@ -990,12 +1003,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sweep_force_bypasses_grace_and_recheck() {
+    async fn sweep_force_bypasses_grace_only_not_live_recheck() {
+        // Regression for #117: --force must skip ONLY the grace window,
+        // not the live-pack re-check. A fresh tombstone names a pack
+        // that has since been referenced by a committed chain — the
+        // classic outcome of mark() snapshotting between a concurrent
+        // push's pack upload and its chain.json commit. Sweep with
+        // --force must NOT delete that pack.
         let store = MockStore::new();
-        // Fresh tombstone (well within grace) but force ignores it.
         let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
         write_tombstone(&store, "repo", &now, sha_set([SHA_PACK_LIVE]));
-        // Live chain references SHA_PACK_LIVE — force ignores re-check.
         let chain = ChainManifest {
             v: 1,
             tip: sha40(SHA_TIP),
@@ -1017,10 +1034,48 @@ mod tests {
         )
         .await
         .unwrap();
+        // Grace was bypassed (fresh tombstone got processed instead of
+        // deferred), but the live-pack guard fired and the pack stayed.
         assert_eq!(outcome.swept_tombstones, 1);
+        assert_eq!(outcome.deferred_tombstones, 0);
+        assert_eq!(outcome.skipped_repointed_packs, 1);
+        assert_eq!(outcome.deleted_objects, 0);
+        store
+            .get_bytes(&format!("repo/packs/{SHA_PACK_LIVE}.pack"))
+            .await
+            .expect("live pack must survive --force sweep");
+        store
+            .get_bytes(&format!("repo/packs/{SHA_PACK_LIVE}.idx"))
+            .await
+            .expect("live idx must survive --force sweep");
+    }
+
+    #[tokio::test]
+    async fn sweep_force_deletes_truly_orphan_pack_inside_grace() {
+        // The happy path for --force: a fresh tombstone naming a pack
+        // that is NOT in any chain. Grace is bypassed, the live-pack
+        // re-check finds the SHA absent, the pack is deleted.
+        let store = MockStore::new();
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        write_tombstone(&store, "repo", &now, sha_set([SHA_PACK_ORPHAN]));
+        insert_pack_pair(&store, Some("repo"), SHA_PACK_ORPHAN);
+
+        let outcome = sweep(
+            &store,
+            "repo",
+            SweepOpts {
+                grace_hours: 24,
+                force: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.swept_tombstones, 1);
+        assert_eq!(outcome.deferred_tombstones, 0);
+        assert_eq!(outcome.skipped_repointed_packs, 0);
         assert_eq!(outcome.deleted_objects, 2);
         let err = store
-            .get_bytes(&format!("repo/packs/{SHA_PACK_LIVE}.pack"))
+            .get_bytes(&format!("repo/packs/{SHA_PACK_ORPHAN}.pack"))
             .await
             .unwrap_err();
         assert!(matches!(err, ObjectStoreError::NotFound(_)));
