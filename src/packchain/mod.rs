@@ -29,11 +29,31 @@
 //!
 //! `chain.json` is the commit point: pack/idx/baseline upload
 //! pre-lock, then under the per-ref lock the push writes
-//! path-index → FORMAT → HEAD → chain.json. Anything that crashed
-//! before the chain.json PUT leaves orphan keys (pack/idx/baseline at
-//! content-SHA or tip-SHA names) which `manage gc` reaps. Anything
-//! written after chain.json (force-push baseline cleanup) is
-//! best-effort and never fails the push.
+//! FORMAT → HEAD → chain.json → path-index.json. Anything that
+//! crashed before the chain.json PUT leaves orphan keys
+//! (pack/idx/baseline at content-SHA or tip-SHA names) which
+//! `manage gc` reaps. Anything written after chain.json
+//! (path-index.json overwrite, force-push baseline cleanup) is
+//! post-commit and may be retried by re-running the push or compact.
+//!
+//! ## chain.json → path-index.json ordering and the reader contract
+//!
+//! Writing `path-index.json` LAST means a crash between the
+//! `chain.json` PUT and the `path-index.json` PUT leaves the bucket
+//! with a fresh chain alongside a stale path-index whose `tip` field
+//! still names the prior chain.tip. The reader detects this with a
+//! single tip-equality check (`path_index.tip == chain.tip`) and
+//! surfaces it as
+//! [`PackchainError::TransientChainPathIndexMismatch`] — a typed,
+//! retry-shaped error — rather than silently returning the wrong
+//! blob bytes or failing with the confusing
+//! [`PackchainError::BlobNotInChain`] that the old (path-index-first)
+//! ordering produced (issue #114).
+//!
+//! The reverse ordering (path-index before chain.json) is rejected
+//! because it lets a stale chain coexist with a fresh path-index
+//! whose blob SHAs are NOT yet in any chain pack, surfacing as
+//! `BlobNotInChain` — indistinguishable from genuine corruption.
 //!
 //! ## Lost-race orphan packs
 //!
@@ -300,6 +320,28 @@ pub enum PackchainError {
     TreeCycle {
         /// The tree OID whose presence in the ancestor set was detected.
         oid: String,
+    },
+
+    /// Reader observed `chain.json` and `path-index.json` with
+    /// mismatched tips — a transient state during the brief window
+    /// where a push or compact has committed the new `chain.json` but
+    /// not yet overwritten `path-index.json` (issue #114). The reader
+    /// refuses to resolve a path against an out-of-sync path-index
+    /// because the resolved blob SHA may name a different file than
+    /// the caller intended; instead it surfaces this typed error so
+    /// the caller can retry. Subsequent reads converge once the writer
+    /// finishes the path-index PUT.
+    #[error(
+        "transient chain/path-index mismatch for {ref_name}: \
+         chain.tip = {chain_tip}, path_index.tip = {path_index_tip}; retry"
+    )]
+    TransientChainPathIndexMismatch {
+        /// The ref the lookup ran against.
+        ref_name: String,
+        /// Tip recorded in `chain.json` at read time.
+        chain_tip: String,
+        /// Tip recorded in `path-index.json` at read time.
+        path_index_tip: String,
     },
 }
 

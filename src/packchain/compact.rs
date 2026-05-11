@@ -326,10 +326,18 @@ async fn compact_under_lock(
 
     // Upload artefacts. Order matters here for crash safety: pack
     // and bundle FIRST (orphan-safe — they become reapable orphans
-    // if the chain commit fails), then path-index, then chain.json.
+    // if the chain commit fails), then chain.json, then path-index.
     // The chain.json PUT is the linearisation point — anything
     // before it is best-effort and reapable; anything after is
-    // already committed.
+    // already committed. path-index follows chain.json so a crash
+    // between them leaves a stale `path_index.tip` paired with a
+    // fresh `chain.tip` (reader-detected, issue #114) rather than
+    // the inverse, which would surface as `BlobNotInChain`.
+    //
+    // In compact specifically the tip is unchanged across the
+    // operation, so even an interrupted path-index PUT leaves
+    // `path_index.tip == chain.tip` and the mismatch check never
+    // trips; readers see consistent state throughout.
     let new_pack_key = pack_key(prefix, &new_pack.content_sha);
     let new_idx_key = pack_idx_key(prefix, &new_pack.content_sha);
     let new_bundle_key = keys::bundle_key(prefix, ref_name, chain.tip.as_str());
@@ -351,9 +359,6 @@ async fn compact_under_lock(
     )
     .await?;
     upload_bundle(store, &new_bundle_key, &bundle_path).await?;
-    if let Some(ref index) = path_index {
-        write_path_index(store, prefix, ref_name, index).await?;
-    }
 
     let new_segment = ChainSegment {
         sha: chain.tip.clone(),
@@ -371,6 +376,12 @@ async fn compact_under_lock(
         segments: vec![new_segment],
     };
     write_chain(store, prefix, ref_name, &new_chain).await?;
+
+    // path-index.json follows chain.json — see the comment block
+    // above on the linearisation invariant.
+    if let Some(ref index) = path_index {
+        write_path_index(store, prefix, ref_name, index).await?;
+    }
 
     // chain.json is now durable — the old baseline bundle is
     // unreachable. See [`delete_prior_baseline_bundle`] for why

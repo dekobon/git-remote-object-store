@@ -602,11 +602,14 @@ fn rev_walk_crosses_shallow_boundary(
 
 /// Under-lock body. By the time this runs, pack/idx/baseline are
 /// already on the bucket (uploaded pre-lock in [`prepare_push`]) — the
-/// remaining work is the path-index walk + FORMAT/HEAD bootstrap +
-/// chain.json commit. Lock-hold time is bounded by JSON-PUT latency,
-/// not pack size. See [`super`]'s module doc on the linearization
-/// invariant: chain.json is the commit point and must be the LAST
-/// referenced-key write.
+/// remaining work is the path-index walk, the FORMAT/HEAD bootstrap,
+/// the chain.json commit, and the post-commit path-index PUT.
+/// Lock-hold time is bounded by JSON-PUT latency, not pack size. See
+/// [`super`]'s module doc on the linearization invariant: chain.json
+/// is the commit point, and `path-index.json` is written AFTER it so
+/// the worst observable crash window is a stale `path_index.tip`
+/// paired with a fresh `chain.tip` (which readers detect and surface
+/// as [`PackchainError::TransientChainPathIndexMismatch`], issue #114).
 async fn perform_push_under_lock(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
@@ -651,8 +654,12 @@ async fn perform_push_under_lock(
     //    `.await`. `cwd` is moved into the closure (it's not used
     //    again after this point); `local_sha: Sha` is `Copy`.
     //
-    //    Returns `None` for blob-tipped chains — there is no tree to
-    //    index, so the engine omits `path-index.json` entirely.
+    //    The PUT is deferred to step 9 (after chain.json) so a crash
+    //    between the two leaves the bucket with `chain.tip` ahead of
+    //    `path_index.tip` rather than the other way around — see the
+    //    module-level "chain.json → path-index.json ordering" doc and
+    //    issue #114. Returns `None` for blob-tipped chains; the engine
+    //    then omits `path-index.json` entirely.
     let path_index = tokio::task::spawn_blocking(move || -> Result<_, PackchainError> {
         let repo = gix::open(&cwd).map_err(crate::git::GitError::from)?;
         let peeled = git::peel_tag_chain(&repo, local_sha).map_err(PackchainError::Git)?;
@@ -662,25 +669,14 @@ async fn perform_push_under_lock(
     .map_err(|join_err| std::io::Error::other(join_err.to_string()))?
     .map_err(PushError::Packchain)?;
 
-    // 4. path-index.json — overwrite (must precede chain.json so the
-    //    `chain.tip == path_index.tip` invariant holds for any reader
-    //    who trusts the chain). Skipped for blob-tipped chains —
-    //    readers detect absence and fall back to "no path-index
-    //    available," which is the correct contract for a leaf blob.
-    if let Some(ref index) = path_index {
-        write_path_index(store, prefix, &remote_ref, index)
-            .await
-            .map_err(PushError::Packchain)?;
-    }
-
-    // 5. FORMAT bootstrap (idempotent — every push past the first is
+    // 4. FORMAT bootstrap (idempotent — every push past the first is
     //    a no-op).
     let format_key = keys::join(prefix.unwrap_or(""), "FORMAT");
     store
         .put_if_absent(&format_key, Bytes::from_static(engine.as_str().as_bytes()))
         .await?;
 
-    // 6. HEAD bootstrap (idempotent — first ref to push wins).
+    // 5. HEAD bootstrap (idempotent — first ref to push wins).
     let head = head_key(prefix);
     store
         .put_if_absent(
@@ -689,7 +685,7 @@ async fn perform_push_under_lock(
         )
         .await?;
 
-    // 7. Build new chain manifest. `next_manifest` produces the
+    // 6. Build new chain manifest. `next_manifest` produces the
     //    correct `parent_sha` itself (None for force / first push,
     //    `prior.tip` for incremental) — we don't precompute it here.
     let new_segment = ChainSegment {
@@ -702,11 +698,27 @@ async fn perform_push_under_lock(
     };
     let manifest = next_manifest(prior.as_ref(), &local_sha40, new_segment, force);
 
-    // 8. chain.json — THE commit point. After this PUT returns the
-    //    push is durable.
+    // 7. chain.json — THE commit point. After this PUT returns the
+    //    push is durable. A crash here leaves orphan pack/idx/baseline
+    //    keys for `manage gc`; the prior chain.json remains visible.
     write_chain(store, prefix, &remote_ref, &manifest)
         .await
         .map_err(PushError::Packchain)?;
+
+    // 8. path-index.json — overwrite AFTER chain.json so a crash in
+    //    the window between the two leaves a stale `path_index.tip`
+    //    paired with a fresh `chain.tip`. Readers detect the mismatch
+    //    via `path_index.tip == chain.tip` and surface
+    //    `TransientChainPathIndexMismatch` (issue #114) — far less
+    //    confusing than the `BlobNotInChain` the reverse ordering
+    //    would produce. Skipped for blob-tipped chains; readers detect
+    //    absence and fall back to "no path-index available," the
+    //    correct contract for a leaf blob.
+    if let Some(ref index) = path_index {
+        write_path_index(store, prefix, &remote_ref, index)
+            .await
+            .map_err(PushError::Packchain)?;
+    }
 
     // 9. Force-push old-baseline cleanup (best-effort, post-commit).
     if force {

@@ -490,3 +490,100 @@ async fn read_blob_recovers_blob_with_specific_byte_count() {
     assert_eq!(body.as_ref(), main_rs_via_git_bytes);
     assert!(!body.is_empty());
 }
+
+#[tokio::test]
+async fn read_blob_stale_path_index_returns_transient_mismatch() {
+    // Issue #114 regression: when a push or compact has committed
+    // a new `chain.json` but is mid-flight on the `path-index.json`
+    // PUT (or crashed between the two), the bucket transiently
+    // exposes a stale `path_index.tip` paired with a fresh
+    // `chain.tip`. `read_blob` MUST detect this and surface
+    // `TransientChainPathIndexMismatch` rather than resolving the
+    // path against a path-index whose blob shas may name different
+    // files than the caller intended — or be absent from the new
+    // chain entirely (the old `BlobNotInChain` failure mode).
+    //
+    // The scenario is constructed by pushing twice (so chain.tip
+    // moves) and then rewinding path-index.json to a snapshot of
+    // its earlier state. The chain still points at the newer tip
+    // while path-index still names the older tip — exactly the
+    // crash-window shape the issue describes.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let store = Arc::new(MockStore::new());
+    let (seed, _files) = make_layered_repo();
+    push_seed_into(&store, seed.path(), Some("repo")).await;
+
+    // Snapshot the path-index after the first push — this is the
+    // "stale" version we restore after the second push lands.
+    let path_index_key = "repo/refs/heads/main/path-index.json";
+    let stale_path_index = store
+        .get_bytes(path_index_key)
+        .await
+        .expect("path-index after first push");
+
+    // Second push: adds a new file, moves chain.tip forward. The
+    // engine writes a fresh path-index.json at the new tip; we
+    // overwrite it back to the stale snapshot to simulate the
+    // crash / mid-flight window.
+    std::fs::write(seed.path().join("NEW.txt"), b"second-segment\n").unwrap();
+    git(&["add", "."], seed.path());
+    git(
+        &["commit", "--quiet", "-m", "second", "--no-gpg-sign"],
+        seed.path(),
+    );
+    push_seed_into(&store, seed.path(), Some("repo")).await;
+
+    // Pin the test premise: chain.tip and path_index.tip must
+    // currently agree (the second push completed cleanly) so the
+    // forced rewind below is the only source of mismatch.
+    let chain_bytes = store
+        .get_bytes("repo/refs/heads/main/chain.json")
+        .await
+        .expect("chain.json after second push");
+    let chain: serde_json::Value = serde_json::from_slice(&chain_bytes).expect("chain.json parses");
+    let fresh_path_index = store
+        .get_bytes(path_index_key)
+        .await
+        .expect("path-index after second push");
+    let fresh_pi: serde_json::Value =
+        serde_json::from_slice(&fresh_path_index).expect("fresh path-index parses");
+    assert_eq!(
+        chain["tip"], fresh_pi["tip"],
+        "fixture invariant: a healthy push leaves chain.tip == path_index.tip",
+    );
+
+    // Rewind path-index.json back to its first-push contents while
+    // chain.json still names the second-push tip.
+    store.insert(path_index_key, stale_path_index);
+
+    let remote = Remote::new_for_test(
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "repo",
+        StorageEngine::Packchain,
+    );
+    let cache = PackIndexCache::default();
+    let err = read_blob(&remote, "refs/heads/main", "README.md", &cache)
+        .await
+        .expect_err("stale path-index must surface transient mismatch");
+    let PackchainError::TransientChainPathIndexMismatch {
+        ref ref_name,
+        ref chain_tip,
+        ref path_index_tip,
+    } = err
+    else {
+        panic!("expected TransientChainPathIndexMismatch, got {err:?}");
+    };
+    assert_eq!(ref_name, "refs/heads/main");
+    assert_ne!(
+        chain_tip, path_index_tip,
+        "the test's whole point is that the tips differ",
+    );
+    assert_eq!(
+        chain_tip,
+        chain["tip"].as_str().expect("chain.tip is a string"),
+        "chain_tip in the error must match the on-bucket chain.json",
+    );
+}

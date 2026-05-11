@@ -298,6 +298,11 @@ impl std::fmt::Debug for PackIndexCache {
 ///   the bucket.
 /// - [`PackchainError::PathIndexAbsent`] when `chain.json` exists but
 ///   `path-index.json` does not (a partially crashed first push).
+/// - [`PackchainError::TransientChainPathIndexMismatch`] when both
+///   exist but `path_index.tip != chain.tip` — a brief window during
+///   a concurrent push or compact where `chain.json` has been
+///   overwritten ahead of `path-index.json`. Retry-shaped: a
+///   subsequent read converges once the writer finishes.
 /// - [`PackchainError::MalformedPath`] for `..` segments, leading
 ///   `/`, empty path, or empty segments (consecutive slashes).
 /// - [`PackchainError::PathNotFound`] when the path does not exist
@@ -342,6 +347,24 @@ pub async fn read_blob(
         .ok_or_else(|| PackchainError::PathIndexAbsent {
             ref_name: ref_name.to_owned(),
         })?;
+
+    // Writers PUT chain.json before path-index.json (see the engine
+    // module doc on the linearisation point and issue #114). A crash
+    // or in-flight push between the two PUTs leaves a stale
+    // `path_index.tip` paired with a fresh `chain.tip`; resolving a
+    // path through the stale path-index would yield a blob SHA that
+    // names a different file than the caller intended (or one absent
+    // from the new chain entirely). Refuse to do that — surface the
+    // mismatch as a typed transient error so the caller can retry,
+    // and so `BlobNotInChain` keeps its honest "bucket corruption"
+    // meaning rather than masking a race window.
+    if path_index.tip != chain.tip {
+        return Err(PackchainError::TransientChainPathIndexMismatch {
+            ref_name: ref_name.to_owned(),
+            chain_tip: chain.tip.as_str().to_owned(),
+            path_index_tip: path_index.tip.as_str().to_owned(),
+        });
+    }
 
     let blob_sha = walk_path(&path_index.tree, &segments, ref_name, path)?;
 
