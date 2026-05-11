@@ -87,13 +87,29 @@ impl<'a> ManageBranch<'a> {
     /// confirmation. Aborts (returns `Ok(())`) if the user answers no;
     /// the `Cancelled` variant is reserved for prompt I/O failures.
     ///
+    /// Refuses outright when a `PROTECTED#` marker is present under the
+    /// branch prefix — the operator must run `unprotect` first. This
+    /// mirrors the refusal the helper-protocol delete path
+    /// (`delete_remote_ref`) emits, so a `git push :branch` against a
+    /// protected ref and a management-CLI `delete-branch` of the same
+    /// ref fail the same way.
+    ///
     /// # Errors
     ///
-    /// Returns [`ManageError::Cancelled`] if the user cancels the prompt,
-    /// [`ManageError::Io`] for prompt I/O failures, or [`ManageError::Store`]
-    /// if a list or delete operation fails.
+    /// Returns [`ManageError::Protected`] if the branch carries a
+    /// `PROTECTED#` marker, [`ManageError::Cancelled`] if the user cancels
+    /// the prompt, [`ManageError::Io`] for prompt I/O failures, or
+    /// [`ManageError::Store`] if a list or delete operation fails.
     pub async fn delete(&self) -> Result<(), ManageError> {
         let objects = self.store.list(&self.branch_prefix()).await?;
+        if objects.iter().any(|entry| {
+            entry
+                .key
+                .rsplit_once('/')
+                .is_some_and(|(_, last)| keys::is_protected_marker_segment(last))
+        }) {
+            return Err(ManageError::Protected(self.branch.clone()));
+        }
         let prompt = format!("Delete branch {} ({} objects)?", self.branch, objects.len());
         if !self.prompter.confirm(&prompt)? {
             println!("Aborted");
@@ -169,8 +185,9 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_every_key_when_confirmed() {
+        // No PROTECTED# marker — the lock file and bundle are the only
+        // residue, and a confirmed delete must clear them.
         let mock = seed_with_branch("main");
-        mock.insert("myrepo/refs/heads/main/PROTECTED#", Bytes::new());
         mock.insert("myrepo/refs/heads/main/LOCK#.lock", Bytes::new());
         let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
         let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
@@ -185,6 +202,59 @@ mod tests {
             mock.keys()
         );
         assert_eq!(prompter.remaining(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_when_protected_marker_present() {
+        // `protect` then `delete-branch` must refuse — same wording the
+        // helper-protocol delete path emits. The prompt is never reached,
+        // so the script queues no answer; the marker and bundle survive.
+        let mock = seed_with_branch("main");
+        mock.insert("myrepo/refs/heads/main/PROTECTED#", Bytes::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        let err = mb
+            .delete()
+            .await
+            .expect_err("delete must refuse when PROTECTED# is present");
+        match &err {
+            ManageError::Protected(name) => assert_eq!(name, "main"),
+            other => panic!("expected ManageError::Protected, got {other:?}"),
+        }
+        assert!(
+            err.to_string()
+                .contains("git-remote-object-store unprotect"),
+            "error message must point at unprotect, got: {err}",
+        );
+        assert!(mock.contains("myrepo/refs/heads/main/PROTECTED#"));
+        assert!(mock.contains("myrepo/refs/heads/main/abc.bundle"));
+        // Prompt must not have been consumed.
+        assert_eq!(prompter.remaining(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_succeeds_after_unprotect_clears_marker() {
+        // Protect, then unprotect, then delete — the canonical recovery
+        // path. The final delete must remove every remaining key.
+        let mock = seed_with_branch("main");
+        mock.insert("myrepo/refs/heads/main/PROTECTED#", Bytes::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        mb.unprotect().await.expect("unprotect");
+        mb.delete().await.expect("delete after unprotect");
+        assert!(
+            mock.keys().is_empty(),
+            "all keys removed after unprotect+delete: {:?}",
+            mock.keys()
+        );
     }
 
     #[tokio::test]
@@ -311,9 +381,12 @@ mod tests {
         // segment. A leading-slash regression here would surface as
         // `BranchNotFound` (the list of `/refs/heads/main/` returns
         // nothing) or as a delete that fails to match the real keys.
+        // No PROTECTED# marker is seeded — protected-ref refusal is
+        // covered separately by
+        // `root_prefix_delete_refuses_when_protected_marker_present`.
         let mock = MockStore::new();
         mock.insert("refs/heads/main/abc.bundle", Bytes::from("body"));
-        mock.insert("refs/heads/main/PROTECTED#", Bytes::new());
+        mock.insert("refs/heads/main/LOCK#.lock", Bytes::new());
         let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
         let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
 
@@ -322,6 +395,32 @@ mod tests {
             .expect("open at root");
         mb.delete().await.expect("delete at root");
         assert!(mock.keys().is_empty(), "all root keys removed");
+    }
+
+    #[tokio::test]
+    async fn root_prefix_delete_refuses_when_protected_marker_present() {
+        // Root-of-bucket layout (no `<prefix>/` segment) must use the
+        // same final-segment match the helper-protocol delete path uses;
+        // a substring-only check could miss the unprefixed marker key.
+        let mock = MockStore::new();
+        mock.insert("refs/heads/main/abc.bundle", Bytes::from("body"));
+        mock.insert("refs/heads/main/PROTECTED#", Bytes::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([]);
+
+        let mb = ManageBranch::open(store, "", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open at root");
+        let err = mb
+            .delete()
+            .await
+            .expect_err("delete at root must refuse PROTECTED#");
+        assert!(
+            matches!(err, ManageError::Protected(ref name) if name == "main"),
+            "expected ManageError::Protected, got {err:?}",
+        );
+        assert!(mock.contains("refs/heads/main/PROTECTED#"));
+        assert!(mock.contains("refs/heads/main/abc.bundle"));
     }
 
     #[tokio::test]

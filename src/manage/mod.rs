@@ -45,6 +45,14 @@ pub enum ManageError {
     #[error("branch not found: {0}")]
     BranchNotFound(String),
 
+    /// `delete-branch` was invoked against a branch that has a
+    /// `PROTECTED#` marker. Mirrors the refusal the helper-protocol
+    /// delete path emits so both surfaces share one wording.
+    #[error(
+        "ref is protected. Run git-remote-object-store unprotect <url> <branch> to remove protection before deleting."
+    )]
+    Protected(String),
+
     /// Branch name failed `gix-validate`'s strict ref-name check; we
     /// reject these at the management boundary so a value like
     /// `foo/../bar` cannot land as a literal substring of a stored
