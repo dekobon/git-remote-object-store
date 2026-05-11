@@ -4,6 +4,11 @@
 # cargo-built binary names cannot contain `+` because cargo rejects
 # crate-name characters outside `[A-Za-z0-9_-]`; the package ships
 # the hyphenated form and we link to the `+` form here.
+#
+# Source of truth for the (cargo-name, plus-name) pairs is the
+# `HELPER_PAIRS` const in `xtask/src/install.rs`. Keep this list in
+# sync; the `packaging_sync` unit tests there will fail if a name
+# present in `HELPER_PAIRS` is missing from this script.
 
 set -eu
 

@@ -33,10 +33,12 @@ that skip cloud accounts entirely.
 ```bash
 git clone https://github.com/dekobon/git-remote-object-store
 cd git-remote-object-store
-cargo install --path cli
+cargo xtask install
 ```
 
-This installs six binaries into `$HOME/.cargo/bin`:
+`cargo xtask install` runs `cargo install --path cli` and then creates
+the four `+`-form helper symlinks git invokes by URL scheme. Six
+binaries land in `$HOME/.cargo/bin`:
 
 | Binary                       | Purpose                                                      |
 | ---------------------------- | ------------------------------------------------------------ |
@@ -47,24 +49,43 @@ This installs six binaries into `$HOME/.cargo/bin`:
 | `git-remote-object-store`    | Management CLI (`doctor`, `delete-branch`, `protect`, …)     |
 | `git-lfs-object-store`       | LFS custom-transfer agent                                    |
 
-### Symlink the `+`-form helpers
+alongside four `+`-form symlinks
+(`git-remote-s3+https`, `git-remote-s3+http`, `git-remote-az+https`,
+`git-remote-az+http`) that point at the matching hyphenated binary
+in the same directory. Re-runs are idempotent.
+
+### Why the symlinks?
 
 Cargo does not allow `+` in `[[bin]] name`, so the four helper
-binaries above ship hyphenated. Git invokes helpers by scheme name —
-i.e. `git-remote-s3+https` for an `s3+https://...` URL — so each
-hyphenated binary needs a `+`-named symlink alongside it. Pick any
-directory on `PATH`; `~/.local/bin` is shown here:
+binaries ship hyphenated. Git looks helpers up by URL scheme — i.e.
+`git-remote-s3+https` for an `s3+https://...` URL — so each
+hyphenated binary needs a `+`-named symlink alongside it.
+`cargo xtask install` automates this; the manual equivalent is:
 
 ```bash
-mkdir -p ~/.local/bin
+cargo install --path cli
 for s in s3+https s3+http az+https az+http; do
     ln -sf "$HOME/.cargo/bin/git-remote-${s/+/-}" \
-           "$HOME/.local/bin/git-remote-$s"
+           "$HOME/.cargo/bin/git-remote-$s"
 done
 ```
 
 `git-remote-object-store` and `git-lfs-object-store` are looked up by
 their literal cargo names and need no rename.
+
+### xtask options
+
+```bash
+cargo xtask install --bin-dir ~/.local/bin   # install into a custom dir
+cargo xtask install --no-install             # refresh symlinks only
+cargo xtask install --dry-run                # preview without writing
+```
+
+`--bin-dir` overrides the auto-detected directory (which is
+`$CARGO_INSTALL_ROOT/bin`, then `$CARGO_HOME/bin`, then
+`$HOME/.cargo/bin`). The xtask refuses to clobber any existing
+regular file or directory at a `+`-form path — only its own symlinks
+are refreshed.
 
 ### Verify
 

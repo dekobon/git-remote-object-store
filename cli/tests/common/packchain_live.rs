@@ -294,7 +294,8 @@ pub async fn first_push_writes_packchain_layout(
     let pi_key = join(prefix, "refs/heads/main/path-index.json");
     let pi_bytes = store.get_bytes(&pi_key).await.expect("path-index.json");
     let pi: serde_json::Value = serde_json::from_slice(&pi_bytes).expect("path-index parses");
-    assert_eq!(pi["commit"], *tip);
+    assert_eq!(pi["v"], 2, "path-index.json schema version");
+    assert_eq!(pi["tip"], *tip);
     let tree = pi["tree"].as_object().expect("tree must be JSON object");
     assert!(
         tree.contains_key("f0.txt"),

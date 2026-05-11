@@ -93,7 +93,7 @@ enum InitError {
 
 /// How to resolve a remote name to an [`ObjectStore`]. Production
 /// uses a `gix`-based resolver; tests inject a closure that returns
-/// a [`crate::object_store::mock::MockStore`].
+/// a `MockStore` (the in-memory test backend gated on `test-util`).
 #[async_trait::async_trait]
 pub trait RemoteResolver: Send + Sync {
     /// Resolve `remote_name` → `(object store, optional bucket prefix)`.
