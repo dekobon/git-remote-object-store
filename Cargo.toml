@@ -203,6 +203,14 @@ reqwest = { version = "0.13", default-features = false, features = [
 # Property-based testing for URL round-trip parse/format.
 proptest = "1"
 
+# `tokio` `test-util` feature gates `tokio::time::pause`, `advance`, and
+# `#[tokio::test(start_paused = true)]`. Issue #118's lock-heartbeat
+# tests advance virtual time across multiple TTLs without actually
+# sleeping, which would otherwise force the test suite to wait minutes
+# of wall time per heartbeat assertion. Production builds do not see
+# this feature — it's dev-only.
+tokio = { version = "1", features = ["test-util"] }
+
 # zlib compression for synthesised pack bytes in unit tests. Production
 # code only needs `Decompress` (provided by `gix::features::zlib`); the
 # delta-depth regression test in `packchain::read::tests` constructs a

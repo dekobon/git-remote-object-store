@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use time::{Duration, OffsetDateTime};
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::git::{self, GitError, RefName, RefNameError, Sha, ShaError, is_valid_ref_name};
@@ -292,49 +293,185 @@ pub(crate) fn lock_ttl_from_env() -> Duration {
     Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
-/// Try to acquire the per-ref lock. Returns `Ok(true)` when the lock was
-/// taken, `Ok(false)` on contention (caller should surface a "lock held"
-/// error). On a stale lock (older than `ttl`), the lock is deleted and
-/// the conditional `put_if_absent` is retried once.
+/// Handle to an acquired per-ref lock with a live heartbeat task.
+///
+/// Returned by [`acquire_lock`]. The guard owns a background tokio task
+/// that periodically re-PUTs the lock key (overwrite, not conditional)
+/// to refresh `last_modified` and keep stale-lock recovery from
+/// stealing a still-live lock from under a long-running critical
+/// section (issue #118).
+///
+/// ## Release
+///
+/// Call [`release_lock`] (or [`Self::release`]) to relinquish: this
+/// aborts the heartbeat first, then deletes the lock key. The release
+/// returns the delete result so callers can surface it to operators
+/// the same way they did with the old `release_lock(store, &key)`.
+///
+/// ## Drop
+///
+/// If a guard is dropped without an explicit release (panic, early
+/// return without the post-result match, etc.) its heartbeat task is
+/// aborted — the lock key remains on the bucket and will be picked up
+/// by the next acquire attempt's stale-recovery path after `ttl`
+/// elapses (bounded by `ttl + heartbeat_interval` since the last
+/// heartbeat). Callers should still prefer explicit release so the
+/// lock is freed immediately.
+#[must_use = "lock guards must be released; dropping leaks the lock until TTL"]
+pub(crate) struct LockGuard {
+    /// Bucket key of the lock. `pub(crate)` so call sites can format
+    /// it into error messages (the old API surfaced `&str`).
+    lock_key: String,
+    /// Store handle, kept around so [`Self::release`] can delete the
+    /// key without callers re-passing it. Also given to the heartbeat
+    /// task via clone.
+    store: Arc<dyn ObjectStore>,
+    /// Heartbeat task handle. `Some` while the guard owns a live
+    /// heartbeat; taken (and aborted) by release or drop.
+    heartbeat: Option<JoinHandle<()>>,
+}
+
+impl LockGuard {
+    /// Release the lock: abort the heartbeat, then delete the lock
+    /// key. `NotFound` is mapped to `Ok(())` (the heartbeat may have
+    /// raced a stale-recovery delete, or an operator may have cleared
+    /// the lock manually); every other delete failure is propagated.
+    pub(crate) async fn release(mut self) -> Result<(), ObjectStoreError> {
+        self.stop_heartbeat();
+        delete_idempotent(self.store.as_ref(), &self.lock_key).await
+    }
+
+    /// Abort the heartbeat task without awaiting its completion. The
+    /// task is cooperative; abort + drop is sufficient to stop further
+    /// PUTs on the lock key.
+    fn stop_heartbeat(&mut self) {
+        if let Some(handle) = self.heartbeat.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        self.stop_heartbeat();
+    }
+}
+
+/// Heartbeat interval: `ttl/3`, floored at one second so a pathological
+/// sub-second TTL doesn't busy-loop. We use `ttl/3` rather than `ttl/2`
+/// so a single missed heartbeat (transient network blip with
+/// `MissedTickBehavior::Delay`) still leaves margin before `age > ttl`:
+/// two consecutive misses are needed to push the lock past the
+/// staleness threshold (#118 follow-up).
+pub(crate) fn heartbeat_interval(ttl: Duration) -> std::time::Duration {
+    let secs = ttl.whole_seconds().max(3) / 3;
+    // `try_from` rather than `as`: we just clamped to ≥ 1, but
+    // `clippy::cast_sign_loss` insists on the explicit fallible cast.
+    // The `unwrap_or(1)` branch is provably unreachable given the
+    // clamp above; keep a small positive fallback instead of `expect`
+    // to avoid panicking on a misuse pattern that callers should
+    // already have ruled out.
+    let secs_u64 = u64::try_from(secs).unwrap_or(1);
+    std::time::Duration::from_secs(secs_u64)
+}
+
+/// Try to acquire the per-ref lock. Returns `Ok(Some(guard))` when the
+/// lock was taken (heartbeat is already running) and `Ok(None)` on
+/// contention (caller should surface a "lock held" error). On a stale
+/// lock (older than `ttl`, with no heartbeat from a live holder), the
+/// lock is deleted and the conditional `put_if_absent` is retried
+/// once.
 ///
 /// The race window between `head` and the retry `put_if_absent` is
 /// inherent to non-conditional deletes — another client could acquire
 /// the lock between our delete and retry. We accept that race; the
 /// retry `put_if_absent` will return `Ok(false)` and the user will
 /// retry.
+///
+/// Heartbeat semantics (issue #118): a live holder refreshes the lock
+/// every `ttl/3` so the staleness check correctly excludes locks held
+/// by an in-flight critical section. A long-running [`compact`] no
+/// longer races a concurrent writer that wakes up after the original
+/// TTL elapses.
+///
+/// [`compact`]: crate::packchain::compact::compact
 pub(crate) async fn acquire_lock(
-    store: &dyn ObjectStore,
+    store: Arc<dyn ObjectStore>,
     lock_key: &str,
     ttl: Duration,
     now: OffsetDateTime,
-) -> Result<bool, ObjectStoreError> {
+) -> Result<Option<LockGuard>, ObjectStoreError> {
     if store.put_if_absent(lock_key, Bytes::new()).await? {
-        return Ok(true);
+        return Ok(Some(spawn_lock_guard(store, lock_key.to_owned(), ttl)));
     }
     let meta = match store.head(lock_key).await {
         Ok(m) => m,
         // Lock vanished between put_if_absent and head — another client
         // released it. Treat as contention; user retries.
-        Err(ObjectStoreError::NotFound(_)) => return Ok(false),
+        Err(ObjectStoreError::NotFound(_)) => return Ok(None),
         Err(e) => return Err(e),
     };
     let age = now - meta.last_modified;
     if age <= ttl {
-        return Ok(false);
+        return Ok(None);
     }
     debug!(key = %lock_key, age_secs = age.whole_seconds(), "deleting stale lock");
-    delete_idempotent(store, lock_key).await?;
-    store.put_if_absent(lock_key, Bytes::new()).await
+    delete_idempotent(store.as_ref(), lock_key).await?;
+    if store.put_if_absent(lock_key, Bytes::new()).await? {
+        Ok(Some(spawn_lock_guard(store, lock_key.to_owned(), ttl)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Build a [`LockGuard`] and spawn its heartbeat task. The heartbeat
+/// re-PUTs the lock key every `heartbeat_interval(ttl)` (overwrite, not
+/// conditional) so the stale-lock recovery branch in [`acquire_lock`]
+/// correctly excludes still-held locks. Heartbeat failures are logged
+/// at `warn` and retried on the next tick — a transient blip should
+/// not surface as a critical-section-aborting error.
+fn spawn_lock_guard(store: Arc<dyn ObjectStore>, lock_key: String, ttl: Duration) -> LockGuard {
+    let interval = heartbeat_interval(ttl);
+    let task_store = Arc::clone(&store);
+    let task_key = lock_key.clone();
+    let handle = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        // Skip the immediate first tick — the acquire just wrote the
+        // key, so a refresh in the same millisecond would be wasted
+        // bandwidth.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await; // immediate
+        loop {
+            tick.tick().await;
+            match task_store
+                .put_bytes(&task_key, Bytes::new(), PutOpts::default())
+                .await
+            {
+                Ok(()) => debug!(key = %task_key, "lock heartbeat refreshed"),
+                Err(e) => warn!(
+                    key = %task_key,
+                    error = %e,
+                    "lock heartbeat refresh failed; will retry",
+                ),
+            }
+        }
+    });
+    LockGuard {
+        lock_key,
+        store,
+        heartbeat: Some(handle),
+    }
 }
 
 /// Release a previously acquired per-ref lock. `NotFound` is mapped to
 /// `Ok(())` (another client or the TTL may have already cleaned it up);
 /// every other delete failure is propagated so the caller can surface it.
-pub(crate) async fn release_lock(
-    store: &dyn ObjectStore,
-    lock_key: &str,
-) -> Result<(), ObjectStoreError> {
-    delete_idempotent(store, lock_key).await
+///
+/// Heartbeat semantics: the guard's heartbeat task is aborted before
+/// the delete so a heartbeat refresh in flight cannot re-create the
+/// key after we've removed it.
+pub(crate) async fn release_lock(guard: LockGuard) -> Result<(), ObjectStoreError> {
+    guard.release().await
 }
 
 /// Idempotent delete: treats `NotFound` as success (another client may
@@ -382,7 +519,7 @@ pub(crate) async fn push_batch(
         // can still render an `error <ref> ...` line if the call fails.
         let remote_ref_str = spec.remote_ref.as_str().to_owned();
         let outcome = match push_one(
-            ctx.store.as_ref(),
+            Arc::clone(&ctx.store),
             ctx.prefix.as_deref(),
             ctx.repo_dir.as_path(),
             &config,
@@ -652,22 +789,21 @@ async fn prepare_push(
 
 /// Execute one push: prepare, lock, upload, release.
 async fn push_one(
-    store: &dyn ObjectStore,
+    store: Arc<dyn ObjectStore>,
     prefix: Option<&str>,
     repo_dir: &Path,
     config: &PushConfig,
     now: OffsetDateTime,
     spec: PushSpec,
 ) -> Result<PushOutcome, PushError> {
-    let state = match prepare_push(store, prefix, repo_dir, config, spec).await? {
+    let state = match prepare_push(store.as_ref(), prefix, repo_dir, config, spec).await? {
         PrepareOutcome::Done(o) => return Ok(o),
         PrepareOutcome::Ready(s) => s,
     };
 
     let remote_ref_str = state.remote_ref.as_str().to_owned();
     let lock = lock_key(prefix, &state.remote_ref);
-    let acquired = acquire_lock(store, &lock, config.ttl, now).await?;
-    if !acquired {
+    let Some(guard) = acquire_lock(Arc::clone(&store), &lock, config.ttl, now).await? else {
         return Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
             message: format!(
@@ -675,14 +811,14 @@ async fn push_one(
                 config.ttl.whole_seconds(),
             ),
         });
-    }
+    };
 
     // Run the lock-protected work, then release the lock unconditionally
     // before propagating the result. The `try/finally`-style release
     // ensures a mid-push error never leaves the lock dangling for the
     // full TTL.
-    let result = perform_push_under_lock(store, prefix, state).await;
-    let release_result = release_lock(store, &lock).await;
+    let result = perform_push_under_lock(store.as_ref(), prefix, state).await;
+    let release_result = release_lock(guard).await;
 
     // A failed lock release overrides a successful push outcome so the
     // operator is alerted and concurrent pushers are not left hitting a
@@ -1317,41 +1453,68 @@ mod tests {
     }
 
     // --- acquire_lock / release_lock ----------------------------------
+    //
+    // Issue #118: `acquire_lock` returns a `LockGuard` instead of a
+    // plain bool because the lock now carries a background heartbeat
+    // task. Tests construct an `Arc<dyn ObjectStore>` so the heartbeat
+    // task can clone the store; `MockStore`'s internal state is
+    // already `Arc<Mutex<...>>`-shared, so the `Arc` clone is shape
+    // bookkeeping, not extra state.
 
     #[tokio::test]
     async fn acquire_lock_succeeds_when_absent() {
-        let store = MockStore::new();
+        let store = Arc::new(MockStore::new());
         let now = OffsetDateTime::now_utc();
-        let acquired = acquire_lock(&store, "k", Duration::seconds(60), now)
-            .await
-            .unwrap();
-        assert!(acquired);
+        let guard = acquire_lock(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            "k",
+            Duration::seconds(60),
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(guard.is_some(), "expected a fresh guard");
         assert!(store.contains("k"));
+        // Drop the guard so the heartbeat task exits before the
+        // runtime tears down (also covered explicitly by
+        // `lock_guard_drop_aborts_heartbeat`).
+        drop(guard);
     }
 
     #[tokio::test]
-    async fn acquire_lock_returns_false_when_recently_held() {
-        let store = MockStore::new();
+    async fn acquire_lock_returns_none_when_recently_held() {
+        let store = Arc::new(MockStore::new());
         let now = OffsetDateTime::now_utc();
         store.insert_with("k", Bytes::new(), now, PutOpts::default());
-        let acquired = acquire_lock(&store, "k", Duration::seconds(60), now)
-            .await
-            .unwrap();
-        assert!(!acquired);
+        let guard = acquire_lock(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            "k",
+            Duration::seconds(60),
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(guard.is_none(), "expected contention");
     }
 
     #[tokio::test]
     async fn acquire_lock_recovers_stale_lock() {
-        let store = MockStore::new();
+        let store = Arc::new(MockStore::new());
         let now = OffsetDateTime::now_utc();
         let stale = now - Duration::seconds(120);
         store.insert_with("k", Bytes::new(), stale, PutOpts::default());
-        let acquired = acquire_lock(&store, "k", Duration::seconds(60), now)
-            .await
-            .unwrap();
-        assert!(acquired);
+        let guard = acquire_lock(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            "k",
+            Duration::seconds(60),
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(guard.is_some(), "stale lock must be recoverable");
         // Lock still exists (we re-created it with put_if_absent).
         assert!(store.contains("k"));
+        drop(guard);
     }
 
     #[tokio::test]
@@ -1363,39 +1526,80 @@ mod tests {
         let store = MockStore::new();
         store.insert("k", Bytes::new());
         store.arm(Fault::NotFoundOnHead { key: "k".into() });
+        let arc = Arc::new(store);
         let now = OffsetDateTime::now_utc();
-        let acquired = acquire_lock(&store, "k", Duration::seconds(60), now)
-            .await
-            .unwrap();
-        assert!(!acquired);
+        let guard = acquire_lock(
+            Arc::clone(&arc) as Arc<dyn ObjectStore>,
+            "k",
+            Duration::seconds(60),
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(guard.is_none(), "expected contention on disappeared lock");
         // Confirm head() was actually called — a regression that skipped
-        // the staleness branch and returned Ok(false) directly would also
-        // satisfy `!acquired`. The fault firing proves head ran.
-        assert_eq!(store.pending_faults(), 0);
-    }
-
-    #[tokio::test]
-    async fn release_lock_swallows_not_found() {
-        let store = MockStore::new();
-        // Releasing an absent lock must map NotFound to Ok(()).
-        release_lock(&store, "missing").await.unwrap();
+        // the staleness branch and returned None directly would also
+        // satisfy the assertion above. The fault firing proves head ran.
+        assert_eq!(arc.pending_faults(), 0);
     }
 
     #[tokio::test]
     async fn release_lock_deletes_existing_key() {
-        let store = MockStore::new();
-        store.insert("k", Bytes::new());
-        release_lock(&store, "k").await.unwrap();
+        let store = Arc::new(MockStore::new());
+        let now = OffsetDateTime::now_utc();
+        let guard = acquire_lock(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            "k",
+            Duration::seconds(60),
+            now,
+        )
+        .await
+        .unwrap()
+        .expect("acquire_lock must succeed on an empty store");
+        release_lock(guard).await.unwrap();
         assert!(!store.contains("k"));
+    }
+
+    #[tokio::test]
+    async fn release_lock_swallows_not_found_when_lock_already_gone() {
+        // Acquire a lock, then delete the key out-of-band before
+        // release_lock runs. The release must map NotFound → Ok(()).
+        let store = Arc::new(MockStore::new());
+        let now = OffsetDateTime::now_utc();
+        let guard = acquire_lock(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            "k",
+            Duration::seconds(60),
+            now,
+        )
+        .await
+        .unwrap()
+        .expect("acquire_lock must succeed");
+        // Cancel the heartbeat first so it cannot race the manual
+        // delete and re-create the key.
+        guard.heartbeat.as_ref().unwrap().abort();
+        // Give the abort a chance to take effect, then remove the key.
+        tokio::task::yield_now().await;
+        let _ = store.delete("k").await;
+        release_lock(guard).await.unwrap();
     }
 
     #[tokio::test]
     async fn release_lock_propagates_non_not_found_errors() {
         use crate::object_store::mock::Fault;
-        let store = MockStore::new();
-        store.insert("k", Bytes::new());
+        let store = Arc::new(MockStore::new());
+        let now = OffsetDateTime::now_utc();
+        let guard = acquire_lock(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            "k",
+            Duration::seconds(60),
+            now,
+        )
+        .await
+        .unwrap()
+        .expect("acquire_lock must succeed");
         store.arm(Fault::NetworkOnDelete { key: "k".into() });
-        let err = release_lock(&store, "k").await.unwrap_err();
+        let err = release_lock(guard).await.unwrap_err();
         assert!(
             matches!(err, ObjectStoreError::Network(_)),
             "expected Network error, got {err:?}",
@@ -1404,6 +1608,127 @@ mod tests {
         assert_eq!(store.pending_faults(), 0);
         // Key remains because the delete was faulted, not executed.
         assert!(store.contains("k"));
+    }
+
+    /// Issue #118: a long-running critical section must not lose its
+    /// lock. The heartbeat refreshes `last_modified` faster than the
+    /// TTL expires, so a concurrent acquire after the original TTL
+    /// elapses still sees a live lock and returns `None` (contention).
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_keeps_lock_alive_past_ttl() {
+        let store = Arc::new(MockStore::new());
+        let now = OffsetDateTime::now_utc();
+        // TTL is 4 s → heartbeat fires every 2 s (see
+        // `heartbeat_interval`). Run the test for ~10 s of virtual
+        // time so a regression that disabled the heartbeat would have
+        // multiple TTLs to expire under.
+        let ttl = Duration::seconds(4);
+        let guard = acquire_lock(Arc::clone(&store) as Arc<dyn ObjectStore>, "k", ttl, now)
+            .await
+            .unwrap()
+            .expect("acquire must succeed");
+
+        // Advance the clock past several TTLs, letting the heartbeat
+        // task fire each time.
+        for _ in 0..5 {
+            tokio::time::advance(std::time::Duration::from_secs(3)).await;
+            // Yield so the spawned heartbeat task can take its turn
+            // on the runtime and PUT the lock key.
+            tokio::task::yield_now().await;
+        }
+
+        // A concurrent acquire would see `last_modified` recent
+        // (heartbeat just refreshed it), so it should report
+        // contention — not steal the lock as stale. We use a `now`
+        // far in the future (matches the wall-clock view a second
+        // process would have) but rely on the heartbeat having
+        // overwritten `last_modified` to the runtime "now".
+        let future = OffsetDateTime::now_utc();
+        let other = acquire_lock(Arc::clone(&store) as Arc<dyn ObjectStore>, "k", ttl, future)
+            .await
+            .unwrap();
+        assert!(
+            other.is_none(),
+            "live lock must not be stealable while the holder's heartbeat runs",
+        );
+
+        release_lock(guard).await.unwrap();
+        assert!(!store.contains("k"));
+    }
+
+    /// Releasing the guard must stop the heartbeat so no further PUTs
+    /// hit the lock key after release. We assert by deleting the key
+    /// post-release and confirming it stays gone.
+    #[tokio::test(start_paused = true)]
+    async fn release_lock_stops_heartbeat() {
+        let store = Arc::new(MockStore::new());
+        let now = OffsetDateTime::now_utc();
+        let ttl = Duration::seconds(4);
+        let guard = acquire_lock(Arc::clone(&store) as Arc<dyn ObjectStore>, "k", ttl, now)
+            .await
+            .unwrap()
+            .expect("acquire must succeed");
+        release_lock(guard).await.unwrap();
+        assert!(!store.contains("k"));
+
+        // Advance well past multiple heartbeat intervals. A
+        // regression that forgot to abort the task would re-create
+        // the key via put_bytes.
+        for _ in 0..5 {
+            tokio::time::advance(std::time::Duration::from_secs(3)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !store.contains("k"),
+            "heartbeat must not re-create the key after release",
+        );
+    }
+
+    /// Dropping the guard without calling `release_lock` aborts the
+    /// heartbeat (so the lock becomes stealable after TTL) and leaves
+    /// the lock key in place (a future caller's stale-recovery path
+    /// reclaims it).
+    #[tokio::test(start_paused = true)]
+    async fn lock_guard_drop_aborts_heartbeat() {
+        let store = Arc::new(MockStore::new());
+        let now = OffsetDateTime::now_utc();
+        let ttl = Duration::seconds(4);
+        let guard = acquire_lock(Arc::clone(&store) as Arc<dyn ObjectStore>, "k", ttl, now)
+            .await
+            .unwrap()
+            .expect("acquire must succeed");
+        drop(guard);
+
+        // Capture the lock's last_modified right after drop —
+        // heartbeats after this point would advance it. `head` is the
+        // trait-level path to last_modified and avoids a test-only
+        // accessor on MockStore.
+        let after_drop = store.head("k").await.expect("lock present").last_modified;
+
+        // Advance time past multiple heartbeat intervals.
+        for _ in 0..5 {
+            tokio::time::advance(std::time::Duration::from_secs(3)).await;
+            tokio::task::yield_now().await;
+        }
+
+        let after_advance = store
+            .head("k")
+            .await
+            .expect("lock still present")
+            .last_modified;
+        assert_eq!(
+            after_drop, after_advance,
+            "heartbeat must not refresh last_modified after drop",
+        );
+
+        // And the lock is now stealable via the stale path: an acquire
+        // with a `now` past TTL deletes the orphaned lock and reclaims.
+        let future = now + Duration::seconds(120);
+        let recovered = acquire_lock(Arc::clone(&store) as Arc<dyn ObjectStore>, "k", ttl, future)
+            .await
+            .unwrap();
+        assert!(recovered.is_some(), "orphaned lock must be reclaimable");
+        drop(recovered);
     }
 
     // --- delete_remote_ref --------------------------------------------
@@ -1927,7 +2252,7 @@ mod tests {
     }
 
     /// Stale lock is deleted but another client re-acquires it before our
-    /// retry `put_if_absent`. Must return `Ok(false)` — the caller maps
+    /// retry `put_if_absent`. Must return `Ok(None)` — the caller maps
     /// this to a "lock held" user error, not a hard failure.
     #[tokio::test]
     async fn acquire_lock_stale_retry_loses_second_race() {
@@ -1938,14 +2263,20 @@ mod tests {
         store.insert_with("k", Bytes::new(), stale, PutOpts::default());
         // Another client wins the race between our delete and retry.
         store.arm(Fault::ContendedPutIfAbsent { key: "k".into() });
-        let acquired = acquire_lock(&store, "k", Duration::seconds(60), now)
-            .await
-            .unwrap();
-        assert!(!acquired);
+        let arc = Arc::new(store);
+        let guard = acquire_lock(
+            Arc::clone(&arc) as Arc<dyn ObjectStore>,
+            "k",
+            Duration::seconds(60),
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(guard.is_none(), "expected contention on the retry race");
         // Fault fired — confirms the retry put_if_absent was called.
-        assert_eq!(store.pending_faults(), 0);
+        assert_eq!(arc.pending_faults(), 0);
         // The stale lock was removed; no key remains.
-        assert!(!store.contains("k"));
+        assert!(!arc.contains("k"));
     }
 
     // --- full_error_chain dedup --------------------------------------

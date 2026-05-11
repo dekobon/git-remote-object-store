@@ -117,7 +117,7 @@ impl<'a> Compact<'a> {
         let mut any_compacted = false;
         for ref_name in targets {
             let outcome = compact::compact(
-                self.store.as_ref(),
+                Arc::clone(&self.store),
                 self.prefix_opt(),
                 &ref_name,
                 compact_opts,

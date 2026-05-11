@@ -29,6 +29,7 @@
 //! compact — paid only by an operator who explicitly opts in.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use futures::stream::{StreamExt, TryStreamExt};
 use tempfile::TempDir;
@@ -121,17 +122,17 @@ pub(crate) enum CompactAction {
 /// - [`PackchainError::Io`] — local I/O failures (tempdir, file
 ///   read/write).
 pub(crate) async fn compact(
-    store: &dyn ObjectStore,
+    store: Arc<dyn ObjectStore>,
     prefix: Option<&str>,
     ref_name: &RefName,
     opts: CompactOpts,
 ) -> Result<CompactOutcome, PackchainError> {
-    let prior =
-        load_chain(store, prefix, ref_name)
-            .await?
-            .ok_or_else(|| PackchainError::ChainAbsent {
-                ref_name: ref_name.as_str().to_owned(),
-            })?;
+    let store_ref = store.as_ref();
+    let prior = load_chain(store_ref, prefix, ref_name)
+        .await?
+        .ok_or_else(|| PackchainError::ChainAbsent {
+            ref_name: ref_name.as_str().to_owned(),
+        })?;
 
     let prior_segments = prior.segments.len();
     let prior_bytes = prior
@@ -177,10 +178,10 @@ pub(crate) async fn compact(
 
     let lock = lock_key(prefix, ref_name);
     let now = OffsetDateTime::now_utc();
-    if !acquire_lock(store, &lock, opts.lock_ttl, now)
+    let Some(guard) = acquire_lock(Arc::clone(&store), &lock, opts.lock_ttl, now)
         .await
         .map_err(PackchainError::Store)?
-    {
+    else {
         return Ok(CompactOutcome {
             action: CompactAction::LockContended,
             ref_path: ref_name.as_str().to_owned(),
@@ -189,12 +190,16 @@ pub(crate) async fn compact(
             new_pack_sha: None,
             new_pack_bytes: 0,
         });
-    }
+    };
 
     // Mirror push.rs's "try / always release" pattern: run work, drop
-    // the lock unconditionally, then surface either error.
-    let result = compact_under_lock(store, prefix, ref_name).await;
-    let release_result = release_lock(store, &lock).await;
+    // the lock unconditionally, then surface either error. The
+    // heartbeat task owned by `guard` (issue #118) refreshes the lock
+    // every `opts.lock_ttl / 2` so a long-running compact cannot be
+    // stolen by a concurrent acquirer that wakes up after the original
+    // TTL elapses.
+    let result = compact_under_lock(store.as_ref(), prefix, ref_name).await;
+    let release_result = release_lock(guard).await;
 
     // Match push.rs:667-687: a genuine work error takes priority,
     // but a release failure on the (Err, Err) path is logged at
@@ -695,6 +700,16 @@ mod tests {
     /// Lay down a real three-segment packchain in `store` using the
     /// repo from [`fixture_three_commits`]. Returns the chain and
     /// the path to the source repo (for read-back verification).
+    /// Wrap a `MockStore` reference in `Arc<dyn ObjectStore>` for the
+    /// `compact()` calls — the API now requires an `Arc` so the
+    /// heartbeat task in `LockGuard` (issue #118) can own a shared
+    /// clone. `MockStore`'s own `Arc<Mutex<…>>` shares state across
+    /// clones, so this preserves the "all references see the same
+    /// store" invariant the tests rely on.
+    fn arc_store(store: &MockStore) -> Arc<dyn ObjectStore> {
+        Arc::new(store.clone())
+    }
+
     async fn lay_down_three_segment_chain(
         store: &MockStore,
         prefix: &str,
@@ -803,7 +818,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = compact(&store, Some("repo"), &ref_main(), opts(true))
+        let outcome = compact(arc_store(&store), Some("repo"), &ref_main(), opts(true))
             .await
             .unwrap();
         assert_eq!(outcome.action, CompactAction::AlreadyMinimal);
@@ -836,7 +851,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = compact(&store, Some("repo"), &ref_main(), opts(false))
+        let outcome = compact(arc_store(&store), Some("repo"), &ref_main(), opts(false))
             .await
             .unwrap();
         assert_eq!(outcome.action, CompactAction::SkippedUnderThreshold);
@@ -854,7 +869,7 @@ mod tests {
         let lock_key = lock_key(Some("repo"), &ref_main());
         store.insert(&lock_key, Bytes::new());
 
-        let outcome = compact(&store, Some("repo"), &ref_main(), opts(true))
+        let outcome = compact(arc_store(&store), Some("repo"), &ref_main(), opts(true))
             .await
             .unwrap();
         assert_eq!(outcome.action, CompactAction::LockContended);
@@ -865,7 +880,7 @@ mod tests {
     #[tokio::test]
     async fn compact_chain_absent_returns_chain_absent_error() {
         let store = MockStore::new();
-        let err = compact(&store, Some("repo"), &ref_main(), opts(true))
+        let err = compact(arc_store(&store), Some("repo"), &ref_main(), opts(true))
             .await
             .unwrap_err();
         assert!(matches!(err, PackchainError::ChainAbsent { .. }));
@@ -890,7 +905,7 @@ mod tests {
         let path_index_key = "repo/refs/heads/main/path-index.json";
         store.delete(path_index_key).await.unwrap();
 
-        let outcome = compact(&store, Some("repo"), &ref_main(), opts(true))
+        let outcome = compact(arc_store(&store), Some("repo"), &ref_main(), opts(true))
             .await
             .unwrap();
         assert_eq!(outcome.action, CompactAction::Compacted);
@@ -979,13 +994,13 @@ mod tests {
         // up-front so the test fails loudly if the fixture changes shape.
         assert!(store.contains(&prior_bundle_key));
 
-        let outcome = compact(&store, Some("repo"), &ref_main(), opts(true))
+        let outcome = compact(arc_store(&store), Some("repo"), &ref_main(), opts(true))
             .await
             .unwrap();
         assert_eq!(outcome.action, CompactAction::Compacted);
         assert!(!store.contains(&prior_bundle_key));
 
-        let second = compact(&store, Some("repo"), &ref_main(), opts(true))
+        let second = compact(arc_store(&store), Some("repo"), &ref_main(), opts(true))
             .await
             .unwrap();
         assert_eq!(second.action, CompactAction::AlreadyMinimal);
@@ -1053,7 +1068,7 @@ mod tests {
             key: prior_bundle_key.clone(),
         });
 
-        let outcome = compact(&store, Some("repo"), &ref_main(), opts(true))
+        let outcome = compact(arc_store(&store), Some("repo"), &ref_main(), opts(true))
             .await
             .expect("compact must report success when post-commit cleanup fails");
         assert_eq!(outcome.action, CompactAction::Compacted);
@@ -1077,7 +1092,7 @@ mod tests {
             store.contains(&prior_bundle_key),
             "delete fault must have left the prior baseline bundle in place",
         );
-        let second = compact(&store, Some("repo"), &ref_main(), opts(true))
+        let second = compact(arc_store(&store), Some("repo"), &ref_main(), opts(true))
             .await
             .unwrap();
         assert_eq!(second.action, CompactAction::AlreadyMinimal);
@@ -1113,7 +1128,7 @@ mod tests {
             .expect("read_blob pre-compact");
 
         // Run compact.
-        let outcome = compact(&store, Some("repo"), &ref_main(), opts(true))
+        let outcome = compact(arc_store(&store), Some("repo"), &ref_main(), opts(true))
             .await
             .unwrap();
         assert_eq!(outcome.action, CompactAction::Compacted);

@@ -15,6 +15,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use time::OffsetDateTime;
@@ -143,7 +144,7 @@ pub(crate) async fn push_batch(
         let spec = parse_push_args(&cmd)?;
         let remote_ref_str = spec.remote_ref.as_str().to_owned();
         let outcome = match push_one(
-            ctx.store.as_ref(),
+            Arc::clone(&ctx.store),
             ctx.prefix.as_deref(),
             ctx.repo_dir.as_path(),
             &config,
@@ -195,22 +196,21 @@ fn full_error_chain(err: &PushError) -> String {
 /// `src/protocol/push.rs:656-676` (lock-release failure overrides a
 /// successful push but never masks a push error).
 async fn push_one(
-    store: &dyn ObjectStore,
+    store: Arc<dyn ObjectStore>,
     prefix: Option<&str>,
     repo_dir: &Path,
     config: &PushConfig,
     now: OffsetDateTime,
     spec: PushSpec,
 ) -> Result<PushOutcome, PushError> {
-    let state = match prepare_push(store, prefix, repo_dir, config, now, spec).await? {
+    let state = match prepare_push(Arc::clone(&store), prefix, repo_dir, config, now, spec).await? {
         PrepareOutcome::Done(o) => return Ok(o),
         PrepareOutcome::Ready(s) => s,
     };
 
     let remote_ref_str = state.remote_ref.as_str().to_owned();
     let lock = lock_key(prefix, &state.remote_ref);
-    let acquired = acquire_lock(store, &lock, config.ttl, now).await?;
-    if !acquired {
+    let Some(guard) = acquire_lock(Arc::clone(&store), &lock, config.ttl, now).await? else {
         return Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
             message: format!(
@@ -218,10 +218,10 @@ async fn push_one(
                 config.ttl.whole_seconds(),
             ),
         });
-    }
+    };
 
-    let result = perform_push_under_lock(store, prefix, config.engine, *state).await;
-    let release_result = bundle_push::release_lock(store, &lock).await;
+    let result = perform_push_under_lock(store.as_ref(), prefix, config.engine, *state).await;
+    let release_result = bundle_push::release_lock(guard).await;
 
     match (&result, release_result) {
         (Ok(PushOutcome::Ok { .. }), Err(e)) => {
@@ -246,7 +246,7 @@ async fn push_one(
 /// build (first / force push). The `gix::Repository` handle is dropped
 /// inside helper scopes so the surrounding future stays `Send`.
 async fn prepare_push(
-    store: &dyn ObjectStore,
+    store: Arc<dyn ObjectStore>,
     prefix: Option<&str>,
     repo_dir: &Path,
     config: &PushConfig,
@@ -269,10 +269,11 @@ async fn prepare_push(
         return Ok(PrepareOutcome::Done(outcome));
     }
 
+    let store_ref = store.as_ref();
     // Force push against a `PROTECTED#` marker is rejected before any
     // pack work. Mirror bundle's gate exactly.
     let force_push = if force {
-        !is_protected(store, prefix, &remote_ref).await?
+        !is_protected(store_ref, prefix, &remote_ref).await?
     } else {
         false
     };
@@ -280,7 +281,7 @@ async fn prepare_push(
 
     // Pre-lock chain snapshot. Used by the stale-tip guard under the
     // lock and by the prior_tip ancestor / incremental-pack-base.
-    let prior = load_chain(store, prefix, &remote_ref)
+    let prior = load_chain(store_ref, prefix, &remote_ref)
         .await
         .map_err(PushError::Packchain)?;
     let prior_tip_sha: Option<Sha> = match prior.as_ref() {
@@ -355,7 +356,7 @@ async fn prepare_push(
     // GC. A single push uploads each of pack/idx/baseline exactly
     // once.
     upload_pack_idx_baseline(
-        store,
+        store_ref,
         prefix,
         &remote_ref,
         local_sha,
@@ -847,7 +848,7 @@ async fn force_push_baseline_cleanup(
 /// concurrent push, letting a third client's `put_if_absent` succeed
 /// and break mutual exclusion.
 async fn delete_remote_ref_packchain(
-    store: &dyn ObjectStore,
+    store: Arc<dyn ObjectStore>,
     prefix: Option<&str>,
     remote_ref: &RefName,
     config: &PushConfig,
@@ -869,8 +870,7 @@ async fn delete_remote_ref_packchain(
     }
 
     let lock = lock_key(prefix, remote_ref);
-    let acquired = acquire_lock(store, &lock, config.ttl, now).await?;
-    if !acquired {
+    let Some(guard) = acquire_lock(Arc::clone(&store), &lock, config.ttl, now).await? else {
         return Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
             message: format!(
@@ -878,7 +878,7 @@ async fn delete_remote_ref_packchain(
                 config.ttl.whole_seconds(),
             ),
         });
-    }
+    };
 
     // Listing under the ref prefix may include the baseline bundle and
     // other per-ref artifacts; sweep them all EXCEPT the lock key.
@@ -887,19 +887,20 @@ async fn delete_remote_ref_packchain(
     // `release_lock` so concurrent pushes cannot slip into the critical
     // section while we are still sweeping.
     let listing = ref_listing_prefix(prefix, remote_ref);
+    let store_ref = store.as_ref();
     let sweep_result: Result<(), PushError> = async {
-        let entries = store.list(&listing).await?;
+        let entries = store_ref.list(&listing).await?;
         for entry in &entries {
             if entry.key == lock {
                 continue;
             }
-            delete_idempotent(store, &entry.key).await?;
+            delete_idempotent(store_ref, &entry.key).await?;
         }
         Ok(())
     }
     .await;
 
-    let release_result = bundle_push::release_lock(store, &lock).await;
+    let release_result = bundle_push::release_lock(guard).await;
 
     match (sweep_result, release_result) {
         (Ok(()), Ok(())) => Ok(PushOutcome::Ok {
@@ -946,7 +947,7 @@ mod tests {
         let store = MockStore::new();
         let config = delete_test_config();
         let outcome = delete_remote_ref_packchain(
-            &store,
+            Arc::new(store) as Arc<dyn ObjectStore>,
             None,
             &rn("refs/heads/main"),
             &config,
@@ -964,7 +965,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_sweeps_chain_path_index_and_baseline() {
-        let store = MockStore::new();
+        let store = Arc::new(MockStore::new());
         let prefix = Some("repo");
         let remote = rn("refs/heads/main");
         let baseline_sha = Sha::from_hex("0000000000000000000000000000000000000001").unwrap();
@@ -979,7 +980,7 @@ mod tests {
 
         let config = delete_test_config();
         let outcome = delete_remote_ref_packchain(
-            &store,
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
             prefix,
             &remote,
             &config,
@@ -1010,7 +1011,7 @@ mod tests {
     /// foreign-held lock) intact.
     #[tokio::test]
     async fn delete_with_lock_held_reports_contention_and_preserves_keys() {
-        let store = MockStore::new();
+        let store = Arc::new(MockStore::new());
         let prefix = Some("repo");
         let remote = rn("refs/heads/main");
         let chain = chain_key(prefix, &remote);
@@ -1027,7 +1028,7 @@ mod tests {
         // `now` close to the lock's insertion time → not stale, lock
         // acquire returns false.
         let outcome = delete_remote_ref_packchain(
-            &store,
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
             prefix,
             &remote,
             &config,
@@ -1063,7 +1064,7 @@ mod tests {
     /// ever existed during the delete's critical section.
     #[tokio::test]
     async fn delete_sweep_excludes_lock_key() {
-        let store = MockStore::new();
+        let store = Arc::new(MockStore::new());
         let prefix = Some("repo");
         let remote = rn("refs/heads/main");
         let chain = chain_key(prefix, &remote);
@@ -1073,7 +1074,7 @@ mod tests {
 
         let config = delete_test_config();
         let outcome = delete_remote_ref_packchain(
-            &store,
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
             prefix,
             &remote,
             &config,
