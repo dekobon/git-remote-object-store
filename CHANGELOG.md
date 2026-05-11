@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **packchain gc mark scales with parallel chain.json fetches.**
+  `packchain::gc::list_referenced_packs` now fetches `chain.json`
+  bodies via `futures::stream::buffer_unordered` bounded by
+  `MAX_FETCH_CONCURRENCY` (= 8), mirroring the shape
+  `packchain::list::list_refs` already used. After #89 widened the
+  mark phase's listing prefix from `<prefix>/refs/heads/` to
+  `<prefix>/refs/`, the candidate set spans heads + tags + notes +
+  any other namespace the packchain engine writes under `refs/`;
+  the previous sequential per-ref `get_bytes` made GC wall-clock
+  scale linearly in total ref count instead of overlapping fetches
+  the way list already did. The bodies stream-fold into the
+  referenced-set as each fetch completes, so parse work overlaps the
+  next batch's fetch latency and no intermediate `Vec<Bytes>` is
+  held. Fail-closed semantics on parse errors and transport errors
+  are preserved — the mark phase still aborts rather than
+  tombstoning live packs against a partial referenced set (#97).
+
 - **Documentation positioning shift.** The project no longer documents
   itself as a Rust port of, or maintains any compatibility contract
   with, `awslabs/git-remote-s3` (Python). The on-bucket key layout,

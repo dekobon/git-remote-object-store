@@ -70,6 +70,7 @@
 use std::collections::HashSet;
 
 use bytes::Bytes;
+use futures::stream::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -78,6 +79,7 @@ use uuid::Uuid;
 
 use crate::keys;
 use crate::object_store::{ObjectStore, ObjectStoreError, PutOpts};
+use crate::protocol::fetch::MAX_FETCH_CONCURRENCY;
 
 use super::PackchainError;
 use super::schema::{ChainManifest, Sha40};
@@ -507,12 +509,29 @@ async fn list_referenced_packs(
 ) -> Result<HashSet<Sha40>, PackchainError> {
     let refs_prefix = keys::join(prefix, "refs/");
     let metas = store.list(&refs_prefix).await?;
-    let mut referenced: HashSet<Sha40> = HashSet::new();
-    for meta in metas {
-        if !super::keys::is_chain_json_key(&meta.key) {
-            continue;
-        }
-        let body = store.get_bytes(&meta.key).await?;
+
+    // Bounded-parallel `get_bytes` per chain.json, parse-as-fetched.
+    // Mirrors `list::list_refs` (#89 widened the listing prefix to
+    // all `refs/` namespaces, so candidate count scales with branches
+    // + tags + notes). `MAX_FETCH_CONCURRENCY` (= 8) is the same bound
+    // Phase 3 fetch uses for chain pack downloads. `try_fold` folds
+    // each body into the set as soon as `buffer_unordered` yields it,
+    // so parse overlaps the next batch's fetch latency and no
+    // intermediate `Vec<Bytes>` is held.
+    //
+    // Fail-closed semantics: a transport failure on any GET, or a
+    // parse failure on any chain, aborts the run — the mark phase
+    // cannot tombstone live packs because of an under-reporting
+    // corrupt chain.
+    futures::stream::iter(
+        metas
+            .into_iter()
+            .filter(|m| super::keys::is_chain_json_key(&m.key))
+            .map(|m| m.key),
+    )
+    .map(|key| async move { store.get_bytes(&key).await.map_err(PackchainError::Store) })
+    .buffer_unordered(MAX_FETCH_CONCURRENCY)
+    .try_fold(HashSet::<Sha40>::new(), |mut acc, body| async move {
         let chain = ChainManifest::from_json_bytes(&body)?;
         for segment in chain.segments {
             // gc fails closed on a malformed pack key (vs read.rs's
@@ -524,10 +543,11 @@ async fn list_referenced_packs(
                     segment.pack,
                 )))
             })?;
-            referenced.insert(sha);
+            acc.insert(sha);
         }
-    }
-    Ok(referenced)
+        Ok(acc)
+    })
+    .await
 }
 
 /// List every `<prefix>/packs/*.pack` and `*.idx` and return the union
@@ -804,6 +824,43 @@ mod tests {
         let store = MockStore::new();
         let referenced = list_referenced_packs(&store, "repo").await.unwrap();
         assert!(referenced.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_referenced_packs_unions_many_chains_with_bounded_parallel_fetch() {
+        // Regression guard for the buffer_unordered fetch path:
+        // exercise more chain.json bodies than MAX_FETCH_CONCURRENCY
+        // (= 8) so multiple batches must complete and union without
+        // dropping any pack sha. Spans heads, tags, and notes so the
+        // listing prefix widening from #89 stays exercised.
+        let store = MockStore::new();
+        let chain_count = MAX_FETCH_CONCURRENCY * 3 + 1;
+        let namespaces = ["refs/heads", "refs/tags", "refs/notes"];
+        let mut expected: HashSet<Sha40> = HashSet::new();
+        for i in 0..chain_count {
+            let pack_sha = format!("{:040x}", 0x1000 + i);
+            let pack_sha40 = sha40(&pack_sha);
+            let namespace = namespaces[i % namespaces.len()];
+            let ref_name = RefName::new(format!("{namespace}/r{i}")).unwrap();
+            let chain = ChainManifest {
+                v: 1,
+                tip: sha40(SHA_TIP),
+                full_at: sha40(SHA_FULL),
+                segments: vec![ChainSegment {
+                    sha: sha40(SHA_TIP),
+                    parent_sha: None,
+                    pack: format!("packs/{pack_sha}.pack"),
+                    bytes: 1_024,
+                }],
+            };
+            write_chain(&store, Some("repo"), &ref_name, &chain)
+                .await
+                .unwrap();
+            expected.insert(pack_sha40);
+        }
+
+        let referenced = list_referenced_packs(&store, "repo").await.unwrap();
+        assert_eq!(referenced, expected);
     }
 
     #[tokio::test]
