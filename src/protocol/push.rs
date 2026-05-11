@@ -240,18 +240,28 @@ async fn bundles_for_ref(
 }
 
 /// Returns `true` iff a `<prefix>/<ref>/PROTECTED#` marker exists.
+///
+/// Uses an exact-key `head` rather than a prefix `list`. `ObjectStore::list`
+/// is a byte-prefix match, so a `list("…/PROTECTED#")` would also return any
+/// future `PROTECTED#`-prefixed sibling key (e.g. `PROTECTED#audit`). The
+/// equality check here matches the semantics of the canonical
+/// `is_protected_marker_segment` snapshot-side helper and avoids
+/// spuriously blocking pushes or deletes on unprotected refs.
 pub(crate) async fn is_protected(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
     remote_ref: &RefName,
 ) -> Result<bool, ObjectStoreError> {
-    let listing = format!(
+    let key = format!(
         "{}{}",
         ref_listing_prefix(prefix, remote_ref),
         keys::PROTECTED_MARKER_SEGMENT,
     );
-    let metas = store.list(&listing).await?;
-    Ok(!metas.is_empty())
+    match store.head(&key).await {
+        Ok(_) => Ok(true),
+        Err(ObjectStoreError::NotFound(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Extract the SHA from a `<…>/<sha>.bundle` key. Returns `None` if the
@@ -1270,6 +1280,40 @@ mod tests {
         assert!(!is_protected(&store, Some("repo"), &r).await.unwrap());
         store.insert("repo/refs/heads/main/PROTECTED#", Bytes::from_static(b""));
         assert!(is_protected(&store, Some("repo"), &r).await.unwrap());
+    }
+
+    /// Regression for #119: only the exact `PROTECTED#` key counts as a
+    /// protection marker. A sibling key that merely starts with
+    /// `PROTECTED#` (e.g. `PROTECTED#audit`) must not flip the result.
+    #[tokio::test]
+    async fn is_protected_ignores_protected_prefixed_sibling() {
+        let store = MockStore::new();
+        let r = rn("refs/heads/main");
+        store.insert(
+            "repo/refs/heads/main/PROTECTED#audit",
+            Bytes::from_static(b""),
+        );
+        assert!(!is_protected(&store, Some("repo"), &r).await.unwrap());
+    }
+
+    /// Regression for #119: `is_protected` must use `head`, not `list`.
+    /// Arm `AccessDeniedOnAnyList`; if the implementation calls `list`
+    /// at all, the fault fires and the call returns an error. We assert
+    /// success and that the fault is still pending (i.e. unfired).
+    #[tokio::test]
+    async fn is_protected_uses_head_not_list() {
+        use crate::object_store::mock::Fault;
+        let store = MockStore::new();
+        let r = rn("refs/heads/main");
+        store.arm(Fault::AccessDeniedOnAnyList);
+        let got = is_protected(&store, Some("repo"), &r).await.unwrap();
+        assert!(!got);
+        assert_eq!(store.pending_faults(), 1, "is_protected must not call list",);
+        // And the positive case too — still no list.
+        store.insert("repo/refs/heads/main/PROTECTED#", Bytes::from_static(b""));
+        let got = is_protected(&store, Some("repo"), &r).await.unwrap();
+        assert!(got);
+        assert_eq!(store.pending_faults(), 1, "is_protected must not call list",);
     }
 
     // --- acquire_lock / release_lock ----------------------------------
