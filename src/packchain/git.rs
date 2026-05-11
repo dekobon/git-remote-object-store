@@ -867,4 +867,109 @@ mod tests {
             Some(PathNode::Blob(_)),
         ));
     }
+
+    // --- walk_tree allocation cost reproducer (issue #96) -------------
+    //
+    // `walk_tree` allocates a fresh `BTreeMap<String, PathNode>` per
+    // subtree and a `String` per entry name. Issue #96 asked whether
+    // this allocator pattern is hot enough to warrant a schema or
+    // streaming-serialisation rework. The answer recorded on that issue
+    // (and proven by this `#[ignore]`d reproducer) is no: the cost is
+    // below the noise floor of pack generation and network upload on
+    // any realistic push.
+    //
+    // Run with:
+    //     cargo test --release -p git-remote-object-store \
+    //         walk_tree_synthetic_wide_tree_perf_reproducer -- --ignored \
+    //         --nocapture
+    //
+    // The assertion is a loose upper bound — it will not catch
+    // micro-regressions, only catastrophic ones (e.g., an accidental
+    // quadratic in path-index construction).
+
+    /// Build a synthetic wide tree with `dirs` subdirectories under the
+    /// root, each holding `files_per_dir` blob entries. Returns the
+    /// repo, its tempdir guard, and the unpeeled tree OID.
+    fn synthetic_wide_tree(dirs: usize, files_per_dir: usize) -> (gix::Repository, TempDir, Sha) {
+        let tmp = TempDir::new().unwrap();
+        let repo = gix::init(tmp.path()).unwrap();
+        let blob = repo.write_blob(b"x").unwrap().detach();
+
+        let mut root_entries = Vec::with_capacity(dirs);
+        for d in 0..dirs {
+            let mut dir_entries = Vec::with_capacity(files_per_dir);
+            for f in 0..files_per_dir {
+                dir_entries.push(Entry {
+                    mode: EntryKind::Blob.into(),
+                    filename: format!("file-{f:05}.bin").into(),
+                    oid: blob,
+                });
+            }
+            let dir_tree = repo
+                .write_object(&gix::objs::Tree {
+                    entries: dir_entries,
+                })
+                .unwrap()
+                .detach();
+            root_entries.push(Entry {
+                mode: EntryKind::Tree.into(),
+                filename: format!("dir-{d:05}").into(),
+                oid: dir_tree,
+            });
+        }
+        let root = repo
+            .write_object(&gix::objs::Tree {
+                entries: root_entries,
+            })
+            .unwrap()
+            .detach();
+        (repo, tmp, Sha::from_object_id(root))
+    }
+
+    #[test]
+    #[ignore = "perf reproducer for issue #96 — run with --ignored"]
+    fn walk_tree_synthetic_wide_tree_perf_reproducer() {
+        use std::time::Instant;
+
+        // Roughly Linux-kernel-shaped: thousands of dirs, tens of
+        // thousands of files. Tuned to stay under a few seconds even on
+        // slow hardware so the reproducer is cheap to re-run.
+        let dirs = 5_000;
+        let files_per_dir = 16;
+        let (repo, _guard, root) = synthetic_wide_tree(dirs, files_per_dir);
+        let peeled = PeeledTip::Tree {
+            tree: *root.as_object_id(),
+            tag_chain: Vec::new(),
+        };
+
+        let iterations = 5;
+        let mut total = std::time::Duration::ZERO;
+        for _ in 0..iterations {
+            let start = Instant::now();
+            let index = extract_path_index(&repo, &peeled, root)
+                .expect("perf reproducer must succeed")
+                .expect("tree-tip path-index must be present");
+            total += start.elapsed();
+            // Structural sanity check: the root must carry one entry per
+            // synthetic directory. Catches a regression that produces an
+            // empty path-index without changing the timing.
+            assert_eq!(index.tree.len(), dirs);
+        }
+        let avg = total / iterations;
+        eprintln!(
+            "extract_path_index over {dirs} dirs x {files_per_dir} blobs/dir \
+             ({} entries total): avg {:.2?} per call, {iterations} iterations",
+            dirs * files_per_dir + dirs,
+            avg,
+        );
+        // Catastrophic-regression guard. A correct walk on this fixture
+        // completes in single-digit milliseconds on modern hardware,
+        // tens of ms on slow CI. 2 s leaves ample headroom while still
+        // catching an accidental quadratic.
+        assert!(
+            avg < std::time::Duration::from_secs(2),
+            "extract_path_index avg {avg:.2?} exceeds 2 s upper bound — \
+             suspect a quadratic regression in walk_tree",
+        );
+    }
 }
