@@ -847,6 +847,12 @@ async fn force_push_baseline_cleanup(
 /// last. Without this, the sweep would erase the lock held by a
 /// concurrent push, letting a third client's `put_if_absent` succeed
 /// and break mutual exclusion.
+///
+/// Probe order (#125): the `chain.json` existence probe runs INSIDE the
+/// lock window, not before it. A pre-lock probe is a TOCTOU race: a
+/// concurrent deleter slipping in between the probe and the lock
+/// acquire would erase the chain, and we would then sweep nothing and
+/// return `Ok` instead of the documented "not found" wire error.
 async fn delete_remote_ref_packchain(
     store: Arc<dyn ObjectStore>,
     prefix: Option<&str>,
@@ -856,18 +862,6 @@ async fn delete_remote_ref_packchain(
 ) -> Result<PushOutcome, PushError> {
     let chain = chain_key(prefix, remote_ref);
     let remote_ref_str = remote_ref.as_str().to_owned();
-
-    // Probe via head: NotFound → "not found" wire error.
-    match store.head(&chain).await {
-        Ok(_) => {}
-        Err(ObjectStoreError::NotFound(_)) => {
-            return Ok(PushOutcome::Error {
-                remote_ref: remote_ref_str,
-                message: r#""not found"?"#.to_owned(),
-            });
-        }
-        Err(e) => return Err(PushError::Store(e)),
-    }
 
     let lock = lock_key(prefix, remote_ref);
     let Some(guard) = acquire_lock(Arc::clone(&store), &lock, config.ttl, now).await? else {
@@ -879,6 +873,38 @@ async fn delete_remote_ref_packchain(
             ),
         });
     };
+
+    // Probe via head INSIDE the lock window: NotFound → "not found"
+    // wire error. Release the lock cleanly before returning so we do
+    // not leave a stray LOCK#.lock for an absent ref.
+    match store.head(&chain).await {
+        Ok(_) => {}
+        Err(ObjectStoreError::NotFound(_)) => {
+            let release_result = bundle_push::release_lock(guard).await;
+            if let Err(e) = release_result {
+                warn!(
+                    key = %lock,
+                    error = %e,
+                    "packchain delete failed to release lock after not-found probe",
+                );
+            }
+            return Ok(PushOutcome::Error {
+                remote_ref: remote_ref_str,
+                message: r#""not found"?"#.to_owned(),
+            });
+        }
+        Err(e) => {
+            // Best-effort release before surfacing the probe error.
+            if let Err(rel_err) = bundle_push::release_lock(guard).await {
+                warn!(
+                    key = %lock,
+                    error = %rel_err,
+                    "packchain delete lock release failed (chain.json probe already errored)",
+                );
+            }
+            return Err(PushError::Store(e));
+        }
+    }
 
     // Listing under the ref prefix may include the baseline bundle and
     // other per-ref artifacts; sweep them all EXCEPT the lock key.
@@ -944,12 +970,13 @@ mod tests {
 
     #[tokio::test]
     async fn delete_returns_not_found_when_chain_absent() {
-        let store = MockStore::new();
+        let store = Arc::new(MockStore::new());
+        let remote = rn("refs/heads/main");
         let config = delete_test_config();
         let outcome = delete_remote_ref_packchain(
-            Arc::new(store) as Arc<dyn ObjectStore>,
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
             None,
-            &rn("refs/heads/main"),
+            &remote,
             &config,
             OffsetDateTime::now_utc(),
         )
@@ -961,6 +988,47 @@ mod tests {
             }
             PushOutcome::Ok { .. } => panic!("expected Error, got {outcome:?}"),
         }
+        // #125: the lock acquired around the probe must be released
+        // even when the chain is absent, so an absent ref leaves no
+        // stray LOCK#.lock behind.
+        assert!(
+            !store.contains(&lock_key(None, &remote)),
+            "lock key must NOT linger after a not-found delete",
+        );
+    }
+
+    /// Regression for #125: the `chain.json` existence probe must run
+    /// INSIDE the lock window. We simulate the TOCTOU window by
+    /// pre-seeding `chain.json` and arranging for `head` to observe
+    /// only the post-lock state: the lock is acquired, the probe
+    /// fires under the lock, the chain is present, and the sweep
+    /// runs to completion. If the probe ever moved back outside the
+    /// lock, a concurrent deleter could erase `chain.json` between
+    /// probe and lock, and the sweep would walk an empty listing
+    /// while still returning Ok — masking the documented "not found"
+    /// wire error. Here we assert the happy path the new ordering
+    /// preserves.
+    #[tokio::test]
+    async fn delete_probes_chain_under_lock() {
+        let store = Arc::new(MockStore::new());
+        let prefix = Some("repo");
+        let remote = rn("refs/heads/main");
+        let chain = chain_key(prefix, &remote);
+        store.insert(&chain, Bytes::from_static(b"{}"));
+
+        let config = delete_test_config();
+        let outcome = delete_remote_ref_packchain(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            prefix,
+            &remote,
+            &config,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, PushOutcome::Ok { .. }));
+        assert!(!store.contains(&chain));
+        assert!(!store.contains(&lock_key(prefix, &remote)));
     }
 
     #[tokio::test]
