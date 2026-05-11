@@ -345,10 +345,24 @@ async fn fetch_full(
     // applies across refs.
     let mut downloads: JoinSet<Result<DownloadedArtifact, FetchError>> = JoinSet::new();
     for segment in needed {
+        // `ChainSegment::pack` is a plain `String` after serde, with
+        // no format check at deserialise time — a crafted chain.json
+        // could otherwise drive `packs_key_with_prefix` to request
+        // an arbitrary bucket key. Mirror the same guard `gc.rs` and
+        // `read.rs` already apply (issue #120).
+        let content_sha = super::keys::parse_pack_key_sha(&segment.pack).ok_or_else(|| {
+            FetchError::Packchain(PackchainError::MalformedPackEntry {
+                offset: 0,
+                reason: format!(
+                    "chain segment pack key `{}` is not of the form `[<prefix>/]packs/<sha>.pack`",
+                    segment.pack,
+                ),
+            })
+        })?;
         let store = Arc::clone(store);
         let permit_pool = Arc::clone(semaphore);
         let key = super::keys::packs_key_with_prefix(prefix, &segment.pack);
-        let dest = temp_path.join(format!("{}.pack", segment.sha.as_str()));
+        let dest = temp_path.join(format!("{}.pack", content_sha.as_str()));
         let segment_clone = segment.clone();
         downloads.spawn(async move {
             let _permit = permit_pool
@@ -450,8 +464,19 @@ async fn fetch_shallow(
     depth: NonZeroU32,
 ) -> Result<(), FetchError> {
     for segment in needed {
+        // Validate the bucket-relative pack key before composing the
+        // GET key; see the matching guard in `fetch_full` and issue #120.
+        let content_sha = super::keys::parse_pack_key_sha(&segment.pack).ok_or_else(|| {
+            FetchError::Packchain(PackchainError::MalformedPackEntry {
+                offset: 0,
+                reason: format!(
+                    "chain segment pack key `{}` is not of the form `[<prefix>/]packs/<sha>.pack`",
+                    segment.pack,
+                ),
+            })
+        })?;
         let key = super::keys::packs_key_with_prefix(prefix, &segment.pack);
-        let dest = temp_path.join(format!("{}.pack", segment.sha.as_str()));
+        let dest = temp_path.join(format!("{}.pack", content_sha.as_str()));
         download_pack(store, &key, &dest).await?;
         let repo_dir_clone = repo_dir.to_path_buf();
         let pack_path = dest;
@@ -734,6 +759,121 @@ mod tests {
             }
             other => panic!("expected ChainAbsent, got {other:?}"),
         }
+    }
+
+    /// Helper for the malformed-pack-key tests: build a `ChainSegment`
+    /// whose `pack` field is `pack`. The other fields use stable dummy
+    /// values; the validation under test only inspects `pack`.
+    fn segment_with_pack(pack: &str) -> ChainSegment {
+        ChainSegment {
+            sha: Sha40::try_new("2222222222222222222222222222222222222222").unwrap(),
+            parent_sha: None,
+            pack: pack.to_owned(),
+            bytes: 1_024,
+        }
+    }
+
+    /// Drive `fetch_full` directly with a single malformed-pack-key
+    /// segment and assert the error variant. Centralises the
+    /// boilerplate so the three regression cases stay declarative.
+    async fn assert_fetch_full_rejects(pack: &str) {
+        let repo_dir = tempfile::tempdir().unwrap();
+        gix::init(repo_dir.path()).unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(MockStore::new());
+        let semaphore = Arc::new(Semaphore::new(MAX_FETCH_CONCURRENCY));
+        let needed = vec![segment_with_pack(pack)];
+
+        let result = fetch_full(
+            &store,
+            &semaphore,
+            Some("repo"),
+            repo_dir.path(),
+            temp_dir.path(),
+            &ref_main(),
+            &needed,
+            None,
+        )
+        .await;
+        match result {
+            Err(FetchError::Packchain(PackchainError::MalformedPackEntry {
+                offset: 0,
+                reason,
+            })) => {
+                assert!(
+                    reason.contains(pack) || pack.is_empty(),
+                    "reason should name the malformed pack key, got: {reason}",
+                );
+            }
+            other => panic!("expected MalformedPackEntry for pack `{pack}`, got {other:?}"),
+        }
+    }
+
+    /// Drive `fetch_shallow` directly with a single malformed-pack-key
+    /// segment and assert the error variant.
+    async fn assert_fetch_shallow_rejects(pack: &str) {
+        let repo_dir = tempfile::tempdir().unwrap();
+        gix::init(repo_dir.path()).unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = MockStore::new();
+        let needed = vec![segment_with_pack(pack)];
+        let tip_sha = Sha::from_hex("2222222222222222222222222222222222222222").unwrap();
+        let depth = NonZeroU32::new(1).unwrap();
+
+        let result = fetch_shallow(
+            &store,
+            Some("repo"),
+            repo_dir.path(),
+            temp_dir.path(),
+            &ref_main(),
+            tip_sha,
+            &needed,
+            None,
+            depth,
+        )
+        .await;
+        match result {
+            Err(FetchError::Packchain(PackchainError::MalformedPackEntry {
+                offset: 0,
+                reason,
+            })) => {
+                assert!(
+                    reason.contains(pack) || pack.is_empty(),
+                    "reason should name the malformed pack key, got: {reason}",
+                );
+            }
+            other => panic!("expected MalformedPackEntry for pack `{pack}`, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_full_rejects_empty_pack_key() {
+        assert_fetch_full_rejects("").await;
+    }
+
+    #[tokio::test]
+    async fn fetch_full_rejects_unstructured_pack_key() {
+        assert_fetch_full_rejects("wrong").await;
+    }
+
+    #[tokio::test]
+    async fn fetch_full_rejects_non_hex_pack_key() {
+        assert_fetch_full_rejects("packs/notahex.pack").await;
+    }
+
+    #[tokio::test]
+    async fn fetch_shallow_rejects_empty_pack_key() {
+        assert_fetch_shallow_rejects("").await;
+    }
+
+    #[tokio::test]
+    async fn fetch_shallow_rejects_unstructured_pack_key() {
+        assert_fetch_shallow_rejects("wrong").await;
+    }
+
+    #[tokio::test]
+    async fn fetch_shallow_rejects_non_hex_pack_key() {
+        assert_fetch_shallow_rejects("packs/notahex.pack").await;
     }
 
     #[tokio::test]

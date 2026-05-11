@@ -416,15 +416,35 @@ async fn download_chain_artefacts(
     chain: &ChainManifest,
     download_dir: &Path,
 ) -> Result<(), PackchainError> {
+    // Validate every segment's bucket-relative pack key before
+    // composing GET keys. `ChainSegment::pack` deserialises as a
+    // plain `String` with no format check, so a crafted chain.json
+    // could otherwise drive `packs_key_with_prefix` to request an
+    // arbitrary bucket key. Mirror the same guard `gc.rs`, `read.rs`,
+    // and `fetch.rs` apply (issue #120). The local destination name
+    // keeps `seg.sha` (commit SHA at the segment tip) to match the
+    // install step's filename convention — `parse_pack_key_sha`'s
+    // output is the pack content SHA, a different identifier.
     let mut tasks: Vec<DownloadTask> = chain
         .segments
         .iter()
-        .map(|seg| DownloadTask {
-            key: packs_key_with_prefix(prefix, &seg.pack),
-            dest: download_dir.join(format!("{}.pack", seg.sha.as_str())),
-            kind: "pack",
+        .map(|seg| {
+            super::keys::parse_pack_key_sha(&seg.pack).ok_or_else(|| {
+                PackchainError::MalformedPackEntry {
+                    offset: 0,
+                    reason: format!(
+                        "chain segment pack key `{}` is not of the form `[<prefix>/]packs/<sha>.pack`",
+                        seg.pack,
+                    ),
+                }
+            })?;
+            Ok::<_, PackchainError>(DownloadTask {
+                key: packs_key_with_prefix(prefix, &seg.pack),
+                dest: download_dir.join(format!("{}.pack", seg.sha.as_str())),
+                kind: "pack",
+            })
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     tasks.push(DownloadTask {
         key: keys::bundle_key(prefix, ref_name, chain.full_at.as_str()),
         dest: download_dir.join(format!("{}.bundle", chain.full_at.as_str())),
@@ -1094,5 +1114,57 @@ mod tests {
             .await
             .expect("read_blob post-compact");
         assert_eq!(pre, post, "blob bytes must round-trip through compact");
+    }
+
+    /// Drive `download_chain_artefacts` with a single segment whose
+    /// `pack` field is malformed and assert the typed error variant.
+    /// Centralises the three regression cases for issue #120.
+    async fn assert_download_chain_artefacts_rejects(pack: &str) {
+        let store = MockStore::new();
+        let download_dir = TempDir::new().unwrap();
+        let chain = ChainManifest {
+            v: 1,
+            tip: sha40("3333333333333333333333333333333333333333"),
+            full_at: sha40("3333333333333333333333333333333333333333"),
+            segments: vec![ChainSegment {
+                sha: sha40("3333333333333333333333333333333333333333"),
+                parent_sha: None,
+                pack: pack.to_owned(),
+                bytes: 1_024,
+            }],
+        };
+
+        let result = download_chain_artefacts(
+            &store,
+            Some("repo"),
+            &ref_main(),
+            &chain,
+            download_dir.path(),
+        )
+        .await;
+        match result {
+            Err(PackchainError::MalformedPackEntry { offset: 0, reason }) => {
+                assert!(
+                    reason.contains(pack) || pack.is_empty(),
+                    "reason should name the malformed pack key, got: {reason}",
+                );
+            }
+            other => panic!("expected MalformedPackEntry for pack `{pack}`, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn download_chain_artefacts_rejects_empty_pack_key() {
+        assert_download_chain_artefacts_rejects("").await;
+    }
+
+    #[tokio::test]
+    async fn download_chain_artefacts_rejects_unstructured_pack_key() {
+        assert_download_chain_artefacts_rejects("wrong").await;
+    }
+
+    #[tokio::test]
+    async fn download_chain_artefacts_rejects_non_hex_pack_key() {
+        assert_download_chain_artefacts_rejects("packs/notahex.pack").await;
     }
 }
