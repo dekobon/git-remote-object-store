@@ -375,8 +375,13 @@ async fn compact_under_lock(
     // chain.json is now durable — the old baseline bundle is
     // unreachable. See [`delete_prior_baseline_bundle`] for why
     // this delete must run under the same lock and after the
-    // chain.json commit.
-    delete_prior_baseline_bundle(store, &old_bundle_key, &new_bundle_key).await?;
+    // chain.json commit. The delete is best-effort: a failure
+    // after the chain commit must NOT report compact as failed,
+    // because the new chain is already live and a retry would
+    // short-circuit through `AlreadyMinimal` without finishing
+    // the cleanup (issue #113). The helper logs at `warn` with
+    // the orphan key so an operator can clean up manually.
+    delete_prior_baseline_bundle(store, ref_name, &old_bundle_key, &new_bundle_key).await;
 
     info!(
         ref_path = %ref_name.as_str(),
@@ -523,8 +528,8 @@ async fn upload_bundle(
     Ok(())
 }
 
-/// Delete the prior `<full_at>.bundle` once the new chain.json is
-/// durable.
+/// Best-effort delete of the prior `<full_at>.bundle` once the new
+/// chain.json is durable.
 ///
 /// Called from [`compact_under_lock`] AFTER the `write_chain` PUT —
 /// any reader after that point follows the new chain.json and never
@@ -535,27 +540,42 @@ async fn upload_bundle(
 /// Skips when `old == new` (compact left `full_at` unchanged — the
 /// keys alias the same live bundle). Tolerates `NotFound` so a retry
 /// after a partial completion is idempotent (issue #84).
+///
+/// Failure contract (issue #113): the new chain manifest is already
+/// durable on the bucket when this function runs, so a transient
+/// store error here must NOT propagate as a compact failure. Retrying
+/// `compact` would short-circuit through `AlreadyMinimal` and never
+/// re-attempt the cleanup, stranding the old baseline indefinitely
+/// (`gc::list_pack_shas` does not sweep bundle keys). Log at `warn`
+/// with the orphan key and return.
 async fn delete_prior_baseline_bundle(
     store: &dyn ObjectStore,
+    ref_name: &RefName,
     old_bundle_key: &str,
     new_bundle_key: &str,
-) -> Result<(), PackchainError> {
+) {
     if old_bundle_key == new_bundle_key {
-        return Ok(());
+        return;
     }
     match store.delete(old_bundle_key).await {
         Ok(()) => {
             debug!(key = %old_bundle_key, "compact: deleted prior baseline bundle");
-            Ok(())
         }
         Err(ObjectStoreError::NotFound(_)) => {
             debug!(
                 key = %old_bundle_key,
                 "compact: prior baseline bundle already absent",
             );
-            Ok(())
         }
-        Err(e) => Err(PackchainError::Store(e)),
+        Err(e) => {
+            warn!(
+                ref_path = %ref_name.as_str(),
+                key = %old_bundle_key,
+                error = %e,
+                "compact: prior baseline cleanup failed (chain.json already committed); \
+                 orphan key left for manual cleanup",
+            );
+        }
     }
 }
 
@@ -958,9 +978,7 @@ mod tests {
         let old_key = "repo/refs/heads/main/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bundle";
         let new_key = "repo/refs/heads/main/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bundle";
         store.insert(new_key, Bytes::from_static(b"new"));
-        delete_prior_baseline_bundle(&store, old_key, new_key)
-            .await
-            .expect("missing old bundle must be tolerated");
+        delete_prior_baseline_bundle(&store, &ref_main(), old_key, new_key).await;
         assert!(
             store.contains(new_key),
             "tolerating NotFound on the old key must not touch the new key",
@@ -977,12 +995,68 @@ mod tests {
         let store = MockStore::new();
         let key = "repo/refs/heads/main/cccccccccccccccccccccccccccccccccccccccc.bundle";
         store.insert(key, Bytes::from_static(b"live"));
-        delete_prior_baseline_bundle(&store, key, key)
-            .await
-            .expect("aliasing keys must short-circuit cleanly");
+        delete_prior_baseline_bundle(&store, &ref_main(), key, key).await;
         assert!(
             store.contains(key),
             "aliasing keys must not delete the live baseline bundle",
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_reports_success_when_post_commit_baseline_delete_fails() {
+        // Issue #113 regression: a non-NotFound delete error on the
+        // prior baseline bundle after `write_chain` has committed
+        // must NOT fail the compact. The new chain manifest is
+        // already durable; on retry the chain would short-circuit
+        // through `AlreadyMinimal` and never re-attempt cleanup, so
+        // operators would observe a "failed" compact that actually
+        // succeeded. Match the force-push baseline-cleanup contract:
+        // log at warn and report success.
+        let store = MockStore::new();
+        let (_repo, _prior, c1, _c2, _c3) = lay_down_three_segment_chain(&store, "repo").await;
+
+        // Arm a delete-time fault on the prior baseline bundle key.
+        // The key is keyed off the fixture's c1 (= `full_at`).
+        let prior_bundle_key = format!("repo/refs/heads/main/{c1}.bundle");
+        store.arm(crate::object_store::mock::Fault::NetworkOnDelete {
+            key: prior_bundle_key.clone(),
+        });
+
+        let outcome = compact(&store, Some("repo"), &ref_main(), opts(true))
+            .await
+            .expect("compact must report success when post-commit cleanup fails");
+        assert_eq!(outcome.action, CompactAction::Compacted);
+
+        // The new chain.json must be durable — readers see the new
+        // single-segment chain at the new tip.
+        let new_chain = crate::packchain::manifest::load_chain(&store, Some("repo"), &ref_main())
+            .await
+            .unwrap()
+            .expect("chain present");
+        assert_eq!(new_chain.segments.len(), 1);
+        assert_eq!(new_chain.full_at, new_chain.tip);
+
+        // The old baseline bundle is still on the bucket (the
+        // delete failed) — the orphan is operator-visible via the
+        // warn log. A second compact must observe AlreadyMinimal
+        // and not re-attempt the cleanup, locking down the
+        // short-circuit behaviour that motivates the best-effort
+        // contract.
+        assert!(
+            store.contains(&prior_bundle_key),
+            "delete fault must have left the prior baseline bundle in place",
+        );
+        let second = compact(&store, Some("repo"), &ref_main(), opts(true))
+            .await
+            .unwrap();
+        assert_eq!(second.action, CompactAction::AlreadyMinimal);
+
+        // Lock must still be released even though the helper logged
+        // a warning.
+        let lock = lock_key(Some("repo"), &ref_main());
+        assert!(
+            !store.contains(&lock),
+            "compact must release the per-ref lock even on best-effort cleanup failure",
         );
     }
 
