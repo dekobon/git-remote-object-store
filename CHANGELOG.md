@@ -131,6 +131,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `is_bundle_candidate` no longer drops bundle keys whose ref name
+  contains the substrings `.zip` or `LOCKS`; the predicate is now a
+  positive `<sha>.bundle` final-segment check (#109).
+- `packchain::compact` no longer reports failure when the prior baseline
+  bundle delete fails after `chain.json` is already durable; the cleanup
+  is best-effort and orphan keys are logged at WARN for manual cleanup
+  (#113).
+- Management `delete-branch` now refuses to delete a branch that has a
+  `PROTECTED#` marker, matching the helper-protocol delete path (#110).
+- `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS=0` no longer silently
+  disables per-ref locking; zero now falls back to the default TTL
+  (#112).
+- `packchain read_blob` now bounds the last-entry pack fetch at
+  `MAX_RANGE_BYTES` (1 GiB) and rejects entries whose implied range
+  exceeds the cap with a typed `MalformedPackEntry` error, instead of
+  buffering the entire pack body (#115).
+- Snapshot classifier now uses the canonical exact-equality
+  `keys::is_protected_marker_segment` helper, so future `PROTECTED#`-
+  prefixed keys are not misclassified as the protection marker (#111).
+- `is_protected` no longer uses a byte-prefix `list()` scan for the
+  `PROTECTED#` marker; it now does an exact `head()` check (cheaper and
+  resistant to future `PROTECTED#`-prefixed sibling keys) (#119).
+- `packchain gc sweep --force` no longer deletes packs that became live
+  between mark and sweep; the live-pack re-check now always runs and
+  `--force` only skips the grace window (#117).
+- `packchain` fetch and compact now validate `ChainSegment.pack` format
+  before deriving bucket keys, so a crafted `chain.json` cannot drive
+  bucket GETs at arbitrary keys (#120).
+- `packchain` push and compact now write `chain.json` before
+  `path-index.json`; a crash between them is detected by the reader and
+  surfaced as the new typed `TransientChainPathIndexMismatch` instead of
+  the misleading `BlobNotInChain` (#114).
+- `packchain` delete refspec acquires the per-ref lock before sweeping
+  ref keys, preventing a concurrent push from losing mutual exclusion
+  when its `LOCK#.lock` was erased by an unrelated delete (#116).
+- Per-ref lock can no longer be stolen by stale-recovery while a
+  long-running critical section (notably `packchain compact`) is still
+  in flight. Locks now carry a background heartbeat that refreshes the
+  key every `ttl/3` (#118).
+- `packchain` delete now probes `chain.json` under the per-ref lock, so
+  a concurrent deleter cannot mask the documented "not found" wire
+  error (#125).
+- `doctor` now reports `<…>.bundle` keys whose stem is not 40 lowercase
+  hex chars (push silently filters them; doctor lists each key with its
+  ref-path and a manual-deletion hint) (#124).
+
+### Added
+
+- `cargo xtask man` generates Unix manpages for every shipped binary
+  (clap-derived for the management CLI, hand-authored troff stubs for
+  the four helper-protocol shims and `git-lfs-object-store`). The
+  `man/` directory is checked in and packaged under
+  `$prefix/share/man/man1/` (#123).
+
+### Changed
+
+- Renamed `AuditReport` child types for consistency:
+  `OrphanReport` → `OrphanSummary` and `BranchAuditRow` → `BranchRow` so
+  the per-row sibling types share the `*Row` suffix and the `*Report`
+  suffix is reserved for the top-level container (#104).
+- Renamed manage-side `ManageCompactOpts` to `CompactOpts` so it matches
+  the `Doctor`/`DoctorOpts` and `Gc`/`GcOpts` sibling pattern (#105).
+- Renamed internal LFS wire-payload struct `EventError` to
+  `ErrorPayload` so the `*Error` suffix stays reserved for real Rust
+  error types (#107).
+- Renamed `bundle::BundleHeader::parse` to `bundle::BundleHeader::read`
+  for naming alignment with `std::fs::read` (#106).
+- Refactored key-builder helpers: `crate::keys::join` now takes
+  `Option<&str>` for consistency with `bundle_key` and every
+  `packchain::keys::*` builder; the redundant `_with_prefix` and
+  verb-mismatched `parse_*` names were renamed to
+  `pack_key_from_relative` and `sha_from_pack_key`; the
+  `optional_prefix` shim is gone (#103).
+- Shell scripts under `spec/` and `utils/` use `UPPERCASE` variables per
+  `.claude/rules/bash.md` (#108).
+
 - `packchain gc` no longer tombstones (and after grace, deletes) packs
   reachable only from chains under non-`refs/heads/` namespaces.
   `list_referenced_packs` previously listed `<prefix>/refs/heads/`,
