@@ -15,9 +15,10 @@ use crate::object_store::{ObjectMeta, ObjectStore};
 #[derive(Debug, Clone)]
 pub(crate) struct BundleEntry {
     /// Hex-encoded commit OID extracted from the bundle filename.
-    /// Stored as `String` (not `Sha`) because the doctor must report
-    /// even malformed entries — `<sha>.bundle` keys with non-hex names
-    /// still need to be displayed and offered for deletion.
+    /// Stored as `String` (not `Sha`) for now to avoid an extra
+    /// parsing step here; the snapshot classifier guarantees this
+    /// value is a 40-lowercase-hex string when populated. Malformed
+    /// `<…>.bundle` keys land in [`MalformedBundleKey`] instead.
     pub(crate) sha: String,
     /// Full object key, used directly for `delete` / `copy` calls so the
     /// caller never has to reconstruct it.

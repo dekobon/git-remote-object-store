@@ -982,9 +982,12 @@ mod tests {
         )
         .await
         .unwrap();
-        match outcome {
+        match &outcome {
             PushOutcome::Error { message, .. } => {
-                assert!(message.contains("not found"), "got: {message}");
+                assert_eq!(
+                    message, r#""not found"?"#,
+                    "wire bytes for not-found delete"
+                );
             }
             PushOutcome::Ok { .. } => panic!("expected Error, got {outcome:?}"),
         }
@@ -1077,6 +1080,13 @@ mod tests {
     /// If another writer already holds the lock, delete returns a
     /// contention error and leaves all per-ref keys (including the
     /// foreign-held lock) intact.
+    ///
+    /// Wire-format pin (#126): the contention message is asserted
+    /// byte-for-byte, not by substring. The helper protocol relies on
+    /// the `"…"?` envelope; a regression that strips the quotes or
+    /// the trailing `?` would silently corrupt the wire encoding, and
+    /// a `contains("failed to acquire ref lock")` assertion would not
+    /// notice.
     #[tokio::test]
     async fn delete_with_lock_held_reports_contention_and_preserves_keys() {
         let store = Arc::new(MockStore::new());
@@ -1104,12 +1114,19 @@ mod tests {
         )
         .await
         .unwrap();
+        // Pin the exact wire bytes — the `"…"?` envelope and the full
+        // message body. The ttl interpolation matches
+        // `delete_test_config()`'s 60-second TTL.
+        let expected = format!(
+            r#""failed to acquire ref lock at {lock}. Another client may be pushing or deleting. If this persists beyond 60s, run git-remote-object-store doctor to inspect and optionally clear stale locks."?"#,
+        );
         match &outcome {
-            PushOutcome::Error { message, .. } => {
-                assert!(
-                    message.contains("failed to acquire ref lock"),
-                    "got: {message}",
-                );
+            PushOutcome::Error {
+                message,
+                remote_ref,
+            } => {
+                assert_eq!(message, &expected, "contention wire message must be exact",);
+                assert_eq!(remote_ref, remote.as_str());
             }
             PushOutcome::Ok { .. } => panic!("expected contention Error, got {outcome:?}"),
         }
@@ -1126,19 +1143,59 @@ mod tests {
         );
     }
 
-    /// Regression for #116: the sweep must skip the lock key, so a
-    /// concurrent `put_if_absent(LOCK#.lock)` between sweep and release
-    /// is impossible — the lock we hold is the only LOCK#.lock that
-    /// ever existed during the delete's critical section.
+    /// Regression for #116/#126: the sweep must skip the lock key,
+    /// so a concurrent `put_if_absent(LOCK#.lock)` between sweep and
+    /// release is impossible — the lock we hold is the only
+    /// `LOCK#.lock` that ever exists during the delete's critical
+    /// section.
+    ///
+    /// We arm a one-shot `NetworkOnDelete` fault on the lock key so
+    /// the lock's deletion is observable. Because the fault only
+    /// fires once, the test discriminates:
+    ///
+    /// - Skip works: sweep deletes every other per-ref key cleanly,
+    ///   then `release_lock` trips the fault and the call surfaces a
+    ///   "failed to release lock" `PushOutcome::Error`. The lock
+    ///   object is still present at the end (the fault blocked
+    ///   release's delete) and the fault was consumed exactly once.
+    /// - Skip broken (`continue` removed): the sweep deletes the
+    ///   lock first, consuming the fault, then continues deleting
+    ///   the rest. `release_lock` then sees `NotFound` (treated as
+    ///   `Ok`) and the outcome is `PushOutcome::Ok`. The witness:
+    ///   the lock is absent at the end. The assertion on the lock
+    ///   being present after the call catches that regression.
+    ///
+    /// The lock is seeded fresh (not stale) so the `acquire_lock`
+    /// path is `put_if_absent` and never touches `delete` on the
+    /// lock key itself — that keeps the armed fault available for
+    /// the sweep/release-stage witness. Stale-recovery coverage
+    /// lives in [`delete_recovers_stale_lock_and_completes`].
     #[tokio::test]
     async fn delete_sweep_excludes_lock_key() {
+        use crate::object_store::mock::Fault;
+
         let store = Arc::new(MockStore::new());
         let prefix = Some("repo");
         let remote = rn("refs/heads/main");
         let chain = chain_key(prefix, &remote);
+        let path_index = path_index_key(prefix, &remote);
+        let baseline_sha = Sha::from_hex("0000000000000000000000000000000000000001").unwrap();
+        let baseline = keys::bundle_key(prefix, &remote, baseline_sha);
         let lock = lock_key(prefix, &remote);
 
+        // Seed chain + path-index + a baseline bundle so the sweep
+        // has real per-iteration work; a regression that broke
+        // iteration would leave these behind and fail the assertions
+        // below.
         store.insert(&chain, Bytes::from_static(b"{}"));
+        store.insert(&path_index, Bytes::from_static(b"{}"));
+        store.insert(&baseline, Bytes::from_static(b"PACK"));
+
+        // Arm a one-shot fault on lock delete. If the sweep ever
+        // touches the lock key, it consumes the fault as a sweep
+        // error; if the sweep correctly skips, the fault fires from
+        // `release_lock` and we observe a release-failure outcome.
+        store.arm(Fault::NetworkOnDelete { key: lock.clone() });
 
         let config = delete_test_config();
         let outcome = delete_remote_ref_packchain(
@@ -1150,11 +1207,98 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(outcome, PushOutcome::Ok { .. }));
-        // After a successful delete the lock is gone (release_lock did
-        // it), but during the sweep it was preserved. We assert the
-        // post-condition: chain gone, lock gone.
-        assert!(!store.contains(&chain));
-        assert!(!store.contains(&lock));
+
+        // Sweep ran to completion: every non-lock per-ref key is
+        // gone. The release-failure path keeps the lock in place
+        // (the fault prevented its deletion), giving us a direct
+        // witness that the sweep did NOT delete it either.
+        assert!(!store.contains(&chain), "chain.json must be swept");
+        assert!(
+            !store.contains(&path_index),
+            "path-index.json must be swept",
+        );
+        assert!(!store.contains(&baseline), "baseline bundle must be swept");
+        assert!(
+            store.contains(&lock),
+            "lock must survive the sweep — only release_lock may delete it, \
+             and the armed fault blocked that delete",
+        );
+
+        // The fault was consumed exactly once, by `release_lock`.
+        assert_eq!(
+            store.pending_faults(),
+            0,
+            "armed delete-fault must have fired exactly once (via release)",
+        );
+
+        // The outcome surfaces the release failure (sweep succeeded,
+        // release tripped the armed fault). The exact wire-format
+        // envelope is pinned here too.
+        let expected = format!(
+            r#""failed to release lock. You may need to manually remove the lock {lock} from the server or use git-remote-object-store doctor to fix."?"#,
+        );
+        match &outcome {
+            PushOutcome::Error {
+                message,
+                remote_ref,
+            } => {
+                assert_eq!(message, &expected, "release-failure wire bytes");
+                assert_eq!(remote_ref, remote.as_str());
+            }
+            PushOutcome::Ok { .. } => panic!(
+                "expected release-failure Error (sweep correctly skipped the lock, \
+                 release tripped the armed fault), got {outcome:?}",
+            ),
+        }
+    }
+
+    /// Regression for #126: end-to-end stale-lock recovery in delete.
+    /// A pre-existing lock whose `last_modified` is older than `ttl`
+    /// is reclaimable; the delete then proceeds, the sweep completes,
+    /// and the lock is released at the end. The previous test suite
+    /// covered stale recovery only inside the bundle-push acquire
+    /// unit tests — not through the packchain delete path.
+    #[tokio::test]
+    async fn delete_recovers_stale_lock_and_completes() {
+        let store = Arc::new(MockStore::new());
+        let prefix = Some("repo");
+        let remote = rn("refs/heads/main");
+        let chain = chain_key(prefix, &remote);
+        let path_index = path_index_key(prefix, &remote);
+        let lock = lock_key(prefix, &remote);
+
+        store.insert(&chain, Bytes::from_static(b"{}"));
+        store.insert(&path_index, Bytes::from_static(b"{}"));
+
+        // Lock pre-existed and is stale (older than the 60-second
+        // TTL). `acquire_lock` should reclaim it on the
+        // stale-recovery branch.
+        let now = OffsetDateTime::now_utc();
+        let stale = now - time::Duration::seconds(120);
+        store.insert_with(&lock, Bytes::new(), stale, PutOpts::default());
+
+        let config = delete_test_config();
+        let outcome = delete_remote_ref_packchain(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            prefix,
+            &remote,
+            &config,
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&outcome, PushOutcome::Ok { remote_ref } if remote_ref == remote.as_str()),
+            "stale lock must be recoverable end-to-end, got {outcome:?}",
+        );
+        assert!(!store.contains(&chain), "chain.json must be swept");
+        assert!(
+            !store.contains(&path_index),
+            "path-index.json must be swept",
+        );
+        assert!(
+            !store.contains(&lock),
+            "lock must be released after a successful stale-recovery delete",
+        );
     }
 }
