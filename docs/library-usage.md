@@ -38,6 +38,7 @@ The conventional suffixes are:
 | Suffix | Purpose |
 |--------|---------|
 | `HEAD` | Ref pointer for the default branch |
+| `FORMAT` | Storage-engine marker (`bundle` or `packchain`) |
 | `refs/heads/<branch>/<sha>.bundle` | Git bundle for a branch commit (bundle engine) |
 | `refs/heads/<branch>/chain.json` | Pack-chain manifest (packchain engine) |
 | `refs/heads/<branch>/LOCK#.lock` | Per-ref push-lock file |
@@ -46,6 +47,9 @@ The conventional suffixes are:
 
 Locks and protection markers are **per-ref**, not repository-wide —
 each branch carries its own under its `refs/heads/<branch>/` prefix.
+The exact layout depends on which storage engine the bucket uses;
+see [storage-engines.md](storage-engines.md) for the full per-engine
+key table.
 
 ## Async runtime
 

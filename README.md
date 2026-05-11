@@ -49,7 +49,9 @@ Use cases that fit naturally:
 - **Two storage engines.** A `bundle` engine (one git bundle per
   push, simple and self-contained) and a `packchain` engine (newest-
   first pack manifest with GC and compaction, smaller fetches on
-  active repos). Pick per-remote with `?engine=`.
+  active repos). Pick per-remote with `?engine=`; default is
+  `bundle`. See [docs/storage-engines.md](docs/storage-engines.md)
+  for the comparison and when to choose which.
 - **RFC 3986 HTTPS-native URL grammar.** `s3+https://<host>/<bucket>/<prefix>`
   and `az+https://<account>.blob.<endpoint>/<container>/<prefix>`.
   Cleartext `*+http://` is loopback-only by default for MinIO /
@@ -104,6 +106,8 @@ API.
 - [Getting started](docs/getting-started.md) — install, credentials,
   first push, LFS, submodules, local dev with MinIO / Azurite,
   troubleshooting.
+- [Storage engines](docs/storage-engines.md) — `bundle` vs
+  `packchain`, trade-offs, on-bucket layout, when to choose which.
 - [Library usage](docs/library-usage.md) — using the crate as a Rust
   library.
 - [Verifying releases](docs/verifying-releases.md) — signature,

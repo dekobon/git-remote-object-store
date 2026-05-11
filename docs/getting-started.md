@@ -299,11 +299,14 @@ Query-string flags:
 
 | Flag                       | Backends | Meaning                                                 |
 | -------------------------- | -------- | ------------------------------------------------------- |
+| `engine=bundle\|packchain` | Both     | Storage engine on first push (defaults to `bundle`); see [storage-engines.md](storage-engines.md) |
 | `profile=<NAME>`           | S3       | Pin AWS named profile                                   |
 | `credential=<NAME>`        | Azure    | Pick the `AZSTORE_<NAME>_*` env-var bundle              |
 | `region=<REGION>`          | S3       | Override SigV4 region                                   |
 | `addressing=path\|virtual` | Both     | Force the addressing style (auto-detected by default)   |
 | `zip=1`                    | Both     | Mirror each push as `repo.zip` (AWS CodePipeline input) |
+| `bundle_uri=1`             | Both     | Advertise the baseline bundle for accelerated clones (packchain only — see §10) |
+| `bundle_uri_presign_ttl=<SECONDS>` | Both | Sign `bundle_uri` URLs for private buckets (see §10) |
 
 The complete grammar lives in the URL parser (`src/url.rs`); the
 table above and the scheme outline earlier in this section cover
@@ -409,7 +412,9 @@ git-remote-object-store unprotect origin main
 
 The `gc` subcommand only applies to **packchain** remotes
 (`?engine=packchain`). Bundle-engine remotes have no garbage to
-collect — every push writes a fresh, self-contained bundle.
+collect — every push writes a fresh, self-contained bundle. See
+[storage-engines.md](storage-engines.md) for the differences between
+the two engines.
 
 ```text
 git-remote-object-store gc <remote> [--mark-only] [--sweep-only] [--force] [--grace-hours <HOURS>]
@@ -589,12 +594,12 @@ Field meanings:
 
 ## 10. Bundle URI (accelerated clones)
 
-Packchain remotes can advertise the git remote-helper
-`bundle-uri` capability so `git clone` fetches the baseline
-bundle directly from the bucket (or a CDN in front of it) in
-parallel with the helper protocol negotiating the incremental
-tail. The clone path takes one round trip per ref instead of
-walking the full chain. Issues #71 / #76.
+Packchain remotes (see [storage-engines.md](storage-engines.md))
+can advertise the git remote-helper `bundle-uri` capability so
+`git clone` fetches the baseline bundle directly from the bucket
+(or a CDN in front of it) in parallel with the helper protocol
+negotiating the incremental tail. The clone path takes one round
+trip per ref instead of walking the full chain. Issues #71 / #76.
 
 Opt in with `?bundle_uri=1`:
 
