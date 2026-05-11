@@ -16,8 +16,8 @@
 //! |--------|---------|
 //! | `HEAD` | Ref pointer for the default branch |
 //! | `refs/heads/<branch>/<sha>.bundle` | Git bundle for a branch commit |
-//! | `PROTECTED#` | Branch-protection sentinel |
-//! | `LOCK#.lock` | Push-lock file |
+//! | `refs/heads/<branch>/LOCK#.lock` | Per-ref push-lock file |
+//! | `refs/heads/<branch>/PROTECTED#` | Per-ref branch-protection sentinel |
 //! | `lfs/<oid>` | Git LFS object |
 //!
 //! Use [`Remote::key`] to build correctly-prefixed keys, then call methods
@@ -42,8 +42,10 @@
 //!     println!("{} ({} bytes)", meta.key, meta.size);
 //! }
 //!
-//! // Direct store access for advanced operations
-//! let data = remote.store().get_bytes(&remote.key("LOCK#.lock")).await?;
+//! // Same data via direct store access, for operations not covered by
+//! // the helper methods (custom keys, raw puts, conditional writes).
+//! let same_head = remote.store().get_bytes(&remote.key("HEAD")).await?;
+//! assert_eq!(head, same_head);
 //! # Ok(())
 //! # }
 //! ```
