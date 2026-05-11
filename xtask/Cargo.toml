@@ -1,0 +1,28 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+description = "Workspace automation tasks (install, …) for git-remote-object-store"
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+# Mirror the workspace policy: `.claude/rules/rust.md` bans `panic!` /
+# `unreachable!()` in non-test code; encoding the rule as a lint catches
+# regressions at compile time.
+unreachable = "deny"
+
+[dependencies]
+# Ergonomic error reporting with context — xtask is an internal tool, so
+# `anyhow` is the right fit (no need for typed errors that downstream
+# crates would match on).
+anyhow = "1"
+
+[dev-dependencies]
+# Scratch directories for the symlink-refresh unit tests.
+tempfile = "3"

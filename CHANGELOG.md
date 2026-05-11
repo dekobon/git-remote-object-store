@@ -31,6 +31,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `cargo xtask install` workspace automation that runs `cargo install
+  --path cli` and creates the four `+`-form helper symlinks
+  (`git-remote-s3+https`, `git-remote-s3+http`, `git-remote-az+https`,
+  `git-remote-az+http`) alongside the cargo-installed hyphenated
+  binaries. Replaces the manual `for s in s3+https …; do ln -sf …;
+  done` loop the README used to ship. Re-runs are idempotent, the
+  task refuses to clobber any existing regular file or directory at a
+  `+`-form path, and `--bin-dir` / `--no-install` / `--dry-run` flags
+  cover custom layouts and pre-flight previews. Lives in a new
+  `xtask/` workspace member, wired up via a `cargo xtask` alias in
+  `.cargo/config.toml`. (#25)
 - Annotated-tag refs whose chain ends at a tree or blob now push
   and fetch correctly across both the `bundle` and `packchain`
   engines. The pack carries the tag chain plus the leaf object — for

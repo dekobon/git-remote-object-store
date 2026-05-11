@@ -27,8 +27,11 @@ path = "src/lib.rs"
 # so the installed binary names must be `git-remote-s3+https` etc.
 #
 # cargo rejects `+` in `[[bin]] name` ("invalid character '+' in crate name").
-# Falling back to hyphenated cargo bin names; an `xtask` step renames /
-# hardlinks them to the `+` form at install time.
+# Falling back to hyphenated cargo bin names; `cargo xtask install`
+# (see `xtask/src/install.rs`) creates the `+`-form symlinks git looks
+# up by URL scheme. Packagers do the same step in their post-install
+# hooks — see the `post_install_script` / `maintainer-scripts` blocks
+# in the package-metadata tables further down.
 
 [[bin]]
 name = "git-remote-s3-https"
@@ -267,7 +270,10 @@ auto-req = "no"
 # installs the hyphenated names and creates the `+`-form symlinks
 # post-install (and removes them on uninstall).
 #
-# Keep this list in sync with:
+# Source of truth for the (cargo-name, plus-name) pairs is the
+# `HELPER_PAIRS` const in `xtask/src/install.rs`. The
+# `packaging_sync` unit tests there will fail on drift. Keep these
+# scripts and their siblings in sync:
 #   packaging/debian/postinst         (deb post-install)
 #   packaging/debian/prerm            (deb pre-remove)
 #   packaging/alpine/APKBUILD.in      (Alpine package() hardlinks)

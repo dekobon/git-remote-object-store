@@ -74,15 +74,16 @@ LFS, submodules, local development against MinIO and Azurite.
 The short version:
 
 ```bash
-cargo install --path cli
-
-# Bridge cargo's hyphenated names to the `+`-form git looks up.
-mkdir -p ~/.local/bin
-for s in s3+https s3+http az+https az+http; do
-    ln -sf "$HOME/.cargo/bin/git-remote-${s/+/-}" \
-           "$HOME/.local/bin/git-remote-$s"
-done
+cargo xtask install
 ```
+
+That runs `cargo install --path cli` and creates the four `+`-form
+helper symlinks (`git-remote-s3+https`, `git-remote-s3+http`,
+`git-remote-az+https`, `git-remote-az+http`) alongside the cargo
+binaries, which is what git looks up by URL scheme. Re-runs are
+idempotent. Pass `--bin-dir <PATH>` to install into a custom
+directory, `--no-install` to refresh the symlinks only, or
+`--dry-run` to preview.
 
 ## Using as a library
 

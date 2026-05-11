@@ -2,6 +2,10 @@
 # prerm script for git-remote-object-store. Tears down the `+`-form
 # symlinks created by postinst before the package is removed, so the
 # install set is fully reversible.
+#
+# Source of truth for the `+`-form names is the `HELPER_PAIRS` const
+# in `xtask/src/install.rs`. The `packaging_sync` unit tests there
+# fail if a `+`-form name from `HELPER_PAIRS` is missing here.
 
 set -eu
 

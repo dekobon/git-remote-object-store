@@ -1,5 +1,9 @@
 [workspace]
-members = [".", "cli"]
+members = [".", "cli", "xtask"]
+# Exclude xtask from the default `cargo build` / `cargo test` set so a plain
+# `cargo build` does not pull a second binary into the workspace target dir.
+# Invoke it explicitly with `cargo xtask install` (see `.cargo/config.toml`).
+default-members = [".", "cli"]
 resolver = "2"
 
 [package]
