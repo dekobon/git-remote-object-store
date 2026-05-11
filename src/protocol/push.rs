@@ -265,12 +265,17 @@ fn parse_remote_sha_from_key(key: &str) -> Option<Sha> {
     Sha::from_hex(stem).ok()
 }
 
-/// Read the lock TTL from `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`, falling back
-/// to [`DEFAULT_LOCK_TTL_SECONDS`] if the env var is unset or unparseable.
+/// Read the lock TTL from `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`,
+/// falling back to [`DEFAULT_LOCK_TTL_SECONDS`] if the env var is unset,
+/// unparseable, or zero. A zero TTL would make `acquire_lock` treat
+/// every held lock as instantly stale and defeat per-ref locking, so
+/// we mirror [`crate::packchain::gc::grace_hours_from_env`] and clamp
+/// it to the default.
 pub(crate) fn lock_ttl_from_env() -> Duration {
     let secs = env::var(ENV_LOCK_TTL_SECONDS)
         .ok()
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
         .unwrap_or(DEFAULT_LOCK_TTL_SECONDS);
     // i64 cast: 60-ish seconds will never overflow; even MAX would just
     // saturate to ~292 billion years which is fine for a TTL ceiling.
@@ -1531,23 +1536,34 @@ mod tests {
     // --- lock_ttl_from_env --------------------------------------------
 
     #[test]
-    fn lock_ttl_from_env_defaults_when_unset() {
-        // Use a guard pattern: clear the env then restore. Keep this
-        // single-threaded relative to the other env-touching tests by
-        // not parallel-mutating the same key.
-        // SAFETY: tests run with `cargo test`'s default thread pool, but
-        // this test only reads when the var is unset — which is the
-        // normal test environment.
-        // No mutation needed: the var is unset by default.
-        if env::var(ENV_LOCK_TTL_SECONDS).is_ok() {
-            // Skip if a parent harness sets the var.
-            return;
+    fn lock_ttl_env_override_falls_back_for_unset_invalid_or_zero() {
+        // Group all env-var cases in one test fn so they run sequentially
+        // — the var is process-global and mutating it from multiple
+        // parallel tests would race.
+        let default_ttl = Duration::seconds(i64::try_from(DEFAULT_LOCK_TTL_SECONDS).unwrap());
+        // Unset returns default.
+        unsafe {
+            env::remove_var(ENV_LOCK_TTL_SECONDS);
         }
-        let ttl = lock_ttl_from_env();
-        assert_eq!(
-            ttl,
-            Duration::seconds(i64::try_from(DEFAULT_LOCK_TTL_SECONDS).unwrap()),
-        );
+        assert_eq!(lock_ttl_from_env(), default_ttl);
+        // Non-numeric falls back.
+        unsafe {
+            env::set_var(ENV_LOCK_TTL_SECONDS, "not-a-number");
+        }
+        assert_eq!(lock_ttl_from_env(), default_ttl);
+        // Zero falls back (would defeat per-ref locking).
+        unsafe {
+            env::set_var(ENV_LOCK_TTL_SECONDS, "0");
+        }
+        assert_eq!(lock_ttl_from_env(), default_ttl);
+        // Positive integer wins.
+        unsafe {
+            env::set_var(ENV_LOCK_TTL_SECONDS, "120");
+        }
+        assert_eq!(lock_ttl_from_env(), Duration::seconds(120));
+        unsafe {
+            env::remove_var(ENV_LOCK_TTL_SECONDS);
+        }
     }
 
     // --- FORMAT key write via perform_push_under_lock --------------------
