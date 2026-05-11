@@ -25,7 +25,7 @@ use git_remote_object_store::git as git_helpers;
 use git_remote_object_store::manage::{
     DEFAULT_LOCK_TTL_SECONDS, DialoguerPrompter,
     branch::ManageBranch,
-    compact::{Compact, ManageCompactOpts},
+    compact::{Compact, CompactOpts},
     doctor::{Doctor, DoctorOpts},
     gc::{Gc, GcOpts},
 };
@@ -256,7 +256,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             gc_grace_hours,
         } => {
             let (store, prefix) = open_target(&target).await?;
-            let opts = ManageCompactOpts {
+            let opts = CompactOpts {
                 ref_name,
                 force,
                 with_gc,

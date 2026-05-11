@@ -21,13 +21,15 @@ use crate::git::RefName;
 use crate::keys;
 use crate::object_store::ObjectStore;
 use crate::packchain::audit::{self, AuditReport, BranchRow};
-use crate::packchain::compact::{self, CompactAction, CompactOpts, CompactOutcome};
+use crate::packchain::compact::{
+    self, CompactAction, CompactOpts as PackchainCompactOpts, CompactOutcome,
+};
 use crate::packchain::gc;
 use crate::protocol::push::lock_ttl_from_env;
 
 /// Tunables for [`Compact::run`]. Field semantics mirror the CLI flags.
 #[derive(Debug, Clone)]
-pub struct ManageCompactOpts {
+pub struct CompactOpts {
     /// Compact only the named ref. `None` triggers the audit-driven
     /// "every ref meeting the heuristic" mode.
     pub ref_name: Option<String>,
@@ -44,7 +46,7 @@ pub struct ManageCompactOpts {
     pub gc_grace_hours: u64,
 }
 
-impl Default for ManageCompactOpts {
+impl Default for CompactOpts {
     fn default() -> Self {
         Self {
             ref_name: None,
@@ -60,7 +62,7 @@ impl Default for ManageCompactOpts {
 pub struct Compact<'a> {
     store: Arc<dyn ObjectStore>,
     prefix: String,
-    opts: ManageCompactOpts,
+    opts: CompactOpts,
     prompter: &'a dyn Prompter,
 }
 
@@ -72,7 +74,7 @@ impl<'a> Compact<'a> {
     pub fn new(
         store: Arc<dyn ObjectStore>,
         prefix: impl Into<String>,
-        opts: ManageCompactOpts,
+        opts: CompactOpts,
         prompter: &'a dyn Prompter,
     ) -> Self {
         Self {
@@ -101,7 +103,7 @@ impl<'a> Compact<'a> {
             .map_or_else(lock_ttl_from_env, |s| {
                 Duration::seconds(i64::try_from(s).unwrap_or(i64::MAX))
             });
-        let compact_opts = CompactOpts {
+        let compact_opts = PackchainCompactOpts {
             force: self.opts.force,
             lock_ttl,
         };
@@ -289,9 +291,9 @@ mod tests {
         let runner = Compact::new(
             store_arc(&mock),
             "repo",
-            ManageCompactOpts {
+            CompactOpts {
                 ref_name: Some("refs/heads/../etc/passwd".to_owned()),
-                ..ManageCompactOpts::default()
+                ..CompactOpts::default()
             },
             &prompter,
         );
@@ -306,12 +308,7 @@ mod tests {
         // prompting.
         let mock = MockStore::new();
         let prompter = ScriptedPrompter::new([]); // no answers queued
-        let runner = Compact::new(
-            store_arc(&mock),
-            "repo",
-            ManageCompactOpts::default(),
-            &prompter,
-        );
+        let runner = Compact::new(store_arc(&mock), "repo", CompactOpts::default(), &prompter);
         runner.run().await.expect("no-candidate run is Ok");
     }
 
@@ -366,10 +363,10 @@ mod tests {
         let runner = Compact::new(
             store_arc(&mock),
             "repo",
-            ManageCompactOpts {
+            CompactOpts {
                 ref_name: Some("refs/heads/main".to_owned()),
                 with_gc: true,
-                ..ManageCompactOpts::default()
+                ..CompactOpts::default()
             },
             &prompter,
         );
