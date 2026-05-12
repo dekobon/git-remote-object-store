@@ -441,6 +441,109 @@ async fn delete_missing_remote_ref_emits_not_found() {
     assert!(text.ends_with("\"?\n\n"), "wire envelope dropped: {text:?}");
 }
 
+/// Issue #133: a fresh held lock (a concurrent client is mid-push)
+/// must serialize with `delete`. The pre-#133 code skipped the lock
+/// entirely on the delete path; this test pins that delete now blocks
+/// on the same per-ref lock as push.
+///
+/// A regression that moves the delete sweep back outside the lock
+/// would let the delete return `Ok(refs/heads/main)` against the
+/// stale pre-lock listing, even though a concurrent push owns the
+/// lock and may be writing a new bundle. This test asserts the
+/// "failed to acquire ref lock" contention error instead.
+#[tokio::test]
+async fn delete_with_held_lock_returns_contention_error() {
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, shas) = make_seed_repo(1, "primary");
+    let store = Arc::new(MockStore::new());
+    // A bundle exists — without the lock check, the delete would
+    // happily sweep it and return Ok, racing the concurrent push.
+    store.insert(
+        format!("repo/refs/heads/main/{}.bundle", &shas[0]),
+        Bytes::from_static(b"x"),
+    );
+    // A concurrent client holds the per-ref lock (fresh, non-stale).
+    store.insert_with(
+        "repo/refs/heads/main/LOCK#.lock",
+        Bytes::new(),
+        OffsetDateTime::now_utc(),
+        PutOpts::default(),
+    );
+
+    let (out, result) = drive_in(
+        s3_url_with_zip(Some("repo"), false),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push :refs/heads/main\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    result.expect("delete should produce a refusal, not a hard error");
+    let text = std::str::from_utf8(&out).unwrap();
+    assert!(
+        text.contains("failed to acquire ref lock"),
+        "delete must report lock contention, got {text:?}",
+    );
+    assert!(text.ends_with("\"?\n\n"), "wire envelope dropped: {text:?}");
+    // The bundle MUST survive: a regression that swept under a stale
+    // pre-lock listing would have deleted it.
+    assert!(
+        store.contains(&format!("repo/refs/heads/main/{}.bundle", &shas[0])),
+        "bundle must survive the lock-contention refusal",
+    );
+    // The concurrent client's lock is untouched.
+    assert!(store.contains("repo/refs/heads/main/LOCK#.lock"));
+}
+
+/// Issue #133: end-to-end serialization. A successful delete must
+/// acquire AND release the per-ref lock — the listing/sweep happens
+/// inside the lock window, so a concurrent push held off here would
+/// observe an empty listing afterwards.
+///
+/// The post-condition pins the lock-release contract: a successful
+/// delete returns the bucket to a state with NO `LOCK#.lock` for the
+/// ref. A regression that swept under a stale pre-lock snapshot
+/// without ever acquiring the lock would leave the on-bucket state
+/// unchanged in that respect — but it would also keep the bundle
+/// around if a concurrent writer raced in, which this test (without
+/// a concurrent writer) can't directly observe. Pairing this with
+/// `delete_with_held_lock_returns_contention_error` covers both
+/// halves of the contract.
+#[tokio::test]
+async fn delete_acquires_and_releases_per_ref_lock() {
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, shas) = make_seed_repo(1, "primary");
+    let store = Arc::new(MockStore::new());
+    store.insert(
+        format!("repo/refs/heads/main/{}.bundle", &shas[0]),
+        Bytes::from_static(b"x"),
+    );
+
+    let (out, result) = drive_in(
+        s3_url_with_zip(Some("repo"), false),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push :refs/heads/main\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    result.expect("delete should succeed");
+    let text = std::str::from_utf8(&out).unwrap();
+    assert_eq!(text, "ok refs/heads/main\n\n");
+    assert!(
+        !store.contains(&format!("repo/refs/heads/main/{}.bundle", &shas[0])),
+        "bundle must be swept under the lock",
+    );
+    assert!(
+        !store.contains("repo/refs/heads/main/LOCK#.lock"),
+        "lock must be released after a successful delete",
+    );
+}
+
 #[tokio::test]
 async fn batched_pushes_emit_outcome_per_command() {
     if !git_available() {

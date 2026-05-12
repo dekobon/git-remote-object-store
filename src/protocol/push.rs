@@ -668,11 +668,22 @@ struct PushReadyState {
     _temp_dir: tempfile::TempDir,
 }
 
-/// Outcome of [`prepare_push`]: either all pre-lock work completed and the
-/// caller should proceed to locking, or the outcome is already decided
-/// (delete-refspec, multiple-bundle error, ancestry failure, …).
+/// Outcome of [`prepare_push`]: one of three paths into [`push_one`]'s
+/// lock window.
+///
+/// - [`PrepareOutcome::Ready`] — pre-lock work completed; caller must
+///   acquire the per-ref lock and call [`perform_push_under_lock`].
+/// - [`PrepareOutcome::Delete`] — delete refspec (`:<ref>`); caller must
+///   acquire the per-ref lock and call [`delete_remote_ref_under_lock`].
+///   Issue #133: the listing and sweep MUST run under the lock so a
+///   concurrent push that lands a new bundle cannot turn the delete
+///   into a silent false success.
+/// - [`PrepareOutcome::Done`] — outcome already decided pre-lock
+///   (multi-bundle corruption, ancestry failure, …); caller returns it
+///   directly without taking the lock.
 enum PrepareOutcome {
     Ready(PushReadyState),
+    Delete { remote_ref: RefName, zip: bool },
     Done(PushOutcome),
 }
 
@@ -749,8 +760,15 @@ async fn prepare_push(
     let remote_ref_str = remote_ref.as_str().to_owned();
 
     if local_spec.is_empty() {
-        let outcome = delete_remote_ref(store, prefix, &remote_ref, config.zip).await?;
-        return Ok(PrepareOutcome::Done(outcome));
+        // Issue #133: do NOT list / sweep here. The bundle engine's
+        // delete must run INSIDE the per-ref lock so a concurrent push
+        // landing a new bundle between our listing and our deletion
+        // cannot produce a silent false success. Defer to
+        // [`delete_remote_ref_under_lock`] in [`push_one`].
+        return Ok(PrepareOutcome::Delete {
+            remote_ref,
+            zip: config.zip,
+        });
     }
 
     let force_push = if force {
@@ -829,7 +847,24 @@ async fn prepare_push(
     }))
 }
 
-/// Execute one push: prepare, lock, upload, release.
+/// Execute one push or delete: prepare, lock, do work, release.
+///
+/// Both the upload path ([`perform_push_under_lock`]) and the delete
+/// path ([`delete_remote_ref_under_lock`]) run inside the SAME per-ref
+/// lock window with identical acquire/release accounting:
+///
+/// - `acquire_lock` returning `None` → emit the standard
+///   "failed to acquire ref lock" wire error without doing work.
+/// - `release_lock` failing AFTER successful work → downgrade the
+///   outcome to an `Error` so the operator is alerted to a potentially
+///   dangling lock.
+/// - A genuine work error takes priority over a release failure — the
+///   release error is logged but never masks the original failure.
+///
+/// Issue #133: putting the delete path under this same window closes
+/// the race where a concurrent push could land a new bundle between a
+/// pre-lock listing and a pre-lock sweep, producing a silent false
+/// success.
 async fn push_one(
     store: Arc<dyn ObjectStore>,
     prefix: Option<&str>,
@@ -838,13 +873,24 @@ async fn push_one(
     now: OffsetDateTime,
     spec: PushSpec,
 ) -> Result<PushOutcome, PushError> {
-    let state = match prepare_push(store.as_ref(), prefix, repo_dir, config, spec).await? {
-        PrepareOutcome::Done(o) => return Ok(o),
-        PrepareOutcome::Ready(s) => s,
+    let (remote_ref_str, work): (String, UnderLockWork) =
+        match prepare_push(store.as_ref(), prefix, repo_dir, config, spec).await? {
+            PrepareOutcome::Done(o) => return Ok(o),
+            PrepareOutcome::Ready(state) => (
+                state.remote_ref.as_str().to_owned(),
+                UnderLockWork::Push(state),
+            ),
+            PrepareOutcome::Delete { remote_ref, zip } => (
+                remote_ref.as_str().to_owned(),
+                UnderLockWork::Delete { remote_ref, zip },
+            ),
+        };
+
+    let lock = match &work {
+        UnderLockWork::Push(state) => lock_key(prefix, &state.remote_ref),
+        UnderLockWork::Delete { remote_ref, .. } => lock_key(prefix, remote_ref),
     };
 
-    let remote_ref_str = state.remote_ref.as_str().to_owned();
-    let lock = lock_key(prefix, &state.remote_ref);
     let Some(guard) = acquire_lock(Arc::clone(&store), &lock, config.ttl, now).await? else {
         return Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
@@ -855,17 +901,14 @@ async fn push_one(
         });
     };
 
-    // Run the lock-protected work, then release the lock unconditionally
-    // before propagating the result. The `try/finally`-style release
-    // ensures a mid-push error never leaves the lock dangling for the
-    // full TTL.
-    let result = perform_push_under_lock(store.as_ref(), prefix, state).await;
+    let result = match work {
+        UnderLockWork::Push(state) => perform_push_under_lock(store.as_ref(), prefix, state).await,
+        UnderLockWork::Delete { remote_ref, zip } => {
+            delete_remote_ref_under_lock(store.as_ref(), prefix, &remote_ref, zip, &lock).await
+        }
+    };
     let release_result = release_lock(guard).await;
 
-    // A failed lock release overrides a successful push outcome so the
-    // operator is alerted and concurrent pushers are not left hitting a
-    // dangling lock for the full TTL. A genuine push error takes
-    // priority — do not mask it with the release failure.
     match (&result, release_result) {
         (Ok(PushOutcome::Ok { .. }), Err(e)) => {
             warn!(key = %lock, error = %e, "failed to release lock");
@@ -876,17 +919,18 @@ async fn push_one(
                 ),
             })
         }
-        // Every other combination: the push's own outcome (whether
-        // Ok(Error{..}) or Err(..)) takes priority over the release
-        // result — including when both fail. Log the release failure
-        // so operators can spot dangling locks that coincide with push
-        // errors; the lock TTL will eventually clean up.
         (_, Err(e)) => {
-            warn!(key = %lock, error = %e, "lock release failed (push already errored)");
+            warn!(key = %lock, error = %e, "lock release failed (work already errored)");
             result
         }
         _ => result,
     }
+}
+
+/// The work to perform inside the per-ref lock acquired by [`push_one`].
+enum UnderLockWork {
+    Push(PushReadyState),
+    Delete { remote_ref: RefName, zip: bool },
 }
 
 /// Re-list under the lock, upload the bundle, init HEAD, write the `FORMAT`
@@ -1096,12 +1140,21 @@ const DELETE_EXPECTED_NO_ZIP: usize = 1;
 /// Expected key count for a zip ref: one bundle + one archive object.
 const DELETE_EXPECTED_WITH_ZIP: usize = 2;
 
-/// Handle a delete refspec (`:<remote_ref>`): list `<prefix>/<ref>/`,
-/// expect 1 (or 2 with zip) keys, delete them all, emit `ok` or the
-/// appropriate error.
+/// Handle a delete refspec (`:<remote_ref>`) UNDER the per-ref lock
+/// acquired by [`push_one`]: list `<prefix>/<ref>/`, expect 1 (or 2
+/// with zip) keys after filtering out the lock we hold, delete them
+/// all, emit `ok` or the appropriate error.
 ///
-/// The listing is **unfiltered** on purpose — it counts `LOCK#.lock`,
-/// `PROTECTED#`, and `repo.zip` against the expected total. The
+/// Issue #133: this must run inside the lock window. A pre-lock
+/// listing-then-sweep races a concurrent push that lands a new bundle
+/// between the listing and the deletion, producing a silent false
+/// success — the delete reports `ok` to git while the ref survives
+/// with a different bundle on the server.
+///
+/// The lock key (`<prefix>/<ref>/LOCK#.lock`) is filtered from the
+/// listing — `release_lock` removes it last, after this function
+/// returns. Apart from that one filter, the listing is unfiltered and
+/// counts `PROTECTED#` and `repo.zip` against the expected total. The
 /// protected-marker case shares the "extra keys" branch with genuine
 /// multi-bundle corruption; the routing distinguishes them by inspecting
 /// the listing for the marker. Three behaviours fall out:
@@ -1109,7 +1162,7 @@ const DELETE_EXPECTED_WITH_ZIP: usize = 2;
 /// 1. **Protected ref** — listing includes a key whose final segment
 ///    is the [`keys::PROTECTED_MARKER_SEGMENT`]. Emit a
 ///    protection-specific refusal naming the management CLI's
-///    `unprotect` workflow. Example listing:
+///    `unprotect` workflow. Example listing (lock filtered out):
 ///    `[ "<prefix>/refs/heads/main/<sha>.bundle",
 ///       "<prefix>/refs/heads/main/PROTECTED#" ]` — count exceeds
 ///    `expected = 1`, marker present, route to (1).
@@ -1118,17 +1171,27 @@ const DELETE_EXPECTED_WITH_ZIP: usize = 2;
 ///    Example listing:
 ///    `[ "<prefix>/refs/heads/main/<sha-a>.bundle",
 ///       "<prefix>/refs/heads/main/<sha-b>.bundle" ]`.
-/// 3. **Stale lock alone** — single `LOCK#.lock` key matches the
-///    expected count and is deleted as if it were the bundle. Returns
-///    `ok`. (Behaviour predates the protection-routing split.)
-async fn delete_remote_ref(
+/// 3. **No bundle present** — listing (lock filtered out) is empty.
+///    Returns the `"not found"?` wire error. This now includes the case
+///    of a ref whose only on-server state was a stale `LOCK#.lock`:
+///    `acquire_lock` recovers the stale lock, the post-lock listing
+///    contains only our newly-held lock, and the filter renders it
+///    empty.
+async fn delete_remote_ref_under_lock(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
     remote_ref: &RefName,
     zip: bool,
+    lock_key: &str,
 ) -> Result<PushOutcome, PushError> {
     let listing = ref_listing_prefix(prefix, remote_ref);
-    let entries = store.list(&listing).await?;
+    let all_entries = store.list(&listing).await?;
+    // Issue #133: filter out the lock key we hold. `release_lock`
+    // removes it last; the sweep below must not touch it (deleting our
+    // own lock mid-critical-section would let concurrent clients
+    // acquire it). The remaining count is what the protocol's
+    // count-vs-expected dispatch operates on.
+    let entries: Vec<&ObjectMeta> = all_entries.iter().filter(|e| e.key != lock_key).collect();
     let expected = if zip {
         DELETE_EXPECTED_WITH_ZIP
     } else {
@@ -1773,7 +1836,7 @@ mod tests {
         drop(recovered);
     }
 
-    // --- delete_remote_ref --------------------------------------------
+    // --- delete_remote_ref_under_lock ---------------------------------
 
     #[tokio::test]
     async fn delete_remote_ref_removes_single_bundle() {
@@ -1783,9 +1846,15 @@ mod tests {
             format!("repo/refs/heads/main/{SHA}.bundle"),
             Bytes::from_static(b"b"),
         );
-        let outcome = delete_remote_ref(&store, Some("repo"), &r, false)
-            .await
-            .unwrap();
+        let outcome = delete_remote_ref_under_lock(
+            &store,
+            Some("repo"),
+            &r,
+            false,
+            "repo/refs/heads/main/LOCK#.lock",
+        )
+        .await
+        .unwrap();
         assert_eq!(
             outcome,
             PushOutcome::Ok {
@@ -1799,9 +1868,15 @@ mod tests {
     async fn delete_remote_ref_returns_not_found_when_empty() {
         let store = MockStore::new();
         let r = rn("refs/heads/main");
-        let outcome = delete_remote_ref(&store, Some("repo"), &r, false)
-            .await
-            .unwrap();
+        let outcome = delete_remote_ref_under_lock(
+            &store,
+            Some("repo"),
+            &r,
+            false,
+            "repo/refs/heads/main/LOCK#.lock",
+        )
+        .await
+        .unwrap();
         match outcome {
             PushOutcome::Error { message, .. } => {
                 assert_eq!(message, r#""not found"?"#);
@@ -1821,9 +1896,15 @@ mod tests {
         let protected = "repo/refs/heads/main/PROTECTED#";
         store.insert(&bundle, Bytes::from_static(b"b"));
         store.insert(protected, Bytes::from_static(b""));
-        let outcome = delete_remote_ref(&store, Some("repo"), &r, false)
-            .await
-            .unwrap();
+        let outcome = delete_remote_ref_under_lock(
+            &store,
+            Some("repo"),
+            &r,
+            false,
+            "repo/refs/heads/main/LOCK#.lock",
+        )
+        .await
+        .unwrap();
         match outcome {
             PushOutcome::Error { message, .. } => {
                 assert_eq!(
@@ -1849,9 +1930,15 @@ mod tests {
         let bundle_b = format!("repo/refs/heads/main/{OTHER_SHA}.bundle");
         store.insert(&bundle_a, Bytes::from_static(b"a"));
         store.insert(&bundle_b, Bytes::from_static(b"b"));
-        let outcome = delete_remote_ref(&store, Some("repo"), &r, false)
-            .await
-            .unwrap();
+        let outcome = delete_remote_ref_under_lock(
+            &store,
+            Some("repo"),
+            &r,
+            false,
+            "repo/refs/heads/main/LOCK#.lock",
+        )
+        .await
+        .unwrap();
         match outcome {
             PushOutcome::Error { message, .. } => {
                 assert_eq!(
@@ -1873,9 +1960,15 @@ mod tests {
         let zip = "repo/refs/heads/main/repo.zip";
         store.insert(&bundle, Bytes::from_static(b"b"));
         store.insert(zip, Bytes::from_static(b""));
-        let outcome = delete_remote_ref(&store, Some("repo"), &r, true)
-            .await
-            .unwrap();
+        let outcome = delete_remote_ref_under_lock(
+            &store,
+            Some("repo"),
+            &r,
+            true,
+            "repo/refs/heads/main/LOCK#.lock",
+        )
+        .await
+        .unwrap();
         assert_eq!(
             outcome,
             PushOutcome::Ok {
@@ -2304,34 +2397,80 @@ mod tests {
         );
     }
 
-    // --- delete_remote_ref --------------------------------------------
+    // --- delete_remote_ref_under_lock ---------------------------------
 
-    /// A ref whose only remaining object is a stale `LOCK#.lock` deletes
-    /// that lock as if it were the bundle and returns `ok` — the
-    /// listing is unfiltered on purpose.
+    /// Issue #133: under the lock, a ref whose only remaining object is
+    /// the lock key itself reports `"not found"?` rather than the
+    /// pre-#133 quirk of treating the lock as a bundle. In production
+    /// the lock here is the one [`acquire_lock`] holds across the call;
+    /// `release_lock` deletes it after this function returns, so the
+    /// caller never sees a dangling lock either way.
     ///
-    /// A regression that filtered `LOCK#.lock` out of the listing (e.g.
-    /// reusing `bundles_for_ref` here) would silently turn this into
-    /// `error <ref> "not found"?` and leave the stale lock dangling
-    /// for the full TTL.
+    /// This pins the new contract: the filter on the lock key must
+    /// short-circuit to `"not found"?` when the lock is the only
+    /// listed entry, NOT delete it as a bundle.
     #[tokio::test]
-    async fn delete_remote_ref_removes_stale_lock_as_if_bundle() {
+    async fn delete_remote_ref_under_lock_reports_not_found_when_only_lock_present() {
         let store = MockStore::new();
         let lock_key = "repo/refs/heads/main/LOCK#.lock";
-        store.insert(lock_key, Bytes::from_static(b"stale-lock-payload"));
+        // Simulate the lock we hold across the call (the production
+        // caller has already acquired it via `acquire_lock`).
+        store.insert(lock_key, Bytes::from_static(b"held-lock-payload"));
         let r = rn("refs/heads/main");
 
-        let outcome = delete_remote_ref(&store, Some("repo"), &r, false)
+        let outcome = delete_remote_ref_under_lock(&store, Some("repo"), &r, false, lock_key)
             .await
             .unwrap();
 
+        match outcome {
+            PushOutcome::Error { message, .. } => {
+                assert_eq!(message, r#""not found"?"#);
+            }
+            PushOutcome::Ok { .. } => panic!("expected Error, got Ok"),
+        }
+        // The lock key is NOT swept by `delete_remote_ref_under_lock` —
+        // `release_lock` is responsible for removing it. Pin that here
+        // so a regression that swept the held lock would fail.
         assert!(
-            matches!(&outcome, PushOutcome::Ok { remote_ref } if remote_ref == "refs/heads/main"),
-            "expected Ok(refs/heads/main), got {outcome:?}",
+            store.contains(lock_key),
+            "delete_remote_ref_under_lock must NOT delete the held lock key",
+        );
+    }
+
+    /// Issue #133: when a concurrent push lands a NEW bundle between
+    /// the lock-acquire and our listing inside the lock, the post-lock
+    /// listing reflects the new bundle. The delete proceeds normally
+    /// against that bundle (and the lock is filtered out). This pins
+    /// the close of the race window the issue describes: the listing
+    /// is now under the lock, so the deletion target is whatever the
+    /// concurrent writer left behind, not a stale pre-lock snapshot.
+    #[tokio::test]
+    async fn delete_remote_ref_under_lock_deletes_concurrently_landed_bundle() {
+        let store = MockStore::new();
+        let r = rn("refs/heads/main");
+        let lock_key = "repo/refs/heads/main/LOCK#.lock";
+        // Concurrent push landed this bundle; we hold the lock now.
+        let bundle = format!("repo/refs/heads/main/{OTHER_SHA}.bundle");
+        store.insert(&bundle, Bytes::from_static(b"new"));
+        store.insert(lock_key, Bytes::from_static(b"held-lock-payload"));
+
+        let outcome = delete_remote_ref_under_lock(&store, Some("repo"), &r, false, lock_key)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            PushOutcome::Ok {
+                remote_ref: "refs/heads/main".into()
+            }
         );
         assert!(
-            !store.contains(lock_key),
-            "stale lock must be removed by delete_remote_ref",
+            !store.contains(&bundle),
+            "concurrently-landed bundle must be swept"
+        );
+        assert!(
+            store.contains(lock_key),
+            "held lock must survive the sweep (release_lock removes it)",
         );
     }
 
