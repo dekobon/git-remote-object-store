@@ -201,15 +201,52 @@ impl<'a> ManageBranch<'a> {
     /// Mark the branch as protected by writing the `PROTECTED#` sentinel.
     /// Idempotent — overwrites any existing marker.
     ///
+    /// Re-lists the branch prefix immediately before the put so a
+    /// concurrent `delete-branch` (or last-bundle removal) that landed
+    /// between [`ManageBranch::open`] and this call is caught and the
+    /// marker is NOT written for a non-existent branch (#137). Without
+    /// this re-check the orphaned `PROTECTED#` would persist with no
+    /// automated cleanup and would silently block a future recreation
+    /// of the same branch from being force-pushed or deleted. The
+    /// re-listing filters out stale lock keys and any pre-existing
+    /// `PROTECTED#` marker so a branch whose only residue is operational
+    /// metadata is treated as gone.
+    ///
     /// # Errors
     ///
-    /// Returns [`ManageError::Store`] if the put operation fails.
+    /// Returns [`ManageError::BranchNotFound`] if the fresh listing
+    /// shows the branch was deleted concurrently. Returns
+    /// [`ManageError::Store`] if a list or put operation fails.
     pub async fn protect(&self) -> Result<(), ManageError> {
+        let fresh = self.store.list(&self.branch_prefix()).await?;
+        if !Self::has_branch_data(&fresh) {
+            warn!(
+                branch = %self.branch,
+                "branch was deleted concurrently between open and protect; refusing to write orphaned marker",
+            );
+            return Err(ManageError::BranchNotFound(self.branch.clone()));
+        }
         self.store
             .put_bytes(&self.protected_key(), Bytes::new(), PutOpts::default())
             .await?;
         println!("Branch {} is now protected", self.branch);
         Ok(())
+    }
+
+    /// `true` iff `entries` contains at least one key that represents
+    /// real branch data — i.e. NOT a lock file and NOT a `PROTECTED#`
+    /// marker. A branch whose only residue is a stale lock or a
+    /// previously-written marker is treated as gone, because writing a
+    /// fresh protection marker against that residue would still leave
+    /// an orphaned marker (#137).
+    fn has_branch_data(entries: &[ObjectMeta]) -> bool {
+        entries.iter().any(|entry| {
+            let last = entry
+                .key
+                .rsplit_once('/')
+                .map_or(entry.key.as_str(), |(_, s)| s);
+            !super::is_lock_key(&entry.key) && !keys::is_protected_marker_segment(last)
+        })
     }
 
     /// Remove the `PROTECTED#` sentinel. A missing marker is treated as
@@ -359,6 +396,102 @@ mod tests {
         // Second call overwrites without error.
         mb.protect().await.expect("protect again");
         assert!(mock.contains("myrepo/refs/heads/main/PROTECTED#"));
+    }
+
+    #[tokio::test]
+    async fn protect_refuses_when_branch_deleted_between_open_and_protect() {
+        // Issue #137: TOCTOU between `open` (which lists to verify the
+        // branch exists) and `protect` (which writes the marker). A
+        // concurrent `delete-branch` or last-bundle removal lands
+        // between the two calls. Pre-fix, `protect` wrote a marker for
+        // a non-existent branch — an orphaned `PROTECTED#` that never
+        // gets cleaned up and silently blocks a future recreation of
+        // the same branch. The fix re-lists immediately before the put
+        // and refuses with BranchNotFound if the branch is gone.
+        let mock = seed_with_branch("main");
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        // Simulate a concurrent delete sweeping every key under the
+        // branch prefix after `open` returned but before `protect` runs.
+        for key in mock.keys() {
+            if key.starts_with("myrepo/refs/heads/main/") {
+                let _ = mock.remove_key(&key);
+            }
+        }
+        let err = mb
+            .protect()
+            .await
+            .expect_err("protect must refuse against a concurrently-deleted branch");
+        match &err {
+            ManageError::BranchNotFound(name) => assert_eq!(name, "main"),
+            other => panic!("expected BranchNotFound, got {other:?}"),
+        }
+        // The orphaned marker must NOT have been written — that is the
+        // exact regression #137 fixes.
+        assert!(
+            !mock.contains("myrepo/refs/heads/main/PROTECTED#"),
+            "orphaned PROTECTED# must not be written when branch is gone",
+        );
+        assert!(
+            mock.keys().is_empty(),
+            "store remains empty: {:?}",
+            mock.keys()
+        );
+    }
+
+    #[tokio::test]
+    async fn protect_refuses_when_only_lock_key_remains() {
+        // A stale `LOCK#.lock` key is operational metadata, not branch
+        // data. Treating a lock-only listing as "branch exists" would
+        // let a `protect` write a marker for a branch that has no
+        // bundles — the same orphan-marker pathology #137 describes,
+        // just with a lock as the misleading residue instead of an
+        // empty listing.
+        let mock = MockStore::new();
+        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("body"));
+        mock.insert("myrepo/refs/heads/main/LOCK#.lock", Bytes::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        // Concurrent push-then-delete leaves only the lock behind.
+        let _ = mock.remove_key("myrepo/refs/heads/main/abc.bundle");
+        let err = mb
+            .protect()
+            .await
+            .expect_err("protect must refuse when only a lock key remains");
+        assert!(
+            matches!(err, ManageError::BranchNotFound(ref name) if name == "main"),
+            "expected BranchNotFound, got {err:?}",
+        );
+        assert!(!mock.contains("myrepo/refs/heads/main/PROTECTED#"));
+    }
+
+    #[tokio::test]
+    async fn protect_remains_idempotent_when_marker_already_present() {
+        // The pre-existing marker plus a real bundle means the branch
+        // is alive. `protect` must still succeed (idempotent overwrite)
+        // — the data-presence check must not regress to "any marker
+        // means orphan" and refuse a legitimate re-protect.
+        let mock = seed_with_branch("main");
+        mock.insert("myrepo/refs/heads/main/PROTECTED#", Bytes::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        mb.protect()
+            .await
+            .expect("protect must remain idempotent over an existing marker");
+        assert!(mock.contains("myrepo/refs/heads/main/PROTECTED#"));
+        assert!(mock.contains("myrepo/refs/heads/main/abc.bundle"));
     }
 
     #[tokio::test]
