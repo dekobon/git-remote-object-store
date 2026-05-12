@@ -1418,8 +1418,64 @@ mod tests {
         );
         // Protection marker survives a refusal.
         assert!(store.contains("repo/refs/heads/main/PROTECTED#"));
-        // Chain.json must not have been written by the refused push.
-        assert!(!store.contains("repo/refs/heads/main/chain.json"));
+        // A refusal path that progressed past the protection check
+        // could have uploaded packchain artefacts before bailing.
+        // Assert none of those keys exist for this ref — only the
+        // `PROTECTED#` marker should be present under the ref prefix.
+        // Note: these are bucket keys (case-sensitive by S3/Azure
+        // contract), not filesystem paths, so the case-sensitive
+        // suffix check is correct.
+        #[allow(clippy::case_sensitive_file_extension_comparisons)]
+        let is_artefact = |k: &str| {
+            k.ends_with(".pack")
+                || k.ends_with(".idx")
+                || k.ends_with("/chain.json")
+                || k.ends_with("/path-index.json")
+        };
+        let ref_prefix = "repo/refs/heads/main/";
+        let stray: Vec<String> = store
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with(ref_prefix) && is_artefact(k))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "refused push must not upload packchain artefacts, found: {stray:?}",
+        );
+    }
+
+    /// Companion to the rejection case: a legitimate force-push (force,
+    /// non-FF, no `PROTECTED#` marker) must NOT hit the protection
+    /// refusal. This pins the polarity of the AND-clause guarding the
+    /// rejection — a regression that dropped the `is_protected` term
+    /// would refuse every non-FF force-push, not just those against
+    /// protected refs.
+    ///
+    /// The packchain engine fails downstream against the empty tempdir
+    /// (no `.git` → path-index walk errors), so we cannot assert a
+    /// successful end-to-end outcome here. What we pin is the absence
+    /// of the `NotAncestor` wire token on every outcome arm: that token
+    /// would appear if and only if the protection guard mis-fired.
+    #[tokio::test]
+    async fn perform_push_under_lock_allows_force_when_not_ancestor_and_not_protected() {
+        let store = MockStore::new();
+        // No PROTECTED# marker seeded.
+        let state = ready_state_for_protection_test(true, false);
+        let outcome =
+            perform_push_under_lock(&store, Some("repo"), StorageEngine::Packchain, *state).await;
+        match outcome {
+            Ok(PushOutcome::Ok { .. }) => {
+                // Passed every stage including the bypassed guard.
+            }
+            Ok(PushOutcome::Error { message, .. }) => assert!(
+                !message.contains("not ancestor"),
+                "unprotected force-push must not emit NotAncestor: {message:?}",
+            ),
+            Err(e) => assert!(
+                !e.to_string().contains("not ancestor"),
+                "unprotected force-push must not emit NotAncestor: {e}",
+            ),
+        }
     }
 
     /// Non-force pushes must not consult `is_protected` under the
@@ -1446,15 +1502,23 @@ mod tests {
         // surface as that exact wire token.
         let outcome =
             perform_push_under_lock(&store, Some("repo"), StorageEngine::Packchain, *state).await;
+        // Pin that the protection check is bypassed for non-force pushes,
+        // regardless of whether the rest of the push happens to succeed
+        // in this test setup. A regression that ran the check for
+        // non-force pushes would surface as the `not ancestor` wire token
+        // on either the Ok-with-Error or the Err arm.
         match outcome {
+            Ok(PushOutcome::Ok { .. }) => {
+                // Passed every stage including the bypassed check.
+            }
             Ok(PushOutcome::Error { message, .. }) => assert!(
                 !message.contains("not ancestor"),
                 "non-force push must not hit the protection rejection: {message:?}",
             ),
-            Ok(PushOutcome::Ok { .. }) | Err(_) => {
-                // Either result is fine for this test — what we're
-                // proving is the absence of the protection rejection.
-            }
+            Err(e) => assert!(
+                !e.to_string().contains("not ancestor"),
+                "non-force push must not hit the protection rejection: {e}",
+            ),
         }
     }
 }

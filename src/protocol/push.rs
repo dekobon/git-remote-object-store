@@ -1002,9 +1002,9 @@ async fn push_one(
 
 /// The work to perform inside the per-ref lock acquired by [`push_one`].
 ///
-/// `PushReadyState` is sizeable (≥240 bytes — paths, the temp dir
-/// guard, the captured refspec); boxing it keeps the
-/// [`UnderLockWork`] discriminant compact regardless of variant.
+/// `PushReadyState` is significantly larger than the `Delete` variant
+/// (paths, the temp dir guard, the captured refspec); boxing it keeps
+/// the [`UnderLockWork`] discriminant compact regardless of variant.
 enum UnderLockWork {
     Push(Box<PushReadyState>),
     Delete { remote_ref: RefName, zip: bool },
@@ -1342,18 +1342,11 @@ async fn delete_remote_ref_under_lock(
             remote_ref: remote_ref_str,
             message: r#""not found"?"#.to_owned(),
         })
-    } else if has_protected_marker {
-        // Unreachable: the canonical guard above returns early when the
-        // marker is present. Kept as a defensive backstop and to keep
-        // the routing comment on `delete_remote_ref_under_lock` accurate
-        // for readers who scan the dispatch tail.
-        Ok(PushOutcome::Error {
-            remote_ref: remote_ref_str,
-            message:
-                r#""ref is protected. Run git-remote-object-store unprotect <url> <branch> to remove protection before deleting."?"#
-                    .to_owned(),
-        })
     } else {
+        // Genuine multi-bundle / corruption: `entries` has more than
+        // `expected` items and no `PROTECTED#` marker (that case
+        // returned at the top guard above). Fall through to the doctor
+        // message — see issue #128 for the routing rationale.
         Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
             message:
@@ -3133,6 +3126,44 @@ mod tests {
         );
         // Protection marker still in place after the push.
         assert!(store.contains("repo/refs/heads/main/PROTECTED#"));
+    }
+
+    /// Companion to the rejection case: a legitimate force-push (force,
+    /// non-FF, no `PROTECTED#` marker) must proceed. This pins the
+    /// polarity of the AND-clause guarding the protection rejection — a
+    /// regression that dropped the `is_protected` check from the
+    /// condition would refuse every non-FF force-push, not just those
+    /// against protected refs.
+    #[tokio::test]
+    async fn perform_push_under_lock_allows_force_when_not_ancestor_and_not_protected() {
+        let store = MockStore::new();
+        let pre_key = format!("repo/refs/heads/main/{OTHER_SHA}.bundle");
+        store.insert(&pre_key, Bytes::from_static(b"old bundle"));
+        // No PROTECTED# marker.
+        let mut state = push_state_with_pre_existing(Some(pre_key.clone()));
+        state.force = true;
+        state.pre_existing_was_ancestor = false; // non-FF force-push.
+        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&outcome, PushOutcome::Ok { remote_ref } if remote_ref == "refs/heads/main"),
+            "legitimate non-FF force-push must proceed, got {outcome:?}",
+        );
+        // A passing push uploads the new bundle keyed by `local_sha`.
+        let local_sha = SHA;
+        assert!(
+            store.contains(&format!("repo/refs/heads/main/{local_sha}.bundle")),
+            "new bundle must be uploaded on a successful force-push",
+        );
+        // Defensive: the NotAncestor wire token must NOT appear anywhere
+        // in the outcome — that would mean the guard mis-fired.
+        if let PushOutcome::Error { message, .. } = &outcome {
+            assert!(
+                !message.contains("not ancestor"),
+                "force-push without protection must not emit NotAncestor: {message}",
+            );
+        }
     }
 
     /// A non-force push (`force=false`) must never consult `is_protected`

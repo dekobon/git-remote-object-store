@@ -90,9 +90,9 @@ impl<'a> ManageBranch<'a> {
     /// Refuses outright when a `PROTECTED#` marker is present under the
     /// branch prefix — the operator must run `unprotect` first. This
     /// mirrors the refusal the helper-protocol delete path
-    /// (`delete_remote_ref`) emits, so a `git push :branch` against a
-    /// protected ref and a management-CLI `delete-branch` of the same
-    /// ref fail the same way.
+    /// (`delete_remote_ref_under_lock`) emits, so a `git push :branch`
+    /// against a protected ref and a management-CLI `delete-branch` of
+    /// the same ref fail the same way.
     ///
     /// # Errors
     ///
