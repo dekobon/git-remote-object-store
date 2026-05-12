@@ -964,6 +964,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_handles_empty_initial_listing_when_branch_swept_between_open_and_delete() {
+        // Distinct from the prompt-window race
+        // (`delete_reports_already_gone_on_concurrent_delete_race`):
+        // here the branch is swept BETWEEN `open()` succeeding (data
+        // existed at open time) and the FIRST listing inside
+        // `delete()`. The function must handle the empty-initial-list
+        // path without panicking, without spuriously claiming success,
+        // and without surfacing an unexpected error variant. The fresh
+        // re-listing inside `delete()` is also empty, so the
+        // "already gone" branch fires and the function returns Ok(()).
+        let mock = seed_with_branch("main");
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        // One confirm answer queued: the current implementation does
+        // NOT short-circuit on an empty INITIAL listing — it falls
+        // through to the prompt (the operator may want to confirm a
+        // "0 objects" delete) and only the empty FRESH listing path
+        // (post-prompt) returns Ok(()). Queuing a single `true`
+        // exercises that exact path.
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open succeeds while branch data is still present");
+
+        // Sweep every key under the branch between open() and delete().
+        // Mirrors a concurrent `delete-branch` or last-bundle removal
+        // that ran while the caller was still holding the open handle.
+        for key in mock.keys() {
+            if key.starts_with("myrepo/refs/heads/main/") {
+                let _ = mock.remove_key(&key);
+            }
+        }
+        assert!(
+            mock.keys().is_empty(),
+            "pre-condition: branch must be fully swept before delete()",
+        );
+
+        mb.delete()
+            .await
+            .expect("delete() must handle an empty initial listing without error");
+        assert!(
+            mock.keys().is_empty(),
+            "delete() against an already-empty branch must not resurrect any key",
+        );
+    }
+
+    #[tokio::test]
     async fn delete_reports_already_gone_on_concurrent_delete_race() {
         // A concurrent `delete-branch` (or last-bundle removal) clears
         // every object under the branch prefix during the prompt

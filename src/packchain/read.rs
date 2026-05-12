@@ -2204,6 +2204,12 @@ mod tests {
         chain_key: String,
         bodies: Vec<Bytes>,
         calls: AtomicUsize,
+        /// Counts `get_bytes` calls whose key ends in
+        /// `/path-index.json`. Used by the issue-#136 contract test
+        /// (`read_with_pack_missing_retries_does_not_reload_path_index`)
+        /// to prove the retry path never re-reads path-index — only
+        /// `chain.json` is reloaded.
+        path_index_calls: AtomicUsize,
     }
 
     impl EvolvingChainStore {
@@ -2214,11 +2220,16 @@ mod tests {
                 chain_key,
                 bodies,
                 calls: AtomicUsize::new(0),
+                path_index_calls: AtomicUsize::new(0),
             }
         }
 
         fn chain_calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+
+        fn path_index_calls(&self) -> usize {
+            self.path_index_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -2243,6 +2254,9 @@ mod tests {
                 let idx = self.calls.fetch_add(1, Ordering::SeqCst);
                 let pick = idx.min(self.bodies.len() - 1);
                 return Ok(self.bodies[pick].clone());
+            }
+            if key.ends_with("/path-index.json") {
+                self.path_index_calls.fetch_add(1, Ordering::SeqCst);
             }
             self.inner.get_bytes(key).await
         }
@@ -2397,6 +2411,94 @@ mod tests {
             store.chain_calls(),
             1,
             "exactly one chain reload should have fired"
+        );
+        // Issue #136 contract: the retry path only reloads `chain.json`.
+        // Path-index is loaded once by `read_blob` before this helper is
+        // entered (the original `blob_oid` represents the snapshot the
+        // caller asked about), and compaction preserves blob content
+        // addressing — so reloading path-index on retry would silently
+        // re-resolve the path against a newer tip's tree, which is the
+        // wrong semantics for a stateless point-in-time read.
+        // `read_with_pack_missing_retries` itself never touches
+        // path-index; pin that with a counter assertion.
+        assert_eq!(
+            store.path_index_calls(),
+            0,
+            "retry path must not reload path-index.json",
+        );
+    }
+
+    /// Companion to `succeeds_after_chain_reload`: pins the
+    /// "path-index is NOT reloaded across retries" half of the
+    /// `read_with_pack_missing_retries` contract documented at issue
+    /// #136. A regression that re-resolved the blob OID via a fresh
+    /// path-index load between retries would resolve to a different
+    /// blob SHA on a force-pushed tree and surface as a stale-read
+    /// bug. We arm a single pack-missing retry, count `get_bytes`
+    /// calls against `path-index.json` through the `EvolvingChainStore`
+    /// counter, and assert the count stays at zero.
+    #[tokio::test]
+    async fn read_with_pack_missing_retries_does_not_reload_path_index() {
+        let inner = MockStore::new();
+        let cache = PackIndexCache::default();
+
+        let p1_sha = sha40(SHA_A);
+        let p2_sha = sha40(SHA_B);
+        let blob_payload = b"recovered blob";
+        let blob_oid_sha = sha40(SHA_C);
+        let blob_oid = sha40_to_object_id(&blob_oid_sha);
+
+        // Build the P2 pack + idx so the retry's read finds the blob.
+        let mut pack = Vec::new();
+        let mut offsets = Vec::new();
+        push_pack_entry(
+            &mut pack,
+            &mut offsets,
+            3, /* BLOB */
+            None,
+            blob_payload,
+        );
+        inner.insert(pack_key(None, &p2_sha), Bytes::from(pack));
+        let idx_bytes = build_one_object_v2_idx(&blob_oid_sha, 0);
+        inner.insert(pack_idx_key(None, &p2_sha), Bytes::from(idx_bytes));
+
+        // Pre-write a sentinel `path-index.json` body so any spurious
+        // load would consume it (and bump the counter) rather than
+        // silently 404 and slip past the assertion.
+        inner.insert("refs/heads/main/path-index.json", Bytes::from_static(b"{}"));
+
+        // Initial chain refs P1 (absent), reloaded chain refs P2 (present).
+        let chain_key = chain_key(None, "refs/heads/main");
+        let v1 = chain_json_bytes(SHA_A, p1_sha.as_str());
+        let v2 = chain_json_bytes(SHA_A, p2_sha.as_str());
+        let store = EvolvingChainStore::new(inner, chain_key, vec![v2]);
+
+        let initial = ChainManifest::from_json_bytes(&v1).expect("chain v1 parses");
+        let remote_ref = RefName::new("refs/heads/main").expect("ref name valid");
+
+        let resolved = read_with_pack_missing_retries(
+            &store,
+            None,
+            &remote_ref,
+            "refs/heads/main",
+            initial,
+            &blob_oid,
+            &cache,
+        )
+        .await
+        .expect("retry must succeed");
+        assert_eq!(resolved.payload, blob_payload);
+        // The retry fired (chain reload count == 1).
+        assert_eq!(store.chain_calls(), 1);
+        // Critical contract: path-index.json is never re-loaded by the
+        // retry path. `read_with_pack_missing_retries` operates on the
+        // already-resolved `blob_oid`; reloading path-index would
+        // re-resolve the path against a possibly-newer tree.
+        assert_eq!(
+            store.path_index_calls(),
+            0,
+            "retry path read path-index.json {} times; must be zero",
+            store.path_index_calls(),
         );
     }
 

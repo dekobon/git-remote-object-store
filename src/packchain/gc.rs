@@ -2063,6 +2063,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sweep_one_baseline_tombstone_re_reads_chain_per_tombstone() {
+        // Companion to `sweep_re_derives_referenced_set_per_tombstone`
+        // for the baseline tombstone path. `sweep_one_baseline_tombstone`
+        // calls `load_chain` inside the function, so each tombstone in
+        // a sweep pass sees a freshly-loaded chain. A regression that
+        // hoisted the chain load out of the per-tombstone loop would
+        // let a concurrent push between iterations slip past the
+        // re-baselined-to-same-SHA guard, deleting a bundle that is
+        // once again live.
+        //
+        // Layout: two stale baseline tombstones for the same ref both
+        // naming SHA_FULL, plus a baseline bundle at SHA_FULL. With
+        // no live chain initially, the first iteration sees
+        // `chain.is_none()` → `still_live = false` → deletes the
+        // bundle. The post-delete hook (firing after the tombstone
+        // delete that follows the bundle delete) writes a chain whose
+        // `full_at == SHA_FULL`, simulating a force-push that
+        // re-baselined to the same SHA. The second iteration must
+        // re-read the chain, observe `full_at == tombstone.sha`, set
+        // `still_live = true`, and refuse to re-delete (the bundle is
+        // already gone anyway, but the assertion is on the counter:
+        // `skipped_repointed_packs == 1`).
+        let inner = MockStore::new();
+        let bundle_key = insert_baseline_bundle(&inner, Some("repo"), SHA_FULL);
+        let stale_a = (OffsetDateTime::now_utc() - time::Duration::hours(49))
+            .format(&Rfc3339)
+            .unwrap();
+        let stale_b = (OffsetDateTime::now_utc() - time::Duration::hours(48))
+            .format(&Rfc3339)
+            .unwrap();
+        let tomb_a = write_baseline_tombstone_at(&inner, "repo", &stale_a, SHA_FULL);
+        let tomb_b = write_baseline_tombstone_at(&inner, "repo", &stale_b, SHA_FULL);
+
+        // Trigger on the baseline-tomb prefix: the hook fires AFTER
+        // the FIRST iteration's tombstone delete completes (the
+        // tombstone delete is the last delete in `sweep_one_baseline_tombstone`),
+        // which is precisely the window in which a concurrent
+        // force-push could land before the second iteration's chain
+        // re-read.
+        let store = PostDeleteHookStore::new(inner, "repo/gc/baseline-tomb-", |inner| {
+            let chain = ChainManifest {
+                v: 1,
+                tip: sha40(SHA_TIP),
+                full_at: sha40(SHA_FULL),
+                segments: vec![segment(SHA_PACK_LIVE, None)],
+            };
+            let body =
+                serde_json::to_vec_pretty(&chain).expect("chain.json serializes for the test");
+            inner.insert("repo/refs/heads/main/chain.json", Bytes::from(body));
+        });
+
+        let outcome = sweep(&store, "repo", SweepOpts::default()).await.unwrap();
+        // Both baseline tombstones processed.
+        assert_eq!(outcome.swept_tombstones, 2);
+        // First iteration deleted the bundle (1 object). Second
+        // iteration's fresh chain read showed full_at == tombstone.sha
+        // and skipped the delete — the recompute is per-tombstone.
+        assert_eq!(outcome.deleted_objects, 1, "only one bundle delete");
+        assert_eq!(
+            outcome.skipped_repointed_packs, 1,
+            "second iteration must see the re-baselined chain and skip",
+        );
+        // Both tombstones are gone.
+        for key in [&tomb_a, &tomb_b] {
+            let err = store.inner.get_bytes(key).await.unwrap_err();
+            assert!(matches!(err, ObjectStoreError::NotFound(_)));
+        }
+        // The bundle was deleted by the first iteration. Asserting on
+        // the counter (not the bundle's presence) is what proves the
+        // chain is re-read per tombstone — the survival is necessarily
+        // about the COUNTER because the first iteration already removed
+        // the bundle before the hook fired.
+        let bundle_err = store.inner.get_bytes(&bundle_key).await.unwrap_err();
+        assert!(matches!(bundle_err, ObjectStoreError::NotFound(_)));
+    }
+
+    #[tokio::test]
     async fn sweep_protects_pack_when_concurrent_push_aliases_existing_key() {
         // Issue #140's canonical scenario, framed as the issue
         // describes it: a force-revert republishes a pack with the

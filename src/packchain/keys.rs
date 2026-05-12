@@ -359,6 +359,42 @@ mod tests {
     }
 
     #[test]
+    fn pack_sha_from_full_key_rejects_degenerate_shapes() {
+        // Empty key (with or without a prefix). A regression that let
+        // an empty key flow into the str-prefix machinery would attempt
+        // to strip `packs/` from `""` and surface `None`, but pinning
+        // the contract here guards against a future refactor that
+        // short-circuits before the strip and accidentally returns a
+        // bogus SHA.
+        assert!(pack_sha_from_full_key(None, "").is_none());
+        assert!(pack_sha_from_full_key(Some("acme"), "").is_none());
+
+        // Zero-length SHA stem: the strip suffixes succeed but
+        // `Sha40::try_new("")` must reject. Covers both extensions so
+        // a future relaxation of one extension's check (but not the
+        // other) is caught.
+        assert!(pack_sha_from_full_key(None, "packs/.pack").is_none());
+        assert!(pack_sha_from_full_key(None, "packs/.idx").is_none());
+
+        // Suffix-after-extension: `packs/<sha>.pack/extra` does NOT end
+        // in `.pack` or `.idx` (the strip_suffix's only accept exact
+        // suffixes), so the helper must reject rather than treat the
+        // trailing component as part of the stem. Guards against a
+        // future regex-based rewrite that would happily match
+        // `packs/<sha>.pack/whatever`.
+        assert!(pack_sha_from_full_key(None, &format!("packs/{SHA}.pack/extra")).is_none());
+        assert!(pack_sha_from_full_key(None, &format!("packs/{SHA}.idx/extra")).is_none());
+
+        // Path-traversal-style key: a `../packs/<sha>.pack` leading
+        // component must not match the no-prefix case. `strip_prefix`
+        // with `Some(p)` already covers the prefixed case (see
+        // `pack_sha_from_full_key_rejects_prefix_mismatch`); this
+        // pins the symmetric `None`-prefix path.
+        assert!(pack_sha_from_full_key(None, &format!("../packs/{SHA}.pack")).is_none());
+        assert!(pack_sha_from_full_key(None, &format!("../packs/{SHA}.idx")).is_none());
+    }
+
+    #[test]
     fn segment_pack_sha_maps_malformed_to_malformed_pack_entry() {
         let segment = super::super::schema::ChainSegment {
             sha: Sha40::try_new(SHA).unwrap(),

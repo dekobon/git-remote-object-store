@@ -1138,6 +1138,84 @@ mod tests {
         );
     }
 
+    /// Prompter that arms a one-shot list fault on the
+    /// [`MockStore`] immediately before returning its first `select`
+    /// answer. Used by
+    /// `fix_head_propagates_recheck_list_failure_without_writing_head`
+    /// to land an `AccessDeniedOnList` fault into the re-verification
+    /// list call without tripping the top-of-run snapshot list (which
+    /// has already completed by the time the prompter is invoked).
+    struct ArmFaultPrompter {
+        mock: MockStore,
+        branch_prefix: String,
+        fired: std::sync::Mutex<bool>,
+    }
+
+    impl Prompter for ArmFaultPrompter {
+        fn select(&self, _prompt: &str, _options: &[String]) -> Result<usize, ManageError> {
+            let mut fired = self.fired.lock().expect("fired mutex poisoned");
+            if !*fired {
+                self.mock.arm(Fault::AccessDeniedOnList {
+                    prefix: self.branch_prefix.clone(),
+                });
+                *fired = true;
+            }
+            Ok(0)
+        }
+        fn confirm(&self, _prompt: &str) -> Result<bool, ManageError> {
+            panic!("ArmFaultPrompter does not expect confirm prompts")
+        }
+    }
+
+    #[tokio::test]
+    async fn fix_head_propagates_recheck_list_failure_without_writing_head() {
+        // The re-verification list at the start of `fix_head` (just
+        // before the HEAD put_bytes) propagates list failures via `?`.
+        // A regression that swallowed the error and proceeded against
+        // the stale top-of-run snapshot would silently re-create the
+        // invalid-HEAD condition #138 was meant to prevent. Arm a
+        // single-shot list fault scoped to the chosen branch's prefix
+        // so only the re-check listing trips; the top-of-run snapshot
+        // listing has already completed by the time the prompter is
+        // invoked.
+        let mock = MockStore::new();
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
+        // Lexicographic order puts `refs/heads/main` at index 0 (it is
+        // the only candidate). The prompter arms the AccessDenied
+        // fault on its first select call — after the top-of-run
+        // snapshot list has already completed but before the
+        // re-verification list runs.
+        let prompter = ArmFaultPrompter {
+            mock: mock.clone(),
+            branch_prefix: "myrepo/refs/heads/main/".to_owned(),
+            fired: std::sync::Mutex::new(false),
+        };
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let err = doctor
+            .run_into(&mut std::io::sink())
+            .await
+            .expect_err("list-fault on the re-check must propagate, not silently succeed");
+        // The exact wording isn't pinned — only the variant chain
+        // (ManageError::Store wrapping an ObjectStoreError). A
+        // regression that swallowed the error would surface as Ok(_),
+        // failing the expect_err above.
+        assert!(
+            matches!(err, ManageError::Store(_)),
+            "expected ManageError::Store from the list-fault, got {err:?}",
+        );
+        // The critical invariant: HEAD must NOT have been written.
+        // A re-check list failure that proceeded with the put would
+        // re-create the invalid-HEAD condition the doctor is supposed
+        // to fix.
+        assert!(
+            !mock.contains("myrepo/HEAD"),
+            "HEAD was written despite the re-check list failing",
+        );
+    }
+
     #[tokio::test]
     async fn stale_lock_listed_but_not_deleted_by_default() {
         let mock = MockStore::new();
