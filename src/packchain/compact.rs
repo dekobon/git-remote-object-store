@@ -10,6 +10,12 @@
 //! - A fresh `path-index.json` reflects the tip's tree.
 //! - Old segment packs are left in `<prefix>/packs/` and become orphans
 //!   for [`super::gc`] to reap on the next mark/sweep cycle.
+//! - The prior baseline bundle is left in place and a baseline
+//!   tombstone is written under `<prefix>/gc/` (issue #134). The
+//!   tombstone defers deletion to the next `gc sweep` past the
+//!   operator-configured grace window, so a concurrent fetch that
+//!   already read the prior `chain.json` can still download the
+//!   bundle it expects.
 //!
 //! ## Concurrency
 //!
@@ -38,17 +44,18 @@ use tracing::{debug, info, warn};
 
 use crate::git::{self, RefName, Sha};
 use crate::keys;
-use crate::object_store::{GetOpts, ObjectStore, ObjectStoreError, PutOpts};
+use crate::object_store::{GetOpts, ObjectStore, PutOpts};
 use crate::protocol::fetch::MAX_FETCH_CONCURRENCY;
 use crate::protocol::push::{acquire_lock, lock_key, release_lock};
 
 use super::PackchainError;
 use super::audit::{COMPACT_BYTES_THRESHOLD, COMPACT_SEGMENTS_THRESHOLD};
 use super::fetch::install_pack;
+use super::gc::write_baseline_tombstone;
 use super::keys::{pack_idx_key, pack_key, pack_key_from_relative};
 use super::manifest::{load_chain, write_chain, write_path_index};
 use super::pack::build_baseline_pack;
-use super::schema::{ChainManifest, ChainSegment};
+use super::schema::{ChainManifest, ChainSegment, Sha40};
 
 /// Knobs for [`compact`]. Mirrors the shape used by `gc::SweepOpts`.
 #[derive(Debug, Clone, Copy)]
@@ -361,15 +368,13 @@ async fn compact_under_lock(
     let new_pack_key = pack_key(prefix, &new_pack.content_sha);
     let new_idx_key = pack_idx_key(prefix, &new_pack.content_sha);
     let new_bundle_key = keys::bundle_key(prefix, ref_name, chain.tip.as_str());
-    // Capture the pre-rewrite baseline bundle key. Once `write_chain`
-    // commits the new manifest, the old `<full_at>.bundle` becomes
-    // unreachable — and bundle keys live outside the `packs/`
-    // namespace that `gc::list_pack_shas` scans, so without an
-    // explicit delete here the file would leak forever (issue #84).
-    // We delete only when `full_at` actually moved; if the tip is
-    // unchanged (compact collapsing only non-baseline packs), the
-    // old key equals the new one and is still live.
-    let old_bundle_key = keys::bundle_key(prefix, ref_name, chain.full_at.as_str());
+    // Capture the prior baseline's `full_at` so the post-commit
+    // helper can write a tombstone naming the bundle key that
+    // becomes unreachable when the new chain.json lands (issue #134).
+    // The bundle itself stays in place during the grace window so an
+    // in-flight fetch that already read the old chain.json can still
+    // download it; `gc sweep` reclaims it after the grace expires.
+    let prior_full_sha = chain.full_at.clone();
     upload_pack_and_idx(
         store,
         &new_pack_key,
@@ -403,16 +408,17 @@ async fn compact_under_lock(
         write_path_index(store, prefix, ref_name, index).await?;
     }
 
-    // chain.json is now durable — the old baseline bundle is
-    // unreachable. See [`delete_prior_baseline_bundle`] for why
-    // this delete must run under the same lock and after the
-    // chain.json commit. The delete is best-effort: a failure
-    // after the chain commit must NOT report compact as failed,
-    // because the new chain is already live and a retry would
-    // short-circuit through `AlreadyMinimal` without finishing
-    // the cleanup (issue #113). The helper logs at `warn` with
-    // the orphan key so an operator can clean up manually.
-    delete_prior_baseline_bundle(store, ref_name, &old_bundle_key, &new_bundle_key).await;
+    // chain.json is now durable — the prior baseline bundle is
+    // unreachable. We write a baseline tombstone instead of
+    // deleting (issue #134): the bundle stays in place for the
+    // grace window so a concurrent fetch that already read the
+    // prior chain.json can still download it, and `gc sweep`
+    // reclaims it afterward. The write is best-effort — a failure
+    // here must NOT fail the compact because the new chain is
+    // already durable and a retry would short-circuit through
+    // `AlreadyMinimal` (issue #113). The helper logs at `warn`
+    // with the orphan key so an operator can clean up manually.
+    tombstone_prior_baseline_bundle(store, prefix, ref_name, &prior_full_sha, &chain.tip).await;
 
     info!(
         ref_path = %ref_name.as_str(),
@@ -564,54 +570,54 @@ async fn upload_bundle(
     Ok(())
 }
 
-/// Best-effort delete of the prior `<full_at>.bundle` once the new
-/// chain.json is durable.
+/// Best-effort tombstone of the prior `<full_at>.bundle` once the
+/// new chain.json is durable (issue #134).
 ///
 /// Called from [`compact_under_lock`] AFTER the `write_chain` PUT —
-/// any reader after that point follows the new chain.json and never
-/// references the old key. Running under the per-ref lock prevents a
-/// concurrent push from reusing the same `full_at` SHA between our
-/// chain commit and our delete.
+/// any reader that starts after that point follows the new chain.json
+/// and never references the old key. A reader that started before
+/// the commit may still be about to GET the prior bundle, so we
+/// defer the actual delete to [`super::gc::sweep`]: it walks past
+/// the operator-configured grace window before reclaiming the
+/// bundle. Running under the per-ref lock prevents a concurrent push
+/// from reusing the same `full_at` SHA between our chain commit and
+/// our tombstone write.
 ///
-/// Skips when `old == new` (compact left `full_at` unchanged — the
-/// keys alias the same live bundle). Tolerates `NotFound` so a retry
-/// after a partial completion is idempotent (issue #84).
+/// Skips when `prior == current` (compact left `full_at` unchanged —
+/// the keys alias the same live bundle), delegated to
+/// [`write_baseline_tombstone`]'s short-circuit.
 ///
 /// Failure contract (issue #113): the new chain manifest is already
 /// durable on the bucket when this function runs, so a transient
 /// store error here must NOT propagate as a compact failure. Retrying
 /// `compact` would short-circuit through `AlreadyMinimal` and never
-/// re-attempt the cleanup, stranding the old baseline indefinitely
-/// (`gc::list_pack_shas` does not sweep bundle keys). Log at `warn`
-/// with the orphan key and return.
-async fn delete_prior_baseline_bundle(
+/// re-attempt the cleanup, leaving the bundle without a tombstone.
+/// Log at `warn` with the orphan key and return so an operator can
+/// either re-run the cleanup or remove the bundle manually.
+async fn tombstone_prior_baseline_bundle(
     store: &dyn ObjectStore,
+    prefix: Option<&str>,
     ref_name: &RefName,
-    old_bundle_key: &str,
-    new_bundle_key: &str,
+    prior_full_sha: &Sha40,
+    current_full_sha: &Sha40,
 ) {
-    if old_bundle_key == new_bundle_key {
-        return;
-    }
-    match store.delete(old_bundle_key).await {
-        Ok(()) => {
-            debug!(key = %old_bundle_key, "compact: deleted prior baseline bundle");
-        }
-        Err(ObjectStoreError::NotFound(_)) => {
-            debug!(
-                key = %old_bundle_key,
-                "compact: prior baseline bundle already absent",
-            );
-        }
-        Err(e) => {
-            warn!(
-                ref_path = %ref_name.as_str(),
-                key = %old_bundle_key,
-                error = %e,
-                "compact: prior baseline cleanup failed (chain.json already committed); \
-                 orphan key left for manual cleanup",
-            );
-        }
+    if let Err(e) =
+        write_baseline_tombstone(store, prefix, ref_name, prior_full_sha, current_full_sha).await
+    {
+        let orphan_key = keys::bundle_key(prefix, ref_name, prior_full_sha.as_str());
+        warn!(
+            ref_path = %ref_name.as_str(),
+            key = %orphan_key,
+            error = %e,
+            "compact: prior baseline tombstone write failed (chain.json already committed); \
+             orphan bundle left for manual cleanup",
+        );
+    } else {
+        debug!(
+            ref_path = %ref_name.as_str(),
+            prior = %prior_full_sha.as_str(),
+            "compact: prior baseline bundle tombstoned for gc sweep",
+        );
     }
 }
 
@@ -945,15 +951,26 @@ mod tests {
             "fresh baseline bundle at the new tip must be uploaded",
         );
 
-        // The PRIOR baseline bundle (at c1) must have been deleted —
-        // it is unreachable from the new chain.json and lives outside
-        // the `packs/` namespace that GC scans, so leaking it would
-        // accumulate orphan files forever (issue #84).
+        // The PRIOR baseline bundle (at c1) must still be on the bucket
+        // — issue #134 defers deletion to `gc sweep` past the grace
+        // window so a concurrent fetch that already read the prior
+        // chain.json can still download it. A baseline tombstone under
+        // `<prefix>/gc/baseline-tomb-*.json` records the bundle for
+        // future reclamation.
         let prior_bundle_key = format!("repo/refs/heads/main/{c1}.bundle");
         assert!(
-            !store.contains(&prior_bundle_key),
-            "compact must delete the prior baseline bundle once \
-             chain.json no longer references it",
+            store.contains(&prior_bundle_key),
+            "compact must leave the prior baseline bundle in place \
+             during the gc grace window",
+        );
+        let tombstones = store.list("repo/gc/").await.unwrap();
+        let baseline_tomb_count = tombstones
+            .iter()
+            .filter(|m| m.key.starts_with("repo/gc/baseline-tomb-"))
+            .count();
+        assert_eq!(
+            baseline_tomb_count, 1,
+            "compact must write exactly one baseline tombstone for the prior full_at",
         );
 
         // The fresh path-index.json at the ref must exist. We
@@ -976,16 +993,9 @@ mod tests {
     #[tokio::test]
     async fn second_compact_after_successful_compact_is_already_minimal() {
         // Idempotency at the public `compact()` entrypoint: a successful
-        // compact deletes the prior baseline bundle and rewrites the chain
-        // to a single segment at the tip. A second compact against the
-        // same ref must observe `AlreadyMinimal` and do nothing.
-        //
-        // NOTE: this test does NOT cover the `delete_prior_baseline_bundle`
-        // `NotFound` branch — the second compact short-circuits at
-        // `AlreadyMinimal` before reaching the helper, so removing the
-        // `NotFound` tolerance from production code does not make this
-        // test fail. The helper's `NotFound` branch is covered directly
-        // by `delete_prior_baseline_bundle_tolerates_already_absent`.
+        // compact rewrites the chain to a single segment at the tip and
+        // tombstones the prior baseline bundle. A second compact against
+        // the same ref must observe `AlreadyMinimal` and do nothing.
         let store = MockStore::new();
         let (_repo, _prior, c1, _c2, _c3) = lay_down_three_segment_chain(&store, "repo").await;
 
@@ -998,7 +1008,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.action, CompactAction::Compacted);
-        assert!(!store.contains(&prior_bundle_key));
+        // Issue #134: the bundle is tombstoned, not deleted. It stays
+        // in place until gc sweep reaps it past the grace window.
+        assert!(store.contains(&prior_bundle_key));
 
         let second = compact(arc_store(&store), Some("repo"), &ref_main(), opts(true))
             .await
@@ -1007,67 +1019,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_prior_baseline_bundle_tolerates_already_absent() {
-        // Direct unit-level coverage of the `NotFound` branch.
-        // `second_compact_after_successful_compact_is_already_minimal`
-        // exercises idempotency at the public `compact()` entrypoint,
-        // but its second run short-circuits via `AlreadyMinimal` before
-        // reaching the helper — so it cannot catch a regression that
-        // breaks the helper's `NotFound` tolerance. This test calls the
-        // helper directly with an old key that does not exist on the
-        // store, locking down the tolerated `NotFound` swallow that
-        // issue #84's fix relies on.
-        let store = MockStore::new();
-        // Old key intentionally absent; new key intentionally present.
-        // Distinct keys so the early `old == new` short-circuit does
-        // not fire — the delete must actually be attempted.
-        let old_key = "repo/refs/heads/main/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bundle";
-        let new_key = "repo/refs/heads/main/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bundle";
-        store.insert(new_key, Bytes::from_static(b"new"));
-        delete_prior_baseline_bundle(&store, &ref_main(), old_key, new_key).await;
-        assert!(
-            store.contains(new_key),
-            "tolerating NotFound on the old key must not touch the new key",
-        );
-    }
-
-    #[tokio::test]
-    async fn delete_prior_baseline_bundle_skips_when_keys_alias() {
-        // The `old_key == new_key` short-circuit guards the case where
+    async fn tombstone_prior_baseline_bundle_skips_when_keys_alias() {
+        // The `prior == current` short-circuit guards the case where
         // compact left `full_at` unchanged (collapsing only non-baseline
-        // segments). A real delete here would erase the live baseline
-        // bundle the new chain still points at — exactly the bug the
-        // guard prevents.
+        // segments). A real tombstone write here would later cause gc
+        // sweep to delete the live baseline bundle the new chain still
+        // points at — exactly the bug the guard prevents.
         let store = MockStore::new();
-        let key = "repo/refs/heads/main/cccccccccccccccccccccccccccccccccccccccc.bundle";
-        store.insert(key, Bytes::from_static(b"live"));
-        delete_prior_baseline_bundle(&store, &ref_main(), key, key).await;
+        let sha = sha40("cccccccccccccccccccccccccccccccccccccccc");
+        let key = keys::bundle_key(Some("repo"), ref_main(), sha.as_str());
+        store.insert(&key, Bytes::from_static(b"live"));
+        tombstone_prior_baseline_bundle(&store, Some("repo"), &ref_main(), &sha, &sha).await;
+        let tombstones = store.list("repo/gc/").await.unwrap();
         assert!(
-            store.contains(key),
-            "aliasing keys must not delete the live baseline bundle",
+            tombstones
+                .iter()
+                .all(|m| !m.key.starts_with("repo/gc/baseline-tomb-")),
+            "aliasing keys must not write a baseline tombstone",
         );
     }
 
     #[tokio::test]
-    async fn compact_reports_success_when_post_commit_baseline_delete_fails() {
-        // Issue #113 regression: a non-NotFound delete error on the
-        // prior baseline bundle after `write_chain` has committed
-        // must NOT fail the compact. The new chain manifest is
-        // already durable; on retry the chain would short-circuit
-        // through `AlreadyMinimal` and never re-attempt cleanup, so
-        // operators would observe a "failed" compact that actually
-        // succeeded. Match the force-push baseline-cleanup contract:
-        // log at warn and report success.
+    async fn compact_reports_success_when_post_commit_baseline_tombstone_fails() {
+        // Issue #113 / #134 regression: a transient error on the
+        // post-commit baseline tombstone PUT must NOT fail the
+        // compact. The new chain manifest is already durable; on
+        // retry the chain would short-circuit through `AlreadyMinimal`
+        // and never re-attempt cleanup, so operators would observe a
+        // "failed" compact that actually succeeded. Best-effort
+        // contract: log at warn and report success.
         let store = MockStore::new();
         let (_repo, _prior, c1, _c2, _c3) = lay_down_three_segment_chain(&store, "repo").await;
 
-        // Arm a delete-time fault on the prior baseline bundle key.
-        // The key is keyed off the fixture's c1 (= `full_at`).
-        let prior_bundle_key = format!("repo/refs/heads/main/{c1}.bundle");
-        store.arm(crate::object_store::mock::Fault::NetworkOnDelete {
-            key: prior_bundle_key.clone(),
+        // Arm a put-time fault on every baseline tombstone PUT under
+        // the gc/ prefix. The key embeds a UUID we cannot predict
+        // here, so match the `gc/baseline-tomb-` prefix.
+        store.arm(crate::object_store::mock::Fault::NetworkOnPutBytesPrefix {
+            prefix: "repo/gc/baseline-tomb-".to_owned(),
         });
 
+        let prior_bundle_key = format!("repo/refs/heads/main/{c1}.bundle");
         let outcome = compact(arc_store(&store), Some("repo"), &ref_main(), opts(true))
             .await
             .expect("compact must report success when post-commit cleanup fails");
@@ -1082,15 +1073,15 @@ mod tests {
         assert_eq!(new_chain.segments.len(), 1);
         assert_eq!(new_chain.full_at, new_chain.tip);
 
-        // The old baseline bundle is still on the bucket (the
-        // delete failed) — the orphan is operator-visible via the
-        // warn log. A second compact must observe AlreadyMinimal
-        // and not re-attempt the cleanup, locking down the
-        // short-circuit behaviour that motivates the best-effort
-        // contract.
+        // The old baseline bundle is still on the bucket (no
+        // tombstone was written, so gc never gets a chance to sweep
+        // it) — the orphan is operator-visible via the warn log. A
+        // second compact must observe AlreadyMinimal and not re-attempt
+        // the cleanup, locking down the short-circuit behaviour that
+        // motivates the best-effort contract.
         assert!(
             store.contains(&prior_bundle_key),
-            "delete fault must have left the prior baseline bundle in place",
+            "put fault must have left the prior baseline bundle in place",
         );
         let second = compact(arc_store(&store), Some("repo"), &ref_main(), opts(true))
             .await

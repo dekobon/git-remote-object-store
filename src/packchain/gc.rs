@@ -51,6 +51,21 @@
 //!    - Delete the tombstone itself.
 //! 3. Younger tombstones survive for the next sweep.
 //!
+//! ### Baseline-bundle tombstones (issue #134)
+//!
+//! Baseline bundles at `<prefix>/<ref>/<full_at>.bundle` are NOT
+//! reapable by the mark/sweep flow above — they live outside
+//! `<prefix>/packs/`, so [`list_pack_shas`] never sees them. The
+//! compact and force-push code paths instead enqueue a baseline
+//! tombstone at `<prefix>/gc/baseline-tomb-<uuid>.json` whenever they
+//! supersede a baseline. Sweep processes those alongside pack
+//! tombstones: after the grace window expires it re-checks the
+//! current `chain.json` for the ref (skipping the delete if a later
+//! push re-baselined to the same SHA), then deletes the bundle and
+//! the tombstone. The bundle stays in place for the entire grace
+//! window, so a concurrent fetch that read the prior `chain.json`
+//! before the compact/force-push committed can still download it.
+//!
 //! ### `--force`
 //!
 //! Skips ONLY the grace window. The live-pack re-check still runs:
@@ -82,11 +97,13 @@ use time::format_description::well_known::Rfc3339;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::git::RefName;
 use crate::keys;
 use crate::object_store::{ObjectStore, ObjectStoreError, PutOpts};
 use crate::protocol::fetch::MAX_FETCH_CONCURRENCY;
 
 use super::PackchainError;
+use super::manifest::load_chain;
 use super::schema::{ChainManifest, Sha40};
 
 /// Default grace window between mark and sweep (24 hours). A pack
@@ -153,6 +170,111 @@ impl Tombstone {
     pub(crate) fn to_json_pretty(&self) -> Result<Vec<u8>, PackchainError> {
         Ok(serde_json::to_vec_pretty(self)?)
     }
+}
+
+/// On-bucket tombstone for a superseded baseline bundle (issue #134).
+///
+/// Lives at `<prefix>/gc/baseline-tomb-<uuid>.json`. Written by
+/// [`super::compact`] and [`super::push`] whenever a chain rewrite
+/// makes a `<prefix>/<ref>/<sha>.bundle` unreachable. Unlike pack
+/// tombstones the body names a specific (ref, sha) — there is exactly
+/// one bundle key per record — so [`sweep`] does not need to re-derive
+/// an orphan set from listings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BaselineTombstone {
+    /// Schema version. Always [`TOMBSTONE_SCHEMA_VERSION`] when written.
+    pub(crate) v: u32,
+    /// RFC 3339 timestamp at which the tombstone was written. Sweep
+    /// compares this against the grace window.
+    pub(crate) marked_at: String,
+    /// Ref the orphaned bundle belonged to (e.g. `refs/heads/main`).
+    /// Stored as a raw string for forward compatibility with whatever
+    /// `RefName` accepts at sweep time.
+    pub(crate) ref_name: String,
+    /// Content-SHA of the bundle (matches the `<sha>.bundle` filename).
+    /// Sweep skips the delete when the ref's current `chain.full_at`
+    /// equals this SHA (a later push re-baselined to the same tip).
+    pub(crate) sha: Sha40,
+}
+
+impl BaselineTombstone {
+    /// Parse `bytes` as a baseline tombstone JSON, validating the
+    /// schema version before returning.
+    ///
+    /// # Errors
+    ///
+    /// - [`PackchainError::ParseJson`] for malformed JSON / missing
+    ///   fields / `Sha40` validation failures.
+    /// - [`PackchainError::UnsupportedSchemaVersion`] when `v` is not
+    ///   [`TOMBSTONE_SCHEMA_VERSION`].
+    pub(crate) fn from_json_bytes(bytes: &[u8]) -> Result<Self, PackchainError> {
+        let parsed: Self = serde_json::from_slice(bytes)?;
+        if parsed.v != TOMBSTONE_SCHEMA_VERSION {
+            return Err(PackchainError::UnsupportedSchemaVersion {
+                found: parsed.v,
+                expected: TOMBSTONE_SCHEMA_VERSION,
+            });
+        }
+        Ok(parsed)
+    }
+
+    /// Render to pretty-printed JSON bytes.
+    pub(crate) fn to_json_pretty(&self) -> Result<Vec<u8>, PackchainError> {
+        Ok(serde_json::to_vec_pretty(self)?)
+    }
+}
+
+/// Write a baseline tombstone for the bundle at
+/// `<prefix>/<ref_name>/<sha>.bundle` (issue #134).
+///
+/// Called from [`super::compact`] and [`super::push`] after the new
+/// `chain.json` is durable — at that point the bundle has no chain
+/// reference and is eligible for deletion, but a fetch that loaded
+/// the prior chain may still be about to GET it. The tombstone
+/// defers the delete to the next `gc sweep` past the grace window.
+///
+/// `prior_full_sha` is the SHA of the superseded baseline; `current_full_sha`
+/// is the new chain's `full_at`. When they are equal the function
+/// returns without writing a tombstone — the keys alias the same live
+/// bundle (compact left `full_at` unchanged, or force-push targeted
+/// the same tip).
+///
+/// # Errors
+///
+/// Returns [`PackchainError::Store`] on a PUT failure. Callers run
+/// this AFTER `chain.json` is committed and must treat the failure as
+/// best-effort: log a warning and report success, since retrying
+/// would short-circuit through `AlreadyMinimal` and never re-attempt
+/// the cleanup.
+pub(crate) async fn write_baseline_tombstone(
+    store: &dyn ObjectStore,
+    prefix: Option<&str>,
+    ref_name: &RefName,
+    prior_full_sha: &Sha40,
+    current_full_sha: &Sha40,
+) -> Result<(), PackchainError> {
+    if prior_full_sha == current_full_sha {
+        return Ok(());
+    }
+    let marked_at = OffsetDateTime::now_utc().format(&Rfc3339).map_err(|e| {
+        PackchainError::Io(std::io::Error::other(format!("rfc3339 format failed: {e}")))
+    })?;
+    let tombstone = BaselineTombstone {
+        v: TOMBSTONE_SCHEMA_VERSION,
+        marked_at,
+        ref_name: ref_name.as_str().to_owned(),
+        sha: prior_full_sha.clone(),
+    };
+    let key = baseline_tombstone_key(prefix.unwrap_or(""), &Uuid::new_v4().to_string());
+    let body = Bytes::from(tombstone.to_json_pretty()?);
+    store.put_bytes(&key, body, PutOpts::default()).await?;
+    debug!(
+        key = %key,
+        ref_path = %ref_name.as_str(),
+        sha = %prior_full_sha.as_str(),
+        "gc: baseline tombstone written",
+    );
+    Ok(())
 }
 
 /// Outcome of [`mark`].
@@ -379,10 +501,17 @@ pub async fn sweep(
     let referenced = list_referenced_packs(store, prefix).await?;
 
     for meta in metas {
-        if !meta.key.as_bytes().ends_with(b".json") || !is_tombstone_key(&meta.key, prefix) {
+        if !meta.key.as_bytes().ends_with(b".json") {
             continue;
         }
-        match sweep_one_tombstone(store, prefix, &meta.key, &referenced, opts).await {
+        let step = if is_tombstone_key(&meta.key, prefix) {
+            sweep_one_tombstone(store, prefix, &meta.key, &referenced, opts).await
+        } else if is_baseline_tombstone_key(&meta.key, prefix) {
+            sweep_one_baseline_tombstone(store, prefix, &meta.key, opts).await
+        } else {
+            continue;
+        };
+        match step {
             Ok(SweepStep::Deferred) => outcome.deferred_tombstones += 1,
             Ok(SweepStep::Swept {
                 deleted_objects,
@@ -491,6 +620,111 @@ async fn sweep_one_tombstone(
     })
 }
 
+/// Sweep one baseline tombstone (issue #134). Parses the tombstone,
+/// honours the grace window, re-checks the ref's current `chain.full_at`
+/// to skip a re-baselined-to-same-SHA case, and then idempotently
+/// deletes both the bundle and the tombstone.
+///
+/// The live-state recheck mirrors the pack sweep's
+/// `referenced.contains` guard: a tombstone written by a force-push
+/// can be invalidated by a subsequent force-push that lands on the
+/// same SHA, in which case the bundle is once again live.
+async fn sweep_one_baseline_tombstone(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    tombstone_key: &str,
+    opts: SweepOpts,
+) -> Result<SweepStep, PackchainError> {
+    let body = match store.get_bytes(tombstone_key).await {
+        Ok(b) => b,
+        Err(ObjectStoreError::NotFound(_)) => {
+            return Ok(SweepStep::Swept {
+                deleted_objects: 0,
+                skipped_repointed_packs: 0,
+            });
+        }
+        Err(e) => return Err(PackchainError::Store(e)),
+    };
+    let tombstone = BaselineTombstone::from_json_bytes(&body)?;
+
+    if !opts.force {
+        let marked_at = OffsetDateTime::parse(&tombstone.marked_at, &Rfc3339).map_err(|e| {
+            PackchainError::Io(std::io::Error::other(format!(
+                "baseline tombstone marked_at parse failed: {e}"
+            )))
+        })?;
+        let age_hours = (OffsetDateTime::now_utc() - marked_at).whole_hours();
+        // Same clock-skew handling as `sweep_one_tombstone`: a negative
+        // age (tombstone marked in the future) is treated as still
+        // inside the grace window.
+        let age_within_grace = age_hours
+            .try_into()
+            .map_or(true, |hours: u64| hours < opts.grace_hours);
+        if age_within_grace {
+            debug!(
+                key = %tombstone_key,
+                marked_at = %tombstone.marked_at,
+                "gc sweep: baseline tombstone within grace window",
+            );
+            return Ok(SweepStep::Deferred);
+        }
+    }
+
+    // Re-check the live chain. A subsequent push that re-baselined to
+    // the same SHA (force-push at the same tip, or compact short-cut)
+    // makes this bundle live again — leave it alone, drop the now-stale
+    // tombstone. A missing ref (chain deleted) means the bundle is also
+    // unreachable; proceed with the delete.
+    let ref_name = match RefName::new(tombstone.ref_name.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(
+                key = %tombstone_key,
+                ref_name = %tombstone.ref_name,
+                error = %e,
+                "gc sweep: baseline tombstone names invalid ref; dropping tombstone",
+            );
+            delete_idempotent(store, tombstone_key).await?;
+            return Ok(SweepStep::Swept {
+                deleted_objects: 0,
+                skipped_repointed_packs: 0,
+            });
+        }
+    };
+    let prefix_opt = (!prefix.is_empty()).then_some(prefix);
+    let chain = load_chain(store, prefix_opt, &ref_name).await?;
+    let mut skipped_repointed_packs = 0usize;
+    let mut deleted_objects = 0usize;
+    let still_live = chain.as_ref().is_some_and(|c| c.full_at == tombstone.sha);
+    if still_live {
+        skipped_repointed_packs += 1;
+        debug!(
+            key = %tombstone_key,
+            ref_path = %ref_name.as_str(),
+            sha = %tombstone.sha.as_str(),
+            "gc sweep: baseline re-referenced; skipping delete",
+        );
+    } else {
+        let bundle_key = keys::bundle_key(prefix_opt, &ref_name, tombstone.sha.as_str());
+        if delete_idempotent(store, &bundle_key).await? {
+            deleted_objects += 1;
+        }
+    }
+    // Drop the tombstone last so a crash mid-delete leaves it for the
+    // next sweep to finish.
+    delete_idempotent(store, tombstone_key).await?;
+    info!(
+        key = %tombstone_key,
+        deleted = deleted_objects,
+        skipped = skipped_repointed_packs,
+        "gc sweep: baseline tombstone applied",
+    );
+    Ok(SweepStep::Swept {
+        deleted_objects,
+        skipped_repointed_packs,
+    })
+}
+
 /// `<prefix>/gc/` prefix for [`ObjectStore::list`]. Empty `prefix`
 /// drops the leading slash (matches the project's bucket-root rule).
 fn gc_listing_prefix(prefix: &str) -> String {
@@ -506,6 +740,14 @@ fn tombstone_key(prefix: &str, run_id: &str, marked_at: &str) -> String {
     )
 }
 
+/// Build a baseline tombstone key. UUID-keyed so concurrent compacts
+/// / force-pushes across different refs never clobber, and the
+/// timestamp lives in the body rather than the filename to keep the
+/// `is_baseline_tombstone_key` predicate cheap.
+fn baseline_tombstone_key(prefix: &str, run_id: &str) -> String {
+    keys::join(Some(prefix), &format!("gc/baseline-tomb-{run_id}.json"))
+}
+
 /// Robust check that `key` is a tombstone under our prefix. Guards
 /// against unrelated `.json` files in `<prefix>/gc/` and against a
 /// regression where a future schema rev moves the prefix.
@@ -516,6 +758,14 @@ fn tombstone_key(prefix: &str, run_id: &str, marked_at: &str) -> String {
 /// repo owns the entire `gc/` namespace.
 fn is_tombstone_key(key: &str, prefix: &str) -> bool {
     let expected_prefix = keys::join(Some(prefix), "gc/tombstones-");
+    key.starts_with(&expected_prefix)
+}
+
+/// Robust check that `key` is a baseline tombstone under our prefix
+/// (issue #134). Mirrors [`is_tombstone_key`] for the
+/// `gc/baseline-tomb-` namespace.
+fn is_baseline_tombstone_key(key: &str, prefix: &str) -> bool {
+    let expected_prefix = keys::join(Some(prefix), "gc/baseline-tomb-");
     key.starts_with(&expected_prefix)
 }
 
@@ -1154,6 +1404,318 @@ mod tests {
             .get_bytes(&format!("repo/packs/{SHA_PACK_ORPHAN}.pack"))
             .await
             .unwrap_err();
+        assert!(matches!(err, ObjectStoreError::NotFound(_)));
+    }
+
+    // --- baseline tombstones (issue #134) -----------------------------
+
+    fn insert_baseline_bundle(store: &MockStore, prefix: Option<&str>, sha: &str) -> String {
+        let key = keys::bundle_key(prefix, ref_main(), sha);
+        store.insert(&key, Bytes::from_static(b"BUNDLE"));
+        key
+    }
+
+    fn write_baseline_tombstone_at(
+        store: &MockStore,
+        prefix: &str,
+        marked_at: &str,
+        sha: &str,
+    ) -> String {
+        let key = baseline_tombstone_key(prefix, &Uuid::new_v4().to_string());
+        let body = BaselineTombstone {
+            v: TOMBSTONE_SCHEMA_VERSION,
+            marked_at: marked_at.to_owned(),
+            ref_name: ref_main().as_str().to_owned(),
+            sha: sha40(sha),
+        }
+        .to_json_pretty()
+        .unwrap();
+        store.insert(&key, Bytes::from(body));
+        key
+    }
+
+    #[tokio::test]
+    async fn write_baseline_tombstone_round_trips() {
+        // Writer + parser agree on the on-bucket shape. Regression
+        // guard: a future serde tweak that broke the JSON layout would
+        // make sweep silently skip every baseline tombstone.
+        let store = MockStore::new();
+        let prior = sha40(SHA_FULL);
+        let current = sha40(SHA_TIP);
+        write_baseline_tombstone(&store, Some("repo"), &ref_main(), &prior, &current)
+            .await
+            .unwrap();
+        let metas = store.list("repo/gc/").await.unwrap();
+        let tomb_key = metas
+            .iter()
+            .find(|m| m.key.starts_with("repo/gc/baseline-tomb-"))
+            .map(|m| m.key.clone())
+            .expect("baseline tombstone written");
+        let body = store.get_bytes(&tomb_key).await.unwrap();
+        let parsed = BaselineTombstone::from_json_bytes(&body).unwrap();
+        assert_eq!(parsed.v, TOMBSTONE_SCHEMA_VERSION);
+        assert_eq!(parsed.ref_name, "refs/heads/main");
+        assert_eq!(parsed.sha, prior);
+    }
+
+    #[tokio::test]
+    async fn write_baseline_tombstone_skips_when_prior_equals_current() {
+        // No-op when the keys alias: a tombstone in this case would
+        // later cause sweep to delete the live baseline bundle.
+        let store = MockStore::new();
+        let sha = sha40(SHA_FULL);
+        write_baseline_tombstone(&store, Some("repo"), &ref_main(), &sha, &sha)
+            .await
+            .unwrap();
+        let metas = store.list("repo/gc/").await.unwrap();
+        assert!(
+            metas.is_empty(),
+            "aliasing prior/current must not write a tombstone",
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_defers_baseline_tombstone_within_grace_window() {
+        // Issue #134: a fetch that started before compact must be able
+        // to read the prior baseline within the grace window. Concrete
+        // manifestation: a baseline tombstone marked "now" is left
+        // alone, and the bundle it names stays on the bucket.
+        let store = MockStore::new();
+        let bundle_key = insert_baseline_bundle(&store, Some("repo"), SHA_FULL);
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        let tomb_key = write_baseline_tombstone_at(&store, "repo", &now, SHA_FULL);
+
+        let outcome = sweep(
+            &store,
+            "repo",
+            SweepOpts {
+                grace_hours: 24,
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.deferred_tombstones, 1);
+        assert_eq!(outcome.swept_tombstones, 0);
+        assert_eq!(outcome.deleted_objects, 0);
+        store
+            .get_bytes(&bundle_key)
+            .await
+            .expect("bundle must survive sweep within grace");
+        store
+            .get_bytes(&tomb_key)
+            .await
+            .expect("tombstone must survive sweep within grace");
+    }
+
+    #[tokio::test]
+    async fn sweep_reclaims_baseline_tombstone_after_grace_window() {
+        // Issue #134: past the grace window, sweep deletes the bundle
+        // and the tombstone. This is the path that reclaims the
+        // orphan baseline left in place by compact / force-push.
+        let store = MockStore::new();
+        let bundle_key = insert_baseline_bundle(&store, Some("repo"), SHA_FULL);
+        let stale = (OffsetDateTime::now_utc() - time::Duration::hours(48))
+            .format(&Rfc3339)
+            .unwrap();
+        let tomb_key = write_baseline_tombstone_at(&store, "repo", &stale, SHA_FULL);
+
+        let outcome = sweep(&store, "repo", SweepOpts::default()).await.unwrap();
+        assert_eq!(outcome.swept_tombstones, 1);
+        assert_eq!(outcome.deferred_tombstones, 0);
+        assert_eq!(outcome.deleted_objects, 1, "bundle delete");
+        let bundle_err = store.get_bytes(&bundle_key).await.unwrap_err();
+        assert!(matches!(bundle_err, ObjectStoreError::NotFound(_)));
+        let tomb_err = store.get_bytes(&tomb_key).await.unwrap_err();
+        assert!(matches!(tomb_err, ObjectStoreError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn sweep_skips_re_baselined_bundle_after_grace() {
+        // A later push re-baselined to the SAME SHA the tombstone names
+        // (force-push at the same tip, or compact short-cut). Sweep
+        // must NOT delete the bundle — it is live again. The
+        // now-stale tombstone is dropped.
+        let store = MockStore::new();
+        let bundle_key = insert_baseline_bundle(&store, Some("repo"), SHA_FULL);
+        // Live chain points at the same SHA the tombstone names.
+        let chain = ChainManifest {
+            v: 1,
+            tip: sha40(SHA_TIP),
+            full_at: sha40(SHA_FULL),
+            segments: vec![segment(SHA_PACK_LIVE, None)],
+        };
+        write_chain(&store, Some("repo"), &ref_main(), &chain)
+            .await
+            .unwrap();
+        let stale = (OffsetDateTime::now_utc() - time::Duration::hours(48))
+            .format(&Rfc3339)
+            .unwrap();
+        let tomb_key = write_baseline_tombstone_at(&store, "repo", &stale, SHA_FULL);
+
+        let outcome = sweep(&store, "repo", SweepOpts::default()).await.unwrap();
+        assert_eq!(outcome.swept_tombstones, 1);
+        assert_eq!(outcome.skipped_repointed_packs, 1);
+        assert_eq!(outcome.deleted_objects, 0);
+        store
+            .get_bytes(&bundle_key)
+            .await
+            .expect("re-baselined bundle must survive");
+        let tomb_err = store.get_bytes(&tomb_key).await.unwrap_err();
+        assert!(matches!(tomb_err, ObjectStoreError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn sweep_baseline_tolerates_already_deleted_bundle() {
+        // The bundle was deleted out of band (operator cleanup, or a
+        // ref deletion that happened to sweep it). Sweep must finish
+        // cleanly.
+        let store = MockStore::new();
+        let stale = (OffsetDateTime::now_utc() - time::Duration::hours(48))
+            .format(&Rfc3339)
+            .unwrap();
+        let tomb_key = write_baseline_tombstone_at(&store, "repo", &stale, SHA_FULL);
+        // No bundle inserted.
+
+        let outcome = sweep(&store, "repo", SweepOpts::default()).await.unwrap();
+        assert_eq!(outcome.swept_tombstones, 1);
+        assert_eq!(outcome.deleted_objects, 0);
+        let tomb_err = store.get_bytes(&tomb_key).await.unwrap_err();
+        assert!(matches!(tomb_err, ObjectStoreError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn sweep_baseline_force_bypasses_grace_only_not_live_recheck() {
+        // --force on a fresh baseline tombstone whose SHA is now live
+        // (re-baselined). Grace is bypassed (tombstone is processed),
+        // but the live-state guard fires and the bundle stays.
+        let store = MockStore::new();
+        let bundle_key = insert_baseline_bundle(&store, Some("repo"), SHA_FULL);
+        let chain = ChainManifest {
+            v: 1,
+            tip: sha40(SHA_TIP),
+            full_at: sha40(SHA_FULL),
+            segments: vec![segment(SHA_PACK_LIVE, None)],
+        };
+        write_chain(&store, Some("repo"), &ref_main(), &chain)
+            .await
+            .unwrap();
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        write_baseline_tombstone_at(&store, "repo", &now, SHA_FULL);
+
+        let outcome = sweep(
+            &store,
+            "repo",
+            SweepOpts {
+                grace_hours: 24,
+                force: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.swept_tombstones, 1);
+        assert_eq!(outcome.deferred_tombstones, 0);
+        assert_eq!(outcome.skipped_repointed_packs, 1);
+        assert_eq!(outcome.deleted_objects, 0);
+        store
+            .get_bytes(&bundle_key)
+            .await
+            .expect("live bundle must survive --force sweep");
+    }
+
+    #[tokio::test]
+    async fn sweep_processes_pack_and_baseline_tombstones_in_one_pass() {
+        // Mixed tombstone types under `<prefix>/gc/`. Sweep must
+        // dispatch each to the right handler without mis-counting or
+        // skipping.
+        let store = MockStore::new();
+        let bundle_key = insert_baseline_bundle(&store, Some("repo"), SHA_FULL);
+        insert_pack_pair(&store, Some("repo"), SHA_PACK_ORPHAN);
+        let stale = (OffsetDateTime::now_utc() - time::Duration::hours(48))
+            .format(&Rfc3339)
+            .unwrap();
+        write_tombstone(&store, "repo", &stale, sha_set([SHA_PACK_ORPHAN]));
+        write_baseline_tombstone_at(&store, "repo", &stale, SHA_FULL);
+
+        let outcome = sweep(&store, "repo", SweepOpts::default()).await.unwrap();
+        assert_eq!(outcome.swept_tombstones, 2);
+        // pack + idx + bundle = 3 deletions
+        assert_eq!(outcome.deleted_objects, 3);
+        let bundle_err = store.get_bytes(&bundle_key).await.unwrap_err();
+        assert!(matches!(bundle_err, ObjectStoreError::NotFound(_)));
+        let pack_err = store
+            .get_bytes(&format!("repo/packs/{SHA_PACK_ORPHAN}.pack"))
+            .await
+            .unwrap_err();
+        assert!(matches!(pack_err, ObjectStoreError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn compact_to_sweep_round_trip_simulates_concurrent_fetch_then_gc() {
+        // End-to-end issue #134 scenario: compact writes a tombstone
+        // (we simulate by hand to avoid pulling in the full compact
+        // fixture), an in-flight fetch reads the prior bundle within
+        // grace and succeeds, and a later sweep past the grace
+        // reclaims it.
+        let store = MockStore::new();
+        let bundle_key = insert_baseline_bundle(&store, Some("repo"), SHA_FULL);
+        // Compact moved the baseline to a new SHA — simulate by
+        // writing a chain pointing to SHA_TIP as full_at.
+        let chain = ChainManifest {
+            v: 1,
+            tip: sha40(SHA_TIP),
+            full_at: sha40(SHA_TIP),
+            segments: vec![segment(SHA_PACK_LIVE, None)],
+        };
+        write_chain(&store, Some("repo"), &ref_main(), &chain)
+            .await
+            .unwrap();
+        let prior = sha40(SHA_FULL);
+        let current = sha40(SHA_TIP);
+        write_baseline_tombstone(&store, Some("repo"), &ref_main(), &prior, &current)
+            .await
+            .unwrap();
+
+        // In-flight fetch: bundle GET within grace MUST succeed.
+        let body = store.get_bytes(&bundle_key).await.unwrap();
+        assert_eq!(&body[..], b"BUNDLE");
+        let in_grace = sweep(
+            &store,
+            "repo",
+            SweepOpts {
+                grace_hours: 24,
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(in_grace.deferred_tombstones, 1);
+        store
+            .get_bytes(&bundle_key)
+            .await
+            .expect("bundle must survive in-grace sweep");
+
+        // Backdate the tombstone past the grace and re-sweep —
+        // bundle is reaped.
+        let metas = store.list("repo/gc/").await.unwrap();
+        let tomb_key = metas
+            .iter()
+            .find(|m| m.key.starts_with("repo/gc/baseline-tomb-"))
+            .map(|m| m.key.clone())
+            .unwrap();
+        let stale = (OffsetDateTime::now_utc() - time::Duration::hours(48))
+            .format(&Rfc3339)
+            .unwrap();
+        let body = store.get_bytes(&tomb_key).await.unwrap();
+        let mut tomb: BaselineTombstone = serde_json::from_slice(&body).unwrap();
+        tomb.marked_at = stale;
+        let new_body = serde_json::to_vec_pretty(&tomb).unwrap();
+        store.insert(&tomb_key, Bytes::from(new_body));
+
+        let post_grace = sweep(&store, "repo", SweepOpts::default()).await.unwrap();
+        assert_eq!(post_grace.swept_tombstones, 1);
+        assert_eq!(post_grace.deleted_objects, 1);
+        let err = store.get_bytes(&bundle_key).await.unwrap_err();
         assert!(matches!(err, ObjectStoreError::NotFound(_)));
     }
 

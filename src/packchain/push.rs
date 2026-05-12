@@ -32,6 +32,7 @@ use crate::protocol::push::{
 use crate::url::StorageEngine;
 
 use super::PackchainError;
+use super::gc::write_baseline_tombstone;
 use super::keys::{chain_key, pack_idx_key, pack_key};
 use super::manifest::{load_chain, next_manifest, write_chain, write_path_index};
 use super::pack::{BuiltPack, build_baseline_pack, build_incremental_pack};
@@ -857,10 +858,17 @@ async fn upload_with_progress(
     Ok(())
 }
 
-/// Best-effort delete of the prior baseline bundle after a force push
-/// has already committed (i.e. `chain.json` has been overwritten).
+/// Best-effort tombstone of the prior baseline bundle after a force
+/// push has already committed (i.e. `chain.json` has been
+/// overwritten). The bundle is NOT deleted here: writing the
+/// tombstone defers reclamation to [`super::gc::sweep`], which waits
+/// for the operator-configured grace window so a concurrent fetch
+/// that already read the prior chain.json can still download the
+/// bundle it expects (issue #134).
+///
 /// Failure here cannot fail the push: we log at `warn` so an operator
-/// notices the orphan and `manage gc` sweeps it later.
+/// notices the un-tombstoned orphan and `manage gc` sweeps it later
+/// via a re-run of this code path or manual cleanup.
 async fn force_push_baseline_cleanup(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
@@ -871,22 +879,14 @@ async fn force_push_baseline_cleanup(
     let Some(prior) = prior else {
         return;
     };
-    if &prior.full_at == local_sha40 {
-        return;
-    }
-    let prior_full_sha = match Sha::from_hex(prior.full_at.as_str()) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(error = %e, "skipping force-push baseline cleanup: invalid prior full_at");
-            return;
-        }
-    };
-    let old_baseline_key = keys::bundle_key(prefix, remote_ref, prior_full_sha);
-    if let Err(e) = delete_idempotent(store, &old_baseline_key).await {
+    if let Err(e) =
+        write_baseline_tombstone(store, prefix, remote_ref, &prior.full_at, local_sha40).await
+    {
+        let orphan_key = keys::bundle_key(prefix, remote_ref, prior.full_at.as_str());
         warn!(
-            key = %old_baseline_key,
+            key = %orphan_key,
             error = %e,
-            "force-push baseline cleanup failed (push already committed)",
+            "force-push baseline tombstone write failed (push already committed)",
         );
     }
 }

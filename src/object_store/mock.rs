@@ -95,6 +95,16 @@ pub enum Fault {
         /// Key being uploaded.
         key: String,
     },
+    /// Force `put_bytes(key, _, _)` to return
+    /// [`ObjectStoreError::Network`] for any key starting with
+    /// `prefix`. Used by tests that target a write whose final key
+    /// embeds a non-deterministic component (e.g. a UUID embedded in
+    /// the path) and so can't be matched exactly. Fires on
+    /// `put_bytes` only; `put_path` is untouched.
+    NetworkOnPutBytesPrefix {
+        /// Prefix the key must start with for the fault to fire.
+        prefix: String,
+    },
     /// Force `get_to_file(key, _)` to return
     /// [`ObjectStoreError::PreconditionFailed`], simulating an object that was
     /// mutated between the `head` and the body download in the S3
@@ -447,6 +457,16 @@ impl ObjectStore for MockStore {
         body: Bytes,
         opts: PutOpts,
     ) -> Result<(), ObjectStoreError> {
+        self.with_state(|s| {
+            Self::check_fault(s, |f| match f {
+                Fault::NetworkOnPutBytesPrefix { prefix } if key.starts_with(prefix.as_str()) => {
+                    Some(ObjectStoreError::Network(Box::new(std::io::Error::other(
+                        format!("mock network on put_bytes: {key} (prefix {prefix})"),
+                    ))))
+                }
+                _ => None,
+            })
+        })?;
         let body_len = body.len() as u64;
         let progress = opts.progress.clone();
         self.insert_with(key, body, OffsetDateTime::now_utc(), opts);

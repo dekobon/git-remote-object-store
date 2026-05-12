@@ -296,12 +296,24 @@ async fn force_push_collapses_segments_and_replaces_baseline() {
         "force-push pack referenced by chain.json must exist at repo/{segment_pack}",
     );
 
-    // New baseline at the diverge tip exists; old baseline at tip_2 is gone.
+    // New baseline at the diverge tip exists; old baseline at tip_2
+    // remains in place during the GC grace window (issue #134). A
+    // baseline tombstone under `<prefix>/gc/baseline-tomb-*.json`
+    // records it for future reclamation.
     let new_baseline = format!("repo/refs/heads/main/{tip_diverge}.bundle");
     assert!(store.contains(&new_baseline));
     assert!(
-        !store.contains(&baseline_key_2),
-        "force push must delete prior baseline at old full_at",
+        store.contains(&baseline_key_2),
+        "force push must leave prior baseline in place during grace window",
+    );
+    let metas = futures::executor::block_on(store.list("repo/gc/")).unwrap();
+    let baseline_tomb_count = metas
+        .iter()
+        .filter(|m| m.key.starts_with("repo/gc/baseline-tomb-"))
+        .count();
+    assert_eq!(
+        baseline_tomb_count, 1,
+        "force push must write exactly one baseline tombstone for the prior full_at",
     );
 }
 
@@ -580,10 +592,11 @@ async fn first_push_pins_format_marker() {
 }
 
 /// Force-push old-baseline cleanup is best-effort: the push commits at
-/// the chain.json write, and a delete failure on the prior baseline
-/// must NOT fail the push (it would leave a confusing wire output for
-/// what is already a successful push). The orphan baseline is reaped
-/// by Phase 5 GC.
+/// the chain.json write, and a tombstone-write failure on the prior
+/// baseline must NOT fail the push (it would leave a confusing wire
+/// output for what is already a successful push). Without the
+/// tombstone the orphan baseline is left for `manage gc` or a manual
+/// operator pass to reap.
 #[tokio::test]
 async fn force_push_baseline_cleanup_failure_does_not_fail_push() {
     use git_remote_object_store::object_store::mock::Fault;
@@ -620,11 +633,13 @@ async fn force_push_baseline_cleanup_failure_does_not_fail_push() {
         seed.path(),
     );
 
-    // Arm a delete fault on the prior baseline key so the post-commit
-    // cleanup at the end of `perform_push_under_lock` fails. The push
-    // must still succeed (chain.json has already been written).
-    store.arm(Fault::NetworkOnDelete {
-        key: baseline_key_2.clone(),
+    // Arm a put-bytes prefix fault on the baseline tombstone path so
+    // the post-commit cleanup at the end of `perform_push_under_lock`
+    // fails. The push must still succeed (chain.json has already been
+    // written). The tombstone key embeds a UUID so we match on the
+    // `gc/baseline-tomb-` prefix.
+    store.arm(Fault::NetworkOnPutBytesPrefix {
+        prefix: "repo/gc/baseline-tomb-".to_owned(),
     });
 
     let (out, r2) = drive_in(
@@ -640,12 +655,13 @@ async fn force_push_baseline_cleanup_failure_does_not_fail_push() {
         "ok refs/heads/main\n\n",
         "wire output must still be `ok` even though baseline cleanup failed",
     );
-    // The orphan baseline survives — Phase 5 GC's job to reap it.
+    // The orphan baseline survives — `manage gc` or manual cleanup
+    // must reap it.
     assert!(
         store.contains(&baseline_key_2),
-        "old baseline must remain when delete fault prevented cleanup",
+        "old baseline must remain when tombstone fault prevented cleanup",
     );
-    // The fault was consumed (one delete attempt was made and rejected).
+    // The fault was consumed (one tombstone PUT was attempted and rejected).
     assert_eq!(store.pending_faults(), 0);
 }
 
