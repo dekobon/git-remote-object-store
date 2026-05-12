@@ -131,6 +131,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Bundle-engine `git push :<ref>` now serializes against concurrent
+  pushes by listing and sweeping under the per-ref lock, eliminating a
+  silent false-success race window (#133).
+- Bundle delete now rejects the operation when a `PROTECTED#` marker is
+  present in the under-lock listing, even when the entry count happens
+  to match expected — closes a count-match TOCTOU bypass of branch
+  protection (#128).
+- Force-push protection check now runs under the per-ref lock in both
+  bundle and packchain engines, preventing a concurrent `protect` from
+  being raced by an in-flight `git push --force` (#129).
+- Protocol push now treats the optional `repo.zip` artifact upload as
+  best-effort once the bundle, HEAD, and FORMAT are durable, mirroring
+  the prior-bundle delete (#121) — a transient store error on the zip
+  no longer reports the push as failed while the git data is already
+  live (#127).
+- `manage delete-branch` now re-lists the branch immediately before the
+  deletion loop so objects from a concurrent push landing during the
+  confirmation prompt are swept; `PROTECTED#` is re-checked on the
+  fresh listing, `NotFound` is tolerated during the sweep, and empty
+  fresh listings report "already deleted" instead of silent
+  success (#139).
+- Pinned the TOCTOU window between the initial protection check and the
+  deletion loop in `ManageBranch::delete` with an explicit regression
+  test; the post-prompt re-list introduced by #139 closes the
+  race (#131).
+- `manage protect` now re-verifies the branch still has user data
+  immediately before writing the `PROTECTED#` marker; a concurrent
+  `delete-branch` no longer leaves an orphan marker that would block
+  future operations on a recreated branch (#137).
+- `manage delete-branch` no longer short-circuits on the first per-key
+  delete failure; the loop now sweeps every listed key, then returns
+  `ManageError::PartialDelete` naming exactly the keys whose deletes
+  failed so a retry can converge. `NotFound` mid-sweep continues to be
+  tolerated (#122).
+- `manage doctor` re-HEADs each stale-listed lock immediately before
+  deleting it so a fresh, active lock at the same key is not silently
+  revoked when the initial bucket listing has gone stale during
+  interactive prompts; skipped locks are surfaced in the doctor
+  report (#132).
+- `manage doctor fix-head` now re-verifies the operator's chosen branch
+  still has user data on the bucket before writing `HEAD`; a concurrent
+  push or delete-branch between the snapshot listing and the HEAD write
+  no longer recreates the invalid-HEAD condition the doctor was trying
+  to fix. Returns the new typed `ManageError::StaleSnapshot` (#138).
+- `packchain::delete_remote_ref_packchain` now honors the `PROTECTED#`
+  marker before sweeping a ref, refusing protected deletes with the
+  canonical wire-format message and closing the lockless-`protect`
+  TOCTOU window by running the check on the under-lock listing (#130).
+- `packchain compact` and force-push no longer immediately delete the
+  prior baseline bundle; the bundle is now claimed by a
+  `gc/baseline-tomb-*` tombstone and reclaimed by `manage gc sweep`
+  after the same grace window that protects segment packs. Closes a
+  race where a concurrent fetch that already read the prior
+  `chain.json` failed with `BaselineMissing` (#134).
+- `manage gc sweep` re-derives the live-referenced pack set per
+  tombstone instead of caching a once-per-sweep snapshot, closing a
+  race where a concurrent push committing `chain.json` mid-sweep
+  (notably a force-revert that aliases an existing pack key via
+  deterministic gix pack emission) could leave a permanently dangling
+  chain reference (#140).
+- `manage gc mark` lists packs first, then chains, eliminating a
+  false-positive orphan tombstone when a concurrent push uploads a
+  pack and commits its chain between mark's two listings (#135).
+- `packchain::read_blob` now transparently retries `PackMissing`
+  failures caused by a concurrent `manage gc sweep` deleting
+  compacted-away packs, reloading `chain.json` between attempts. After
+  exhausting the bounded retry schedule (3 retries, ~2.6s worst case),
+  the call surfaces the new typed
+  `PackchainError::ConcurrentGcRetriesExhausted` so callers can
+  distinguish a vigorous compact+sweep cycle from a permanent bucket
+  inconsistency (#136).
 - `is_bundle_candidate` no longer drops bundle keys whose ref name
   contains the substrings `.zip` or `LOCKS`; the predicate is now a
   positive `<sha>.bundle` final-segment check (#109).
