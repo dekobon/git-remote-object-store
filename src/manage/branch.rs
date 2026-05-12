@@ -9,15 +9,16 @@
 // note in `doctor.rs` for the rationale behind the lint exception.
 #![allow(clippy::disallowed_macros)]
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{ManageError, Prompter};
 use crate::git::RefName;
 use crate::keys;
-use crate::object_store::{ObjectStore, ObjectStoreError, PutOpts};
+use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
 
 /// Operations on a single branch within a repository.
 pub struct ManageBranch<'a> {
@@ -94,33 +95,105 @@ impl<'a> ManageBranch<'a> {
     /// against a protected ref and a management-CLI `delete-branch` of
     /// the same ref fail the same way.
     ///
+    /// The prompt-display and protection-marker check use a first listing
+    /// for accuracy of the displayed object count, then a **second
+    /// listing is taken immediately before the deletion loop**. The
+    /// fresh listing drives the sweep so that any concurrent push
+    /// landing under the branch prefix during the prompt window is
+    /// caught and deleted rather than left as a zombie object. The
+    /// protection-marker check is re-evaluated on the fresh listing so a
+    /// `protect` racing with the prompt is honoured. If the fresh
+    /// listing is empty (a concurrent delete won the race) the function
+    /// reports it and returns `Ok(())` rather than silently claiming
+    /// success.
+    ///
+    /// `NotFound` errors observed during the sweep are tolerated — they
+    /// mean a concurrent deleter swept the key first, which still
+    /// satisfies the operator's intent. Other store errors propagate
+    /// immediately.
+    ///
     /// # Errors
     ///
     /// Returns [`ManageError::Protected`] if the branch carries a
-    /// `PROTECTED#` marker, [`ManageError::Cancelled`] if the user cancels
-    /// the prompt, [`ManageError::Io`] for prompt I/O failures, or
-    /// [`ManageError::Store`] if a list or delete operation fails.
+    /// `PROTECTED#` marker (checked on both listings),
+    /// [`ManageError::Cancelled`] if the user cancels the prompt,
+    /// [`ManageError::Io`] for prompt I/O failures, or
+    /// [`ManageError::Store`] if a list or delete operation fails for
+    /// reasons other than `NotFound`.
     pub async fn delete(&self) -> Result<(), ManageError> {
-        let objects = self.store.list(&self.branch_prefix()).await?;
-        if objects.iter().any(|entry| {
-            entry
-                .key
-                .rsplit_once('/')
-                .is_some_and(|(_, last)| keys::is_protected_marker_segment(last))
-        }) {
+        let prefix = self.branch_prefix();
+        let initial = self.store.list(&prefix).await?;
+        if Self::contains_protected_marker(&initial) {
             return Err(ManageError::Protected(self.branch.clone()));
         }
-        let prompt = format!("Delete branch {} ({} objects)?", self.branch, objects.len());
+        let prompt = format!("Delete branch {} ({} objects)?", self.branch, initial.len());
         if !self.prompter.confirm(&prompt)? {
             println!("Aborted");
             return Ok(());
         }
-        for object in &objects {
-            self.store.delete(&object.key).await?;
+
+        // Re-list immediately before the sweep so concurrent pushes that
+        // landed during the prompt window are included in the deletion
+        // set. The first listing can be arbitrarily stale once the user
+        // has had time to answer; #139 was filed because pushes during
+        // that window left zombie objects.
+        let fresh = self.store.list(&prefix).await?;
+        if fresh.is_empty() {
+            println!(
+                "Branch {} is already gone (concurrent delete during prompt); nothing to do",
+                self.branch,
+            );
+            info!(
+                branch = %self.branch,
+                "branch already deleted by concurrent operation",
+            );
+            return Ok(());
+        }
+        if Self::contains_protected_marker(&fresh) {
+            return Err(ManageError::Protected(self.branch.clone()));
+        }
+
+        let initial_keys: BTreeSet<&str> = initial.iter().map(|m| m.key.as_str()).collect();
+        let concurrent_adds = fresh
+            .iter()
+            .filter(|m| !initial_keys.contains(m.key.as_str()))
+            .count();
+        if concurrent_adds > 0 {
+            warn!(
+                branch = %self.branch,
+                added = concurrent_adds,
+                "concurrent activity detected during prompt; sweeping fresh listing",
+            );
+        }
+
+        for object in &fresh {
+            // Tolerate `NotFound` from a concurrent sweeper racing us
+            // mid-loop — the operator's intent is "key gone" and the key
+            // is gone. Other errors (Network, AccessDenied, etc.)
+            // propagate.
+            match self.store.delete(&object.key).await {
+                Ok(()) | Err(ObjectStoreError::NotFound(_)) => {}
+                Err(other) => return Err(other.into()),
+            }
         }
         println!("Branch {} has been deleted", self.branch);
-        info!(branch = %self.branch, count = objects.len(), "branch deleted");
+        info!(branch = %self.branch, count = fresh.len(), "branch deleted");
         Ok(())
+    }
+
+    /// `true` iff `entries` contains a key whose final segment is the
+    /// `PROTECTED#` marker. Used by [`delete`] on both the initial and
+    /// the fresh listing so a `protect` that lands during the prompt
+    /// window is still honoured.
+    ///
+    /// [`delete`]: ManageBranch::delete
+    fn contains_protected_marker(entries: &[ObjectMeta]) -> bool {
+        entries.iter().any(|entry| {
+            entry
+                .key
+                .rsplit_once('/')
+                .is_some_and(|(_, last)| keys::is_protected_marker_segment(last))
+        })
     }
 
     /// Mark the branch as protected by writing the `PROTECTED#` sentinel.
@@ -371,6 +444,196 @@ mod tests {
         assert!(!mock.contains("myrepo/refs/heads/main/aaa.bundle"));
         assert!(mock.contains("myrepo/refs/heads/main/bbb.bundle"));
         assert!(mock.contains("myrepo/refs/heads/main/ccc.bundle"));
+    }
+
+    /// Prompter that performs a side effect against a [`MockStore`]
+    /// before replying to `confirm`, simulating a concurrent operation
+    /// landing during the user's prompt window. Each call consumes one
+    /// queued `(action, answer)` pair; running dry returns
+    /// [`ManageError::Cancelled`] so an under-armed script fails loudly.
+    struct ConcurrentPrompter {
+        store: MockStore,
+        actions: std::sync::Mutex<std::collections::VecDeque<(ConcurrentAction, bool)>>,
+    }
+
+    enum ConcurrentAction {
+        /// Insert `(key, body)` into the store.
+        Insert(String, Bytes),
+        /// Delete every key currently under `prefix` (simulates a
+        /// concurrent `delete-branch` winning the race).
+        DeleteAllUnder(String),
+    }
+
+    impl ConcurrentPrompter {
+        fn new(
+            store: MockStore,
+            actions: impl IntoIterator<Item = (ConcurrentAction, bool)>,
+        ) -> Self {
+            Self {
+                store,
+                actions: std::sync::Mutex::new(actions.into_iter().collect()),
+            }
+        }
+    }
+
+    impl Prompter for ConcurrentPrompter {
+        fn select(&self, _prompt: &str, _options: &[String]) -> Result<usize, ManageError> {
+            panic!("ConcurrentPrompter does not expect select");
+        }
+
+        fn confirm(&self, _prompt: &str) -> Result<bool, ManageError> {
+            let (action, answer) = self
+                .actions
+                .lock()
+                .expect("concurrent mutex poisoned")
+                .pop_front()
+                .ok_or(ManageError::Cancelled)?;
+            match action {
+                ConcurrentAction::Insert(key, body) => self.store.insert(key, body),
+                ConcurrentAction::DeleteAllUnder(prefix) => {
+                    for key in self.store.keys() {
+                        if key.starts_with(&prefix) {
+                            let _ = self.store.remove_key(&key);
+                        }
+                    }
+                }
+            }
+            Ok(answer)
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_sweeps_objects_added_during_prompt() {
+        // Issue #139: a concurrent push lands a new bundle key between
+        // the initial LIST and the deletion loop. Pre-fix, that key was
+        // not in the captured listing and survived the "successful"
+        // delete. The fix re-lists after the prompt, so the new key is
+        // included in the sweep.
+        let mock = seed_with_branch("main");
+        let new_key = "myrepo/refs/heads/main/concurrent.bundle".to_owned();
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ConcurrentPrompter::new(
+            mock.clone(),
+            [(
+                ConcurrentAction::Insert(new_key.clone(), Bytes::from("racing body")),
+                true,
+            )],
+        );
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        mb.delete()
+            .await
+            .expect("delete must include concurrently-added key");
+        assert!(
+            mock.keys().is_empty(),
+            "fresh listing must drive sweep; zombie keys remaining: {:?}",
+            mock.keys(),
+        );
+        assert!(
+            !mock.contains(&new_key),
+            "concurrently-added bundle must be deleted, not left as a zombie",
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_when_marker_lands_during_prompt() {
+        // Initial listing has no PROTECTED# marker, so the protection
+        // check passes and the prompt fires. A concurrent `protect`
+        // lands during the prompt, then the user answers "yes". The
+        // fresh-listing protection check must catch the marker and
+        // refuse — otherwise the operator silently bulldozes a ref that
+        // was just protected.
+        let mock = seed_with_branch("main");
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ConcurrentPrompter::new(
+            mock.clone(),
+            [(
+                ConcurrentAction::Insert(
+                    "myrepo/refs/heads/main/PROTECTED#".to_owned(),
+                    Bytes::new(),
+                ),
+                true,
+            )],
+        );
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        let err = mb
+            .delete()
+            .await
+            .expect_err("delete must refuse marker that landed during prompt");
+        assert!(
+            matches!(err, ManageError::Protected(ref name) if name == "main"),
+            "expected Protected, got {err:?}",
+        );
+        // Both the marker and the original bundle survive.
+        assert!(mock.contains("myrepo/refs/heads/main/PROTECTED#"));
+        assert!(mock.contains("myrepo/refs/heads/main/abc.bundle"));
+    }
+
+    #[tokio::test]
+    async fn delete_reports_already_gone_on_concurrent_delete_race() {
+        // A concurrent `delete-branch` (or last-bundle removal) clears
+        // every object under the branch prefix during the prompt
+        // window. The fresh listing is empty; the function must report
+        // the race and return Ok(()), not claim success without doing
+        // anything.
+        let mock = seed_with_branch("main");
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ConcurrentPrompter::new(
+            mock.clone(),
+            [(
+                ConcurrentAction::DeleteAllUnder("myrepo/refs/heads/main/".to_owned()),
+                true,
+            )],
+        );
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        mb.delete()
+            .await
+            .expect("empty fresh listing must return Ok, not silent success");
+        assert!(mock.keys().is_empty(), "store remains empty");
+    }
+
+    #[tokio::test]
+    async fn delete_tolerates_notfound_mid_sweep() {
+        // A concurrent sweeper races between our fresh listing and a
+        // per-key delete: the listing still reports `bbb`, but by the
+        // time `delete(bbb)` fires the key is gone. Pre-fix, the
+        // ObjectStoreError::NotFound surfaced as ManageError::Store and
+        // aborted the sweep mid-flight. The fix tolerates NotFound in
+        // the loop so a partial concurrent delete doesn't leave the
+        // rest of the branch standing.
+        let mock = MockStore::new();
+        mock.insert("myrepo/refs/heads/main/aaa.bundle", Bytes::from("a"));
+        mock.insert("myrepo/refs/heads/main/bbb.bundle", Bytes::from("b"));
+        mock.insert("myrepo/refs/heads/main/ccc.bundle", Bytes::from("c"));
+        mock.arm(crate::object_store::mock::Fault::NotFoundOnDelete {
+            key: "myrepo/refs/heads/main/bbb.bundle".to_owned(),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        mb.delete()
+            .await
+            .expect("NotFound mid-sweep must not abort the loop");
+        // aaa and ccc are deleted; the NotFound fault on bbb is
+        // tolerated and the fault is consumed (the body remains because
+        // the fault fired BEFORE the actual removal).
+        assert!(!mock.contains("myrepo/refs/heads/main/aaa.bundle"));
+        assert!(!mock.contains("myrepo/refs/heads/main/ccc.bundle"));
+        // bbb's body is still present because the fault short-circuited
+        // the delete with NotFound before removal. In production the
+        // analogous case is a concurrent sweeper that ALREADY removed
+        // it — same observable: key gone or not, the loop continues.
+        assert_eq!(mock.pending_faults(), 0);
     }
 
     // --- Root-of-bucket (empty prefix) coverage --------------------------

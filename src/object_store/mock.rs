@@ -78,6 +78,13 @@ pub enum Fault {
         /// Key being deleted.
         key: String,
     },
+    /// Force `delete(key)` to return [`ObjectStoreError::NotFound`],
+    /// simulating a concurrent sweeper that removed the key after we
+    /// listed it but before we deleted it.
+    NotFoundOnDelete {
+        /// Key being deleted.
+        key: String,
+    },
     /// Force `put_path(key, _, _)` to return [`ObjectStoreError::Network`]
     /// without writing. Fires before the source file is read, so the
     /// fault is independent of disk state. Scoped to `put_path` (not
@@ -228,6 +235,18 @@ impl MockStore {
     #[must_use]
     pub fn contains(&self, key: &str) -> bool {
         self.with_state(|s| s.objects.contains_key(key))
+    }
+
+    /// Remove `key` synchronously. Returns `true` if the key existed,
+    /// `false` otherwise. Test-only mutator used to simulate a
+    /// concurrent operation racing the system under test from a
+    /// synchronous context (e.g., inside a [`Prompter::confirm`]
+    /// callback) where the async `delete` is unavailable.
+    ///
+    /// [`Prompter::confirm`]: crate::manage::Prompter::confirm
+    #[must_use]
+    pub fn remove_key(&self, key: &str) -> bool {
+        self.with_state(|s| s.objects.remove(key).is_some())
     }
 
     /// Number of armed faults that have not yet fired. Tests assert this
@@ -534,6 +553,9 @@ impl ObjectStore for MockStore {
                     Some(ObjectStoreError::Network(Box::new(std::io::Error::other(
                         format!("mock network on delete: {k}"),
                     ))))
+                }
+                Fault::NotFoundOnDelete { key: k } if k == key => {
+                    Some(ObjectStoreError::NotFound(k.clone()))
                 }
                 _ => None,
             })?;
