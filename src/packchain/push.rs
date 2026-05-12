@@ -1793,7 +1793,13 @@ mod tests {
         let store = MockStore::new();
         // Marker present, but a non-force push must not even probe for it.
         store.insert("repo/refs/heads/main/PROTECTED#", Bytes::from_static(b""));
-        let state = ready_state_for_protection_test(false, true);
+        // prior_was_ancestor=false: keep the `!prior_was_ancestor` clause
+        // TRUE so the only clause holding the guard
+        // `force && !prior_was_ancestor && is_protected(...)` off is `force`
+        // itself. Using `prior_was_ancestor=true` would short-circuit on the
+        // second clause and silently mask a regression that dropped the
+        // leading `force &&` from production.
+        let state = ready_state_for_protection_test(false, false);
         // We expect the call to progress past the protection check
         // and fail downstream (chain.json absent → path-index walk
         // against a tempdir without a git repo). What we're pinning is

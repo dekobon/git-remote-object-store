@@ -57,6 +57,16 @@ pub enum Fault {
         /// Key being inspected.
         key: String,
     },
+    /// Force `head(key)` to return [`ObjectStoreError::Network`],
+    /// simulating a transient remote failure (timeout, 5xx) on the
+    /// HEAD round-trip. Distinct from [`Fault::NotFoundOnHead`]: a
+    /// `NotFound` is a definitive answer ("object is absent"), whereas
+    /// a `Network` error tells the caller nothing about presence and
+    /// must be treated as inconclusive.
+    NetworkOnHead {
+        /// Key being inspected.
+        key: String,
+    },
     /// Force `get_bytes(key)` to return [`ObjectStoreError::Network`].
     NetworkOnGetBytes {
         /// Key being read.
@@ -537,6 +547,9 @@ impl ObjectStore for MockStore {
                 Fault::NotFoundOnHead { key: k } if k == key => {
                     Some(ObjectStoreError::NotFound(k.clone()))
                 }
+                Fault::NetworkOnHead { key: k } if k == key => Some(ObjectStoreError::Network(
+                    Box::new(std::io::Error::other(format!("mock network on head: {k}"))),
+                )),
                 _ => None,
             })?;
             s.objects

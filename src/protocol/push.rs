@@ -3185,22 +3185,31 @@ mod tests {
     /// pre-lock by the ancestry probe, and FF non-force pushes are
     /// unaffected by protection. The under-lock check is gated on
     /// `force` precisely so this round-trip costs zero extra HEAD calls.
+    ///
+    /// Test-design note: `pre_existing_was_ancestor` is forced to `false`
+    /// here so that ONLY the `force` clause of the under-lock guard
+    /// (`force && !pre_existing_was_ancestor && is_protected(...)`)
+    /// keeps the protection check off. A regression that drops the
+    /// `force &&` clause would flip the guard to true and fail this
+    /// test; if `pre_existing_was_ancestor` were left as `true`, the
+    /// `!pre_existing_was_ancestor` clause would short-circuit and
+    /// hide that regression. The `pre_existing` bundle key is omitted
+    /// to keep the FF-vs-non-FF semantics consistent with "no prior
+    /// remote SHA, therefore not an ancestor".
     #[tokio::test]
     async fn perform_push_under_lock_skips_protection_check_for_non_force() {
         let store = MockStore::new();
-        let pre_key = format!("repo/refs/heads/main/{OTHER_SHA}.bundle");
-        store.insert(&pre_key, Bytes::from_static(b"old bundle"));
         // Marker present, but a non-force push must not even probe for it.
         store.insert("repo/refs/heads/main/PROTECTED#", Bytes::from_static(b""));
-        let mut state = push_state_with_pre_existing(Some(pre_key));
+        let mut state = push_state_with_pre_existing(None);
         state.force = false;
-        state.pre_existing_was_ancestor = true;
+        state.pre_existing_was_ancestor = false;
         let outcome = perform_push_under_lock(&store, Some("repo"), state)
             .await
             .unwrap();
         assert!(
             matches!(&outcome, PushOutcome::Ok { remote_ref } if remote_ref == "refs/heads/main"),
-            "non-force FF push must pass regardless of protection: {outcome:?}",
+            "non-force push must pass regardless of protection: {outcome:?}",
         );
     }
 }

@@ -707,7 +707,7 @@ mod tests {
     use super::*;
     use crate::manage::snapshot::analyze;
     use crate::manage::{ScriptedPrompter, scripted::Answer};
-    use crate::object_store::mock::MockStore;
+    use crate::object_store::mock::{Fault, MockStore};
     use bytes::Bytes;
     use time::OffsetDateTime;
 
@@ -1351,6 +1351,132 @@ mod tests {
         assert!(
             !captured.contains("Deleted myrepo/refs/heads/main/LOCK#.lock"),
             "must not log a delete for a vanished key: {captured:?}",
+        );
+    }
+
+    /// Transient (non-`NotFound`) failure on the re-HEAD must be
+    /// treated as inconclusive: the doctor must NOT delete on the
+    /// stale-listing assumption, must NOT abort the run, and must
+    /// surface the failure to the operator. Issue #132's "best-effort
+    /// sweep" contract pins this arm — a regression that deletes on
+    /// any non-`Ok` HEAD outcome would silently revoke another
+    /// client's lock the moment the network burped.
+    #[tokio::test]
+    async fn stale_listing_with_transient_head_error_skips_lock_without_aborting() {
+        let mock = MockStore::new();
+        let key = "myrepo/refs/heads/main/LOCK#.lock";
+        // Lock body present with a stale timestamp; the HEAD fault
+        // fires before the timestamp is consulted, so the lock's
+        // freshness is irrelevant. What matters is that delete is
+        // skipped on the inconclusive HEAD.
+        let stale_ts = OffsetDateTime::now_utc() - time::Duration::seconds(120);
+        mock.insert_with(key, Bytes::new(), stale_ts, PutOpts::default());
+        mock.arm(Fault::NetworkOnHead {
+            key: key.to_owned(),
+        });
+
+        let synthetic_listing = vec![ObjectMeta {
+            key: key.to_owned(),
+            size: 0,
+            last_modified: stale_ts,
+            etag: None,
+        }];
+
+        let opts = DoctorOpts {
+            delete_stale_locks: true,
+            ..DoctorOpts::default()
+        };
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", opts, &prompter);
+        let mut out = Vec::new();
+        doctor
+            .list_and_handle_stale_locks(&mut out, &synthetic_listing)
+            .await
+            .expect("transient HEAD error must not abort the sweep");
+        let captured = String::from_utf8(out).expect("utf-8 output");
+
+        assert!(
+            mock.contains(key),
+            "lock must survive a transient HEAD failure (best-effort sweep)",
+        );
+        assert!(
+            captured.contains("Failed to re-check"),
+            "operator output missing re-check failure line: {captured:?}",
+        );
+        assert!(
+            !captured.contains("Deleted myrepo/refs/heads/main/LOCK#.lock"),
+            "must not log a delete when HEAD was inconclusive: {captured:?}",
+        );
+        assert!(
+            captured.contains("Skipped 1 lock(s)"),
+            "skipped-count summary missing: {captured:?}",
+        );
+    }
+
+    /// A per-key `delete` failure must be logged and the sweep must
+    /// continue to the next stale lock. This pins the "best-effort:
+    /// report each failure but keep going" contract — a regression
+    /// that returned the first delete error would leave the second
+    /// stale lock in place AND abort the run.
+    #[tokio::test]
+    async fn stale_listing_with_delete_failure_logs_and_continues() {
+        let mock = MockStore::new();
+        let main_key = "myrepo/refs/heads/main/LOCK#.lock";
+        let dev_key = "myrepo/refs/heads/dev/LOCK#.lock";
+        let stale_ts = OffsetDateTime::now_utc() - time::Duration::seconds(120);
+        mock.insert_with(main_key, Bytes::new(), stale_ts, PutOpts::default());
+        mock.insert_with(dev_key, Bytes::new(), stale_ts, PutOpts::default());
+        // First key's delete fails (still-stale at HEAD, then network on
+        // delete). Second key's delete should still fire.
+        mock.arm(Fault::NetworkOnDelete {
+            key: main_key.to_owned(),
+        });
+
+        // `list_and_handle_stale_locks` iterates the synthetic listing
+        // in order; pin order so the failing key is processed first.
+        let synthetic_listing = vec![
+            ObjectMeta {
+                key: main_key.to_owned(),
+                size: 0,
+                last_modified: stale_ts,
+                etag: None,
+            },
+            ObjectMeta {
+                key: dev_key.to_owned(),
+                size: 0,
+                last_modified: stale_ts,
+                etag: None,
+            },
+        ];
+
+        let opts = DoctorOpts {
+            delete_stale_locks: true,
+            ..DoctorOpts::default()
+        };
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", opts, &prompter);
+        let mut out = Vec::new();
+        doctor
+            .list_and_handle_stale_locks(&mut out, &synthetic_listing)
+            .await
+            .expect("delete failure must not abort the sweep");
+        let captured = String::from_utf8(out).expect("utf-8 output");
+
+        assert!(
+            mock.contains(main_key),
+            "first key must survive its delete failure",
+        );
+        assert!(
+            !mock.contains(dev_key),
+            "second key must still be deleted after the first failure",
+        );
+        assert!(
+            captured.contains(&format!("Failed to delete {main_key}")),
+            "operator output missing delete-failure line for {main_key}: {captured:?}",
+        );
+        assert!(
+            captured.contains(&format!("Deleted {dev_key}")),
+            "operator output missing delete confirmation for {dev_key}: {captured:?}",
         );
     }
 
