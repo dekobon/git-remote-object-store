@@ -637,6 +637,12 @@ struct LocalGit {
     /// `None` on the regular push path. The `TempDir` keeps the file
     /// alive until the async caller reads its bytes.
     zip_artifacts: Option<ZipArtifacts>,
+    /// Whether the pre-lock-listed remote bundle's SHA was an ancestor
+    /// of `local_sha`. `true` when there was no pre-existing bundle.
+    /// Stashed so [`perform_push_under_lock`] can decide, under the
+    /// per-ref lock, whether a force-push against a now-`PROTECTED#`
+    /// ref is a safe fast-forward (issue #129).
+    pre_existing_was_ancestor: bool,
 }
 
 struct ZipArtifacts {
@@ -663,6 +669,20 @@ struct PushReadyState {
     bundle_path: PathBuf,
     zip_artifacts: Option<ZipArtifacts>,
     engine: StorageEngine,
+    /// User's `--force` intent. Carried into the lock window so the
+    /// `PROTECTED#` check can run *under* the lock and close the TOCTOU
+    /// window between the pre-lock check and the lock acquisition
+    /// (issue #129).
+    force: bool,
+    /// Whether the pre-lock-listed bundle's SHA was an ancestor of
+    /// `local_sha` (always `true` when there was no pre-existing
+    /// bundle). Used together with `force` and the under-lock
+    /// protection re-check to decide whether to reject a force-push
+    /// that became protected mid-flight.
+    pre_existing_was_ancestor: bool,
+    /// Original local refspec, kept so the under-lock `NotAncestor` error
+    /// message renders the same text the pre-lock arm would have used.
+    local_spec: String,
     /// Keeps the temp directory (and `bundle_path`) alive until the bundle
     /// is uploaded inside `perform_push_under_lock`.
     _temp_dir: tempfile::TempDir,
@@ -687,12 +707,19 @@ enum PrepareOutcome {
     Done(PushOutcome),
 }
 
-/// Open the repo, resolve `local_sha`, optionally check ancestry, and
-/// (for the zip variant) build the archive synchronously. The
-/// `Repository` handle is dropped before this returns so the caller's
-/// `Future` can stay `Send`. Archive bytes are NOT read here — the
-/// async caller does that with `tokio::fs::read` to avoid blocking the
-/// runtime on file I/O.
+/// Open the repo, resolve `local_sha`, compute ancestry of the
+/// pre-existing remote bundle, and (for the zip variant) build the
+/// archive synchronously. The `Repository` handle is dropped before
+/// this returns so the caller's `Future` can stay `Send`. Archive
+/// bytes are NOT read here — the async caller does that with
+/// `tokio::fs::read` to avoid blocking the runtime on file I/O.
+///
+/// Ancestry is always computed and returned via
+/// [`LocalGit::pre_existing_was_ancestor`]; this function only emits
+/// [`GitProbeError::NotAncestor`] for the non-force case. Force pushes
+/// defer the ancestry-vs-protection decision to
+/// [`perform_push_under_lock`] so a concurrent `protect` cannot race
+/// the pre-lock check (issue #129).
 fn local_git_work(
     repo_dir: &Path,
     local_spec: &str,
@@ -707,9 +734,11 @@ fn local_git_work(
         return Ok(Err(GitProbeError::LocalRefNotFound));
     };
 
-    if let (Some(remote_sha), false) = (pre_existing_sha, force_push)
-        && !git::is_ancestor(&repo, remote_sha, local_sha)?
-    {
+    let pre_existing_was_ancestor = match pre_existing_sha {
+        None => true,
+        Some(remote_sha) => git::is_ancestor(&repo, remote_sha, local_sha)?,
+    };
+    if !force_push && !pre_existing_was_ancestor {
         return Ok(Err(GitProbeError::NotAncestor));
     }
 
@@ -736,6 +765,7 @@ fn local_git_work(
         local_sha,
         cwd,
         zip_artifacts,
+        pre_existing_was_ancestor,
     }))
 }
 
@@ -771,11 +801,17 @@ async fn prepare_push(
         });
     }
 
-    let force_push = if force {
-        !is_protected(store, prefix, &remote_ref).await?
-    } else {
-        false
-    };
+    // Issue #129: do NOT call `is_protected` here. A pre-lock check
+    // races against a concurrent `protect`: the check could pass and a
+    // `PROTECTED#` marker could land before we acquire the per-ref
+    // lock, letting a force-push overwrite a now-protected ref. The
+    // check is performed *under* the lock in
+    // [`perform_push_under_lock`] instead. Pre-lock we just respect the
+    // user's `--force` intent; the `local_git_work` probe still returns
+    // ancestry info via [`LocalGit::pre_existing_was_ancestor`] so the
+    // under-lock arm can render the same NotAncestor message a
+    // protection-demoted non-force push would have produced.
+    let force_push = force;
     debug!(local = %local_spec, remote = %remote_ref, force_push, "push");
 
     let pre_bundles = bundles_for_ref(store, prefix, &remote_ref).await?;
@@ -843,6 +879,9 @@ async fn prepare_push(
         bundle_path,
         zip_artifacts: local.zip_artifacts,
         engine: config.engine,
+        force,
+        pre_existing_was_ancestor: local.pre_existing_was_ancestor,
+        local_spec,
         _temp_dir: temp_dir,
     }))
 }
@@ -878,7 +917,7 @@ async fn push_one(
             PrepareOutcome::Done(o) => return Ok(o),
             PrepareOutcome::Ready(state) => (
                 state.remote_ref.as_str().to_owned(),
-                UnderLockWork::Push(state),
+                UnderLockWork::Push(Box::new(state)),
             ),
             PrepareOutcome::Delete { remote_ref, zip } => (
                 remote_ref.as_str().to_owned(),
@@ -902,7 +941,9 @@ async fn push_one(
     };
 
     let result = match work {
-        UnderLockWork::Push(state) => perform_push_under_lock(store.as_ref(), prefix, state).await,
+        UnderLockWork::Push(state) => {
+            perform_push_under_lock(store.as_ref(), prefix, *state).await
+        }
         UnderLockWork::Delete { remote_ref, zip } => {
             delete_remote_ref_under_lock(store.as_ref(), prefix, &remote_ref, zip, &lock).await
         }
@@ -928,8 +969,12 @@ async fn push_one(
 }
 
 /// The work to perform inside the per-ref lock acquired by [`push_one`].
+///
+/// `PushReadyState` is sizeable (≥240 bytes — paths, the temp dir
+/// guard, the captured refspec); boxing it keeps the
+/// [`UnderLockWork`] discriminant compact regardless of variant.
 enum UnderLockWork {
-    Push(PushReadyState),
+    Push(Box<PushReadyState>),
     Delete { remote_ref: RefName, zip: bool },
 }
 
@@ -948,9 +993,30 @@ async fn perform_push_under_lock(
         bundle_path,
         zip_artifacts,
         engine,
+        force,
+        pre_existing_was_ancestor,
+        local_spec,
         _temp_dir,
     } = state;
     let remote_ref_str = remote_ref.as_str().to_owned();
+
+    // Issue #129: under-lock force-push protection check. A pre-lock
+    // check would race against a concurrent `protect`; running here —
+    // after `acquire_lock`, before any writes — closes that TOCTOU
+    // window. The historical "protected ref + force" semantic is
+    // "demote to non-force": if the local SHA would have been a
+    // fast-forward against the pre-lock-listed remote (already pinned
+    // by the stale-remote guard below), let the push through; if not,
+    // emit the same NotAncestor wire error a pre-lock non-force probe
+    // would have produced. The `is_protected` helper uses `head`, not
+    // `list`, so this adds one cheap key probe and does not duplicate
+    // any existing under-lock listing.
+    if force && !pre_existing_was_ancestor && is_protected(store, prefix, &remote_ref).await? {
+        return Ok(PushOutcome::Error {
+            remote_ref: remote_ref_str,
+            message: format!(r#""remote ref is {NOT_ANCESTOR_TOKEN} of {local_spec}."?"#),
+        });
+    }
 
     let current = bundles_for_ref(store, prefix, &remote_ref).await?;
     if current.len() > 1 {
@@ -2236,6 +2302,9 @@ mod tests {
             bundle_path,
             zip_artifacts: None,
             engine,
+            force: false,
+            pre_existing_was_ancestor: true,
+            local_spec: "refs/heads/main".to_owned(),
             _temp_dir: temp_dir,
         };
 
@@ -2316,6 +2385,9 @@ mod tests {
             bundle_path,
             zip_artifacts: None,
             engine: StorageEngine::Bundle,
+            force: false,
+            pre_existing_was_ancestor: true,
+            local_spec: "refs/heads/main".to_owned(),
             _temp_dir: temp_dir,
         }
     }
@@ -2775,6 +2847,9 @@ mod tests {
             bundle_path,
             zip_artifacts: None,
             engine: StorageEngine::Bundle,
+            force: false,
+            pre_existing_was_ancestor: true,
+            local_spec: "refs/heads/main".to_owned(),
             _temp_dir: temp_dir,
         };
         let outcome = perform_push_under_lock(&store, Some("repo"), state)
@@ -2863,5 +2938,106 @@ mod tests {
             "non-ASCII printable characters must pass through unchanged",
         );
         assert_eq!(sanitize_metadata_value(""), "");
+    }
+
+    // --- Issue #129: force-push protection check runs under the lock ---
+
+    /// Regression for issue #129. If a concurrent `protect` lands a
+    /// `PROTECTED#` marker between the pre-lock work in `prepare_push`
+    /// and the lock acquisition in `push_one`, the under-lock arm of
+    /// `perform_push_under_lock` must observe it and reject a non-FF
+    /// force-push with the same `NotAncestor` wire token the pre-lock
+    /// non-force probe would have produced.
+    ///
+    /// `pre_existing_was_ancestor = false` represents "this force-push
+    /// is NOT a fast-forward" — exactly the case the historical
+    /// protection-demotion logic rejected. The `PROTECTED#` key is
+    /// seeded after the would-be pre-lock check (we simulate that by
+    /// constructing the state with `force=true` and seeding the marker
+    /// alongside the matching pre-existing bundle).
+    #[tokio::test]
+    async fn perform_push_under_lock_rejects_force_when_protected_under_lock_and_not_ff() {
+        let store = MockStore::new();
+        let pre_key = format!("repo/refs/heads/main/{OTHER_SHA}.bundle");
+        store.insert(&pre_key, Bytes::from_static(b"old bundle"));
+        // Concurrent `protect` lands the marker before we get the lock.
+        store.insert("repo/refs/heads/main/PROTECTED#", Bytes::from_static(b""));
+        let mut state = push_state_with_pre_existing(Some(pre_key.clone()));
+        state.force = true;
+        state.pre_existing_was_ancestor = false;
+        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                &outcome,
+                PushOutcome::Error { message, .. }
+                    if message == r#""remote ref is not ancestor of refs/heads/main."?"#
+            ),
+            "expected under-lock NotAncestor refusal, got {outcome:?}",
+        );
+        // The protection marker must survive — the engine never touches
+        // protect/unprotect state. A regression that swept it on the
+        // refusal path would silently downgrade a server's protection.
+        assert!(store.contains("repo/refs/heads/main/PROTECTED#"));
+        // The pre-existing bundle must survive intact: a refusal path
+        // that erroneously progressed past the protection check could
+        // overwrite or delete it.
+        let local_sha = SHA;
+        assert!(store.contains(&pre_key));
+        assert!(
+            !store.contains(&format!("repo/refs/heads/main/{local_sha}.bundle")),
+            "refused push must not upload the new bundle",
+        );
+    }
+
+    /// Companion to the rejection case: when the user's local tip IS a
+    /// fast-forward of the pre-existing remote bundle (`pre_existing_was_ancestor
+    /// = true`), the historical "protected ref + force" semantic is to
+    /// proceed — protection only blocks non-fast-forward force-pushes.
+    /// This test pins that branch: a `PROTECTED#` marker under the
+    /// lock plus a FF push must still succeed.
+    #[tokio::test]
+    async fn perform_push_under_lock_allows_force_when_protected_under_lock_but_ff() {
+        let store = MockStore::new();
+        let pre_key = format!("repo/refs/heads/main/{OTHER_SHA}.bundle");
+        store.insert(&pre_key, Bytes::from_static(b"old bundle"));
+        store.insert("repo/refs/heads/main/PROTECTED#", Bytes::from_static(b""));
+        let mut state = push_state_with_pre_existing(Some(pre_key.clone()));
+        state.force = true;
+        state.pre_existing_was_ancestor = true; // FF case.
+        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&outcome, PushOutcome::Ok { remote_ref } if remote_ref == "refs/heads/main"),
+            "FF push must pass even when protected, got {outcome:?}",
+        );
+        // Protection marker still in place after the push.
+        assert!(store.contains("repo/refs/heads/main/PROTECTED#"));
+    }
+
+    /// A non-force push (`force=false`) must never consult `is_protected`
+    /// under the lock: non-FF non-force pushes were already rejected
+    /// pre-lock by the ancestry probe, and FF non-force pushes are
+    /// unaffected by protection. The under-lock check is gated on
+    /// `force` precisely so this round-trip costs zero extra HEAD calls.
+    #[tokio::test]
+    async fn perform_push_under_lock_skips_protection_check_for_non_force() {
+        let store = MockStore::new();
+        let pre_key = format!("repo/refs/heads/main/{OTHER_SHA}.bundle");
+        store.insert(&pre_key, Bytes::from_static(b"old bundle"));
+        // Marker present, but a non-force push must not even probe for it.
+        store.insert("repo/refs/heads/main/PROTECTED#", Bytes::from_static(b""));
+        let mut state = push_state_with_pre_existing(Some(pre_key));
+        state.force = false;
+        state.pre_existing_was_ancestor = true;
+        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&outcome, PushOutcome::Ok { remote_ref } if remote_ref == "refs/heads/main"),
+            "non-force FF push must pass regardless of protection: {outcome:?}",
+        );
     }
 }
