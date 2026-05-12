@@ -1154,29 +1154,35 @@ const DELETE_EXPECTED_WITH_ZIP: usize = 2;
 /// The lock key (`<prefix>/<ref>/LOCK#.lock`) is filtered from the
 /// listing — `release_lock` removes it last, after this function
 /// returns. Apart from that one filter, the listing is unfiltered and
-/// counts `PROTECTED#` and `repo.zip` against the expected total. The
-/// protected-marker case shares the "extra keys" branch with genuine
-/// multi-bundle corruption; the routing distinguishes them by inspecting
-/// the listing for the marker. Three behaviours fall out:
+/// counts `PROTECTED#` and `repo.zip` against the expected total.
 ///
-/// 1. **Protected ref** — listing includes a key whose final segment
-///    is the [`keys::PROTECTED_MARKER_SEGMENT`]. Emit a
-///    protection-specific refusal naming the management CLI's
-///    `unprotect` workflow. Example listing (lock filtered out):
-///    `[ "<prefix>/refs/heads/main/<sha>.bundle",
-///       "<prefix>/refs/heads/main/PROTECTED#" ]` — count exceeds
-///    `expected = 1`, marker present, route to (1).
-/// 2. **Genuine multi-bundle / corruption** — count exceeds
-///    `expected`, no marker. Fall through to the doctor message.
-///    Example listing:
-///    `[ "<prefix>/refs/heads/main/<sha-a>.bundle",
-///       "<prefix>/refs/heads/main/<sha-b>.bundle" ]`.
+/// Issue #128: the `PROTECTED#` marker check is the FIRST guard, run
+/// against the fresh under-lock listing BEFORE any count-vs-expected
+/// dispatch. The pre-#128 ordering only consulted the marker in the
+/// `else if` mismatch branch, so a count-matching listing (e.g.
+/// `[bundle.bundle, PROTECTED#]` in zip mode, or `[PROTECTED#]` alone
+/// in non-zip mode) would sweep the marker and report `ok`. With the
+/// guard at the top, that bypass is closed.
+///
+/// Four behaviours fall out:
+///
+/// 1. **Protected ref** — listing (lock filtered out) includes a key
+///    whose final segment is the [`keys::PROTECTED_MARKER_SEGMENT`].
+///    Emit a protection-specific refusal naming the management CLI's
+///    `unprotect` workflow.
+/// 2. **Count matches `expected`, no marker** — sweep the entries and
+///    report `ok`.
 /// 3. **No bundle present** — listing (lock filtered out) is empty.
 ///    Returns the `"not found"?` wire error. This now includes the case
 ///    of a ref whose only on-server state was a stale `LOCK#.lock`:
 ///    `acquire_lock` recovers the stale lock, the post-lock listing
 ///    contains only our newly-held lock, and the filter renders it
 ///    empty.
+/// 4. **Genuine multi-bundle / corruption** — count exceeds `expected`
+///    and no marker is present. Fall through to the doctor message.
+///    Example listing:
+///    `[ "<prefix>/refs/heads/main/<sha-a>.bundle",
+///       "<prefix>/refs/heads/main/<sha-b>.bundle" ]`.
 async fn delete_remote_ref_under_lock(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
@@ -1198,6 +1204,29 @@ async fn delete_remote_ref_under_lock(
         DELETE_EXPECTED_NO_ZIP
     };
     let remote_ref_str = remote_ref.as_str().to_owned();
+    let has_protected_marker = entries.iter().any(|e| {
+        e.key
+            .rsplit_once('/')
+            .is_some_and(|(_, last)| keys::is_protected_marker_segment(last))
+    });
+    // Issue #128: the canonical protection guard. Run it FIRST against
+    // the fresh, under-lock listing, BEFORE the count-match deletion
+    // branch. The pre-#128 ordering only checked for the marker in the
+    // `else if` mismatch branch, so a count-matching listing (e.g.
+    // `[bundle.bundle, PROTECTED#]` with `expected = 2` in zip mode, or
+    // `[PROTECTED#]` alone with `expected = 1`) would sweep the marker
+    // and complete the delete silently. The `lock_key` is filtered out
+    // above, and `is_protected_marker_segment` matches only the literal
+    // `PROTECTED#` last segment — never the `LOCK#.lock` lock key — so
+    // this guard cannot misfire on the lock itself.
+    if has_protected_marker {
+        return Ok(PushOutcome::Error {
+            remote_ref: remote_ref_str,
+            message:
+                r#""ref is protected. Run git-remote-object-store unprotect <url> <branch> to remove protection before deleting."?"#
+                    .to_owned(),
+        });
+    }
     if entries.len() == expected {
         for entry in &entries {
             delete_idempotent(store, &entry.key).await?;
@@ -1210,11 +1239,11 @@ async fn delete_remote_ref_under_lock(
             remote_ref: remote_ref_str,
             message: r#""not found"?"#.to_owned(),
         })
-    } else if entries.iter().any(|e| {
-        e.key
-            .rsplit_once('/')
-            .is_some_and(|(_, last)| keys::is_protected_marker_segment(last))
-    }) {
+    } else if has_protected_marker {
+        // Unreachable: the canonical guard above returns early when the
+        // marker is present. Kept as a defensive backstop and to keep
+        // the routing comment on `delete_remote_ref_under_lock` accurate
+        // for readers who scan the dispatch tail.
         Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
             message:
@@ -1950,6 +1979,119 @@ mod tests {
         }
         assert!(store.contains(&bundle_a));
         assert!(store.contains(&bundle_b));
+    }
+
+    /// Issue #128: the canonical PROTECTED# guard must reject even when
+    /// the count happens to match `expected`. Pre-#128 this listing
+    /// `[bundle.bundle, PROTECTED#]` matched `expected = 2` in zip mode
+    /// and was swept silently. Pin the guard: both keys survive, and
+    /// the wire error is the protection-specific message — not the
+    /// generic doctor message.
+    #[tokio::test]
+    async fn delete_remote_ref_rejects_protected_marker_when_count_matches_zip() {
+        let store = MockStore::new();
+        let r = rn("refs/heads/main");
+        let bundle = format!("repo/refs/heads/main/{SHA}.bundle");
+        let protected = "repo/refs/heads/main/PROTECTED#";
+        store.insert(&bundle, Bytes::from_static(b"b"));
+        store.insert(protected, Bytes::from_static(b""));
+        // zip = true → expected = 2, and the listing has exactly 2
+        // entries (bundle + marker). Pre-#128 this fell through to the
+        // count-match deletion branch.
+        let outcome = delete_remote_ref_under_lock(
+            &store,
+            Some("repo"),
+            &r,
+            true,
+            "repo/refs/heads/main/LOCK#.lock",
+        )
+        .await
+        .unwrap();
+        match outcome {
+            PushOutcome::Error { message, .. } => {
+                assert_eq!(
+                    message,
+                    r#""ref is protected. Run git-remote-object-store unprotect <url> <branch> to remove protection before deleting."?"#,
+                );
+            }
+            PushOutcome::Ok { .. } => panic!("expected protection-refusal Error"),
+        }
+        assert!(store.contains(&bundle), "bundle must survive");
+        assert!(store.contains(protected), "marker must survive");
+    }
+
+    /// Issue #128: the protection guard must also fire when the lone
+    /// remaining key under the ref prefix is the PROTECTED# marker
+    /// itself. Pre-#128, `entries == [PROTECTED#]` matched `expected = 1`
+    /// in non-zip mode and the marker was swept — the next push to the
+    /// ref would then succeed against an unprotected branch even though
+    /// the operator never ran `unprotect`. Pin the guard: the marker
+    /// survives and the wire error is the protection-specific message.
+    #[tokio::test]
+    async fn delete_remote_ref_rejects_protected_marker_when_only_marker_present() {
+        let store = MockStore::new();
+        let r = rn("refs/heads/main");
+        let protected = "repo/refs/heads/main/PROTECTED#";
+        store.insert(protected, Bytes::from_static(b""));
+        let outcome = delete_remote_ref_under_lock(
+            &store,
+            Some("repo"),
+            &r,
+            false,
+            "repo/refs/heads/main/LOCK#.lock",
+        )
+        .await
+        .unwrap();
+        match outcome {
+            PushOutcome::Error { message, .. } => {
+                assert_eq!(
+                    message,
+                    r#""ref is protected. Run git-remote-object-store unprotect <url> <branch> to remove protection before deleting."?"#,
+                );
+            }
+            PushOutcome::Ok { .. } => panic!("expected protection-refusal Error"),
+        }
+        assert!(store.contains(protected), "marker must survive");
+    }
+
+    /// Issue #128: simulate the TOCTOU sequence the bug describes.
+    /// Client A starts a delete; between `acquire_lock` and the
+    /// under-lock listing, client B writes a PROTECTED# marker
+    /// (`protect` takes no per-ref lock — it's a single `put_bytes`).
+    /// The fresh under-lock listing reflects the marker, so the
+    /// canonical guard rejects the delete. Both the bundle and the
+    /// marker survive.
+    #[tokio::test]
+    async fn delete_remote_ref_rejects_protect_landed_between_acquire_and_list() {
+        let store = MockStore::new();
+        let r = rn("refs/heads/main");
+        let bundle = format!("repo/refs/heads/main/{SHA}.bundle");
+        let lock_key = "repo/refs/heads/main/LOCK#.lock";
+        let protected = "repo/refs/heads/main/PROTECTED#";
+        // Client A acquired the lock; bundle was already present.
+        store.insert(&bundle, Bytes::from_static(b"b"));
+        store.insert(lock_key, Bytes::from_static(b"held-lock-payload"));
+        // Client B's concurrent `protect` lands AFTER our lock-acquire
+        // but BEFORE our under-lock listing — exactly the window the
+        // pre-#128 ordering left open.
+        store.insert(protected, Bytes::from_static(b""));
+
+        let outcome = delete_remote_ref_under_lock(&store, Some("repo"), &r, false, lock_key)
+            .await
+            .unwrap();
+
+        match outcome {
+            PushOutcome::Error { message, .. } => {
+                assert_eq!(
+                    message,
+                    r#""ref is protected. Run git-remote-object-store unprotect <url> <branch> to remove protection before deleting."?"#,
+                );
+            }
+            PushOutcome::Ok { .. } => panic!("expected protection-refusal Error"),
+        }
+        assert!(store.contains(&bundle), "bundle must survive");
+        assert!(store.contains(protected), "marker must survive");
+        assert!(store.contains(lock_key), "held lock must survive");
     }
 
     #[tokio::test]
