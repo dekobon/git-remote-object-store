@@ -22,13 +22,13 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use time::OffsetDateTime;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::snapshot::{BundleEntry, MalformedBundleKey, RepoSnapshot, analyze_objects};
 use super::{DEFAULT_LOCK_TTL_SECONDS, ManageError, Prompter};
 use crate::keys;
-use crate::object_store::{ObjectMeta, ObjectStore, PutOpts};
+use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
 use crate::packchain::audit::{self, AuditReport, BranchRow};
 use crate::url::StorageEngine;
 
@@ -417,24 +417,82 @@ impl<'a> Doctor<'a> {
             writeln!(out, " - {key} (age: {}s)", age.as_secs())?;
         }
 
-        if self.opts.delete_stale_locks {
-            writeln!(out, "\nDeleting stale locks...")?;
-            for (key, _) in &stale {
-                match self.store.delete(key).await {
-                    Ok(()) => {
-                        writeln!(out, "Deleted {key}")?;
-                        info!(key, "deleted stale lock");
-                    }
-                    Err(e) => {
-                        // Best-effort: report each failure but keep going.
-                        writeln!(out, "Failed to delete {key}: {e}")?;
-                    }
-                }
-            }
-        } else {
+        if !self.opts.delete_stale_locks {
             writeln!(
                 out,
                 "\nRun with --delete-stale-locks to remove them automatically."
+            )?;
+            return Ok(());
+        }
+
+        writeln!(out, "\nDeleting stale locks...")?;
+        let mut deleted = 0usize;
+        let mut skipped = 0usize;
+        for (key, _) in &stale {
+            // Re-HEAD the lock immediately before deleting it. The
+            // listing fed into this function originates from the
+            // top-of-run `list` call and can be minutes old after the
+            // interactive duplicate-bundle / HEAD-fix prompts. Without
+            // this re-check the lock at `key` may have been cleaned up
+            // and replaced by a fresh, active lock at the same key —
+            // and an unconditional `delete` would silently revoke
+            // another client's mutual exclusion (issue #132).
+            //
+            // The `ObjectStore` trait exposes no conditional delete
+            // primitive (no `If-Unmodified-Since` / `If-Match`), so a
+            // residual HEAD→delete window of a few milliseconds
+            // remains. Adding conditional delete is a broader trait
+            // change; the HEAD-then-delete approach shrinks the race
+            // from minutes to milliseconds and is the trade-off the
+            // issue's "suggested fix" accepts.
+            let recheck = self.store.head(key).await;
+            let recheck_now = OffsetDateTime::now_utc();
+            match recheck {
+                Ok(meta) => {
+                    let still_stale = Duration::try_from(recheck_now - meta.last_modified)
+                        .is_ok_and(|elapsed| elapsed > ttl);
+                    if !still_stale {
+                        writeln!(
+                            out,
+                            "Skipping {key}: lock no longer stale, refusing to delete"
+                        )?;
+                        warn!(key, "lock no longer stale, skipping doctor delete");
+                        skipped += 1;
+                        continue;
+                    }
+                }
+                Err(ObjectStoreError::NotFound(_)) => {
+                    writeln!(out, "Skipping {key}: lock disappeared concurrently")?;
+                    warn!(key, "lock disappeared between listing and delete, skipping");
+                    skipped += 1;
+                    continue;
+                }
+                Err(e) => {
+                    // Best-effort sweep: a transient HEAD failure
+                    // must not abort the run or delete on a stale
+                    // assumption.
+                    writeln!(out, "Failed to re-check {key}: {e}")?;
+                    warn!(key, error = %e, "head re-check failed; skipping delete");
+                    skipped += 1;
+                    continue;
+                }
+            }
+            match self.store.delete(key).await {
+                Ok(()) => {
+                    writeln!(out, "Deleted {key}")?;
+                    info!(key, "deleted stale lock");
+                    deleted += 1;
+                }
+                Err(e) => {
+                    // Best-effort: report each failure but keep going.
+                    writeln!(out, "Failed to delete {key}: {e}")?;
+                }
+            }
+        }
+        if skipped > 0 {
+            writeln!(
+                out,
+                "Skipped {skipped} lock(s) that became fresh or disappeared since listing; deleted {deleted}."
             )?;
         }
         Ok(())
@@ -889,6 +947,145 @@ mod tests {
             .await
             .expect("doctor.run");
         assert!(mock.contains("myrepo/refs/heads/main/LOCK#.lock"));
+    }
+
+    // --- Stale-listing race window (#132) ---------------------------------
+    //
+    // The initial bucket listing is reused for stale-lock detection after
+    // interactive duplicate-bundle / HEAD-fix prompts have run, which can
+    // take minutes. In that window the stale lock may have been cleaned up
+    // and replaced by a fresh, active lock at the same key — and an
+    // unconditional delete would silently revoke the new client's mutual
+    // exclusion. The fix re-HEADs each lock key immediately before the
+    // delete and skips keys that are no longer stale (or vanished).
+
+    /// Lock key was stale at listing time but a fresh lock now sits at the
+    /// same key. The re-HEAD must catch it and refuse to delete.
+    #[tokio::test]
+    async fn stale_listing_with_fresh_head_skips_delete() {
+        let mock = MockStore::new();
+        // Store the lock with a FRESH timestamp — this is what HEAD will
+        // see at delete time, simulating the lock having been refreshed
+        // by another client between listing and stale-handling.
+        mock.insert("myrepo/refs/heads/main/LOCK#.lock", Bytes::new());
+
+        // Synthesize the stale listing the way `run_into` would see it if
+        // the lock had been stale when the initial `list` ran. Calling
+        // `list_and_handle_stale_locks` directly lets the test inject the
+        // race condition deterministically.
+        let stale_ts = OffsetDateTime::now_utc() - time::Duration::seconds(120);
+        let synthetic_listing = vec![ObjectMeta {
+            key: "myrepo/refs/heads/main/LOCK#.lock".to_owned(),
+            size: 0,
+            last_modified: stale_ts,
+            etag: None,
+        }];
+
+        let opts = DoctorOpts {
+            delete_stale_locks: true,
+            ..DoctorOpts::default()
+        };
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", opts, &prompter);
+        let mut out = Vec::new();
+        doctor
+            .list_and_handle_stale_locks(&mut out, &synthetic_listing)
+            .await
+            .expect("stale-lock handler");
+        let captured = String::from_utf8(out).expect("utf-8 output");
+
+        assert!(
+            mock.contains("myrepo/refs/heads/main/LOCK#.lock"),
+            "fresh lock at stale-listed key must not be deleted",
+        );
+        assert!(
+            captured.contains("no longer stale"),
+            "skip reason missing from operator output: {captured:?}",
+        );
+        assert!(
+            captured.contains("Skipped 1 lock(s)"),
+            "skipped-count summary missing: {captured:?}",
+        );
+    }
+
+    /// Lock key was stale at listing time AND still stale at HEAD time —
+    /// the re-HEAD must NOT suppress the legitimate delete.
+    #[tokio::test]
+    async fn stale_listing_with_stale_head_deletes() {
+        let mock = MockStore::new();
+        let stale_ts = OffsetDateTime::now_utc() - time::Duration::seconds(120);
+        mock.insert_with(
+            "myrepo/refs/heads/main/LOCK#.lock",
+            Bytes::new(),
+            stale_ts,
+            PutOpts::default(),
+        );
+        let synthetic_listing = vec![ObjectMeta {
+            key: "myrepo/refs/heads/main/LOCK#.lock".to_owned(),
+            size: 0,
+            last_modified: stale_ts,
+            etag: None,
+        }];
+
+        let opts = DoctorOpts {
+            delete_stale_locks: true,
+            ..DoctorOpts::default()
+        };
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", opts, &prompter);
+        let mut out = Vec::new();
+        doctor
+            .list_and_handle_stale_locks(&mut out, &synthetic_listing)
+            .await
+            .expect("stale-lock handler");
+        let captured = String::from_utf8(out).expect("utf-8 output");
+
+        assert!(
+            !mock.contains("myrepo/refs/heads/main/LOCK#.lock"),
+            "stale lock must be deleted when HEAD confirms staleness",
+        );
+        assert!(
+            captured.contains("Deleted myrepo/refs/heads/main/LOCK#.lock"),
+            "delete confirmation missing: {captured:?}",
+        );
+    }
+
+    /// Lock vanished between listing and stale-handling (e.g. another
+    /// client's stale-lock recovery already cleaned it up). HEAD returns
+    /// `NotFound` — the doctor must skip cleanly without erroring.
+    #[tokio::test]
+    async fn stale_listing_with_vanished_head_skips_without_error() {
+        let mock = MockStore::new();
+        // No lock object inserted — HEAD will return NotFound.
+        let stale_ts = OffsetDateTime::now_utc() - time::Duration::seconds(120);
+        let synthetic_listing = vec![ObjectMeta {
+            key: "myrepo/refs/heads/main/LOCK#.lock".to_owned(),
+            size: 0,
+            last_modified: stale_ts,
+            etag: None,
+        }];
+
+        let opts = DoctorOpts {
+            delete_stale_locks: true,
+            ..DoctorOpts::default()
+        };
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", opts, &prompter);
+        let mut out = Vec::new();
+        doctor
+            .list_and_handle_stale_locks(&mut out, &synthetic_listing)
+            .await
+            .expect("vanished lock must not error");
+        let captured = String::from_utf8(out).expect("utf-8 output");
+
+        assert!(
+            captured.contains("disappeared concurrently"),
+            "concurrent-cleanup skip reason missing: {captured:?}",
+        );
+        assert!(
+            !captured.contains("Deleted myrepo/refs/heads/main/LOCK#.lock"),
+            "must not log a delete for a vanished key: {captured:?}",
+        );
     }
 
     #[tokio::test]
