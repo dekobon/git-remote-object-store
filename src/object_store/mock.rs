@@ -78,6 +78,16 @@ pub enum Fault {
         /// Key being deleted.
         key: String,
     },
+    /// Force `put_path(key, _, _)` to return [`ObjectStoreError::Network`]
+    /// without writing. Fires before the source file is read, so the
+    /// fault is independent of disk state. Scoped to `put_path` (not
+    /// `put_bytes`) so tests that drive multiple uploads through the
+    /// same store can target one path-based upload at a time without
+    /// perturbing other writes.
+    NetworkOnPutPath {
+        /// Key being uploaded.
+        key: String,
+    },
     /// Force `get_to_file(key, _)` to return
     /// [`ObjectStoreError::PreconditionFailed`], simulating an object that was
     /// mutated between the `head` and the body download in the S3
@@ -433,6 +443,16 @@ impl ObjectStore for MockStore {
     /// `put_bytes` without progress and then emits a single
     /// end-of-transfer event, defeating the chunk knob.
     async fn put_path(&self, key: &str, src: &Path, opts: PutOpts) -> Result<(), ObjectStoreError> {
+        self.with_state(|s| {
+            Self::check_fault(s, |f| match f {
+                Fault::NetworkOnPutPath { key: k } if k == key => {
+                    Some(ObjectStoreError::Network(Box::new(std::io::Error::other(
+                        format!("mock network on put_path: {k}"),
+                    ))))
+                }
+                _ => None,
+            })
+        })?;
         let body = tokio::fs::read(src).await.map_err(other_boxed)?;
         self.put_bytes(key, Bytes::from(body), opts).await
     }

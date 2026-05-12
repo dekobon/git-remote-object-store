@@ -528,6 +528,40 @@ async fn delete_prior_bundle_best_effort(
     }
 }
 
+/// Best-effort upload of the optional zip artifact once the new bundle
+/// is durable.
+///
+/// Issue #127: `perform_push_under_lock` writes the new bundle, `HEAD`,
+/// and `FORMAT` (the git-protocol contract for a successful push) and
+/// then uploads an optional `repo.zip` CodePipeline-side convenience
+/// artifact. A non-`NotFound` error on the zip upload must NOT fail
+/// the push — the bundle is already durable, so reporting failure is
+/// a lie about the remote state. The next push re-puts the zip at
+/// the same key (idempotent), so an operator who notices the warn log
+/// or wants the artifact re-uploaded simply re-pushes.
+///
+/// Mirrors [`delete_prior_bundle_best_effort`] (issue #121) and
+/// `force_push_baseline_cleanup` in `packchain::push` (issue #113):
+/// log at warn with `ref_path`, `key`, and `error`, and return
+/// without propagating.
+async fn upload_zip_artifact_best_effort(
+    store: &dyn ObjectStore,
+    remote_ref: &RefName,
+    zip_dest: &str,
+    archive_path: &Path,
+    opts: PutOpts,
+) {
+    if let Err(e) = store.put_path(zip_dest, archive_path, opts).await {
+        warn!(
+            ref_path = %remote_ref.as_str(),
+            key = %zip_dest,
+            error = %e,
+            "zip artifact upload failed (bundle already committed); \
+             retry the push to re-upload the zip at the same key",
+        );
+    }
+}
+
 /// Drive a batch of `push` commands sequentially.
 ///
 /// Each command is parsed, executed under its own per-ref lock, and
@@ -941,9 +975,7 @@ async fn push_one(
     };
 
     let result = match work {
-        UnderLockWork::Push(state) => {
-            perform_push_under_lock(store.as_ref(), prefix, *state).await
-        }
+        UnderLockWork::Push(state) => perform_push_under_lock(store.as_ref(), prefix, *state).await,
         UnderLockWork::Delete { remote_ref, zip } => {
             delete_remote_ref_under_lock(store.as_ref(), prefix, &remote_ref, zip, &lock).await
         }
@@ -1109,9 +1141,14 @@ async fn perform_push_under_lock(
             )],
             progress: Some(bundle_progress_sink(&zip_dest, zip_total)),
         };
-        store
-            .put_path(&zip_dest, &artifacts.archive_path, opts)
-            .await?;
+        upload_zip_artifact_best_effort(
+            store,
+            &remote_ref,
+            &zip_dest,
+            &artifacts.archive_path,
+            opts,
+        )
+        .await;
     }
 
     Ok(PushOutcome::Ok {
@@ -2608,6 +2645,87 @@ mod tests {
         assert!(
             store.contains(&pre_key),
             "delete fault must leave the prior bundle in place",
+        );
+    }
+
+    /// Issue #127 regression: a non-`NotFound` error on the optional
+    /// zip artifact upload after the new bundle has been put must NOT
+    /// fail the push. The bundle, `HEAD`, and `FORMAT` are already
+    /// durable; reporting failure misrepresents the remote state. The
+    /// zip is a CodePipeline-side convenience surface — bundle
+    /// availability is what determines whether `git clone`/`fetch`
+    /// work. Match the `delete_prior_bundle_best_effort` contract: log
+    /// at warn and report success.
+    #[tokio::test]
+    async fn perform_push_under_lock_succeeds_when_zip_upload_fails() {
+        use crate::object_store::mock::Fault;
+        let store = MockStore::new();
+
+        // Build a PushReadyState with zip_artifacts present so the
+        // zip-upload block runs. The archive file is written to disk
+        // so a future refactor that re-orders the fault check vs. the
+        // file read still has a real file to act on.
+        let r = rn("refs/heads/main");
+        let temp_dir = tempfile::Builder::new()
+            .prefix("test_push_")
+            .tempdir()
+            .unwrap();
+        let bundle_path = temp_dir.path().join("bundle");
+        std::fs::write(&bundle_path, b"fake bundle").unwrap();
+
+        let archive_tempdir = tempfile::Builder::new()
+            .prefix("test_zip_")
+            .tempdir()
+            .unwrap();
+        let archive_path = archive_tempdir.path().join("repo.zip");
+        std::fs::write(&archive_path, b"fake zip body").unwrap();
+
+        let state = PushReadyState {
+            remote_ref: r,
+            local_sha: Sha::from_hex(SHA).unwrap(),
+            pre_existing: None,
+            bundle_path,
+            zip_artifacts: Some(ZipArtifacts {
+                archive_path,
+                short_sha: "deadbeef".to_owned(),
+                commit_msg: "test commit".to_owned(),
+                _tempdir: archive_tempdir,
+            }),
+            engine: StorageEngine::Bundle,
+            force: false,
+            pre_existing_was_ancestor: true,
+            local_spec: "refs/heads/main".to_owned(),
+            _temp_dir: temp_dir,
+        };
+
+        let zip_dest = "repo/refs/heads/main/repo.zip".to_owned();
+        store.arm(Fault::NetworkOnPutPath {
+            key: zip_dest.clone(),
+        });
+
+        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+            .await
+            .expect("push must succeed even when zip upload fails");
+        assert!(
+            matches!(&outcome, PushOutcome::Ok { remote_ref } if remote_ref == "refs/heads/main"),
+            "expected Ok(refs/heads/main), got {outcome:?}",
+        );
+
+        // The bundle reached the bucket — that is the git-protocol
+        // contract for a successful push.
+        let bundle_dest = format!("repo/refs/heads/main/{SHA}.bundle");
+        assert!(
+            store.contains(&bundle_dest),
+            "new bundle must be uploaded at bundle_dest",
+        );
+        // The zip fault fired exactly once — proves put_path was
+        // attempted and failed.
+        assert_eq!(store.pending_faults(), 0);
+        // The zip key is absent — proves the failure was not silently
+        // swallowed by a retry that masked the regression.
+        assert!(
+            !store.contains(&zip_dest),
+            "zip key must be absent when the upload fault fires",
         );
     }
 
