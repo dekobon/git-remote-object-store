@@ -380,6 +380,41 @@ impl<'a> Doctor<'a> {
             })?
             .to_owned();
 
+        // Re-verify the chosen branch is still present on the bucket
+        // before writing HEAD. The candidate list above is taken from
+        // the top-of-run snapshot, which can be minutes old after the
+        // interactive prompt; a concurrent `git push :<branch>` or
+        // `manage delete-branch` may have removed the chosen branch
+        // since the snapshot was taken. Writing HEAD anyway would
+        // re-create the invalid-HEAD condition the doctor was trying
+        // to fix (issue #138).
+        //
+        // We re-list the branch prefix (rather than HEADing a single
+        // object) because a packchain branch is healthy with
+        // `chain.json` and `packs/*` but no `.bundle` — there is no
+        // single object key that uniquely identifies "branch exists"
+        // across both engines. The `analyze_objects` snapshot pass
+        // treats any object under `refs/heads/<branch>/` as evidence
+        // the branch exists, so we mirror that here.
+        // `keys::join` with a trailing `/` on the suffix produces the
+        // exact `<prefix>/<ref>/` listing prefix `analyze_objects`
+        // walks, so the re-check sees the same shape the original
+        // snapshot did.
+        let branch_prefix = keys::join(Some(&self.prefix), &format!("{new_head}/"));
+        let recheck = self.store.list(&branch_prefix).await?;
+        if recheck.is_empty() {
+            writeln!(
+                out,
+                "Selected branch {new_head} was deleted between selection and HEAD write; \
+                 refusing to write stale HEAD. Re-run doctor."
+            )?;
+            warn!(
+                branch = %new_head,
+                "doctor fix_head: chosen branch disappeared between snapshot and HEAD write"
+            );
+            return Err(ManageError::StaleSnapshot(new_head));
+        }
+
         let head_key = keys::join(Some(&self.prefix), "HEAD");
         writeln!(out, "Setting {new_head} as HEAD")?;
         self.store
@@ -866,6 +901,131 @@ mod tests {
             .run_into(&mut std::io::sink())
             .await
             .expect("doctor.run");
+
+        let head_bytes = mock.get_bytes("myrepo/HEAD").await.expect("HEAD written");
+        assert_eq!(&head_bytes[..], b"refs/heads/main");
+    }
+
+    /// Prompter that runs a one-shot side effect immediately before
+    /// returning its first `select` answer. Used by the issue #138
+    /// regression tests to simulate a concurrent
+    /// `git push :<branch>` / `manage delete-branch` that fires
+    /// **between** the operator's selection and the HEAD write.
+    struct DeleteBeforeReturnPrompter {
+        index: usize,
+        mock: MockStore,
+        keys_to_delete: Vec<String>,
+        fired: std::sync::Mutex<bool>,
+    }
+
+    impl Prompter for DeleteBeforeReturnPrompter {
+        fn select(&self, _prompt: &str, _options: &[String]) -> Result<usize, ManageError> {
+            let mut fired = self.fired.lock().expect("fired mutex poisoned");
+            if !*fired {
+                for key in &self.keys_to_delete {
+                    let _ = self.mock.remove_key(key);
+                }
+                *fired = true;
+            }
+            Ok(self.index)
+        }
+
+        fn confirm(&self, _prompt: &str) -> Result<bool, ManageError> {
+            panic!("DeleteBeforeReturnPrompter does not expect confirm prompts")
+        }
+    }
+
+    #[tokio::test]
+    async fn fix_head_refuses_when_chosen_branch_deleted_between_select_and_write() {
+        // Issue #138: `fix_head` presents candidates from the
+        // top-of-run snapshot. If a concurrent push / delete-branch
+        // removes the chosen branch between the operator's selection
+        // and the HEAD write, the doctor must NOT write HEAD pointing
+        // at a now-deleted branch. Simulate the race by deleting the
+        // chosen branch's only object inside the prompter's `select`
+        // implementation (which fires after the candidate list is
+        // computed but before `put_bytes(HEAD)` runs).
+        let mock = MockStore::new();
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
+        mock.insert(
+            format!("myrepo/refs/heads/dev/{SHA_C}.bundle"),
+            Bytes::from("c"),
+        );
+        // Index 1 == `refs/heads/main` (lexicographic ordering).
+        let prompter = DeleteBeforeReturnPrompter {
+            index: 1,
+            mock: mock.clone(),
+            keys_to_delete: vec![format!("myrepo/refs/heads/main/{SHA_A}.bundle")],
+            fired: std::sync::Mutex::new(false),
+        };
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let mut out = Vec::new();
+        let err = doctor
+            .run_into(&mut out)
+            .await
+            .expect_err("stale snapshot must surface as an error, not silent success");
+        assert!(
+            matches!(err, ManageError::StaleSnapshot(ref b) if b == "refs/heads/main"),
+            "expected ManageError::StaleSnapshot(refs/heads/main), got {err:?}",
+        );
+
+        // HEAD must NOT have been written — the doctor refused to
+        // create a HEAD pointing at the deleted branch.
+        assert!(
+            !mock.contains("myrepo/HEAD"),
+            "HEAD was written despite chosen branch being deleted",
+        );
+
+        // The operator-facing output names the deleted branch and
+        // tells them to re-run.
+        let output = String::from_utf8(out).expect("doctor output is utf-8");
+        assert!(
+            output.contains("refs/heads/main")
+                && output.contains("deleted between selection and HEAD write")
+                && output.contains("Re-run doctor"),
+            "expected race-detection message, got:\n{output}",
+        );
+        // The "Setting … as HEAD" line MUST NOT appear — we aborted
+        // before that write.
+        assert!(
+            !output.contains("Setting refs/heads/main as HEAD"),
+            "doctor printed the HEAD-write confirmation despite aborting:\n{output}",
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_head_succeeds_when_unrelated_branch_deleted_during_prompt() {
+        // Companion to the race-detection test above: if a concurrent
+        // delete removes a branch the operator did NOT select, the
+        // re-verification must still let the HEAD write proceed. This
+        // pins the re-check to the chosen branch only — it does not
+        // re-list everything and abort on any drift.
+        let mock = MockStore::new();
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
+        mock.insert(
+            format!("myrepo/refs/heads/dev/{SHA_C}.bundle"),
+            Bytes::from("c"),
+        );
+        // Index 1 == `refs/heads/main`. Delete `refs/heads/dev` (the
+        // non-chosen branch) during the prompt to prove the chosen
+        // branch's re-verification is the only thing that matters.
+        let prompter = DeleteBeforeReturnPrompter {
+            index: 1,
+            mock: mock.clone(),
+            keys_to_delete: vec![format!("myrepo/refs/heads/dev/{SHA_C}.bundle")],
+            fired: std::sync::Mutex::new(false),
+        };
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        doctor
+            .run_into(&mut std::io::sink())
+            .await
+            .expect("unrelated concurrent delete must not block HEAD write");
 
         let head_bytes = mock.get_bytes("myrepo/HEAD").await.expect("HEAD written");
         assert_eq!(&head_bytes[..], b"refs/heads/main");

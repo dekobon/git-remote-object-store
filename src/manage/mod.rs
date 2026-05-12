@@ -108,6 +108,22 @@ pub enum ManageError {
     #[error("internal management error: {0}")]
     Internal(String),
 
+    /// `doctor`'s top-of-run snapshot disagreed with a fresh re-check
+    /// taken immediately before a mutating write — the on-bucket state
+    /// changed under us between the snapshot LIST and the write. The
+    /// canonical case (issue #138) is `fix_head` racing against a
+    /// concurrent `git push :<branch>` or `manage delete-branch`: the
+    /// operator picks a HEAD candidate from the snapshot, but by the
+    /// time the prompt returns the chosen branch has been deleted.
+    /// Writing HEAD anyway would reproduce the invalid-HEAD condition
+    /// the doctor was trying to fix.
+    ///
+    /// Carries the entity whose presence was re-verified (e.g.
+    /// `"refs/heads/main"`) so the operator-facing message names the
+    /// branch and tells them to re-run the doctor.
+    #[error("doctor snapshot is stale: {0} was deleted between selection and write; re-run doctor")]
+    StaleSnapshot(String),
+
     /// Packchain engine surface error. Surfaced by the `doctor`'s
     /// engine-aware audit path. Carries the typed source so the
     /// `main`-level downcast can recognise transport failures and
