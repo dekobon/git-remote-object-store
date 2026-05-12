@@ -306,7 +306,7 @@ async fn force_push_collapses_segments_and_replaces_baseline() {
         store.contains(&baseline_key_2),
         "force push must leave prior baseline in place during grace window",
     );
-    let metas = futures::executor::block_on(store.list("repo/gc/")).unwrap();
+    let metas = store.list("repo/gc/").await.unwrap();
     let baseline_tomb_count = metas
         .iter()
         .filter(|m| m.key.starts_with("repo/gc/baseline-tomb-"))

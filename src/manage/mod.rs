@@ -15,12 +15,37 @@ pub mod doctor;
 pub mod gc;
 pub(crate) mod snapshot;
 
+use std::fmt;
 use std::io;
 
 use thiserror::Error;
 
 use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStoreError};
+
+/// `fmt = ...` helper for [`ManageError::PartialDelete`]. Branches on
+/// `n_undeleted == 1` so the operator-facing wording reads "1 key" /
+/// "<N> keys" instead of always-plural "<N> keys".
+///
+/// thiserror's `fmt = path` hook calls this with each variant field
+/// passed by reference and the formatter as the final argument; we
+/// silence `clippy::{ptr_arg, trivially_copy_pass_by_ref}` because
+/// thiserror controls the signature, not us.
+#[allow(clippy::ptr_arg, clippy::trivially_copy_pass_by_ref)]
+fn fmt_partial_delete(
+    branch: &String,
+    undeleted: &Vec<String>,
+    attempted: &usize,
+    f: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    let n = undeleted.len();
+    let noun = if n == 1 { "key" } else { "keys" };
+    write!(
+        f,
+        "delete-branch {branch} failed: {n} of {attempted} {noun} could not be deleted: {} (retry to converge)",
+        undeleted.join(", "),
+    )
+}
 
 /// Default lock TTL in seconds.
 pub const DEFAULT_LOCK_TTL_SECONDS: u64 = 60;
@@ -86,11 +111,7 @@ pub enum ManageError {
     /// `NotFound` mid-sweep is tolerated and counts as success, so the
     /// `undeleted` field is strictly the set of keys whose deletes
     /// raised something else (Network, `AccessDenied`, etc.).
-    #[error(
-        "delete-branch {branch} failed: {n_undeleted} of {attempted} keys could not be deleted: {} (retry to converge)",
-        undeleted.join(", "),
-        n_undeleted = undeleted.len(),
-    )]
+    #[error(fmt = fmt_partial_delete)]
     PartialDelete {
         /// Branch the sweep ran against.
         branch: String,

@@ -25,9 +25,9 @@ use crate::git::{self, PeeledTip, RefName, Sha};
 use crate::keys;
 use crate::object_store::{ObjectStore, ObjectStoreError, PutOpts};
 use crate::protocol::push::{
-    self as bundle_push, DELETE_PROTECTION_MESSAGE, PushError, PushOutcome, PushSpec, acquire_lock,
-    bundle_progress_sink, delete_idempotent, head_key, is_protected, lock_key, lock_ttl_from_env,
-    not_ancestor_wire_message, parse_push_args, ref_listing_prefix,
+    self as bundle_push, DELETE_PROTECTION_MESSAGE, LockGuard, PushError, PushOutcome, PushSpec,
+    acquire_lock, bundle_progress_sink, delete_idempotent, head_key, is_protected, lock_key,
+    lock_ttl_from_env, not_ancestor_wire_message, parse_push_args, ref_listing_prefix,
 };
 use crate::url::StorageEngine;
 
@@ -918,6 +918,28 @@ async fn force_push_baseline_cleanup(
 /// concurrent-`protect` TOCTOU window between `acquire_lock` and the
 /// listing is closed by running the check against the under-lock
 /// listing rather than a pre-lock snapshot.
+/// Release `guard` and downgrade any release failure to a structured
+/// `warn!`. The `after` argument names the early-exit context the
+/// release follows (e.g. "not-found probe", "list failure",
+/// "protection rejection"); it appears verbatim at the tail of the log
+/// message so each call site keeps its distinct trail in the logs.
+///
+/// Used by [`delete_remote_ref_packchain`] to consolidate the
+/// previously copy-pasted "release-on-error" tails into a single
+/// helper. Release failures here are by definition best-effort: the
+/// caller is already on an error / wire-error path and will surface
+/// the primary outcome regardless of the release result.
+async fn release_lock_or_warn(guard: LockGuard, lock: &str, after: &str) {
+    if let Err(e) = bundle_push::release_lock(guard).await {
+        warn!(
+            key = %lock,
+            error = %e,
+            after,
+            "packchain delete failed to release lock",
+        );
+    }
+}
+
 async fn delete_remote_ref_packchain(
     store: Arc<dyn ObjectStore>,
     prefix: Option<&str>,
@@ -945,14 +967,7 @@ async fn delete_remote_ref_packchain(
     match store.head(&chain).await {
         Ok(_) => {}
         Err(ObjectStoreError::NotFound(_)) => {
-            let release_result = bundle_push::release_lock(guard).await;
-            if let Err(e) = release_result {
-                warn!(
-                    key = %lock,
-                    error = %e,
-                    "packchain delete failed to release lock after not-found probe",
-                );
-            }
+            release_lock_or_warn(guard, &lock, "not-found probe").await;
             return Ok(PushOutcome::Error {
                 remote_ref: remote_ref_str,
                 message: r#""not found"?"#.to_owned(),
@@ -960,13 +975,7 @@ async fn delete_remote_ref_packchain(
         }
         Err(e) => {
             // Best-effort release before surfacing the probe error.
-            if let Err(rel_err) = bundle_push::release_lock(guard).await {
-                warn!(
-                    key = %lock,
-                    error = %rel_err,
-                    "packchain delete lock release failed (chain.json probe already errored)",
-                );
-            }
+            release_lock_or_warn(guard, &lock, "chain.json probe error").await;
             return Err(PushError::Store(e));
         }
     }
@@ -986,13 +995,7 @@ async fn delete_remote_ref_packchain(
     let entries = match store_ref.list(&listing).await {
         Ok(es) => es,
         Err(e) => {
-            if let Err(rel_err) = bundle_push::release_lock(guard).await {
-                warn!(
-                    key = %lock,
-                    error = %rel_err,
-                    "packchain delete lock release failed (list already errored)",
-                );
-            }
+            release_lock_or_warn(guard, &lock, "list failure").await;
             return Err(PushError::Store(e));
         }
     };
@@ -1001,13 +1004,7 @@ async fn delete_remote_ref_packchain(
     // listing, BEFORE the sweep. Mirrors the bundle engine's first-guard
     // protection check in `protocol::push::delete_remote_ref_under_lock`.
     if keys::entries_have_protected_marker(&entries) {
-        if let Err(e) = bundle_push::release_lock(guard).await {
-            warn!(
-                key = %lock,
-                error = %e,
-                "packchain delete failed to release lock after protection rejection",
-            );
-        }
+        release_lock_or_warn(guard, &lock, "protection rejection").await;
         return Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
             message: DELETE_PROTECTION_MESSAGE.to_owned(),
