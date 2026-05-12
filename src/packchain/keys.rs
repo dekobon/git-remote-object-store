@@ -115,6 +115,27 @@ pub(crate) fn path_index_key(prefix: Option<&str>, ref_name: impl fmt::Display) 
     }
 }
 
+/// Extract the content SHA from a fully-qualified pack-or-idx key,
+/// verifying that the key matches the given prefix and ends in
+/// `.pack` or `.idx`. Returns `None` if the key does not fit the
+/// shape `[<prefix>/]packs/<sha>.{pack,idx}` for the supplied prefix.
+///
+/// Used on the `PackMissing` retry path
+/// ([`super::read::chain_references_pack_key`]) to compare a missing
+/// bucket key against each chain segment's content SHA without
+/// allocating two prefix-joined strings per segment.
+#[must_use]
+pub(crate) fn pack_sha_from_full_key(prefix: Option<&str>, key: &str) -> Option<Sha40> {
+    let unprefixed = match prefix {
+        Some(p) if !p.is_empty() => key.strip_prefix(p).and_then(|s| s.strip_prefix('/'))?,
+        _ => key,
+    };
+    let stem = unprefixed
+        .strip_prefix("packs/")
+        .and_then(|s| s.strip_suffix(".pack").or_else(|| s.strip_suffix(".idx")))?;
+    Sha40::try_new(stem).ok()
+}
+
 /// `<prefix>/packs/<content_sha>.pack` — pack file keyed by its
 /// content SHA (the trailing SHA1 appended by git's PACK format).
 pub(crate) fn pack_key(prefix: Option<&str>, content_sha: &Sha40) -> String {
@@ -258,6 +279,83 @@ mod tests {
         assert!(sha_from_pack_key("packs/abcdef0123456789abcdef0123456789abcdef0.pack").is_none());
         // Non-hex character in sha.
         assert!(sha_from_pack_key("packs/zbcdef0123456789abcdef0123456789abcdef01.pack").is_none());
+    }
+
+    #[test]
+    fn pack_sha_from_full_key_matches_pack_and_idx_with_prefix() {
+        let key = format!("acme/packs/{SHA}.pack");
+        assert_eq!(
+            pack_sha_from_full_key(Some("acme"), &key).unwrap().as_str(),
+            SHA,
+        );
+        let idx = format!("acme/packs/{SHA}.idx");
+        assert_eq!(
+            pack_sha_from_full_key(Some("acme"), &idx).unwrap().as_str(),
+            SHA,
+        );
+    }
+
+    #[test]
+    fn pack_sha_from_full_key_matches_without_prefix() {
+        let key = format!("packs/{SHA}.pack");
+        assert_eq!(pack_sha_from_full_key(None, &key).unwrap().as_str(), SHA);
+        assert_eq!(
+            pack_sha_from_full_key(Some(""), &key).unwrap().as_str(),
+            SHA,
+        );
+        // `.idx` shape with no prefix — closes the with-prefix /
+        // without-prefix × pack / idx matrix.
+        let idx = format!("packs/{SHA}.idx");
+        assert_eq!(pack_sha_from_full_key(None, &idx).unwrap().as_str(), SHA);
+        assert_eq!(
+            pack_sha_from_full_key(Some(""), &idx).unwrap().as_str(),
+            SHA,
+        );
+    }
+
+    #[test]
+    fn pack_sha_from_full_key_rejects_prefix_mismatch() {
+        // Unprefixed key with a prefix expected: must be rejected so
+        // a chain authored under `acme/` doesn't false-match an
+        // un-prefixed missing-key lookup (mirrors the prior pack_key
+        // equality semantics).
+        let key = format!("packs/{SHA}.pack");
+        assert!(pack_sha_from_full_key(Some("acme"), &key).is_none());
+        // Sibling-prefix collision: `acme-other` must not match `acme`.
+        let key = format!("acme-other/packs/{SHA}.pack");
+        assert!(pack_sha_from_full_key(Some("acme"), &key).is_none());
+        // Symmetric case: prefixed key against `None` must also be
+        // rejected (the missing-key was for a prefixed bucket; a chain
+        // authored without a prefix must not false-match). A future
+        // relaxation to "ignore prefix when None" would slip past the
+        // other rejections without this guard.
+        let key = format!("acme/packs/{SHA}.pack");
+        assert!(pack_sha_from_full_key(None, &key).is_none());
+        let idx = format!("acme/packs/{SHA}.idx");
+        assert!(pack_sha_from_full_key(None, &idx).is_none());
+    }
+
+    #[test]
+    fn pack_sha_from_full_key_rejects_malformed_shapes() {
+        // Missing `packs/` segment.
+        assert!(pack_sha_from_full_key(None, &format!("blobs/{SHA}.pack")).is_none());
+        // Missing extension.
+        assert!(pack_sha_from_full_key(None, &format!("packs/{SHA}")).is_none());
+        // Wrong-length sha (39 hex chars).
+        assert!(
+            pack_sha_from_full_key(None, "packs/abcdef0123456789abcdef0123456789abcdef0.pack")
+                .is_none()
+        );
+        // Overlength sha (41 hex chars) — a future relaxation of
+        // Sha40::try_new to "at least 40" would slip through without
+        // this symmetric guard.
+        assert!(pack_sha_from_full_key(None, &format!("packs/{SHA}f.pack")).is_none());
+        // Uppercase sha — Sha40 is lowercase-only; a corrupted bucket
+        // key with uppercase hex must be rejected.
+        assert!(
+            pack_sha_from_full_key(None, "packs/ABCDEF0123456789ABCDEF0123456789ABCDEF01.pack")
+                .is_none()
+        );
     }
 
     #[test]

@@ -393,8 +393,9 @@ impl<'a> Doctor<'a> {
         // object) because a packchain branch is healthy with
         // `chain.json` and `packs/*` but no `.bundle` — there is no
         // single object key that uniquely identifies "branch exists"
-        // across both engines. `keys::join` with a trailing `/` on the
-        // suffix produces a `<prefix>/<ref>/` listing prefix.
+        // across both engines. `keys::ref_listing_prefix` produces the
+        // canonical `<prefix>/<ref>/` shape shared with the push
+        // engines and `ManageBranch::protect`.
         //
         // The "branch exists" predicate uses [`super::has_branch_data`],
         // which excludes `*.lock` keys and the `PROTECTED#` marker.
@@ -407,7 +408,7 @@ impl<'a> Doctor<'a> {
         // that residue as evidence the branch is gone. Sharing the
         // helper with `ManageBranch::protect` keeps the two
         // race-detection paths in lockstep.
-        let branch_prefix = keys::join(Some(&self.prefix), &format!("{new_head}/"));
+        let branch_prefix = keys::ref_listing_prefix(Some(&self.prefix), &new_head);
         let recheck = self.store.list(&branch_prefix).await?;
         if !super::has_branch_data(&recheck) {
             // `recheck` may still be non-empty here if it contains only

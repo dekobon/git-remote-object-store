@@ -78,6 +78,41 @@ pub(crate) fn join(prefix: Option<&str>, suffix: &str) -> String {
     }
 }
 
+/// Build a `<prefix>/<ref_path>/` listing prefix in a single allocation,
+/// applying the same empty-prefix rule as [`join`]. The trailing `/` is
+/// always present so the result is suitable for an object-store byte-
+/// prefix `list` of every object under the ref.
+///
+/// `ref_path` is taken verbatim — pass `refs/heads/main` (or any other
+/// already-validated git ref path); helper-protocol callers that hold a
+/// `RefName` should pass `remote_ref.as_str()`. Pre-validate untyped
+/// strings before reaching here.
+///
+/// `ref_path` must be non-empty and must not already end with `/` — the
+/// helper appends the trailing slash itself, so an empty or already-
+/// terminated input would produce a degenerate `<prefix>/` or
+/// `<prefix>/<ref>//` key that no caller wants. Both preconditions are
+/// checked with `debug_assert!` so test builds catch a violation
+/// immediately; release builds accept the input verbatim.
+///
+/// Centralised so the bundle and packchain push paths, the management
+/// `delete-branch` flow, and the `doctor` HEAD-fix all build the same
+/// `<prefix>/<ref>/` shape from a single canonical helper.
+pub(crate) fn ref_listing_prefix(prefix: Option<&str>, ref_path: &str) -> String {
+    debug_assert!(
+        !ref_path.is_empty(),
+        "ref_listing_prefix: ref_path is empty"
+    );
+    debug_assert!(
+        !ref_path.ends_with('/'),
+        "ref_listing_prefix: ref_path already ends with '/' (helper appends one)"
+    );
+    match prefix {
+        Some(p) if !p.is_empty() => format!("{p}/{ref_path}/"),
+        _ => format!("{ref_path}/"),
+    }
+}
+
 /// Returns `true` iff `stem` is a syntactically valid bundle-file SHA:
 /// exactly 40 characters, all lowercase hex (`0-9`, `a-f`).
 ///
@@ -120,7 +155,7 @@ pub(crate) fn bundle_key(
 
 #[cfg(test)]
 mod tests {
-    use super::{bundle_key, is_valid_bundle_stem, join};
+    use super::{bundle_key, is_valid_bundle_stem, join, ref_listing_prefix};
 
     #[test]
     fn joins_prefix_and_suffix_with_slash() {
@@ -198,6 +233,58 @@ mod tests {
             "not-a-valid-sha-not-a-valid-sha-not-aval"
         ));
         assert!(!is_valid_bundle_stem(""));
+    }
+
+    #[test]
+    fn ref_listing_prefix_with_prefix() {
+        assert_eq!(
+            ref_listing_prefix(Some("acme"), "refs/heads/main"),
+            "acme/refs/heads/main/",
+        );
+    }
+
+    #[test]
+    fn ref_listing_prefix_without_prefix() {
+        assert_eq!(
+            ref_listing_prefix(None, "refs/heads/main"),
+            "refs/heads/main/"
+        );
+        assert_eq!(
+            ref_listing_prefix(Some(""), "refs/heads/main"),
+            "refs/heads/main/",
+        );
+    }
+
+    #[test]
+    fn ref_listing_prefix_matches_join_with_trailing_slash() {
+        // Equivalent to the prior two-allocation `join(prefix, &format!("{r}/"))`
+        // shape so call sites can switch over without behavior change.
+        for prefix in [None, Some(""), Some("acme"), Some("acme/repo")] {
+            for ref_path in ["refs/heads/main", "refs/heads/feature/x"] {
+                assert_eq!(
+                    ref_listing_prefix(prefix, ref_path),
+                    join(prefix, &format!("{ref_path}/")),
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "ref_path is empty")]
+    fn ref_listing_prefix_panics_on_empty_ref_path() {
+        // Pins the debug_assert! contract: an empty ref_path would
+        // produce a degenerate `<prefix>/` listing key that no caller
+        // wants. A silent weakening of the guard would slip past this.
+        let _ = ref_listing_prefix(Some("acme"), "");
+    }
+
+    #[test]
+    #[should_panic(expected = "ref_path already ends with '/'")]
+    fn ref_listing_prefix_panics_on_trailing_slash_ref_path() {
+        // Pins the debug_assert! contract: a pre-terminated ref_path
+        // would produce a `<prefix>/<ref>//` key. The helper appends
+        // the trailing slash itself, so callers must not.
+        let _ = ref_listing_prefix(Some("acme"), "refs/heads/main/");
     }
 
     #[test]

@@ -9,7 +9,7 @@
 // note in `doctor.rs` for the rationale behind the lint exception.
 #![allow(clippy::disallowed_macros)]
 
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -70,7 +70,7 @@ impl<'a> ManageBranch<'a> {
     }
 
     fn branch_prefix(&self) -> String {
-        keys::join(Some(&self.prefix), &format!("refs/heads/{}/", self.branch))
+        keys::ref_listing_prefix(Some(&self.prefix), &format!("refs/heads/{}", self.branch))
     }
 
     fn protected_key(&self) -> String {
@@ -162,7 +162,7 @@ impl<'a> ManageBranch<'a> {
             return Err(ManageError::Protected(self.branch.clone()));
         }
 
-        let initial_keys: BTreeSet<&str> = initial.iter().map(|m| m.key.as_str()).collect();
+        let initial_keys: HashSet<&str> = initial.iter().map(|m| m.key.as_str()).collect();
         let concurrent_adds = fresh
             .iter()
             .filter(|m| !initial_keys.contains(m.key.as_str()))

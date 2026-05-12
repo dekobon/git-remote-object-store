@@ -48,7 +48,7 @@ use crate::remote::Remote;
 use crate::url::StorageEngine;
 
 use super::PackchainError;
-use super::keys::{pack_idx_key, pack_key, segment_pack_sha};
+use super::keys::{pack_idx_key, pack_key, pack_sha_from_full_key, segment_pack_sha};
 use super::manifest::{load_chain, load_path_index};
 use super::schema::{ChainManifest, ChainSegment, PathNode, Sha40};
 
@@ -547,11 +547,20 @@ fn chain_references_pack_key(
     prefix: Option<&str>,
     missing_key: &str,
 ) -> Result<bool, PackchainError> {
+    // Parse the missing key once up front: extract `<sha>` from
+    // `[<prefix>/]packs/<sha>.{pack,idx}`. A malformed key (or one whose
+    // prefix doesn't match `prefix`) cannot match any segment by
+    // construction, so we return `Ok(false)` without iterating. Note
+    // that this short-circuits past per-segment `segment_pack_sha`
+    // parse errors that the prior per-segment string-eq implementation
+    // would have surfaced; on the #136 retry path this is benign
+    // because a malformed missing-key is observable evidence of bucket
+    // corruption the caller will surface from its original `PackMissing`.
+    let Some(missing_sha) = pack_sha_from_full_key(prefix, missing_key) else {
+        return Ok(false);
+    };
     for segment in &chain.segments {
-        let content_sha = segment_pack_sha(segment)?;
-        if pack_key(prefix, &content_sha) == missing_key
-            || pack_idx_key(prefix, &content_sha) == missing_key
-        {
+        if segment_pack_sha(segment)? == missing_sha {
             return Ok(true);
         }
     }
@@ -2160,6 +2169,25 @@ mod tests {
             !chain_references_pack_key(&chain, Some("repo"), &format!("packs/{SHA_B}.pack"))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn chain_references_pack_key_returns_false_for_malformed_missing_key() {
+        // Commit 8fbe693's refactor short-circuits on a missing_key
+        // that fails to parse as `[<prefix>/]packs/<sha>.{pack,idx}` —
+        // the function returns Ok(false) without iterating segments.
+        // This pins that behavior so a future change that re-routes
+        // malformed keys through the per-segment path (or that
+        // surfaces a parse error to the caller) fails this test.
+        let chain = make_chain_with(SHA_A, SHA_B);
+        // No `packs/` segment.
+        assert!(!chain_references_pack_key(&chain, None, "weird/key").unwrap());
+        // `packs/` present but non-hex stem — fails Sha40 validation.
+        assert!(!chain_references_pack_key(&chain, None, "packs/not-a-sha.pack").unwrap());
+        // Wrong extension.
+        assert!(!chain_references_pack_key(&chain, None, &format!("packs/{SHA_B}.bin")).unwrap());
+        // Empty key.
+        assert!(!chain_references_pack_key(&chain, None, "").unwrap());
     }
 
     /// `ObjectStore` wrapper that serves a list of `chain.json` bodies

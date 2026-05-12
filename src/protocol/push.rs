@@ -210,8 +210,14 @@ pub(crate) fn parse_push_args(args: &str) -> Result<PushSpec, PushError> {
 
 /// Build the `<prefix>/<ref>/` listing prefix used by lock and bundle
 /// listings. Empty / absent prefix collapses to a bare `<ref>/`.
+///
+/// Thin typed wrapper over [`keys::ref_listing_prefix`] that takes the
+/// validated `RefName` newtype so helper-protocol call sites can't pass
+/// an unvalidated string. The shared helper is the single allocation
+/// point — `manage::doctor` and `manage::branch` reach it directly with
+/// already-validated `&str` ref paths.
 pub(crate) fn ref_listing_prefix(prefix: Option<&str>, remote_ref: &RefName) -> String {
-    keys::join(prefix, &format!("{remote_ref}/"))
+    keys::ref_listing_prefix(prefix, remote_ref.as_str())
 }
 
 /// Build the lock key: `<prefix>/<ref>/LOCK#.lock`.
