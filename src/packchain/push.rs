@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 
 use crate::git::{self, PeeledTip, RefName, Sha};
 use crate::keys;
-use crate::object_store::{ObjectStore, ObjectStoreError, PutOpts};
+use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
 use crate::protocol::push::{
     self as bundle_push, NOT_ANCESTOR_TOKEN, PushError, PushOutcome, PushSpec, acquire_lock,
     bundle_progress_sink, delete_idempotent, head_key, is_protected, lock_key, lock_ttl_from_env,
@@ -891,6 +891,30 @@ async fn force_push_baseline_cleanup(
     }
 }
 
+/// Canonical wire-format message returned when a delete is refused
+/// because a `PROTECTED#` marker is present under the ref. Mirrors the
+/// bundle engine's wording in
+/// [`crate::protocol::push::delete_remote_ref_under_lock`] byte-for-byte
+/// so both engines surface identical errors to git/clients. Tests pin
+/// this string against the bundle engine's copy via the test-module
+/// constant of the same name.
+const DELETE_PROTECTION_MESSAGE: &str = r#""ref is protected. Run git-remote-object-store unprotect <url> <branch> to remove protection before deleting."?"#;
+
+/// Returns `true` iff any listed entry's final path segment is the
+/// literal `PROTECTED#` marker. Used by [`delete_remote_ref_packchain`]
+/// to refuse deletion of a protected ref. The
+/// [`keys::is_protected_marker_segment`] predicate matches only the
+/// exact `PROTECTED#` segment — never the `LOCK#.lock` lock key or a
+/// `PROTECTED#`-prefixed sibling (#119) — so an unfiltered listing is
+/// safe to scan here without first removing the held lock key.
+fn entries_contain_protected_marker(entries: &[ObjectMeta]) -> bool {
+    entries.iter().any(|e| {
+        e.key
+            .rsplit_once('/')
+            .is_some_and(|(_, last)| keys::is_protected_marker_segment(last))
+    })
+}
+
 /// Delete a packchain-engine ref: remove `chain.json`, `path-index.json`,
 /// and the baseline bundle. Pack files are NOT deleted (they may be
 /// referenced by other branches; `manage gc` reaps unreferenced packs).
@@ -911,6 +935,16 @@ async fn force_push_baseline_cleanup(
 /// concurrent deleter slipping in between the probe and the lock
 /// acquire would erase the chain, and we would then sweep nothing and
 /// return `Ok` instead of the documented "not found" wire error.
+///
+/// Protection guard (#130): after listing under the lock, the function
+/// checks for a `PROTECTED#` marker segment in any entry's last path
+/// segment and refuses the delete with the canonical wire-format
+/// protection message. Mirrors the bundle engine's first-guard check in
+/// [`crate::protocol::push::delete_remote_ref_under_lock`]. Because
+/// `protect` is a lockless `put_if_absent` on the marker key, the
+/// concurrent-`protect` TOCTOU window between `acquire_lock` and the
+/// listing is closed by running the check against the under-lock
+/// listing rather than a pre-lock snapshot.
 async fn delete_remote_ref_packchain(
     store: Arc<dyn ObjectStore>,
     prefix: Option<&str>,
@@ -972,8 +1006,42 @@ async fn delete_remote_ref_packchain(
     // section while we are still sweeping.
     let listing = ref_listing_prefix(prefix, remote_ref);
     let store_ref = store.as_ref();
+
+    // List under the lock. A list failure releases the lock cleanly
+    // before surfacing the error — same shape as the chain.json probe's
+    // error branch above.
+    let entries = match store_ref.list(&listing).await {
+        Ok(es) => es,
+        Err(e) => {
+            if let Err(rel_err) = bundle_push::release_lock(guard).await {
+                warn!(
+                    key = %lock,
+                    error = %rel_err,
+                    "packchain delete lock release failed (list already errored)",
+                );
+            }
+            return Err(PushError::Store(e));
+        }
+    };
+
+    // Issue #130: PROTECTED# marker check against the fresh, under-lock
+    // listing, BEFORE the sweep. Mirrors the bundle engine's first-guard
+    // protection check in `protocol::push::delete_remote_ref_under_lock`.
+    if entries_contain_protected_marker(&entries) {
+        if let Err(e) = bundle_push::release_lock(guard).await {
+            warn!(
+                key = %lock,
+                error = %e,
+                "packchain delete failed to release lock after protection rejection",
+            );
+        }
+        return Ok(PushOutcome::Error {
+            remote_ref: remote_ref_str,
+            message: DELETE_PROTECTION_MESSAGE.to_owned(),
+        });
+    }
+
     let sweep_result: Result<(), PushError> = async {
-        let entries = store_ref.list(&listing).await?;
         for entry in &entries {
             if entry.key == lock {
                 continue;
@@ -1357,6 +1425,224 @@ mod tests {
         assert!(
             !store.contains(&lock),
             "lock must be released after a successful stale-recovery delete",
+        );
+    }
+
+    // --- Issue #130: delete must honor the PROTECTED# marker ---
+
+    /// Compile-time guard that the packchain delete-protection message
+    /// matches the bundle engine's wording byte-for-byte. If the bundle
+    /// engine's wire-format ever drifts, this assertion fails the
+    /// build and forces both engines to stay in lockstep.
+    ///
+    /// The bundle engine's wording is inlined as a literal here because
+    /// it is not exposed as a `pub` constant from `protocol::push`.
+    const _: () = {
+        let a = super::DELETE_PROTECTION_MESSAGE.as_bytes();
+        let b = r#""ref is protected. Run git-remote-object-store unprotect <url> <branch> to remove protection before deleting."?"#
+            .as_bytes();
+        let mut i = 0;
+        let mut differs = a.len() != b.len();
+        while i < a.len() && i < b.len() {
+            if a[i] != b[i] {
+                differs = true;
+            }
+            i += 1;
+        }
+        assert!(
+            !differs,
+            "packchain DELETE_PROTECTION_MESSAGE must match bundle engine wording",
+        );
+    };
+
+    /// Regression for #130: a `PROTECTED#` marker present alongside the
+    /// chain manifest must cause the delete to refuse with the canonical
+    /// protection wire message. Both seeded keys (chain.json and the
+    /// marker) must survive — a regression that swept either before
+    /// noticing the marker would let `git push :<branch>` quietly bypass
+    /// the protection.
+    ///
+    /// Wire-format pin: the message is asserted byte-for-byte, including
+    /// the `"…"?` envelope. A regression that dropped the envelope or
+    /// drifted the body off the bundle engine's wording would not be
+    /// caught by a substring check.
+    #[tokio::test]
+    async fn delete_rejects_when_protected_marker_present_with_chain() {
+        let store = Arc::new(MockStore::new());
+        let prefix = Some("repo");
+        let remote = rn("refs/heads/main");
+        let chain = chain_key(prefix, &remote);
+        let protected = "repo/refs/heads/main/PROTECTED#";
+
+        store.insert(&chain, Bytes::from_static(b"{}"));
+        store.insert(protected, Bytes::new());
+
+        let config = delete_test_config();
+        let outcome = delete_remote_ref_packchain(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            prefix,
+            &remote,
+            &config,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+
+        match &outcome {
+            PushOutcome::Error {
+                message,
+                remote_ref,
+            } => {
+                assert_eq!(
+                    message, DELETE_PROTECTION_MESSAGE,
+                    "wire bytes for protection rejection must match the bundle engine",
+                );
+                assert_eq!(remote_ref, remote.as_str());
+            }
+            PushOutcome::Ok { .. } => {
+                panic!("expected protection Error, got {outcome:?}")
+            }
+        }
+
+        // Critical: NOTHING under the ref prefix was deleted. The
+        // protection check must run BEFORE the sweep, so chain.json and
+        // the marker both survive.
+        assert!(
+            store.contains(&chain),
+            "chain.json must NOT be swept when PROTECTED# marker is present",
+        );
+        assert!(
+            store.contains(protected),
+            "PROTECTED# marker must NOT be swept by a refused delete",
+        );
+        // The lock is still released cleanly on the protection branch.
+        assert!(
+            !store.contains(&lock_key(prefix, &remote)),
+            "lock must be released after a protection-rejected delete",
+        );
+    }
+
+    /// Regression for #130: closes the TOCTOU window where a concurrent
+    /// `protect` lands the marker between `acquire_lock` and the
+    /// listing. The synchronous mock cannot reproduce a true race
+    /// in-process, but the production code reads the marker from the
+    /// under-lock listing rather than a pre-lock snapshot — so any
+    /// marker present at list time is observed. Seeding the marker
+    /// before invoking delete simulates that "lands during the lock
+    /// window" timing: the head probe for `chain.json` succeeds, the
+    /// listing then surfaces the marker, and the sweep is suppressed.
+    ///
+    /// What this pins separately from
+    /// [`delete_rejects_when_protected_marker_present_with_chain`]: that
+    /// the marker check operates on the under-lock LIST output (not on
+    /// the head probe's snapshot), so a marker that arrives strictly
+    /// AFTER the head probe is still caught. A regression that
+    /// pre-computed `has_protected_marker` from a snapshot read before
+    /// the list would let this scenario slip through.
+    #[tokio::test]
+    async fn delete_rejects_when_protected_marker_lands_after_lock_acquire() {
+        let store = Arc::new(MockStore::new());
+        let prefix = Some("repo");
+        let remote = rn("refs/heads/main");
+        let chain = chain_key(prefix, &remote);
+        let protected = "repo/refs/heads/main/PROTECTED#";
+
+        // Chain present (head probe will succeed); marker also present,
+        // representing a concurrent `protect` that landed before we
+        // listed entries under the lock.
+        store.insert(&chain, Bytes::from_static(b"{}"));
+        store.insert(protected, Bytes::new());
+
+        let config = delete_test_config();
+        let outcome = delete_remote_ref_packchain(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            prefix,
+            &remote,
+            &config,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(
+                &outcome,
+                PushOutcome::Error { message, .. }
+                    if message == DELETE_PROTECTION_MESSAGE
+            ),
+            "TOCTOU-window protect must reject with the canonical message, got {outcome:?}",
+        );
+
+        // No keys swept — exhaustive check across every key under the
+        // ref prefix (other than the now-released lock). A regression
+        // that swept any subset before bailing would leave one of these
+        // assertions failing.
+        let ref_prefix = "repo/refs/heads/main/";
+        let surviving: Vec<String> = store
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with(ref_prefix))
+            .collect();
+        assert!(
+            surviving.iter().any(|k| k == &chain),
+            "chain.json must survive a TOCTOU-window rejection, surviving = {surviving:?}",
+        );
+        assert!(
+            surviving.iter().any(|k| k == protected),
+            "PROTECTED# marker must survive a TOCTOU-window rejection, surviving = {surviving:?}",
+        );
+    }
+
+    /// Regression check: the non-protected path is unaffected by the
+    /// #130 guard. An unprotected ref with a chain.json (and other
+    /// per-ref artefacts) must still sweep cleanly. A regression that
+    /// mis-fired the marker check — e.g., matching any key containing
+    /// the substring "PROTECTED" instead of the exact last segment —
+    /// would refuse this delete and fail here.
+    ///
+    /// This complements [`delete_under_lock_completes_when_chain_present`]
+    /// (which covers the chain-only happy path) by seeding a richer
+    /// listing (chain + path-index + baseline bundle) and asserting all
+    /// of them are swept.
+    #[tokio::test]
+    async fn delete_unprotected_with_chain_sweeps_as_before() {
+        let store = Arc::new(MockStore::new());
+        let prefix = Some("repo");
+        let remote = rn("refs/heads/main");
+        let chain = chain_key(prefix, &remote);
+        let path_index = path_index_key(prefix, &remote);
+        let baseline_sha = Sha::from_hex("0000000000000000000000000000000000000001").unwrap();
+        let baseline = keys::bundle_key(prefix, &remote, baseline_sha);
+
+        store.insert(&chain, Bytes::from_static(b"{}"));
+        store.insert(&path_index, Bytes::from_static(b"{}"));
+        store.insert(&baseline, Bytes::from_static(b"PACK"));
+        // Explicitly NO PROTECTED# marker — the guard must not fire.
+
+        let config = delete_test_config();
+        let outcome = delete_remote_ref_packchain(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            prefix,
+            &remote,
+            &config,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&outcome, PushOutcome::Ok { remote_ref } if remote_ref == remote.as_str()),
+            "unprotected delete must succeed, got {outcome:?}",
+        );
+        assert!(!store.contains(&chain), "chain.json must be swept");
+        assert!(
+            !store.contains(&path_index),
+            "path-index.json must be swept",
+        );
+        assert!(!store.contains(&baseline), "baseline bundle must be swept");
+        assert!(
+            !store.contains(&lock_key(prefix, &remote)),
+            "lock must be released after a successful unprotected delete",
         );
     }
 
