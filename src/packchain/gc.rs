@@ -30,14 +30,17 @@
 //!
 //! ### Phase 1 (mark)
 //!
-//! 1. List `<prefix>/refs/**/chain.json` across every ref namespace
+//! 1. List `<prefix>/packs/` to snapshot the packs currently on the
+//!    bucket. Packs-first is deliberate (issue #135): see "Concurrency"
+//!    below.
+//! 2. List `<prefix>/refs/**/chain.json` across every ref namespace
 //!    (`refs/heads/`, `refs/tags/`, `refs/notes/`, etc.), parse each,
 //!    collect referenced pack content-shas.
-//! 2. **Fail closed** on parse error: abort, log the bad key, do not
+//! 3. **Fail closed** on parse error: abort, log the bad key, do not
 //!    write tombstones. A corrupt chain could under-report the
 //!    referenced set and tombstone live packs.
-//! 3. List `<prefix>/packs/`, derive the orphan set.
-//! 4. Write `<prefix>/gc/tombstones-<run_id>-<rfc3339>.json`.
+//! 4. Derive the orphan set (`on_bucket - referenced`) and write
+//!    `<prefix>/gc/tombstones-<run_id>-<rfc3339>.json`.
 //!
 //! ### Phase 2 (sweep)
 //!
@@ -87,12 +90,34 @@
 //!
 //! Two operators running `gc` simultaneously each get a `UUIDv4` run id
 //! → distinct tombstone files, no clobber. Concurrent sweeps tolerate
-//! `NotFound` on already-deleted packs. A push landing during mark
-//! either uploaded *before* the pack list (orphan candidate, but its
-//! chain commit lands before the chain re-list — survives) or *after*
-//! the pack list (not in orphan set — survives). The grace window
-//! covers a fetch reading an old chain whose packs are about to be
-//! swept.
+//! `NotFound` on already-deleted packs.
+//!
+//! Mark lists packs first, then chains (issue #135). With this order,
+//! a push landing during mark either:
+//!
+//! - uploaded its pack *after* [`list_pack_shas`] — the pack is not in
+//!   the on-bucket snapshot, so it cannot enter the orphan set
+//!   regardless of when its chain commits; or
+//! - uploaded its pack *before* [`list_pack_shas`] AND committed
+//!   `chain.json` before [`list_referenced_packs`] — the pack is in the
+//!   referenced set, so it is filtered out of orphans; or
+//! - uploaded its pack *before* [`list_pack_shas`] and has not yet
+//!   committed `chain.json` by the time [`list_referenced_packs`] runs
+//!   — the pack is tombstoned, but the grace window leaves it readable
+//!   long enough for the push to complete (the genuine-orphan case for
+//!   an aborted push is exactly what the GC is designed to reap).
+//!
+//! The reverse order (chains-first) is the bug fixed by #135: a chain
+//! commit landing between the chain list and the pack list would let a
+//! freshly-uploaded pack appear in [`list_pack_shas`] without appearing
+//! in [`list_referenced_packs`], producing a false-positive tombstone.
+//! Sweep's per-tombstone re-derive (issue #140) would usually catch
+//! that at sweep time, but a `--force` sweep run in the same session as
+//! mark (e.g. `compact --with-gc`) could still delete the live pack
+//! before the push's chain commit lands.
+//!
+//! The grace window separately covers a fetch reading an old chain
+//! whose packs are about to be swept.
 
 use std::collections::HashSet;
 
@@ -359,11 +384,24 @@ pub fn grace_hours_from_env() -> u64 {
         .unwrap_or(DEFAULT_GRACE_HOURS)
 }
 
-/// Run the mark phase: list every chain, list every pack, write a
-/// tombstone naming the orphans.
+/// Run the mark phase: snapshot every pack on the bucket, then every
+/// chain, then write a tombstone naming the orphans.
 ///
 /// `prefix` is the repository prefix without leading or trailing
 /// slashes — pass an empty string for bucket-root repositories.
+///
+/// # Ordering
+///
+/// Listings run packs-first, chains-second (issue #135). The reverse
+/// order races a concurrent push that uploads a new pack between the
+/// two listings and commits its `chain.json` *between the chain list
+/// and the pack list*: the new pack would appear in the on-bucket set
+/// but not in the referenced set, producing a false-positive tombstone.
+/// Packs-first inverts the staleness: the referenced set is always at
+/// least as fresh as the on-bucket set, so a pack appearing in the
+/// snapshot is either also in the chain set (saved) or genuinely
+/// orphan at some point during the mark (correctly tombstoned, with
+/// the grace window covering in-flight pushes).
 ///
 /// # Errors
 ///
@@ -396,8 +434,15 @@ pub async fn mark(
     prefix: &str,
     opts: MarkOpts,
 ) -> Result<MarkOutcome, PackchainError> {
-    let referenced = list_referenced_packs(store, prefix).await?;
+    // Packs-first ordering (issue #135): the on-bucket snapshot must
+    // be at least as stale as the referenced set. A pack uploaded by a
+    // concurrent push between these two listings is harmless — it
+    // either is not in `on_bucket` (uploaded after the pack list) or
+    // is in `referenced` (uploaded before the pack list AND its
+    // chain.json committed before the chain list). The reverse order
+    // produces false-positive tombstones; see the module docstring.
     let on_bucket = list_pack_shas(store, prefix).await?;
+    let referenced = list_referenced_packs(store, prefix).await?;
     let orphans: Vec<Sha40> = on_bucket
         .into_iter()
         .filter(|sha| !referenced.contains(sha))
@@ -2013,5 +2058,166 @@ mod tests {
         unsafe {
             std::env::remove_var(ENV_GC_GRACE_HOURS);
         }
+    }
+
+    // --- mark list-order race (issue #135) ---------------------------
+
+    /// One-shot post-`list` hook used by [`PostListHookStore`].
+    type PostListHook = Box<dyn FnOnce(&MockStore) + Send>;
+
+    /// Test-only [`ObjectStore`] decorator that runs a one-shot
+    /// callback the first time `list()` returns successfully, *after*
+    /// the inner list completes. Used to simulate a concurrent push
+    /// that uploads a new pack AND commits its `chain.json` between
+    /// `mark`'s two listings — the regression scenario for issue #135.
+    /// Firing on the first list (regardless of prefix) means the hook
+    /// runs between `list_pack_shas` and `list_referenced_packs` under
+    /// either ordering, so the test exercises the race against both
+    /// the buggy chains-first order and the fixed packs-first order.
+    struct PostListHookStore {
+        inner: MockStore,
+        hook: std::sync::Mutex<Option<PostListHook>>,
+    }
+
+    impl PostListHookStore {
+        fn new(inner: MockStore, hook: impl FnOnce(&MockStore) + Send + 'static) -> Self {
+            Self {
+                inner,
+                hook: std::sync::Mutex::new(Some(Box::new(hook))),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for PostListHookStore {
+        async fn list(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<crate::object_store::ObjectMeta>, ObjectStoreError> {
+            let result = self.inner.list(prefix).await;
+            if result.is_ok() {
+                let hook = self.hook.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook(&self.inner);
+                }
+            }
+            result
+        }
+
+        async fn get_to_file(
+            &self,
+            key: &str,
+            dest: &std::path::Path,
+            opts: crate::object_store::GetOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.get_to_file(key, dest, opts).await
+        }
+
+        async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+            self.inner.get_bytes(key).await
+        }
+
+        async fn get_bytes_range(
+            &self,
+            key: &str,
+            range: std::ops::Range<u64>,
+        ) -> Result<Bytes, ObjectStoreError> {
+            self.inner.get_bytes_range(key, range).await
+        }
+
+        async fn put_bytes(
+            &self,
+            key: &str,
+            body: Bytes,
+            opts: PutOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.put_bytes(key, body, opts).await
+        }
+
+        async fn put_path(
+            &self,
+            key: &str,
+            src: &std::path::Path,
+            opts: PutOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.put_path(key, src, opts).await
+        }
+
+        async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
+            self.inner.put_if_absent(key, body).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<crate::object_store::ObjectMeta, ObjectStoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
+            self.inner.copy(src, dst).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_packs_first_ordering_avoids_false_positive_under_concurrent_push() {
+        // Issue #135 regression: a concurrent push that uploads a new
+        // pack AND commits its chain.json between mark's two listings
+        // must not be tombstoned as orphan.
+        //
+        // The hook fires after the FIRST list call against
+        // `<prefix>/packs/` and inserts a new pack pair plus a
+        // chain.json referencing it. With the fixed packs-first
+        // ordering, the new pack is absent from the on-bucket snapshot
+        // (the snapshot was already taken) and present in the
+        // referenced set (the chain.json is committed before the
+        // chain list runs). Either way, the new pack is NOT in the
+        // orphan set.
+        //
+        // Pre-fix (chains-first ordering): the hook would fire after
+        // the chain list, the chain commit would miss the chain
+        // listing, and the pack would appear in `list_pack_shas` →
+        // tombstoned as a false positive. The fix flips the ordering
+        // so this test asserts orphan_count == 0.
+        let inner = MockStore::new();
+        // Seed an existing live chain + its pack so the test exercises
+        // a realistic non-empty state.
+        seed_live_chain(&inner, Some("repo")).await;
+        insert_pack_pair(&inner, Some("repo"), SHA_PACK_LIVE);
+
+        let store = PostListHookStore::new(inner, |inner| {
+            // Simulate the concurrent push landing mid-mark: upload a
+            // fresh pack AND commit its chain.json BEFORE mark's
+            // second listing runs.
+            insert_pack_pair(inner, Some("repo"), SHA_PACK_ORPHAN);
+            let new_chain = ChainManifest {
+                v: 1,
+                tip: sha40(SHA_TIP),
+                full_at: sha40(SHA_FULL),
+                segments: vec![segment(SHA_PACK_ORPHAN, None)],
+            };
+            // `write_chain` is async; the hook is sync, so insert
+            // chain.json directly at the canonical key.
+            let body =
+                serde_json::to_vec_pretty(&new_chain).expect("chain.json serializes for the test");
+            inner.insert("repo/refs/heads/concurrent/chain.json", Bytes::from(body));
+        });
+
+        let outcome = mark(&store, "repo", MarkOpts::default()).await.unwrap();
+        // The fresh pack must NOT be tombstoned: under packs-first
+        // ordering it is either absent from `on_bucket` or present in
+        // `referenced`.
+        assert_eq!(
+            outcome.orphan_count, 0,
+            "packs-first ordering must not tombstone packs uploaded \
+             during mark whose chain commits before the chain listing"
+        );
+        // No tombstone object emitted for an empty orphan set.
+        let gc_metas = store.inner.list("repo/gc/").await.unwrap();
+        assert!(gc_metas.is_empty(), "no tombstone for empty orphan set");
     }
 }
