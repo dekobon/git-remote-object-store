@@ -19,7 +19,8 @@ use std::io;
 
 use thiserror::Error;
 
-use crate::object_store::ObjectStoreError;
+use crate::keys;
+use crate::object_store::{ObjectMeta, ObjectStoreError};
 
 /// Default lock TTL in seconds.
 pub const DEFAULT_LOCK_TTL_SECONDS: u64 = 60;
@@ -31,6 +32,26 @@ pub const DEFAULT_LOCK_TTL_SECONDS: u64 = 60;
 #[allow(clippy::case_sensitive_file_extension_comparisons)]
 pub(crate) fn is_lock_key(key: &str) -> bool {
     key.ends_with(".lock")
+}
+
+/// `true` iff `entries` contains at least one key that represents real
+/// branch data — i.e. NOT a lock file and NOT a `PROTECTED#` marker.
+///
+/// A branch whose only residue is operational metadata (a stale
+/// `*.lock` or a previously-written `PROTECTED#` marker) is treated as
+/// gone for the purposes of "does the branch still exist on the
+/// bucket?" — those keys are coordination state, not user-visible
+/// branch data. Both `ManageBranch::protect` (issue #137) and
+/// `Doctor::fix_head` (issue #138) consult this helper before writing
+/// state that would otherwise re-anchor against a deleted branch.
+pub(crate) fn has_branch_data(entries: &[ObjectMeta]) -> bool {
+    entries.iter().any(|entry| {
+        let last = entry
+            .key
+            .rsplit_once('/')
+            .map_or(entry.key.as_str(), |(_, s)| s);
+        !is_lock_key(&entry.key) && !keys::is_protected_marker_segment(last)
+    })
 }
 
 /// Errors surfaced by the management surface.

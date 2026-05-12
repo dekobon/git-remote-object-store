@@ -393,23 +393,45 @@ impl<'a> Doctor<'a> {
         // object) because a packchain branch is healthy with
         // `chain.json` and `packs/*` but no `.bundle` — there is no
         // single object key that uniquely identifies "branch exists"
-        // across both engines. The `analyze_objects` snapshot pass
-        // treats any object under `refs/heads/<branch>/` as evidence
-        // the branch exists, so we mirror that here.
-        // `keys::join` with a trailing `/` on the suffix produces the
-        // exact `<prefix>/<ref>/` listing prefix `analyze_objects`
-        // walks, so the re-check sees the same shape the original
-        // snapshot did.
+        // across both engines. `keys::join` with a trailing `/` on the
+        // suffix produces a `<prefix>/<ref>/` listing prefix.
+        //
+        // The "branch exists" predicate uses [`super::has_branch_data`],
+        // which excludes `*.lock` keys and the `PROTECTED#` marker.
+        // Those keys are operational metadata — a stale lock file or a
+        // surviving protection marker — that can outlive the user-data
+        // keys (`chain.json`, `packs/*`, `*.bundle`) when a concurrent
+        // delete runs partially. Writing HEAD against a branch whose
+        // only residue is operational metadata would re-create the
+        // invalid-HEAD condition #138 set out to prevent, so we treat
+        // that residue as evidence the branch is gone. Sharing the
+        // helper with `ManageBranch::protect` keeps the two
+        // race-detection paths in lockstep.
         let branch_prefix = keys::join(Some(&self.prefix), &format!("{new_head}/"));
         let recheck = self.store.list(&branch_prefix).await?;
-        if recheck.is_empty() {
-            writeln!(
-                out,
-                "Selected branch {new_head} was deleted between selection and HEAD write; \
-                 refusing to write stale HEAD. Re-run doctor."
-            )?;
+        if !super::has_branch_data(&recheck) {
+            // `recheck` may still be non-empty here if it contains only
+            // operational metadata (lock files, `PROTECTED#` markers);
+            // surface that distinction to the operator so a residual
+            // lock or marker doesn't read as "the branch is back".
+            let residue_only = !recheck.is_empty();
+            if residue_only {
+                writeln!(
+                    out,
+                    "Selected branch {new_head} is considered gone — only operational \
+                     metadata (lock files / PROTECTED# marker) remains under its prefix. \
+                     Refusing to write stale HEAD. Re-run doctor."
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "Selected branch {new_head} was deleted between selection and HEAD write; \
+                     refusing to write stale HEAD. Re-run doctor."
+                )?;
+            }
             warn!(
                 branch = %new_head,
+                residue_only,
                 "doctor fix_head: chosen branch disappeared between snapshot and HEAD write"
             );
             return Err(ManageError::StaleSnapshot(new_head));
@@ -915,6 +937,11 @@ mod tests {
         index: usize,
         mock: MockStore,
         keys_to_delete: Vec<String>,
+        /// Keys to insert (with an empty body) immediately before
+        /// returning the answer — lets a race test seed residue
+        /// (lock files, `PROTECTED#` markers) into the branch prefix
+        /// the doctor is about to re-check.
+        keys_to_insert: Vec<String>,
         fired: std::sync::Mutex<bool>,
     }
 
@@ -924,6 +951,9 @@ mod tests {
             if !*fired {
                 for key in &self.keys_to_delete {
                     let _ = self.mock.remove_key(key);
+                }
+                for key in &self.keys_to_insert {
+                    self.mock.insert(key.clone(), Bytes::new());
                 }
                 *fired = true;
             }
@@ -959,6 +989,7 @@ mod tests {
             index: 1,
             mock: mock.clone(),
             keys_to_delete: vec![format!("myrepo/refs/heads/main/{SHA_A}.bundle")],
+            keys_to_insert: vec![],
             fired: std::sync::Mutex::new(false),
         };
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
@@ -1019,6 +1050,7 @@ mod tests {
             index: 1,
             mock: mock.clone(),
             keys_to_delete: vec![format!("myrepo/refs/heads/dev/{SHA_C}.bundle")],
+            keys_to_insert: vec![],
             fired: std::sync::Mutex::new(false),
         };
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
@@ -1029,6 +1061,80 @@ mod tests {
 
         let head_bytes = mock.get_bytes("myrepo/HEAD").await.expect("HEAD written");
         assert_eq!(&head_bytes[..], b"refs/heads/main");
+    }
+
+    #[tokio::test]
+    async fn fix_head_refuses_when_chosen_branch_left_with_only_lock_or_marker() {
+        // Tightens the #138 race-detection check: an empty re-listing is
+        // not the only "branch is gone" signal. A concurrent partial
+        // delete can leave a stale `LOCK#.lock` and / or a `PROTECTED#`
+        // marker behind after every user-data key (bundles, `chain.json`,
+        // `packs/*`) has been swept. Those keys are operational
+        // metadata, not branch contents — writing HEAD against them would
+        // recreate exactly the invalid-HEAD condition the doctor exists
+        // to prevent.
+        //
+        // We drive the race by seeding the branch with one bundle and
+        // letting the prompter both delete the bundle AND insert the
+        // residue (lock + marker) between candidate selection and the
+        // HEAD-write re-check.
+        let mock = MockStore::new();
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
+        mock.insert(
+            format!("myrepo/refs/heads/dev/{SHA_C}.bundle"),
+            Bytes::from("c"),
+        );
+        // Index 1 == `refs/heads/main` (lexicographic ordering).
+        let prompter = DeleteBeforeReturnPrompter {
+            index: 1,
+            mock: mock.clone(),
+            keys_to_delete: vec![format!("myrepo/refs/heads/main/{SHA_A}.bundle")],
+            keys_to_insert: vec![
+                "myrepo/refs/heads/main/LOCK#.lock".to_owned(),
+                format!("myrepo/refs/heads/main/{}", keys::PROTECTED_MARKER_SEGMENT),
+            ],
+            fired: std::sync::Mutex::new(false),
+        };
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let mut out = Vec::new();
+        let err = doctor
+            .run_into(&mut out)
+            .await
+            .expect_err("residue-only branch must surface as stale snapshot");
+        assert!(
+            matches!(err, ManageError::StaleSnapshot(ref b) if b == "refs/heads/main"),
+            "expected ManageError::StaleSnapshot(refs/heads/main), got {err:?}",
+        );
+
+        // HEAD must NOT have been written — the doctor refused even
+        // though the lock and marker keys make the listing non-empty.
+        assert!(
+            !mock.contains("myrepo/HEAD"),
+            "HEAD was written despite chosen branch having only operational metadata",
+        );
+
+        // The operator-facing output names the branch and explains why
+        // a non-empty listing was still treated as "gone".
+        let output = String::from_utf8(out).expect("doctor output is utf-8");
+        assert!(
+            output.contains("refs/heads/main"),
+            "expected branch name in output:\n{output}",
+        );
+        assert!(
+            output.contains("considered gone"),
+            "expected 'considered gone' framing in output:\n{output}",
+        );
+        assert!(
+            output.contains("operational metadata"),
+            "expected residue rationale in output:\n{output}",
+        );
+        assert!(
+            !output.contains("Setting refs/heads/main as HEAD"),
+            "doctor printed the HEAD-write confirmation despite aborting:\n{output}",
+        );
     }
 
     #[tokio::test]

@@ -245,7 +245,7 @@ impl<'a> ManageBranch<'a> {
     /// [`ManageError::Store`] if a list or put operation fails.
     pub async fn protect(&self) -> Result<(), ManageError> {
         let fresh = self.store.list(&self.branch_prefix()).await?;
-        if !Self::has_branch_data(&fresh) {
+        if !super::has_branch_data(&fresh) {
             warn!(
                 branch = %self.branch,
                 "branch was deleted concurrently between open and protect; refusing to write orphaned marker",
@@ -257,22 +257,6 @@ impl<'a> ManageBranch<'a> {
             .await?;
         println!("Branch {} is now protected", self.branch);
         Ok(())
-    }
-
-    /// `true` iff `entries` contains at least one key that represents
-    /// real branch data — i.e. NOT a lock file and NOT a `PROTECTED#`
-    /// marker. A branch whose only residue is a stale lock or a
-    /// previously-written marker is treated as gone, because writing a
-    /// fresh protection marker against that residue would still leave
-    /// an orphaned marker (#137).
-    fn has_branch_data(entries: &[ObjectMeta]) -> bool {
-        entries.iter().any(|entry| {
-            let last = entry
-                .key
-                .rsplit_once('/')
-                .map_or(entry.key.as_str(), |(_, s)| s);
-            !super::is_lock_key(&entry.key) && !keys::is_protected_marker_segment(last)
-        })
     }
 
     /// Remove the `PROTECTED#` sentinel. A missing marker is treated as
@@ -634,6 +618,10 @@ mod tests {
         assert!(
             rendered.contains("retry to converge"),
             "error message must point at the retry path, got: {rendered}",
+        );
+        assert!(
+            rendered.contains("1 of 3"),
+            "render should pin the count framing, got: {rendered}",
         );
         // The loop did NOT short-circuit on bbb — aaa AND ccc are
         // both gone, and only bbb survives.
