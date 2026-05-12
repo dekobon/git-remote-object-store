@@ -100,9 +100,11 @@ impl<'a> ManageBranch<'a> {
     /// listing is taken immediately before the deletion loop**. The
     /// fresh listing drives the sweep so that any concurrent push
     /// landing under the branch prefix during the prompt window is
-    /// caught and deleted rather than left as a zombie object. The
-    /// protection-marker check is re-evaluated on the fresh listing so a
-    /// `protect` racing with the prompt is honoured. If the fresh
+    /// caught and deleted rather than left as a zombie object (#139).
+    /// The protection-marker check is re-evaluated on the fresh listing
+    /// so a `protect` racing with the prompt is honoured (#131) — the
+    /// post-prompt re-check is what closes the TOCTOU window between
+    /// the initial marker check and the deletion loop. If the fresh
     /// listing is empty (a concurrent delete won the race) the function
     /// reports it and returns `Ok(())` rather than silently claiming
     /// success.
@@ -459,6 +461,10 @@ mod tests {
     enum ConcurrentAction {
         /// Insert `(key, body)` into the store.
         Insert(String, Bytes),
+        /// Insert multiple `(key, body)` pairs in one prompt window —
+        /// used to model an interleaved `git push` + `protect` race
+        /// against a single user prompt (#131).
+        InsertMany(Vec<(String, Bytes)>),
         /// Delete every key currently under `prefix` (simulates a
         /// concurrent `delete-branch` winning the race).
         DeleteAllUnder(String),
@@ -490,6 +496,11 @@ mod tests {
                 .ok_or(ManageError::Cancelled)?;
             match action {
                 ConcurrentAction::Insert(key, body) => self.store.insert(key, body),
+                ConcurrentAction::InsertMany(pairs) => {
+                    for (key, body) in pairs {
+                        self.store.insert(key, body);
+                    }
+                }
                 ConcurrentAction::DeleteAllUnder(prefix) => {
                     for key in self.store.keys() {
                         if key.starts_with(&prefix) {
@@ -571,6 +582,61 @@ mod tests {
         );
         // Both the marker and the original bundle survive.
         assert!(mock.contains("myrepo/refs/heads/main/PROTECTED#"));
+        assert!(mock.contains("myrepo/refs/heads/main/abc.bundle"));
+    }
+
+    #[tokio::test]
+    async fn issue_131_protect_during_prompt_blocks_delete_even_with_concurrent_push() {
+        // Issue #131 regression: TOCTOU between the initial protection
+        // check and the deletion loop. This pins the specific scenario
+        // where a `protect` lands DURING the user prompt — distinct from
+        // #139's pure-push race. The combined push+protect interleaving
+        // here proves two things about the post-prompt re-check:
+        //
+        //   1. The marker check fires on the FRESH listing, not the
+        //      stale initial listing (otherwise the marker is missed
+        //      because it didn't exist when `delete` started).
+        //   2. The marker check takes precedence over the sweep even
+        //      when other concurrent activity (a racing push) would
+        //      otherwise look "successful" — the operator must not
+        //      silently bulldoze a freshly-protected ref just because
+        //      the listing also grew.
+        //
+        // Pre-#139 the marker check was only on the initial listing, so
+        // both concurrent writes were ignored and the original bundle
+        // was deleted. The fix re-lists after the prompt and re-checks
+        // for the marker, refusing the delete entirely.
+        let mock = seed_with_branch("main");
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ConcurrentPrompter::new(
+            mock.clone(),
+            [(
+                ConcurrentAction::InsertMany(vec![
+                    ("myrepo/refs/heads/main/PROTECTED#".to_owned(), Bytes::new()),
+                    (
+                        "myrepo/refs/heads/main/racing-push.bundle".to_owned(),
+                        Bytes::from("pushed during prompt"),
+                    ),
+                ]),
+                true,
+            )],
+        );
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        let err = mb
+            .delete()
+            .await
+            .expect_err("delete must refuse marker even when push also raced");
+        assert!(
+            matches!(err, ManageError::Protected(ref name) if name == "main"),
+            "expected Protected (post-prompt re-check), got {err:?}",
+        );
+        // The marker, the racing push, and the original bundle all
+        // survive — refusal is total, not partial.
+        assert!(mock.contains("myrepo/refs/heads/main/PROTECTED#"));
+        assert!(mock.contains("myrepo/refs/heads/main/racing-push.bundle"));
         assert!(mock.contains("myrepo/refs/heads/main/abc.bundle"));
     }
 
