@@ -343,6 +343,29 @@ pub enum PackchainError {
         /// Tip recorded in `path-index.json` at read time.
         path_index_tip: String,
     },
+
+    /// [`read::read_blob`] retried [`Self::PackMissing`] failures the
+    /// configured number of times and gave up. Each retry reloaded
+    /// `chain.json` and observed that the failing pack key was no
+    /// longer referenced — consistent with a concurrent
+    /// `manage gc sweep` deleting compacted-away packs — but a fresh
+    /// `PackMissing` showed up on the new chain anyway, suggesting a
+    /// vigorous compact+sweep cycle that kept outpacing the reader.
+    /// Distinct from [`Self::PackMissing`] so callers can treat it as
+    /// "retry the whole `read_blob` call later" rather than as a
+    /// permanent bucket inconsistency (issue #136).
+    #[error(
+        "read_blob exhausted {attempts} retries against concurrent GC: \
+         last missing pack `{last_missing_key}`; retry the call"
+    )]
+    ConcurrentGcRetriesExhausted {
+        /// The key whose final `PackMissing` ended the retry loop.
+        last_missing_key: String,
+        /// Number of retry attempts that were made (excluding the
+        /// initial attempt). Pinned in the error so logs and tests can
+        /// assert on it.
+        attempts: u32,
+    },
 }
 
 impl From<gix_pack::bundle::write::Error> for PackchainError {

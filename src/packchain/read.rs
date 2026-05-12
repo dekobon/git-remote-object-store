@@ -36,10 +36,11 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use gix_pack::data::entry::Header as EntryHeader;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::git::RefName;
 use crate::object_store::{ObjectStore, ObjectStoreError};
@@ -47,9 +48,9 @@ use crate::remote::Remote;
 use crate::url::StorageEngine;
 
 use super::PackchainError;
-use super::keys::{pack_idx_key, pack_key};
+use super::keys::{pack_idx_key, pack_key, segment_pack_sha};
 use super::manifest::{load_chain, load_path_index};
-use super::schema::{ChainSegment, PathNode, Sha40};
+use super::schema::{ChainManifest, ChainSegment, PathNode, Sha40};
 
 /// Hard cap on delta-chain depth, matching git's own
 /// `pack.deltaCacheLimit`-adjacent recursion limit. A correctly built
@@ -86,6 +87,26 @@ const MAX_DECOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
 /// reader gives up with [`PackchainError::MalformedPackEntry`]. Each
 /// expansion doubles the range, so 6 retries cover up to ~1 GiB.
 const MAX_RANGE_EXPANSIONS: u32 = 6;
+
+/// Maximum number of times [`read_blob`] reloads `chain.json` and
+/// retries the pack-read phase after observing a [`PackchainError::PackMissing`]
+/// that the reloaded chain shows is no longer referenced — i.e. a
+/// concurrent `manage gc sweep` deleted packs the original chain
+/// snapshot pointed at (issue #136). After this many retries the
+/// reader surfaces [`PackchainError::ConcurrentGcRetriesExhausted`].
+const PACK_MISSING_MAX_RETRIES: u32 = 3;
+
+/// Backoff schedule (per retry attempt) for the [`read_blob`] pack
+/// reload loop. The schedule must have exactly [`PACK_MISSING_MAX_RETRIES`]
+/// entries: index `i` is the sleep before the `i`-th retry. The
+/// growing pattern (100 ms → 500 ms → 2 s) gives a vigorous compact
+/// cycle time to settle without unnecessarily blocking a quick read
+/// when the race was a one-shot.
+const PACK_MISSING_RETRY_BACKOFFS: [Duration; PACK_MISSING_MAX_RETRIES as usize] = [
+    Duration::from_millis(100),
+    Duration::from_millis(500),
+    Duration::from_millis(2_000),
+];
 
 /// In-process LRU cache of decoded pack indices keyed by
 /// `(prefix, content-sha)`.
@@ -316,6 +337,11 @@ impl std::fmt::Debug for PackIndexCache {
 ///   for pack-corruption shapes.
 /// - [`PackchainError::PackMissing`], [`PackchainError::Store`], or
 ///   [`PackchainError::Io`] for transport / I/O failures.
+/// - [`PackchainError::ConcurrentGcRetriesExhausted`] when a
+///   vigorous concurrent `manage gc sweep` kept deleting packs the
+///   reader had just discovered, exhausting the internal retry
+///   schedule. Callers should re-invoke `read_blob` after the
+///   compaction settles.
 pub async fn read_blob(
     remote: &Remote,
     ref_name: &str,
@@ -380,14 +406,14 @@ pub async fn read_blob(
     );
 
     let blob_oid = sha40_to_object_id(&blob_sha);
-    let mut depth = 0u32;
-    let result = read_object_from_chain(
+    let result = read_with_pack_missing_retries(
         remote.store(),
         prefix_opt,
-        &chain.segments,
+        &remote_ref,
+        ref_name,
+        chain,
         &blob_oid,
         cache,
-        &mut depth,
     )
     .await;
     let blob_not_in_chain = || PackchainError::BlobNotInChain {
@@ -411,6 +437,114 @@ pub async fn read_blob(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Pack-read driver for [`read_blob`]. Walks the supplied chain for
+/// `blob_oid`; on a [`PackchainError::PackMissing`] caused by a
+/// concurrent `manage gc sweep` (detected by reloading `chain.json`
+/// and observing that the failing key is no longer referenced), waits
+/// a backoff and retries against the fresh chain. After
+/// [`PACK_MISSING_MAX_RETRIES`] retries gives up with
+/// [`PackchainError::ConcurrentGcRetriesExhausted`] (issue #136).
+///
+/// Path-index is **not** reloaded across retries — the original
+/// `blob_oid` represents the snapshot the caller asked about, and
+/// compaction preserves blob content addressing so the same SHA
+/// resolves in any compatible chain. A new push that overwrote
+/// path-index between the initial load and the retry would resolve
+/// to a different blob SHA, but the read is still well-defined at
+/// the snapshot point (the path-as-of-the-initial-load) and that is
+/// the right semantics for a stateless point-in-time read.
+///
+/// Non-`PackMissing` errors (parse, decompress, transport, etc.)
+/// pass through immediately — they are not retryable in this
+/// fashion and would otherwise wait through the backoff schedule
+/// for no reason. `BlobNotInChain` is also a passthrough so the
+/// caller can attach the user-facing `path` field.
+async fn read_with_pack_missing_retries(
+    store: &dyn ObjectStore,
+    prefix: Option<&str>,
+    remote_ref: &RefName,
+    ref_name: &str,
+    initial_chain: ChainManifest,
+    blob_oid: &gix_hash::ObjectId,
+    cache: &PackIndexCache,
+) -> Result<ResolvedObject, PackchainError> {
+    let mut current_chain = initial_chain;
+    let mut attempt: u32 = 0;
+    loop {
+        let mut depth = 0u32;
+        let result = read_object_from_chain(
+            store,
+            prefix,
+            &current_chain.segments,
+            blob_oid,
+            cache,
+            &mut depth,
+        )
+        .await;
+        let missing_key = match result {
+            Ok(resolved) => return Ok(resolved),
+            Err(PackchainError::PackMissing { key }) => key,
+            Err(e) => return Err(e),
+        };
+        // PackMissing — distinguish concurrent GC (retryable) from
+        // genuine bucket inconsistency (data loss → fail fast).
+        let reloaded = load_chain(store, prefix, remote_ref)
+            .await?
+            .ok_or_else(|| PackchainError::ChainAbsent {
+                ref_name: ref_name.to_owned(),
+            })?;
+        if chain_references_pack_key(&reloaded, prefix, &missing_key)? {
+            // The reloaded chain still names this pack — the bucket
+            // is genuinely missing data the chain still references.
+            // Surface the original PackMissing without retrying.
+            return Err(PackchainError::PackMissing { key: missing_key });
+        }
+        if attempt >= PACK_MISSING_MAX_RETRIES {
+            warn!(
+                ref_name = %ref_name,
+                last_missing_key = %missing_key,
+                attempts = attempt,
+                "read_blob: exhausted pack-missing retries against concurrent GC"
+            );
+            return Err(PackchainError::ConcurrentGcRetriesExhausted {
+                last_missing_key: missing_key,
+                attempts: attempt,
+            });
+        }
+        debug!(
+            ref_name = %ref_name,
+            missing_key = %missing_key,
+            attempt = attempt,
+            "read_blob: PackMissing on chain no longer references the pack — retrying after GC race"
+        );
+        tokio::time::sleep(PACK_MISSING_RETRY_BACKOFFS[attempt as usize]).await;
+        attempt += 1;
+        current_chain = reloaded;
+    }
+}
+
+/// Whether any segment of `chain` would produce a pack or idx key
+/// equal to `missing_key`. Used to distinguish a concurrent
+/// `manage gc sweep` (the key is *not* in the reloaded chain → retry
+/// is safe) from a genuine bucket inconsistency (the key *is* still
+/// referenced → data loss, fail fast). Returns the parse error from
+/// [`segment_pack_sha`] if a segment's `pack` field is malformed.
+fn chain_references_pack_key(
+    chain: &ChainManifest,
+    prefix: Option<&str>,
+    missing_key: &str,
+) -> Result<bool, PackchainError> {
+    for segment in &chain.segments {
+        let content_sha = segment_pack_sha(segment)?;
+        if pack_key(prefix, &content_sha) == missing_key
+            || pack_idx_key(prefix, &content_sha) == missing_key
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Decoded pack object — the kind discriminates blobs from other
@@ -1957,5 +2091,440 @@ mod tests {
         .expect("OFS_DELTA decodes below cap");
         assert_eq!(resolved.payload, b"hi");
         assert_eq!(resolved.kind, ObjectKind::Blob);
+    }
+
+    // --- concurrent-GC retry loop (issue #136) -----------------------------
+    //
+    // `read_blob` must transparently retry `PackMissing` failures that
+    // were caused by a concurrent `manage gc sweep` deleting compacted-
+    // away packs. The retry reloads `chain.json` and inspects whether
+    // the missing key is still referenced (data loss → fail fast) or
+    // gone (GC → retry).
+
+    use crate::packchain::keys::chain_key;
+    use crate::packchain::schema::ChainManifest;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn make_chain_with(tip_hex: &str, pack_sha_hex: &str) -> ChainManifest {
+        ChainManifest {
+            v: ChainManifest::SCHEMA_VERSION,
+            tip: sha40(tip_hex),
+            full_at: sha40(tip_hex),
+            segments: vec![ChainSegment {
+                sha: sha40(tip_hex),
+                parent_sha: None,
+                pack: format!("packs/{pack_sha_hex}.pack"),
+                bytes: 1_024,
+            }],
+        }
+    }
+
+    #[test]
+    fn chain_references_pack_key_matches_pack_and_idx_keys() {
+        let chain = make_chain_with(SHA_A, SHA_B);
+        // Both `.pack` and `.idx` belonging to the same content-sha
+        // are considered referenced.
+        assert!(chain_references_pack_key(&chain, None, &format!("packs/{SHA_B}.pack")).unwrap());
+        assert!(chain_references_pack_key(&chain, None, &format!("packs/{SHA_B}.idx")).unwrap());
+    }
+
+    #[test]
+    fn chain_references_pack_key_returns_false_for_unreferenced_pack() {
+        let chain = make_chain_with(SHA_A, SHA_B);
+        assert!(!chain_references_pack_key(&chain, None, &format!("packs/{SHA_C}.pack")).unwrap());
+        assert!(!chain_references_pack_key(&chain, None, &format!("packs/{SHA_C}.idx")).unwrap());
+    }
+
+    #[test]
+    fn chain_references_pack_key_respects_prefix() {
+        let chain = make_chain_with(SHA_A, SHA_B);
+        // With a prefix, the membership check is against the
+        // prefix-joined key — an un-prefixed key for the same
+        // content-sha is *not* a match (the join differs).
+        assert!(
+            chain_references_pack_key(&chain, Some("repo"), &format!("repo/packs/{SHA_B}.pack"))
+                .unwrap()
+        );
+        assert!(
+            !chain_references_pack_key(&chain, Some("repo"), &format!("packs/{SHA_B}.pack"))
+                .unwrap()
+        );
+    }
+
+    /// `ObjectStore` wrapper that serves a list of `chain.json` bodies
+    /// in order: call 0 returns `bodies[0]`, call 1 returns `bodies[1]`,
+    /// and so on. The last entry is repeated for any further calls.
+    /// All other keys go through to the inner [`MockStore`].
+    ///
+    /// Lets a test simulate compact+sweep happening *between* the
+    /// reader's chain reloads: the reader observes a new chain (a
+    /// different segment set) on each retry without the test needing
+    /// to race a real concurrent task.
+    struct EvolvingChainStore {
+        inner: MockStore,
+        chain_key: String,
+        bodies: Vec<Bytes>,
+        calls: AtomicUsize,
+    }
+
+    impl EvolvingChainStore {
+        fn new(inner: MockStore, chain_key: String, bodies: Vec<Bytes>) -> Self {
+            assert!(!bodies.is_empty(), "must supply at least one chain body");
+            Self {
+                inner,
+                chain_key,
+                bodies,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn chain_calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for EvolvingChainStore {
+        async fn list(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<crate::object_store::ObjectMeta>, ObjectStoreError> {
+            self.inner.list(prefix).await
+        }
+        async fn get_to_file(
+            &self,
+            key: &str,
+            dest: &std::path::Path,
+            opts: crate::object_store::GetOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.get_to_file(key, dest, opts).await
+        }
+        async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+            if key == self.chain_key {
+                let idx = self.calls.fetch_add(1, Ordering::SeqCst);
+                let pick = idx.min(self.bodies.len() - 1);
+                return Ok(self.bodies[pick].clone());
+            }
+            self.inner.get_bytes(key).await
+        }
+        async fn get_bytes_range(
+            &self,
+            key: &str,
+            range: std::ops::Range<u64>,
+        ) -> Result<Bytes, ObjectStoreError> {
+            self.inner.get_bytes_range(key, range).await
+        }
+        async fn put_bytes(
+            &self,
+            key: &str,
+            body: Bytes,
+            opts: crate::object_store::PutOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.put_bytes(key, body, opts).await
+        }
+        async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
+            self.inner.put_if_absent(key, body).await
+        }
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<crate::object_store::ObjectMeta, ObjectStoreError> {
+            self.inner.head(key).await
+        }
+        async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
+            self.inner.copy(src, dst).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Build a real v2 `.idx` carrying a single object: `target_sha` at
+    /// pack offset `pack_offset`. `gix_pack`'s parser validates the
+    /// fanout and table sizes, so this must match the format exactly.
+    fn build_one_object_v2_idx(target_sha: &Sha40, pack_offset: u32) -> Vec<u8> {
+        // Decode the 40-hex sha into 20 raw bytes. `gix_hash::ObjectId`
+        // already does this for us — re-use it rather than hand-rolling
+        // a hex parser.
+        let oid = sha40_to_object_id(target_sha);
+        let sha_bytes = oid.as_bytes();
+        let first_byte = sha_bytes[0];
+
+        let mut data = Vec::with_capacity(8 + 256 * 4 + 20 + 4 + 4 + 20 + 20);
+        // V2 magic + version.
+        data.extend_from_slice(b"\xfftOc");
+        data.extend_from_slice(&2u32.to_be_bytes());
+        // Fanout: cumulative count of objects with sha[0] <= i. With a
+        // single object whose first byte is `first_byte`, every entry
+        // from `first_byte` onwards is 1. `u8::try_from(i)` cannot fail
+        // for `i in 0u16..256`.
+        for i in 0u16..256 {
+            let count = u32::from(u8::try_from(i).expect("0..256 fits in u8") >= first_byte);
+            data.extend_from_slice(&count.to_be_bytes());
+        }
+        // Names table (20 bytes per sha).
+        data.extend_from_slice(sha_bytes);
+        // CRC32 table (one u32; value is unused by `lookup`).
+        data.extend_from_slice(&0u32.to_be_bytes());
+        // Offset table (one u32; MSB clear → 32-bit absolute offset).
+        data.extend_from_slice(&pack_offset.to_be_bytes());
+        // Pack trailer (20-byte sha placeholder) + idx trailer
+        // (20-byte sha placeholder). The parser doesn't validate the
+        // content of either against the body for `from_data`.
+        data.extend_from_slice(&[0u8; 20]);
+        data.extend_from_slice(&[0u8; 20]);
+        data
+    }
+
+    /// Convenience: turn the `tip_hex` and `pack_sha_hex` strings into
+    /// a serialised chain.json `Bytes` body the wrapper can return.
+    fn chain_json_bytes(tip_hex: &str, pack_sha_hex: &str) -> Bytes {
+        let json = make_chain_with(tip_hex, pack_sha_hex)
+            .to_json_pretty()
+            .expect("chain serialise");
+        Bytes::from(json)
+    }
+
+    /// GC-race retry succeeds: the initial chain points at pack P1
+    /// (absent from the store — simulating "already deleted by a
+    /// concurrent sweep"); the reloaded chain points at pack P2 which
+    /// is fully present (real one-object `.idx` + zlib-compressed
+    /// blob entry). The retry must find the blob via P2 and return
+    /// the payload.
+    #[tokio::test]
+    async fn read_with_pack_missing_retries_succeeds_after_chain_reload() {
+        let inner = MockStore::new();
+        let cache = PackIndexCache::default();
+
+        let p1_sha = sha40(SHA_A);
+        let p2_sha = sha40(SHA_B);
+        let blob_payload = b"recovered blob";
+        // The blob's git OID — `gix_hash::ObjectId` for "hello blob"
+        // shape. We don't compute the real git sha here; we register
+        // the same sha in both the .idx names table and in
+        // `target_oid` so `gix_pack::index::File::lookup` returns the
+        // single object.
+        let blob_oid_sha = sha40(SHA_C);
+        let blob_oid = sha40_to_object_id(&blob_oid_sha);
+
+        // Build a P2 pack containing one Blob entry at offset 0.
+        let mut pack = Vec::new();
+        let mut offsets = Vec::new();
+        push_pack_entry(
+            &mut pack,
+            &mut offsets,
+            3, /* BLOB */
+            None,
+            blob_payload,
+        );
+        inner.insert(pack_key(None, &p2_sha), Bytes::from(pack.clone()));
+
+        // Build the corresponding one-object v2 .idx for P2 and plant
+        // it under the canonical idx key. `read_object_from_chain`
+        // will load it via `load_index`.
+        let idx_bytes = build_one_object_v2_idx(&blob_oid_sha, 0);
+        inner.insert(pack_idx_key(None, &p2_sha), Bytes::from(idx_bytes));
+
+        // The reader enters the helper carrying chain v1 (refs P1,
+        // absent from the store). When it reloads `chain.json` after
+        // the first PackMissing, the wrapper serves v2 (refs P2 with
+        // a working idx + pack), simulating a compact+sweep that
+        // happened between the reader's two loads.
+        let chain_key = chain_key(None, "refs/heads/main");
+        let v1 = chain_json_bytes(SHA_A, p1_sha.as_str());
+        let v2 = chain_json_bytes(SHA_A, p2_sha.as_str());
+        let store = EvolvingChainStore::new(inner, chain_key, vec![v2]);
+
+        let initial = ChainManifest::from_json_bytes(&v1).expect("chain v1 parses");
+        let remote_ref = RefName::new("refs/heads/main").expect("ref name valid");
+
+        let resolved = read_with_pack_missing_retries(
+            &store,
+            None,
+            &remote_ref,
+            "refs/heads/main",
+            initial,
+            &blob_oid,
+            &cache,
+        )
+        .await
+        .expect("retry must succeed after chain reload");
+        assert_eq!(resolved.payload, blob_payload);
+        assert_eq!(resolved.kind, ObjectKind::Blob);
+        // Exactly one chain reload was needed — the first read against
+        // the initial in-memory chain, then one reload that swapped to
+        // v2 referencing P2.
+        assert_eq!(
+            store.chain_calls(),
+            1,
+            "exactly one chain reload should have fired"
+        );
+    }
+
+    /// `PackMissing` where the reload still references the same pack
+    /// means genuine data loss — the bucket is missing a pack
+    /// `chain.json` still names. The reader must fail fast with
+    /// `PackMissing` rather than retry forever or upgrade to the
+    /// concurrent-GC retry-exhausted variant.
+    #[tokio::test]
+    async fn read_with_pack_missing_retries_fails_fast_when_chain_still_references_missing_pack() {
+        let inner = MockStore::new();
+        let cache = PackIndexCache::default();
+
+        let p1_sha = sha40(SHA_A);
+        let blob_oid = sha40_to_object_id(&sha40(SHA_C));
+
+        // Initial and reloaded chain both reference the same missing
+        // pack — the "data loss" scenario, distinct from GC.
+        let chain_key = chain_key(None, "refs/heads/main");
+        let body = chain_json_bytes(SHA_A, p1_sha.as_str());
+        let store = EvolvingChainStore::new(inner, chain_key, vec![body.clone()]);
+        let initial = ChainManifest::from_json_bytes(&body).expect("chain parses");
+        let remote_ref = RefName::new("refs/heads/main").expect("ref name valid");
+
+        let err = read_with_pack_missing_retries(
+            &store,
+            None,
+            &remote_ref,
+            "refs/heads/main",
+            initial,
+            &blob_oid,
+            &cache,
+        )
+        .await
+        .expect_err("missing pack still in chain must fail fast");
+        match err {
+            PackchainError::PackMissing { key } => {
+                assert!(
+                    key.contains(&format!("packs/{SHA_A}")),
+                    "PackMissing key should name the missing pack, got {key}",
+                );
+            }
+            other => panic!("expected fail-fast PackMissing, got {other:?}"),
+        }
+        // Exactly one chain reload was issued (to verify the missing
+        // key was still referenced) — no further reloads or sleeps.
+        assert_eq!(store.chain_calls(), 1);
+    }
+
+    /// Retries are exhausted when each reload shows a *different*
+    /// missing pack — i.e. compact+sweep keeps outpacing the reader.
+    /// After `PACK_MISSING_MAX_RETRIES` retries the call surfaces
+    /// `ConcurrentGcRetriesExhausted` with the last observed key.
+    #[tokio::test(start_paused = true)]
+    async fn read_with_pack_missing_retries_surfaces_exhausted_after_max_retries() {
+        // `start_paused` lets the tokio runtime auto-advance time
+        // through the backoff sleeps so the test doesn't pay the
+        // wall-clock 2.6 s worst case.
+        let inner = MockStore::new();
+        let cache = PackIndexCache::default();
+
+        let blob_oid = sha40_to_object_id(&sha40(SHA_C));
+
+        // Five distinct chain versions, each referencing a different
+        // missing pack. The initial in-memory chain is v1; the
+        // wrapper serves v2..v5 on successive reloads. The reader's
+        // walk is:
+        //   - attempt 0 with v1 → PackMissing(P0); reload → v2 (refs P1)
+        //   - attempt 1 with v2 → PackMissing(P1); reload → v3 (refs P2)
+        //   - attempt 2 with v3 → PackMissing(P2); reload → v4 (refs P3)
+        //   - attempt 3 with v4 → PackMissing(P3); reload → v5 (refs P4)
+        //     → attempt >= MAX → exhausted with key for P3.
+        let pack_shas = [
+            "0000000000000000000000000000000000000000",
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+            "3333333333333333333333333333333333333333",
+            "4444444444444444444444444444444444444444",
+        ];
+        let chain_key = chain_key(None, "refs/heads/main");
+        let v1 = chain_json_bytes(SHA_A, pack_shas[0]);
+        let reload_bodies: Vec<Bytes> = pack_shas[1..]
+            .iter()
+            .map(|sha| chain_json_bytes(SHA_A, sha))
+            .collect();
+        let initial = ChainManifest::from_json_bytes(&v1).expect("chain v1 parses");
+        let store = EvolvingChainStore::new(inner, chain_key, reload_bodies);
+        let remote_ref = RefName::new("refs/heads/main").expect("ref name valid");
+
+        let err = read_with_pack_missing_retries(
+            &store,
+            None,
+            &remote_ref,
+            "refs/heads/main",
+            initial,
+            &blob_oid,
+            &cache,
+        )
+        .await
+        .expect_err("exhausted retries must error");
+        match err {
+            PackchainError::ConcurrentGcRetriesExhausted {
+                last_missing_key,
+                attempts,
+            } => {
+                // The last attempt was against v4 referencing P3
+                // (the fourth pack in our table). `attempts` records
+                // retries beyond the initial attempt: 3.
+                assert_eq!(attempts, PACK_MISSING_MAX_RETRIES);
+                assert!(
+                    last_missing_key.contains(pack_shas[3]),
+                    "last missing key should name pack[3], got {last_missing_key}"
+                );
+            }
+            other => panic!("expected ConcurrentGcRetriesExhausted, got {other:?}"),
+        }
+        // Exactly MAX_RETRIES + 1 reloads: one verification per
+        // attempted read. Each reload showed the missing pack absent
+        // from the freshly-loaded chain so the loop kept retrying
+        // (or, on the final reload, recorded "exhausted").
+        assert_eq!(
+            store.chain_calls(),
+            usize::try_from(PACK_MISSING_MAX_RETRIES + 1).unwrap()
+        );
+    }
+
+    /// Non-PackMissing errors are not retried — they pass through
+    /// directly. Otherwise a transport error or a malformed pack would
+    /// wait through the backoff schedule for no reason.
+    #[tokio::test]
+    async fn read_with_pack_missing_retries_does_not_retry_on_non_pack_missing_errors() {
+        let inner = MockStore::new();
+        let cache = PackIndexCache::default();
+
+        // Plant a malformed `.idx` for the chain's pack. `load_index`
+        // will parse-fail with `MalformedPackEntry`, *not*
+        // `PackMissing`, so the retry path must not fire.
+        let p1_sha = sha40(SHA_A);
+        inner.insert(
+            pack_idx_key(None, &p1_sha),
+            Bytes::from_static(b"not a real idx"),
+        );
+
+        let chain_key = chain_key(None, "refs/heads/main");
+        let body = chain_json_bytes(SHA_A, p1_sha.as_str());
+        let store = EvolvingChainStore::new(inner, chain_key, vec![body.clone()]);
+        let initial = ChainManifest::from_json_bytes(&body).expect("chain parses");
+        let remote_ref = RefName::new("refs/heads/main").expect("ref name valid");
+        let blob_oid = sha40_to_object_id(&sha40(SHA_C));
+
+        let err = read_with_pack_missing_retries(
+            &store,
+            None,
+            &remote_ref,
+            "refs/heads/main",
+            initial,
+            &blob_oid,
+            &cache,
+        )
+        .await
+        .expect_err("malformed idx must surface immediately");
+        assert!(
+            matches!(err, PackchainError::MalformedPackEntry { .. }),
+            "expected MalformedPackEntry passthrough, got {err:?}"
+        );
+        // No chain reloads — the error path did not enter the retry
+        // branch at all.
+        assert_eq!(store.chain_calls(), 0);
     }
 }
