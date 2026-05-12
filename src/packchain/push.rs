@@ -25,9 +25,9 @@ use crate::git::{self, PeeledTip, RefName, Sha};
 use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
 use crate::protocol::push::{
-    self as bundle_push, NOT_ANCESTOR_TOKEN, PushError, PushOutcome, PushSpec, acquire_lock,
-    bundle_progress_sink, delete_idempotent, head_key, is_protected, lock_key, lock_ttl_from_env,
-    parse_push_args, ref_listing_prefix,
+    self as bundle_push, DELETE_PROTECTION_MESSAGE, NOT_ANCESTOR_TOKEN, PushError, PushOutcome,
+    PushSpec, acquire_lock, bundle_progress_sink, delete_idempotent, head_key, is_protected,
+    lock_key, lock_ttl_from_env, parse_push_args, ref_listing_prefix,
 };
 use crate::url::StorageEngine;
 
@@ -891,15 +891,6 @@ async fn force_push_baseline_cleanup(
     }
 }
 
-/// Canonical wire-format message returned when a delete is refused
-/// because a `PROTECTED#` marker is present under the ref. Mirrors the
-/// bundle engine's wording in
-/// [`crate::protocol::push::delete_remote_ref_under_lock`] byte-for-byte
-/// so both engines surface identical errors to git/clients. Tests pin
-/// this string against the bundle engine's copy via the test-module
-/// constant of the same name.
-const DELETE_PROTECTION_MESSAGE: &str = r#""ref is protected. Run git-remote-object-store unprotect <url> <branch> to remove protection before deleting."?"#;
-
 /// Returns `true` iff any listed entry's final path segment is the
 /// literal `PROTECTED#` marker. Used by [`delete_remote_ref_packchain`]
 /// to refuse deletion of a protected ref. The
@@ -1430,31 +1421,6 @@ mod tests {
 
     // --- Issue #130: delete must honor the PROTECTED# marker ---
 
-    /// Compile-time guard that the packchain delete-protection message
-    /// matches the bundle engine's wording byte-for-byte. If the bundle
-    /// engine's wire-format ever drifts, this assertion fails the
-    /// build and forces both engines to stay in lockstep.
-    ///
-    /// The bundle engine's wording is inlined as a literal here because
-    /// it is not exposed as a `pub` constant from `protocol::push`.
-    const _: () = {
-        let a = super::DELETE_PROTECTION_MESSAGE.as_bytes();
-        let b = r#""ref is protected. Run git-remote-object-store unprotect <url> <branch> to remove protection before deleting."?"#
-            .as_bytes();
-        let mut i = 0;
-        let mut differs = a.len() != b.len();
-        while i < a.len() && i < b.len() {
-            if a[i] != b[i] {
-                differs = true;
-            }
-            i += 1;
-        }
-        assert!(
-            !differs,
-            "packchain DELETE_PROTECTION_MESSAGE must match bundle engine wording",
-        );
-    };
-
     /// Regression for #130: a `PROTECTED#` marker present alongside the
     /// chain manifest must cause the delete to refuse with the canonical
     /// protection wire message. Both seeded keys (chain.json and the
@@ -1643,6 +1609,72 @@ mod tests {
         assert!(
             !store.contains(&lock_key(prefix, &remote)),
             "lock must be released after a successful unprotected delete",
+        );
+    }
+
+    /// Regression for #130: when the under-lock `list` call itself
+    /// errors (transport failure, `AccessDenied`, …), the function must
+    /// surface the store error AND release the lock cleanly before
+    /// returning. A pre-fix code path that returned `?` directly from
+    /// the list call would leak the LOCK#.lock key, blocking every
+    /// subsequent push/delete on the ref until TTL recovery.
+    #[tokio::test]
+    async fn delete_remote_ref_packchain_releases_lock_on_list_failure() {
+        use crate::object_store::mock::Fault;
+
+        let store = Arc::new(MockStore::new());
+        let prefix = Some("repo");
+        let remote = rn("refs/heads/main");
+        let chain = chain_key(prefix, &remote);
+        let listing = ref_listing_prefix(prefix, &remote);
+        let lock = lock_key(prefix, &remote);
+
+        // Seed chain.json so the under-lock `head` probe succeeds and
+        // execution reaches the `list` call.
+        store.insert(&chain, Bytes::from_static(b"{}"));
+
+        // Arm a one-shot list fault scoped to the ref-listing prefix.
+        // The fault fires once and is then consumed, so any subsequent
+        // delete in `release_lock` proceeds normally.
+        store.arm(Fault::AccessDeniedOnList { prefix: listing });
+
+        let config = delete_test_config();
+        let result = delete_remote_ref_packchain(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            prefix,
+            &remote,
+            &config,
+            OffsetDateTime::now_utc(),
+        )
+        .await;
+
+        // The list error must propagate as a store error — the
+        // function must NOT silently return Ok or convert the failure
+        // into a per-ref Error outcome.
+        match result {
+            Err(PushError::Store(_)) => {}
+            Err(other) => panic!("expected PushError::Store, got {other:?}"),
+            Ok(outcome) => panic!("expected list-failure error, got Ok({outcome:?})"),
+        }
+
+        // Witness: the listing fault was consumed exactly once.
+        assert_eq!(
+            store.pending_faults(),
+            0,
+            "armed list-fault must have fired exactly once on the under-lock listing",
+        );
+
+        // Critical: no orphan lock survives the call. Even though the
+        // listing failed, `release_lock` must have run before the
+        // function returned.
+        assert!(
+            !store.contains(&lock),
+            "lock key must be released even when the under-lock list call fails",
+        );
+        // chain.json is untouched on the error path (sweep never ran).
+        assert!(
+            store.contains(&chain),
+            "chain.json must NOT be swept when the listing call failed before the sweep",
         );
     }
 

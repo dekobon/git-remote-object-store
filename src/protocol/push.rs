@@ -69,6 +69,15 @@ pub(crate) const ENV_LOCK_TTL_SECONDS: &str = "GIT_REMOTE_OBJECT_STORE_LOCK_TTL_
 /// `spec/live/*/force_push_spec.sh`.
 pub(crate) const NOT_ANCESTOR_TOKEN: &str = "not ancestor";
 
+/// Canonical wire-format message returned when a delete is refused
+/// because a `PROTECTED#` marker is present under the ref. Shared by
+/// the bundle engine ([`delete_remote_ref_under_lock`]) and the
+/// packchain engine ([`crate::packchain`]'s `delete_remote_ref_packchain`)
+/// so both surface identical bytes to git/clients. A single source of
+/// truth here avoids the duplicate-literal drift that a `const _` byte
+/// equality guard previously had to defend against.
+pub(crate) const DELETE_PROTECTION_MESSAGE: &str = r#""ref is protected. Run git-remote-object-store unprotect <url> <branch> to remove protection before deleting."?"#;
+
 /// Errors surfaced by the push path. These abort the helper — per-ref
 /// failures (multi-bundle, ancestor mismatch, lock contention, ...) are
 /// returned as [`PushOutcome::Error`] without aborting the batch.
@@ -1325,9 +1334,7 @@ async fn delete_remote_ref_under_lock(
     if has_protected_marker {
         return Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
-            message:
-                r#""ref is protected. Run git-remote-object-store unprotect <url> <branch> to remove protection before deleting."?"#
-                    .to_owned(),
+            message: DELETE_PROTECTION_MESSAGE.to_owned(),
         });
     }
     if entries.len() == expected {

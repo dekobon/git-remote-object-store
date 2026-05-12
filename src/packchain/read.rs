@@ -108,6 +108,17 @@ const PACK_MISSING_RETRY_BACKOFFS: [Duration; PACK_MISSING_MAX_RETRIES as usize]
     Duration::from_millis(2_000),
 ];
 
+/// Compile-time pin: the backoff schedule must have exactly one entry
+/// per retry attempt. If the cap and the schedule ever drift apart
+/// (e.g. someone bumps the cap without extending the array, or trims
+/// the array without lowering the cap), the resulting index into
+/// `PACK_MISSING_RETRY_BACKOFFS` at the loop's last attempt would
+/// panic at runtime. Catch the desync at build time instead.
+const _: () = assert!(
+    PACK_MISSING_RETRY_BACKOFFS.len() == PACK_MISSING_MAX_RETRIES as usize,
+    "PACK_MISSING_RETRY_BACKOFFS length must equal PACK_MISSING_MAX_RETRIES",
+);
+
 /// In-process LRU cache of decoded pack indices keyed by
 /// `(prefix, content-sha)`.
 ///
@@ -2526,5 +2537,65 @@ mod tests {
         // No chain reloads — the error path did not enter the retry
         // branch at all.
         assert_eq!(store.chain_calls(), 0);
+    }
+
+    /// Regression for #136: a chain reload that itself errors (transport
+    /// failure on `chain.json`) must surface as `PackchainError::Store`
+    /// — NOT be converted into `ConcurrentGcRetriesExhausted` and NOT
+    /// swallowed back into the original `PackMissing`. The retry loop
+    /// uses `?` on `load_chain`, so a network fault during reload
+    /// short-circuits to the wrapped store error.
+    ///
+    /// Setup: initial in-memory chain refs P1; the store has no pack
+    /// for P1 (so the first read fails with `PackMissing`), and a
+    /// one-shot `NetworkOnGetBytes` fault armed on the chain key
+    /// fires when the retry loop calls `load_chain`.
+    #[tokio::test]
+    async fn read_with_pack_missing_retries_surfaces_chain_reload_error() {
+        use crate::object_store::mock::Fault;
+
+        let store = MockStore::new();
+        let cache = PackIndexCache::default();
+
+        let p1_sha = sha40(SHA_A);
+        let blob_oid = sha40_to_object_id(&sha40(SHA_C));
+
+        // Initial chain refs P1, which is absent from the store. The
+        // first pack-read will surface PackMissing, sending the loop
+        // into its reload branch.
+        let chain_key_str = chain_key(None, "refs/heads/main");
+        let body = chain_json_bytes(SHA_A, p1_sha.as_str());
+        let initial = ChainManifest::from_json_bytes(&body).expect("chain v1 parses");
+        let remote_ref = RefName::new("refs/heads/main").expect("ref name valid");
+
+        // Arm a network fault on the chain key. `load_chain` calls
+        // `store.get_bytes(chain_key)`; the fault fires there and the
+        // wrapped error must propagate out of the retry helper.
+        store.arm(Fault::NetworkOnGetBytes { key: chain_key_str });
+
+        let err = read_with_pack_missing_retries(
+            &store,
+            None,
+            &remote_ref,
+            "refs/heads/main",
+            initial,
+            &blob_oid,
+            &cache,
+        )
+        .await
+        .expect_err("chain reload failure must surface as an error");
+
+        assert!(
+            matches!(err, PackchainError::Store(_)),
+            "expected PackchainError::Store wrapping the chain-reload transport error; \
+             a regression that swallowed the reload error would yield \
+             ConcurrentGcRetriesExhausted or the original PackMissing instead. got {err:?}"
+        );
+        // Fault was consumed exactly once by the single reload attempt.
+        assert_eq!(
+            store.pending_faults(),
+            0,
+            "armed chain-reload fault must have fired exactly once"
+        );
     }
 }
