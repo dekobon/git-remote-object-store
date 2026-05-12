@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use super::{ManageError, Prompter};
 use crate::git::RefName;
 use crate::keys;
-use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
+use crate::object_store::{ObjectStore, ObjectStoreError, PutOpts};
 
 /// Operations on a single branch within a repository.
 pub struct ManageBranch<'a> {
@@ -132,7 +132,7 @@ impl<'a> ManageBranch<'a> {
     pub async fn delete(&self) -> Result<(), ManageError> {
         let prefix = self.branch_prefix();
         let initial = self.store.list(&prefix).await?;
-        if Self::contains_protected_marker(&initial) {
+        if keys::entries_have_protected_marker(&initial) {
             return Err(ManageError::Protected(self.branch.clone()));
         }
         let prompt = format!("Delete branch {} ({} objects)?", self.branch, initial.len());
@@ -158,7 +158,7 @@ impl<'a> ManageBranch<'a> {
             );
             return Ok(());
         }
-        if Self::contains_protected_marker(&fresh) {
+        if keys::entries_have_protected_marker(&fresh) {
             return Err(ManageError::Protected(self.branch.clone()));
         }
 
@@ -207,21 +207,6 @@ impl<'a> ManageBranch<'a> {
         println!("Branch {} has been deleted", self.branch);
         info!(branch = %self.branch, count = fresh.len(), "branch deleted");
         Ok(())
-    }
-
-    /// `true` iff `entries` contains a key whose final segment is the
-    /// `PROTECTED#` marker. Used by [`delete`] on both the initial and
-    /// the fresh listing so a `protect` that lands during the prompt
-    /// window is still honoured.
-    ///
-    /// [`delete`]: ManageBranch::delete
-    fn contains_protected_marker(entries: &[ObjectMeta]) -> bool {
-        entries.iter().any(|entry| {
-            entry
-                .key
-                .rsplit_once('/')
-                .is_some_and(|(_, last)| keys::is_protected_marker_segment(last))
-        })
     }
 
     /// Mark the branch as protected by writing the `PROTECTED#` sentinel.

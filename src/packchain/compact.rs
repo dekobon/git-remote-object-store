@@ -51,7 +51,7 @@ use crate::protocol::push::{acquire_lock, lock_key, release_lock};
 use super::PackchainError;
 use super::audit::{COMPACT_BYTES_THRESHOLD, COMPACT_SEGMENTS_THRESHOLD};
 use super::fetch::install_pack;
-use super::gc::write_baseline_tombstone;
+use super::gc::write_baseline_tombstone_best_effort;
 use super::keys::{pack_idx_key, pack_key, pack_key_from_relative};
 use super::manifest::{load_chain, write_chain, write_path_index};
 use super::pack::build_baseline_pack;
@@ -601,18 +601,19 @@ async fn tombstone_prior_baseline_bundle(
     prior_full_sha: &Sha40,
     current_full_sha: &Sha40,
 ) {
-    if let Err(e) =
-        write_baseline_tombstone(store, prefix, ref_name, prior_full_sha, current_full_sha).await
-    {
-        let orphan_key = keys::bundle_key(prefix, ref_name, prior_full_sha.as_str());
-        warn!(
-            ref_path = %ref_name.as_str(),
-            key = %orphan_key,
-            error = %e,
-            "compact: prior baseline tombstone write failed (chain.json already committed); \
-             orphan bundle left for manual cleanup",
-        );
-    } else {
+    let wrote = write_baseline_tombstone_best_effort(
+        store,
+        prefix,
+        ref_name,
+        prior_full_sha,
+        current_full_sha,
+        "compact",
+    )
+    .await;
+    // The helper covers the warn-on-Err shape both call sites share;
+    // the compact-specific success trace stays here because the
+    // force-push caller does not emit it.
+    if wrote {
         debug!(
             ref_path = %ref_name.as_str(),
             prior = %prior_full_sha.as_str(),

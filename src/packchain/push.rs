@@ -23,16 +23,16 @@ use tracing::{debug, info, warn};
 
 use crate::git::{self, PeeledTip, RefName, Sha};
 use crate::keys;
-use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
+use crate::object_store::{ObjectStore, ObjectStoreError, PutOpts};
 use crate::protocol::push::{
-    self as bundle_push, DELETE_PROTECTION_MESSAGE, NOT_ANCESTOR_TOKEN, PushError, PushOutcome,
-    PushSpec, acquire_lock, bundle_progress_sink, delete_idempotent, head_key, is_protected,
-    lock_key, lock_ttl_from_env, parse_push_args, ref_listing_prefix,
+    self as bundle_push, DELETE_PROTECTION_MESSAGE, PushError, PushOutcome, PushSpec, acquire_lock,
+    bundle_progress_sink, delete_idempotent, head_key, is_protected, lock_key, lock_ttl_from_env,
+    not_ancestor_wire_message, parse_push_args, ref_listing_prefix,
 };
 use crate::url::StorageEngine;
 
 use super::PackchainError;
-use super::gc::write_baseline_tombstone;
+use super::gc::write_baseline_tombstone_best_effort;
 use super::keys::{chain_key, pack_idx_key, pack_key};
 use super::manifest::{load_chain, next_manifest, write_chain, write_path_index};
 use super::pack::{BuiltPack, build_baseline_pack, build_incremental_pack};
@@ -413,9 +413,7 @@ fn probe_error_to_outcome(
 ) -> PushOutcome {
     let message = match err {
         GitProbeError::LocalRefNotFound => format!(r#""{local_spec} not found"?"#),
-        GitProbeError::NotAncestor => {
-            format!(r#""remote ref is {NOT_ANCESTOR_TOKEN} of {local_spec}."?"#)
-        }
+        GitProbeError::NotAncestor => not_ancestor_wire_message(local_spec),
         GitProbeError::Shallow => {
             r#""cannot push from a shallow clone: rev-walk crosses a shallow boundary"?"#.to_owned()
         }
@@ -689,7 +687,7 @@ async fn perform_push_under_lock(
     if force && !prior_was_ancestor && is_protected(store, prefix, &remote_ref).await? {
         return Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
-            message: format!(r#""remote ref is {NOT_ANCESTOR_TOKEN} of {local_spec}."?"#),
+            message: not_ancestor_wire_message(&local_spec),
         });
     }
 
@@ -879,31 +877,15 @@ async fn force_push_baseline_cleanup(
     let Some(prior) = prior else {
         return;
     };
-    if let Err(e) =
-        write_baseline_tombstone(store, prefix, remote_ref, &prior.full_at, local_sha40).await
-    {
-        let orphan_key = keys::bundle_key(prefix, remote_ref, prior.full_at.as_str());
-        warn!(
-            key = %orphan_key,
-            error = %e,
-            "force-push baseline tombstone write failed (push already committed)",
-        );
-    }
-}
-
-/// Returns `true` iff any listed entry's final path segment is the
-/// literal `PROTECTED#` marker. Used by [`delete_remote_ref_packchain`]
-/// to refuse deletion of a protected ref. The
-/// [`keys::is_protected_marker_segment`] predicate matches only the
-/// exact `PROTECTED#` segment — never the `LOCK#.lock` lock key or a
-/// `PROTECTED#`-prefixed sibling (#119) — so an unfiltered listing is
-/// safe to scan here without first removing the held lock key.
-fn entries_contain_protected_marker(entries: &[ObjectMeta]) -> bool {
-    entries.iter().any(|e| {
-        e.key
-            .rsplit_once('/')
-            .is_some_and(|(_, last)| keys::is_protected_marker_segment(last))
-    })
+    write_baseline_tombstone_best_effort(
+        store,
+        prefix,
+        remote_ref,
+        &prior.full_at,
+        local_sha40,
+        "force-push",
+    )
+    .await;
 }
 
 /// Delete a packchain-engine ref: remove `chain.json`, `path-index.json`,
@@ -1018,7 +1000,7 @@ async fn delete_remote_ref_packchain(
     // Issue #130: PROTECTED# marker check against the fresh, under-lock
     // listing, BEFORE the sweep. Mirrors the bundle engine's first-guard
     // protection check in `protocol::push::delete_remote_ref_under_lock`.
-    if entries_contain_protected_marker(&entries) {
+    if keys::entries_have_protected_marker(&entries) {
         if let Err(e) = bundle_push::release_lock(guard).await {
             warn!(
                 key = %lock,

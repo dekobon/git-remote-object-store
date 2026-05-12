@@ -143,6 +143,98 @@ use super::schema::{ChainManifest, Sha40};
 /// elapsed since `marked_at`.
 pub const DEFAULT_GRACE_HOURS: u64 = 24;
 
+/// Decision returned by [`check_grace_window`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraceDecision {
+    /// `marked_at` is recent enough that the tombstone must remain.
+    Within,
+    /// `marked_at` is older than `grace_hours`; the sweep may proceed.
+    Past,
+}
+
+/// Format `now` as an RFC 3339 string and wrap the underlying
+/// formatter error in a [`PackchainError::Io`]. Centralises the
+/// `OffsetDateTime::format` + `map_err` shape previously inlined at
+/// the two tombstone-write paths in [`write_baseline_tombstone`] and
+/// [`mark`].
+fn rfc3339_now() -> Result<String, PackchainError> {
+    OffsetDateTime::now_utc().format(&Rfc3339).map_err(|e| {
+        PackchainError::Io(std::io::Error::other(format!("rfc3339 format failed: {e}")))
+    })
+}
+
+/// Parse `marked_at` as RFC 3339 and decide whether `now - marked_at`
+/// has crossed `grace_hours`. A negative age (tombstone marked in the
+/// future under operator clock skew) is treated as
+/// [`GraceDecision::Within`] so a sweep does not run prematurely.
+///
+/// `kind` is interpolated into both the parse-error message and the
+/// `debug!` log line so the two sweep call paths (pack tombstones vs.
+/// baseline tombstones) stay distinguishable in operator logs.
+fn check_grace_window(
+    marked_at: &str,
+    grace_hours: u64,
+    kind: &'static str,
+) -> Result<GraceDecision, PackchainError> {
+    let marked_at_ts = OffsetDateTime::parse(marked_at, &Rfc3339).map_err(|e| {
+        PackchainError::Io(std::io::Error::other(format!(
+            "{kind} marked_at parse failed: {e}"
+        )))
+    })?;
+    let age_hours = (OffsetDateTime::now_utc() - marked_at_ts).whole_hours();
+    // Negative age = a tombstone marked in the future (operator clock
+    // skew). Treat as "still within grace" rather than sweeping
+    // prematurely. The `try_into` is the canonical way to compare an
+    // `i64` against an unsigned grace window without a sign-loss cast.
+    let within = age_hours
+        .try_into()
+        .map_or(true, |hours: u64| hours < grace_hours);
+    Ok(if within {
+        GraceDecision::Within
+    } else {
+        GraceDecision::Past
+    })
+}
+
+/// Best-effort version of [`write_baseline_tombstone`]: writes the
+/// tombstone and, on error, logs at `warn` with the orphan key and
+/// `source` discriminator (`"force-push"` / `"compact"`). Used by
+/// callers that run AFTER `chain.json` is durable, where a tombstone
+/// failure must NOT propagate as a push/compact failure — retrying the
+/// caller would short-circuit through `AlreadyMinimal` (compact) or
+/// the no-op same-SHA branch (push) and never re-attempt the cleanup,
+/// leaving the orphaned bundle without a tombstone.
+///
+/// Returns `true` iff a tombstone was successfully written. Callers
+/// that emit a success-only debug trace check the return value;
+/// `false` covers both the same-SHA short-circuit and a warned-on
+/// write error.
+pub(crate) async fn write_baseline_tombstone_best_effort(
+    store: &dyn ObjectStore,
+    prefix: Option<&str>,
+    ref_name: &RefName,
+    prior_full_sha: &Sha40,
+    current_full_sha: &Sha40,
+    source: &'static str,
+) -> bool {
+    match write_baseline_tombstone(store, prefix, ref_name, prior_full_sha, current_full_sha).await
+    {
+        Ok(()) => prior_full_sha != current_full_sha,
+        Err(e) => {
+            let orphan_key = keys::bundle_key(prefix, ref_name.as_str(), prior_full_sha.as_str());
+            warn!(
+                source,
+                ref_path = %ref_name.as_str(),
+                key = %orphan_key,
+                error = %e,
+                "baseline tombstone write failed (chain.json already committed); \
+                 orphan bundle left for manual cleanup",
+            );
+            false
+        }
+    }
+}
+
 /// Environment variable that overrides [`DEFAULT_GRACE_HOURS`] when
 /// set to a positive integer. Mirrors the shape of
 /// `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` used by the protocol REPL.
@@ -150,6 +242,22 @@ pub const ENV_GC_GRACE_HOURS: &str = "GIT_REMOTE_OBJECT_STORE_GC_GRACE_HOURS";
 
 /// On-bucket schema version this build reads and writes.
 pub const TOMBSTONE_SCHEMA_VERSION: u32 = 1;
+
+/// Reject a parsed schema version that does not match
+/// [`TOMBSTONE_SCHEMA_VERSION`]. Shared by the two tombstone parsers
+/// ([`Tombstone::from_json_bytes`] and [`BaselineTombstone::from_json_bytes`])
+/// so both report the same `UnsupportedSchemaVersion` shape against
+/// the same constant.
+fn check_tombstone_schema_version(found: u32) -> Result<(), PackchainError> {
+    if found == TOMBSTONE_SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(PackchainError::UnsupportedSchemaVersion {
+            found,
+            expected: TOMBSTONE_SCHEMA_VERSION,
+        })
+    }
+}
 
 /// On-bucket tombstone — a record of one mark phase's orphan set.
 ///
@@ -183,12 +291,7 @@ impl Tombstone {
     ///   [`TOMBSTONE_SCHEMA_VERSION`].
     pub(crate) fn from_json_bytes(bytes: &[u8]) -> Result<Self, PackchainError> {
         let parsed: Self = serde_json::from_slice(bytes)?;
-        if parsed.v != TOMBSTONE_SCHEMA_VERSION {
-            return Err(PackchainError::UnsupportedSchemaVersion {
-                found: parsed.v,
-                expected: TOMBSTONE_SCHEMA_VERSION,
-            });
-        }
+        check_tombstone_schema_version(parsed.v)?;
         Ok(parsed)
     }
 
@@ -241,12 +344,7 @@ impl BaselineTombstone {
     ///   [`TOMBSTONE_SCHEMA_VERSION`].
     pub(crate) fn from_json_bytes(bytes: &[u8]) -> Result<Self, PackchainError> {
         let parsed: Self = serde_json::from_slice(bytes)?;
-        if parsed.v != TOMBSTONE_SCHEMA_VERSION {
-            return Err(PackchainError::UnsupportedSchemaVersion {
-                found: parsed.v,
-                expected: TOMBSTONE_SCHEMA_VERSION,
-            });
-        }
+        check_tombstone_schema_version(parsed.v)?;
         Ok(parsed)
     }
 
@@ -288,9 +386,7 @@ pub(crate) async fn write_baseline_tombstone(
     if prior_full_sha == current_full_sha {
         return Ok(());
     }
-    let marked_at = OffsetDateTime::now_utc().format(&Rfc3339).map_err(|e| {
-        PackchainError::Io(std::io::Error::other(format!("rfc3339 format failed: {e}")))
-    })?;
+    let marked_at = rfc3339_now()?;
     let tombstone = BaselineTombstone {
         v: TOMBSTONE_SCHEMA_VERSION,
         marked_at,
@@ -449,9 +545,7 @@ pub async fn mark(
         .collect();
 
     let run_id = Uuid::new_v4().to_string();
-    let marked_at = OffsetDateTime::now_utc().format(&Rfc3339).map_err(|e| {
-        PackchainError::Io(std::io::Error::other(format!("rfc3339 format failed: {e}")))
-    })?;
+    let marked_at = rfc3339_now()?;
     let tombstone_key = tombstone_key(prefix, &run_id, &marked_at);
     let orphan_count = orphans.len();
     let tombstone = Tombstone {
@@ -597,29 +691,16 @@ async fn sweep_one_tombstone(
     };
     let tombstone = Tombstone::from_json_bytes(&body)?;
 
-    if !opts.force {
-        let marked_at = OffsetDateTime::parse(&tombstone.marked_at, &Rfc3339).map_err(|e| {
-            PackchainError::Io(std::io::Error::other(format!(
-                "tombstone marked_at parse failed: {e}"
-            )))
-        })?;
-        let age_hours = (OffsetDateTime::now_utc() - marked_at).whole_hours();
-        // Negative age = a tombstone marked in the future (operator
-        // clock skew). Treat as "still within grace" rather than
-        // sweeping prematurely. The `try_from` is the canonical way
-        // to compare an `i64` against an unsigned grace window
-        // without a sign-loss cast.
-        let age_within_grace = age_hours
-            .try_into()
-            .map_or(true, |hours: u64| hours < opts.grace_hours);
-        if age_within_grace {
-            debug!(
-                key = %tombstone_key,
-                marked_at = %tombstone.marked_at,
-                "gc sweep: tombstone within grace window",
-            );
-            return Ok(SweepStep::Deferred);
-        }
+    if !opts.force
+        && check_grace_window(&tombstone.marked_at, opts.grace_hours, "tombstone")?
+            == GraceDecision::Within
+    {
+        debug!(
+            key = %tombstone_key,
+            marked_at = %tombstone.marked_at,
+            "gc sweep: tombstone within grace window",
+        );
+        return Ok(SweepStep::Deferred);
     }
 
     // Re-derive the live referenced set per tombstone, AFTER the
@@ -702,27 +783,16 @@ async fn sweep_one_baseline_tombstone(
     };
     let tombstone = BaselineTombstone::from_json_bytes(&body)?;
 
-    if !opts.force {
-        let marked_at = OffsetDateTime::parse(&tombstone.marked_at, &Rfc3339).map_err(|e| {
-            PackchainError::Io(std::io::Error::other(format!(
-                "baseline tombstone marked_at parse failed: {e}"
-            )))
-        })?;
-        let age_hours = (OffsetDateTime::now_utc() - marked_at).whole_hours();
-        // Same clock-skew handling as `sweep_one_tombstone`: a negative
-        // age (tombstone marked in the future) is treated as still
-        // inside the grace window.
-        let age_within_grace = age_hours
-            .try_into()
-            .map_or(true, |hours: u64| hours < opts.grace_hours);
-        if age_within_grace {
-            debug!(
-                key = %tombstone_key,
-                marked_at = %tombstone.marked_at,
-                "gc sweep: baseline tombstone within grace window",
-            );
-            return Ok(SweepStep::Deferred);
-        }
+    if !opts.force
+        && check_grace_window(&tombstone.marked_at, opts.grace_hours, "baseline tombstone")?
+            == GraceDecision::Within
+    {
+        debug!(
+            key = %tombstone_key,
+            marked_at = %tombstone.marked_at,
+            "gc sweep: baseline tombstone within grace window",
+        );
+        return Ok(SweepStep::Deferred);
     }
 
     // Re-check the live chain. A subsequent push that re-baselined to

@@ -69,6 +69,17 @@ pub(crate) const ENV_LOCK_TTL_SECONDS: &str = "GIT_REMOTE_OBJECT_STORE_LOCK_TTL_
 /// `spec/live/*/force_push_spec.sh`.
 pub(crate) const NOT_ANCESTOR_TOKEN: &str = "not ancestor";
 
+/// Build the canonical wire-format rejection message returned when a
+/// push is refused because the remote ref is not an ancestor of
+/// `local_spec`. Centralising the template here keeps the bundle and
+/// packchain engines in lockstep — they previously inlined byte-identical
+/// `format!` calls, and silent drift between them would have produced
+/// engine-dependent wire output the spec suites could not match against
+/// [`NOT_ANCESTOR_TOKEN`].
+pub(crate) fn not_ancestor_wire_message(local_spec: &str) -> String {
+    format!(r#""remote ref is {NOT_ANCESTOR_TOKEN} of {local_spec}."?"#)
+}
+
 /// Canonical wire-format message returned when a delete is refused
 /// because a `PROTECTED#` marker is present under the ref. Shared by
 /// the bundle engine ([`delete_remote_ref_under_lock`]) and the
@@ -904,7 +915,7 @@ async fn prepare_push(
         Err(GitProbeError::NotAncestor) => {
             return Ok(PrepareOutcome::Done(PushOutcome::Error {
                 remote_ref: remote_ref_str,
-                message: format!(r#""remote ref is {NOT_ANCESTOR_TOKEN} of {local_spec}."?"#),
+                message: not_ancestor_wire_message(&local_spec),
             }));
         }
     };
@@ -1055,7 +1066,7 @@ async fn perform_push_under_lock(
     if force && !pre_existing_was_ancestor && is_protected(store, prefix, &remote_ref).await? {
         return Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
-            message: format!(r#""remote ref is {NOT_ANCESTOR_TOKEN} of {local_spec}."?"#),
+            message: not_ancestor_wire_message(&local_spec),
         });
     }
 
@@ -1316,22 +1327,18 @@ async fn delete_remote_ref_under_lock(
         DELETE_EXPECTED_NO_ZIP
     };
     let remote_ref_str = remote_ref.as_str().to_owned();
-    let has_protected_marker = entries.iter().any(|e| {
-        e.key
-            .rsplit_once('/')
-            .is_some_and(|(_, last)| keys::is_protected_marker_segment(last))
-    });
     // Issue #128: the canonical protection guard. Run it FIRST against
     // the fresh, under-lock listing, BEFORE the count-match deletion
     // branch. The pre-#128 ordering only checked for the marker in the
     // `else if` mismatch branch, so a count-matching listing (e.g.
     // `[bundle.bundle, PROTECTED#]` with `expected = 2` in zip mode, or
     // `[PROTECTED#]` alone with `expected = 1`) would sweep the marker
-    // and complete the delete silently. The `lock_key` is filtered out
-    // above, and `is_protected_marker_segment` matches only the literal
-    // `PROTECTED#` last segment — never the `LOCK#.lock` lock key — so
-    // this guard cannot misfire on the lock itself.
-    if has_protected_marker {
+    // and complete the delete silently. `entries_have_protected_marker`
+    // matches only the literal `PROTECTED#` last segment — never the
+    // `LOCK#.lock` lock key — so scanning the unfiltered `all_entries`
+    // here is safe and avoids re-deriving a filtered view solely for
+    // this check.
+    if keys::entries_have_protected_marker(&all_entries) {
         return Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
             message: DELETE_PROTECTION_MESSAGE.to_owned(),

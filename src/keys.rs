@@ -13,6 +13,8 @@
 
 use std::fmt;
 
+use crate::object_store::ObjectMeta;
+
 /// Final-segment name written for protected refs. Shape on bucket:
 /// `<prefix>/<ref-path>/PROTECTED#`. The literal `#` keeps it cleanly
 /// outside the bundle/lock/zip namespaces and `gix-validate` rejects
@@ -31,6 +33,26 @@ pub(crate) const PROTECTED_MARKER_SEGMENT: &str = "PROTECTED#";
 /// [`PROTECTED_MARKER_SEGMENT`].
 pub(crate) fn is_protected_marker_segment(last_segment: &str) -> bool {
     last_segment == PROTECTED_MARKER_SEGMENT
+}
+
+/// Returns `true` iff any entry's final path segment is the
+/// `PROTECTED#` marker. Centralised here so the bundle engine, the
+/// packchain engine, and the management `delete-branch` flow share one
+/// canonical predicate against the same byte-exact segment match —
+/// substring matching against the full key is unsafe (the literal could
+/// appear elsewhere in a future schema).
+///
+/// [`is_protected_marker_segment`] matches only the exact `PROTECTED#`
+/// segment — never the `LOCK#.lock` lock key or a `PROTECTED#`-prefixed
+/// sibling — so an unfiltered listing is safe to scan: a held lock key
+/// in `entries` cannot be conflated with the marker.
+pub(crate) fn entries_have_protected_marker(entries: &[ObjectMeta]) -> bool {
+    entries.iter().any(|entry| {
+        entry
+            .key
+            .rsplit_once('/')
+            .is_some_and(|(_, last)| is_protected_marker_segment(last))
+    })
 }
 
 /// Join `prefix` and `suffix` with a single `/`, omitting both the
