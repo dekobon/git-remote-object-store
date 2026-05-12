@@ -43,9 +43,16 @@
 //!
 //! 1. List `<prefix>/gc/tombstones-*.json`.
 //! 2. For each tombstone past the grace age:
-//!    - Re-derive the orphan set from the *current* chain state. A
-//!      pack tombstoned by an earlier mark may have become re-referenced
-//!      (engine bug edge case, cheap to verify).
+//!    - Re-derive the orphan set from the *current* chain state.
+//!      Repeated **per tombstone**, not cached across the sweep: a
+//!      concurrent push committing `chain.json` mid-sweep would let
+//!      a cached snapshot delete a pack the new chain references,
+//!      permanently dangling the reference (issue #140). Force-revert
+//!      is the canonical trigger — deterministic gix pack emission
+//!      lets the new push reuse the tombstoned pack key without
+//!      re-uploading. The cost is one `list("refs/")` per eligible
+//!      tombstone vs one per sweep; correctness wins over the linear
+//!      overhead for the O(1)-eligible-tombstones common case.
 //!    - For each pack still orphan, delete `.pack` + `.idx`
 //!      idempotently (a prior partial sweep is fine).
 //!    - Delete the tombstone itself.
@@ -488,24 +495,12 @@ pub async fn sweep(
         warn!("gc sweep: --force in effect; skipping grace window");
     }
 
-    // Re-derive the live referenced set once per sweep, not per
-    // tombstone — sweeping many tombstones at once is the dominant
-    // case and the chain set doesn't change between iterations of
-    // the same `sweep` call.
-    //
-    // ALWAYS recompute, even under --force: mark() can record a pack
-    // as orphan during the window where a concurrent push has uploaded
-    // packs/<sha>.{pack,idx} but has not yet committed chain.json. By
-    // sweep time the chain has landed and the pack is live. --force
-    // suppresses the grace window only, NOT this guard (issue #117).
-    let referenced = list_referenced_packs(store, prefix).await?;
-
     for meta in metas {
         if !meta.key.as_bytes().ends_with(b".json") {
             continue;
         }
         let step = if is_tombstone_key(&meta.key, prefix) {
-            sweep_one_tombstone(store, prefix, &meta.key, &referenced, opts).await
+            sweep_one_tombstone(store, prefix, &meta.key, opts).await
         } else if is_baseline_tombstone_key(&meta.key, prefix) {
             sweep_one_baseline_tombstone(store, prefix, &meta.key, opts).await
         } else {
@@ -542,7 +537,6 @@ async fn sweep_one_tombstone(
     store: &dyn ObjectStore,
     prefix: &str,
     tombstone_key: &str,
-    referenced: &HashSet<Sha40>,
     opts: SweepOpts,
 ) -> Result<SweepStep, PackchainError> {
     let body = match store.get_bytes(tombstone_key).await {
@@ -583,11 +577,27 @@ async fn sweep_one_tombstone(
         }
     }
 
+    // Re-derive the live referenced set per tombstone, AFTER the
+    // grace check passes — never cache across iterations (issue #140).
+    // A concurrent push committing chain.json after a sweep-wide
+    // snapshot would let sweep delete a pack the new chain references,
+    // permanently dangling the chain. Force-revert is the canonical
+    // trigger: gix pack emission is deterministic for the same object
+    // set, so the new pack key aliases the tombstoned one and the push
+    // skips upload, only touching chain.json. Per-tombstone re-listing
+    // costs one extra `list("refs/")` + bounded-parallel chain GETs
+    // per eligible tombstone vs once per sweep — for typical workloads
+    // with O(1) eligible tombstones this is negligible; correctness
+    // wins over the linear-in-tombstones overhead. The recompute also
+    // runs under --force: that flag suppresses the grace window only,
+    // NOT this guard (issue #117).
+    let referenced = list_referenced_packs(store, prefix).await?;
+
     let mut deleted_objects = 0usize;
     let mut skipped_repointed_packs = 0usize;
     for sha in &tombstone.orphan_packs {
         // Always honour the live-pack guard, including under --force.
-        // See the recompute comment in `sweep` and issue #117 for why.
+        // See the recompute comment above and issue #117 for why.
         if referenced.contains(sha) {
             skipped_repointed_packs += 1;
             debug!(
@@ -1717,6 +1727,265 @@ mod tests {
         assert_eq!(post_grace.deleted_objects, 1);
         let err = store.get_bytes(&bundle_key).await.unwrap_err();
         assert!(matches!(err, ObjectStoreError::NotFound(_)));
+    }
+
+    // --- per-tombstone live-pack recompute (issue #140) --------------
+
+    /// One-shot post-delete hook used by [`PostDeleteHookStore`].
+    type PostDeleteHook = Box<dyn FnOnce(&MockStore) + Send>;
+
+    /// Test-only [`ObjectStore`] decorator that runs a one-shot
+    /// callback the first time `delete()` succeeds on a key matching
+    /// `trigger_prefix`, *after* the inner delete completes. Used to
+    /// inject a concurrent push (writing a fresh `chain.json`) between
+    /// successive `sweep_one_tombstone` iterations and verify that the
+    /// per-tombstone live-pack recompute picks it up.
+    ///
+    /// Every other trait method forwards to the inner store unchanged.
+    struct PostDeleteHookStore {
+        inner: MockStore,
+        hook: std::sync::Mutex<Option<PostDeleteHook>>,
+        /// Key-prefix the hook fires on. The pack-tombstone case
+        /// uses `<prefix>/gc/tombstones-`; the test never deletes
+        /// other keys before the intended trigger so this stays
+        /// unambiguous.
+        trigger_prefix: String,
+    }
+
+    impl PostDeleteHookStore {
+        fn new(
+            inner: MockStore,
+            trigger_prefix: impl Into<String>,
+            hook: impl FnOnce(&MockStore) + Send + 'static,
+        ) -> Self {
+            Self {
+                inner,
+                hook: std::sync::Mutex::new(Some(Box::new(hook))),
+                trigger_prefix: trigger_prefix.into(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for PostDeleteHookStore {
+        async fn list(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<crate::object_store::ObjectMeta>, ObjectStoreError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn get_to_file(
+            &self,
+            key: &str,
+            dest: &std::path::Path,
+            opts: crate::object_store::GetOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.get_to_file(key, dest, opts).await
+        }
+
+        async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+            self.inner.get_bytes(key).await
+        }
+
+        async fn get_bytes_range(
+            &self,
+            key: &str,
+            range: std::ops::Range<u64>,
+        ) -> Result<Bytes, ObjectStoreError> {
+            self.inner.get_bytes_range(key, range).await
+        }
+
+        async fn put_bytes(
+            &self,
+            key: &str,
+            body: Bytes,
+            opts: PutOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.put_bytes(key, body, opts).await
+        }
+
+        async fn put_path(
+            &self,
+            key: &str,
+            src: &std::path::Path,
+            opts: PutOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.put_path(key, src, opts).await
+        }
+
+        async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
+            self.inner.put_if_absent(key, body).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<crate::object_store::ObjectMeta, ObjectStoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
+            self.inner.copy(src, dst).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
+            let result = self.inner.delete(key).await;
+            if result.is_ok()
+                && key.starts_with(&self.trigger_prefix)
+                && let Some(hook) = self.hook.lock().unwrap().take()
+            {
+                hook(&self.inner);
+            }
+            result
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_re_derives_referenced_set_per_tombstone() {
+        // Issue #140 regression: a concurrent push committing
+        // chain.json between two `sweep_one_tombstone` iterations
+        // must not let sweep delete a pack the new chain references.
+        //
+        // Layout: two stale tombstones, each naming a distinct pack
+        // on its own ref. After the FIRST tombstone is fully
+        // processed and deleted, the post-delete hook fires and
+        // writes BOTH refs' `chain.json` files — simulating a
+        // concurrent push that committed chain.json for the second
+        // ref between sweep's two iterations. The second iteration
+        // must re-derive the live set and skip the delete.
+        //
+        // Pre-fix: the once-per-sweep snapshot is empty for both
+        // iterations and BOTH packs are deleted (`deleted_objects = 4`).
+        // Post-fix: the second iteration's recompute picks up the new
+        // chain and the second pack survives
+        // (`deleted_objects = 2`, `skipped_repointed_packs = 1`).
+        //
+        // The hook writes chains for both refs (rather than guessing
+        // which tombstone runs first) so the assertions are independent
+        // of MockStore iteration order. Writing the first ref's chain
+        // is a no-op for that pack — its delete already happened
+        // before the hook fired — and the second ref's chain is what
+        // protects the still-pending pack.
+        let inner = MockStore::new();
+        let stale_a = (OffsetDateTime::now_utc() - time::Duration::hours(49))
+            .format(&Rfc3339)
+            .unwrap();
+        let stale_b = (OffsetDateTime::now_utc() - time::Duration::hours(48))
+            .format(&Rfc3339)
+            .unwrap();
+        write_tombstone(&inner, "repo", &stale_a, sha_set([SHA_PACK_ORPHAN]));
+        write_tombstone(&inner, "repo", &stale_b, sha_set([SHA_PACK_ORPHAN_2]));
+        insert_pack_pair(&inner, Some("repo"), SHA_PACK_ORPHAN);
+        insert_pack_pair(&inner, Some("repo"), SHA_PACK_ORPHAN_2);
+
+        // After the FIRST tombstone delete completes, simulate the
+        // concurrent push by committing chain.json files for both
+        // refs at once.
+        let store = PostDeleteHookStore::new(inner, "repo/gc/tombstones-", |inner| {
+            for (ref_path, pack_sha) in [
+                ("repo/refs/heads/branch_a/chain.json", SHA_PACK_ORPHAN),
+                ("repo/refs/heads/branch_b/chain.json", SHA_PACK_ORPHAN_2),
+            ] {
+                let chain = ChainManifest {
+                    v: 1,
+                    tip: sha40(SHA_TIP),
+                    full_at: sha40(SHA_FULL),
+                    segments: vec![segment(pack_sha, None)],
+                };
+                let body =
+                    serde_json::to_vec_pretty(&chain).expect("chain.json serializes for the test");
+                inner.insert(ref_path, Bytes::from(body));
+            }
+        });
+
+        let outcome = sweep(&store, "repo", SweepOpts::default()).await.unwrap();
+        // Both tombstones processed.
+        assert_eq!(outcome.swept_tombstones, 2);
+        // Whichever tombstone ran first deleted its pack pair (2
+        // objects). The second iteration's recompute saw the
+        // freshly-committed chain and skipped the delete.
+        assert_eq!(outcome.deleted_objects, 2);
+        assert_eq!(outcome.skipped_repointed_packs, 1);
+
+        // Exactly one of the two packs survives — the one whose
+        // tombstone was processed second.
+        let first_survives = store
+            .inner
+            .get_bytes(&format!("repo/packs/{SHA_PACK_ORPHAN}.pack"))
+            .await
+            .is_ok();
+        let second_survives = store
+            .inner
+            .get_bytes(&format!("repo/packs/{SHA_PACK_ORPHAN_2}.pack"))
+            .await
+            .is_ok();
+        assert!(
+            first_survives ^ second_survives,
+            "exactly one pack must survive: \
+             first_survives={first_survives}, second_survives={second_survives}",
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_reclaims_genuinely_orphan_pack_with_per_tombstone_recompute() {
+        // Sanity: the per-tombstone recompute does NOT regress the
+        // normal sweep path. A stale tombstone naming a pack with no
+        // chain reference is reclaimed exactly as before.
+        let store = MockStore::new();
+        let stale = (OffsetDateTime::now_utc() - time::Duration::hours(48))
+            .format(&Rfc3339)
+            .unwrap();
+        write_tombstone(&store, "repo", &stale, sha_set([SHA_PACK_ORPHAN]));
+        insert_pack_pair(&store, Some("repo"), SHA_PACK_ORPHAN);
+        // No chain.json at all: referenced set is empty for every
+        // recompute pass.
+
+        let outcome = sweep(&store, "repo", SweepOpts::default()).await.unwrap();
+        assert_eq!(outcome.swept_tombstones, 1);
+        assert_eq!(outcome.deleted_objects, 2);
+        assert_eq!(outcome.skipped_repointed_packs, 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_protects_pack_when_concurrent_push_aliases_existing_key() {
+        // Issue #140's canonical scenario, framed as the issue
+        // describes it: a force-revert republishes a pack with the
+        // SAME content SHA as the tombstoned pack (deterministic gix
+        // pack emission). The concurrent push only updates
+        // chain.json; the pack key is reused. Sweep must observe
+        // the new chain reference and leave the pack alone.
+        //
+        // Modelled at the post-fix invariant level: the chain
+        // referencing the tombstoned SHA exists when
+        // `sweep_one_tombstone` runs its recompute, and the pack is
+        // preserved with `skipped_repointed_packs += 1`.
+        let store = MockStore::new();
+        let stale = (OffsetDateTime::now_utc() - time::Duration::hours(48))
+            .format(&Rfc3339)
+            .unwrap();
+        write_tombstone(&store, "repo", &stale, sha_set([SHA_PACK_LIVE]));
+        // Insert the pack, then commit chain.json referencing it —
+        // identical-content SHA path through the engine ends here.
+        insert_pack_pair(&store, Some("repo"), SHA_PACK_LIVE);
+        let chain = ChainManifest {
+            v: 1,
+            tip: sha40(SHA_TIP),
+            full_at: sha40(SHA_FULL),
+            segments: vec![segment(SHA_PACK_LIVE, None)],
+        };
+        write_chain(&store, Some("repo"), &ref_main(), &chain)
+            .await
+            .unwrap();
+
+        let outcome = sweep(&store, "repo", SweepOpts::default()).await.unwrap();
+        assert_eq!(outcome.swept_tombstones, 1);
+        assert_eq!(outcome.skipped_repointed_packs, 1);
+        assert_eq!(outcome.deleted_objects, 0);
+        store
+            .get_bytes(&format!("repo/packs/{SHA_PACK_LIVE}.pack"))
+            .await
+            .expect("aliased pack must survive sweep");
     }
 
     #[tokio::test]
