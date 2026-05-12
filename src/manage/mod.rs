@@ -53,6 +53,35 @@ pub enum ManageError {
     )]
     Protected(String),
 
+    /// `delete-branch` swept the fresh listing but one or more per-key
+    /// deletes failed with a non-`NotFound` error. The loop continues
+    /// past each transient failure so the caller has a complete
+    /// inventory of which keys survived; this variant carries that
+    /// inventory verbatim.
+    ///
+    /// Retry on the same branch is naturally idempotent — the re-list
+    /// at the start of the next `delete` call will only show the
+    /// surviving keys, and the same loop will try to delete them. A
+    /// `NotFound` mid-sweep is tolerated and counts as success, so the
+    /// `undeleted` field is strictly the set of keys whose deletes
+    /// raised something else (Network, `AccessDenied`, etc.).
+    #[error(
+        "delete-branch {branch} failed: {n_undeleted} of {attempted} keys could not be deleted: {} (retry to converge)",
+        undeleted.join(", "),
+        n_undeleted = undeleted.len(),
+    )]
+    PartialDelete {
+        /// Branch the sweep ran against.
+        branch: String,
+        /// Keys whose per-key delete returned a non-`NotFound` error.
+        /// Stored verbatim so a retry-by-key tool can target exactly
+        /// what survived.
+        undeleted: Vec<String>,
+        /// Total number of keys the fresh listing yielded, for the
+        /// operator-facing "N of M" framing in the error message.
+        attempted: usize,
+    },
+
     /// Branch name failed `gix-validate`'s strict ref-name check; we
     /// reject these at the management boundary so a value like
     /// `foo/../bar` cannot land as a literal substring of a stored

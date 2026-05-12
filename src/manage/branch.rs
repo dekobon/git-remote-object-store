@@ -111,17 +111,24 @@ impl<'a> ManageBranch<'a> {
     ///
     /// `NotFound` errors observed during the sweep are tolerated — they
     /// mean a concurrent deleter swept the key first, which still
-    /// satisfies the operator's intent. Other store errors propagate
-    /// immediately.
+    /// satisfies the operator's intent. Other per-key delete errors
+    /// (Network, `AccessDenied`, ...) are collected: the loop does NOT
+    /// short-circuit, every remaining key is still attempted, and the
+    /// function returns [`ManageError::PartialDelete`] with the exact
+    /// list of keys that survived so a retry can converge (#122). A
+    /// list-call failure still propagates immediately because there is
+    /// nothing to recover — without a listing the sweep cannot proceed.
     ///
     /// # Errors
     ///
     /// Returns [`ManageError::Protected`] if the branch carries a
     /// `PROTECTED#` marker (checked on both listings),
     /// [`ManageError::Cancelled`] if the user cancels the prompt,
-    /// [`ManageError::Io`] for prompt I/O failures, or
-    /// [`ManageError::Store`] if a list or delete operation fails for
-    /// reasons other than `NotFound`.
+    /// [`ManageError::Io`] for prompt I/O failures,
+    /// [`ManageError::Store`] if a list operation fails, or
+    /// [`ManageError::PartialDelete`] when one or more per-key deletes
+    /// fail with a non-`NotFound` error after every key in the fresh
+    /// listing has been attempted.
     pub async fn delete(&self) -> Result<(), ManageError> {
         let prefix = self.branch_prefix();
         let initial = self.store.list(&prefix).await?;
@@ -168,15 +175,34 @@ impl<'a> ManageBranch<'a> {
             );
         }
 
+        // Collect, don't short-circuit: a transient failure on key #2
+        // of a 4-key listing must not leave #3 and #4 standing with no
+        // inventory of what survived. NotFound continues to be tolerated
+        // (the key is gone — operator intent satisfied). Every other
+        // per-key error is logged and recorded; at the end we either
+        // declare full success or return PartialDelete naming every
+        // surviving key so a retry can converge (#122).
+        let mut undeleted: Vec<String> = Vec::new();
         for object in &fresh {
-            // Tolerate `NotFound` from a concurrent sweeper racing us
-            // mid-loop — the operator's intent is "key gone" and the key
-            // is gone. Other errors (Network, AccessDenied, etc.)
-            // propagate.
             match self.store.delete(&object.key).await {
                 Ok(()) | Err(ObjectStoreError::NotFound(_)) => {}
-                Err(other) => return Err(other.into()),
+                Err(err) => {
+                    warn!(
+                        branch = %self.branch,
+                        key = %object.key,
+                        error = %err,
+                        "delete-branch: per-key delete failed; continuing sweep",
+                    );
+                    undeleted.push(object.key.clone());
+                }
             }
+        }
+        if !undeleted.is_empty() {
+            return Err(ManageError::PartialDelete {
+                branch: self.branch.clone(),
+                undeleted,
+                attempted: fresh.len(),
+            });
         }
         println!("Branch {} has been deleted", self.branch);
         info!(branch = %self.branch, count = fresh.len(), "branch deleted");
@@ -549,12 +575,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_partial_failure_propagates_error() {
+    async fn delete_partial_failure_continues_and_returns_structured_error() {
+        // Issue #122: pre-fix, `delete` short-circuited on the first
+        // per-key error, leaving the later keys untouched and the
+        // operator with no inventory of what survived. The fix is to
+        // collect failures, continue past each, and return a structured
+        // `PartialDelete` naming exactly the keys that remain.
+        //
         // `MockStore::list` returns keys in lexicographic (BTreeMap)
-        // order, so the loop deletes aaa, then attempts bbb (armed to
-        // fail), then ccc. `delete` returns the error
-        // immediately on the failed delete; aaa is gone, bbb and ccc
-        // remain.
+        // order. The loop deletes aaa, attempts bbb (armed to fail
+        // transiently), and must still attempt ccc. Post-fix: aaa and
+        // ccc are gone, bbb remains, the error names bbb explicitly.
         let mock = MockStore::new();
         mock.insert("myrepo/refs/heads/main/aaa.bundle", Bytes::from("a"));
         mock.insert("myrepo/refs/heads/main/bbb.bundle", Bytes::from("b"));
@@ -565,20 +596,206 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
         let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
 
-        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
-            .await
-            .expect("open");
+        let mb = ManageBranch::open(
+            Arc::clone(&store),
+            "myrepo",
+            "main",
+            &prompter as &dyn Prompter,
+        )
+        .await
+        .expect("open");
         let err = mb
             .delete()
             .await
-            .expect_err("partial delete must propagate");
+            .expect_err("partial delete must surface PartialDelete");
+        match &err {
+            ManageError::PartialDelete {
+                branch,
+                undeleted,
+                attempted,
+            } => {
+                assert_eq!(branch, "main");
+                assert_eq!(*attempted, 3);
+                assert_eq!(
+                    undeleted.as_slice(),
+                    ["myrepo/refs/heads/main/bbb.bundle"],
+                    "undeleted list must name exactly the failed key",
+                );
+            }
+            other => panic!("expected PartialDelete, got {other:?}"),
+        }
+        // The error message must name the failed key so a copy-paste
+        // retry tool (or human) can act on it.
+        let rendered = err.to_string();
         assert!(
-            matches!(err, ManageError::Store(_)),
-            "expected Store error, got {err:?}"
+            rendered.contains("myrepo/refs/heads/main/bbb.bundle"),
+            "error message must name surviving key, got: {rendered}",
         );
+        assert!(
+            rendered.contains("retry to converge"),
+            "error message must point at the retry path, got: {rendered}",
+        );
+        // The loop did NOT short-circuit on bbb — aaa AND ccc are
+        // both gone, and only bbb survives.
         assert!(!mock.contains("myrepo/refs/heads/main/aaa.bundle"));
         assert!(mock.contains("myrepo/refs/heads/main/bbb.bundle"));
-        assert!(mock.contains("myrepo/refs/heads/main/ccc.bundle"));
+        assert!(!mock.contains("myrepo/refs/heads/main/ccc.bundle"));
+        assert_eq!(mock.pending_faults(), 0);
+
+        // Retry-converges: clear nothing extra (the fault is already
+        // consumed) and run delete again. The fresh listing inside
+        // `delete` will only show bbb; the loop deletes it; the branch
+        // is now fully gone.
+        let prompter2 = ScriptedPrompter::new([Answer::Confirm(true)]);
+        let mb2 = ManageBranch::open(store, "myrepo", "main", &prompter2 as &dyn Prompter)
+            .await
+            .expect("re-open after partial delete");
+        mb2.delete().await.expect("retry must converge to Ok");
+        assert!(
+            mock.keys().is_empty(),
+            "retry must remove the surviving key: {:?}",
+            mock.keys(),
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_partial_failure_attempts_every_key_in_listing() {
+        // Issue #122 explicit four-key case: a transient failure on
+        // key #2 of a 4-key listing must not stop the loop from
+        // attempting keys #3 and #4. Pre-fix, this seeded with key
+        // names a-d, fault on bbb, would leave bbb/ccc/ddd standing.
+        // Post-fix, only bbb survives (the named failure).
+        let mock = MockStore::new();
+        mock.insert("myrepo/refs/heads/main/aaa.bundle", Bytes::from("a"));
+        mock.insert("myrepo/refs/heads/main/bbb.bundle", Bytes::from("b"));
+        mock.insert("myrepo/refs/heads/main/ccc.bundle", Bytes::from("c"));
+        mock.insert("myrepo/refs/heads/main/ddd.bundle", Bytes::from("d"));
+        mock.arm(crate::object_store::mock::Fault::NetworkOnDelete {
+            key: "myrepo/refs/heads/main/bbb.bundle".to_owned(),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        let err = mb.delete().await.expect_err("partial delete expected");
+        match err {
+            ManageError::PartialDelete {
+                undeleted,
+                attempted,
+                ..
+            } => {
+                assert_eq!(attempted, 4, "loop must visit every listed key");
+                assert_eq!(undeleted.as_slice(), ["myrepo/refs/heads/main/bbb.bundle"]);
+            }
+            other => panic!("expected PartialDelete, got {other:?}"),
+        }
+        // Keys #1, #3, #4 were all attempted and succeeded; only the
+        // named failure key survives.
+        assert!(!mock.contains("myrepo/refs/heads/main/aaa.bundle"));
+        assert!(mock.contains("myrepo/refs/heads/main/bbb.bundle"));
+        assert!(!mock.contains("myrepo/refs/heads/main/ccc.bundle"));
+        assert!(!mock.contains("myrepo/refs/heads/main/ddd.bundle"));
+    }
+
+    #[tokio::test]
+    async fn delete_all_keys_fail_returns_full_inventory() {
+        // Two faults arm against two of the three keys, plus a third
+        // standalone failure. We assert that PartialDelete lists every
+        // surviving key in lexicographic order so an operator (or
+        // tooling that reads the structured field) gets a complete
+        // inventory rather than just the first failure.
+        let mock = MockStore::new();
+        mock.insert("myrepo/refs/heads/main/aaa.bundle", Bytes::from("a"));
+        mock.insert("myrepo/refs/heads/main/bbb.bundle", Bytes::from("b"));
+        mock.insert("myrepo/refs/heads/main/ccc.bundle", Bytes::from("c"));
+        for key in [
+            "myrepo/refs/heads/main/aaa.bundle",
+            "myrepo/refs/heads/main/bbb.bundle",
+            "myrepo/refs/heads/main/ccc.bundle",
+        ] {
+            mock.arm(crate::object_store::mock::Fault::NetworkOnDelete {
+                key: key.to_owned(),
+            });
+        }
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        let err = mb.delete().await.expect_err("all-fail must surface error");
+        match err {
+            ManageError::PartialDelete {
+                undeleted,
+                attempted,
+                ..
+            } => {
+                assert_eq!(attempted, 3);
+                assert_eq!(
+                    undeleted,
+                    vec![
+                        "myrepo/refs/heads/main/aaa.bundle".to_owned(),
+                        "myrepo/refs/heads/main/bbb.bundle".to_owned(),
+                        "myrepo/refs/heads/main/ccc.bundle".to_owned(),
+                    ],
+                    "every surviving key must be reported, in listing order",
+                );
+            }
+            other => panic!("expected PartialDelete, got {other:?}"),
+        }
+        // All three originals survive — nothing was deleted.
+        assert_eq!(mock.keys().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn delete_mixed_notfound_and_failure_only_lists_real_failures() {
+        // NotFound mid-sweep is tolerated (#139). The PartialDelete
+        // inventory must NOT include keys that the listing showed but
+        // that a concurrent sweeper had already removed — those are
+        // success from the operator's POV. Only the genuine network
+        // failure on bbb should be in `undeleted`.
+        let mock = MockStore::new();
+        mock.insert("myrepo/refs/heads/main/aaa.bundle", Bytes::from("a"));
+        mock.insert("myrepo/refs/heads/main/bbb.bundle", Bytes::from("b"));
+        mock.insert("myrepo/refs/heads/main/ccc.bundle", Bytes::from("c"));
+        // aaa raced and is gone; bbb is a genuine network failure; ccc
+        // succeeds normally.
+        mock.arm(crate::object_store::mock::Fault::NotFoundOnDelete {
+            key: "myrepo/refs/heads/main/aaa.bundle".to_owned(),
+        });
+        mock.arm(crate::object_store::mock::Fault::NetworkOnDelete {
+            key: "myrepo/refs/heads/main/bbb.bundle".to_owned(),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        let err = mb.delete().await.expect_err("bbb failure must surface");
+        match err {
+            ManageError::PartialDelete {
+                undeleted,
+                attempted,
+                ..
+            } => {
+                assert_eq!(attempted, 3);
+                assert_eq!(
+                    undeleted.as_slice(),
+                    ["myrepo/refs/heads/main/bbb.bundle"],
+                    "only the genuine non-NotFound failure must appear",
+                );
+            }
+            other => panic!("expected PartialDelete, got {other:?}"),
+        }
+        // ccc was deleted by the loop. bbb survives. aaa's NotFound
+        // fault short-circuited its delete BEFORE the actual removal,
+        // so the body is still in the mock — same observable as the
+        // pre-existing `delete_tolerates_notfound_mid_sweep` test.
+        assert!(!mock.contains("myrepo/refs/heads/main/ccc.bundle"));
+        assert!(mock.contains("myrepo/refs/heads/main/bbb.bundle"));
     }
 
     /// Prompter that performs a side effect against a [`MockStore`]
