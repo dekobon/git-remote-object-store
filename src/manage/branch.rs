@@ -205,7 +205,7 @@ impl<'a> ManageBranch<'a> {
         // key, so a concurrent `git push` or `compact` racing this
         // delete is mutually excluded.
         let ref_name = self.validated_ref_name()?;
-        let prefix_opt = (!self.prefix.is_empty()).then_some(self.prefix.as_str());
+        let prefix_opt = self.prefix_opt();
         let lock = lock_key(prefix_opt, &ref_name);
         let ttl = lock_ttl_from_env();
         let now = OffsetDateTime::now_utc();
@@ -357,15 +357,20 @@ impl<'a> ManageBranch<'a> {
                 }
             }
         }
+        // attempted excludes the deferred bundle (if any): that key was
+        // intentionally skipped via tombstone, not "attempted and missing"
+        // — the operator-facing count must reflect what was swept, not
+        // what was listed.
+        let attempted = fresh.len() - usize::from(deferred_bundle_key.is_some());
         if !undeleted.is_empty() {
             return Err(ManageError::PartialDelete {
                 branch: self.branch.clone(),
                 undeleted,
-                attempted: fresh.len(),
+                attempted,
             });
         }
         writeln!(out, "Branch {} has been deleted", self.branch)?;
-        info!(branch = %self.branch, count = fresh.len(), "branch deleted");
+        info!(branch = %self.branch, count = attempted, "branch deleted");
         Ok(())
     }
 
@@ -378,6 +383,14 @@ impl<'a> ManageBranch<'a> {
     fn validated_ref_name(&self) -> Result<RefName, ManageError> {
         RefName::new(format!("refs/heads/{}", self.branch))
             .map_err(|_| ManageError::InvalidBranch(self.branch.clone()))
+    }
+
+    /// Returns `Some(&prefix)` when a non-empty bucket prefix is
+    /// configured, `None` for root-prefixed buckets. Centralises the
+    /// `(!self.prefix.is_empty()).then_some(self.prefix.as_str())`
+    /// pattern previously duplicated across delete and tombstone paths.
+    fn prefix_opt(&self) -> Option<&str> {
+        (!self.prefix.is_empty()).then_some(self.prefix.as_str())
     }
 
     /// Attempt to tombstone the baseline bundle for a packchain ref so
@@ -404,7 +417,7 @@ impl<'a> ManageBranch<'a> {
         // future loosening of `open`'s validator must not make
         // delete-branch unsafe.
         let ref_name = RefName::new(ref_path).ok()?;
-        let prefix_opt = (!self.prefix.is_empty()).then_some(self.prefix.as_str());
+        let prefix_opt = self.prefix_opt();
         let chain = match load_chain(self.store.as_ref(), prefix_opt, &ref_name).await {
             Ok(Some(chain)) => chain,
             Ok(None) => return None,

@@ -415,11 +415,15 @@ impl<'a> Doctor<'a> {
     ) -> Result<(), ManageError> {
         writeln!(out, "\nFix invalid HEAD for repo {}", self.report_label())?;
 
+        // Only offer refs that pass `has_branch_data`: a PROTECTED#-only
+        // ref appears in `snapshot.refs` (see #154) but would always fail
+        // the keeper recheck. Surfacing it in the Select picker is a
+        // usability trap.
         let candidates: Vec<&str> = snapshot
             .refs
-            .keys()
-            .filter(|k| k.starts_with("refs/heads/"))
-            .map(String::as_str)
+            .iter()
+            .filter(|(k, r)| k.starts_with("refs/heads/") && r.has_branch_data())
+            .map(|(k, _)| k.as_str())
             .collect();
         if candidates.is_empty() {
             writeln!(
@@ -1109,6 +1113,13 @@ mod tests {
         assert!(mock.contains(&format!("myrepo/refs/heads/main/{SHA_A}.bundle")));
         // The non-keeper that the simulated race deleted is gone.
         assert!(!mock.contains(&format!("myrepo/refs/heads/main/{SHA_B}.bundle")));
+        // SHA_C is the remaining loser — eviction must have run on it.
+        // Without this assertion, a regression where the keeper recheck
+        // passes but the eviction loop is skipped would silently pass.
+        assert!(
+            !mock.contains(&format!("myrepo/refs/heads/main/{SHA_C}.bundle")),
+            "loser SHA_C must be evicted from the ref after a successful keeper recheck",
+        );
     }
 
     #[tokio::test]
