@@ -55,7 +55,7 @@ use std::sync::atomic::AtomicBool;
 use gix_pack::Find as _;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::git::{self, RefName, Sha};
 use crate::keys;
@@ -66,6 +66,9 @@ use crate::protocol::fetch::{
 
 use super::PackchainError;
 use super::manifest::load_chain;
+use super::retry::{
+    PACK_MISSING_MAX_RETRIES, PACK_MISSING_RETRY_BACKOFFS, chain_references_pack_key,
+};
 use super::schema::{ChainManifest, ChainSegment, Sha40};
 
 /// Drive a batch of `fetch` commands against a packchain bucket.
@@ -180,85 +183,8 @@ async fn fetch_one(ctx: FetchOneCtx<'_>) -> Result<(), FetchError> {
     if fetched_refs.contains(&sha) {
         debug!(%sha, ref_name = %ref_name, "skipping fetch: already fetched in this session");
     } else {
-        // Load chain.json. None → the bucket has no record of this
-        // ref under the packchain engine; surface as a typed
-        // PackchainError rather than an opaque NotFound.
-        let chain = load_chain(store.as_ref(), prefix, ref_name)
-            .await
-            .map_err(FetchError::Packchain)?
-            .ok_or_else(|| {
-                FetchError::Packchain(PackchainError::ChainAbsent {
-                    ref_name: ref_name.as_str().to_owned(),
-                })
-            })?;
-
-        // Walk the chain once here so both the full and shallow paths
-        // share the same cut-point analysis. Doing this in
-        // spawn_blocking keeps the !Sync `gix::Repository` off any
-        // .await in the surrounding task.
-        //
-        // `??` works because `FetchError: From<JoinError>` (outer
-        // task error) and `From<FetchError>` for the inner result is
-        // identity — `?` propagates each layer with the appropriate
-        // From conversion. The same pattern applies to every
-        // spawn_blocking call below.
-        let chain_for_walk = chain.clone();
-        let repo_dir_owned = repo_dir.to_path_buf();
-        let (needed, need_baseline) = tokio::task::spawn_blocking(move || {
-            select_needed_segments(&repo_dir_owned, &chain_for_walk)
-        })
-        .await??;
-
-        let temp_dir = tempfile::Builder::new()
-            .prefix("git_remote_object_store_packchain_fetch_")
-            .tempdir()?;
-
-        // Resolve the baseline SHA up front. `Sha::from_hex` cannot
-        // fail here: `chain.full_at` is a `Sha40`, validated as
-        // exactly 40 lowercase-hex bytes at deserialise time
-        // (see `schema::Sha40::try_new`). Per
-        // `.claude/rules/rust.md`, document the invariant in-place
-        // rather than propagating an error path that the type
-        // system already rules out.
-        let baseline_sha = need_baseline.then(|| {
-            Sha::from_hex(chain.full_at.as_str())
-                .expect("chain.full_at is a Sha40 — guaranteed 40 lowercase hex bytes")
-        });
-
-        if let Some(depth) = depth {
-            // Shallow path: sequential newest-first download + install
-            // + BFS-after-each. Stops as soon as the boundary set is
-            // non-empty, so deeper segments and the baseline never
-            // leave the bucket. See the module doc on why this can't
-            // be parallelised.
-            fetch_shallow(
-                store.as_ref(),
-                prefix,
-                repo_dir,
-                temp_dir.path(),
-                ref_name,
-                sha,
-                &needed,
-                baseline_sha,
-                depth,
-            )
+        fetch_with_pack_missing_retries(&store, &semaphore, prefix, repo_dir, ref_name, sha, depth)
             .await?;
-        } else {
-            // Full path: parallel-download every needed pack
-            // (and the baseline when applicable), install
-            // oldest-first.
-            fetch_full(
-                &store,
-                &semaphore,
-                prefix,
-                repo_dir,
-                temp_dir.path(),
-                ref_name,
-                &needed,
-                baseline_sha,
-            )
-            .await?;
-        }
         fetched_refs.insert(sha);
     }
 
@@ -274,6 +200,195 @@ async fn fetch_one(ctx: FetchOneCtx<'_>) -> Result<(), FetchError> {
         })
         .await??;
         boundaries.extend(ids);
+    }
+    Ok(())
+}
+
+/// Chain-walk-and-fetch driver wrapped in a `PackMissing` retry loop.
+///
+/// Loads `chain.json`, walks it to pick needed segments, then drives
+/// either [`fetch_full`] (no depth) or [`fetch_shallow`] (with depth).
+/// On a [`PackchainError::PackMissing`] caused by a concurrent
+/// `manage gc sweep` (detected by reloading `chain.json` and observing
+/// that the failing pack key is no longer referenced), waits a backoff
+/// and retries against the fresh chain. After
+/// [`PACK_MISSING_MAX_RETRIES`] retries gives up with
+/// [`PackchainError::ConcurrentGcRetriesExhausted`] (issue #148, the
+/// fetch-side analogue of issue #136's read-side retry).
+///
+/// Non-`PackMissing` errors (transport faults, malformed pack,
+/// `BaselineMissing`, etc.) pass through immediately — they are not
+/// retryable in this fashion and would otherwise wait through the
+/// backoff schedule for no reason. A `chain.json` that vanishes
+/// mid-fetch (the ref was deleted) surfaces as
+/// [`PackchainError::ChainAbsent`], not as `PackMissing`.
+///
+/// Already-installed packs from a previous attempt are NOT
+/// redownloaded under the shallow path: each install lands in the
+/// destination repo's ODB, and the next iteration's chain walk stops
+/// at the first known ancestor. Under the full path nothing installs
+/// until all parallel downloads succeed, so a mid-fetch retry does
+/// re-download the survivors — acceptable cost for a rare race that
+/// only fires when compact+sweep keeps outpacing the receiver.
+#[allow(clippy::too_many_arguments)] // mirrors fetch_one's existing call shape
+async fn fetch_with_pack_missing_retries(
+    store: &Arc<dyn ObjectStore>,
+    semaphore: &Arc<Semaphore>,
+    prefix: Option<&str>,
+    repo_dir: &Path,
+    ref_name: &RefName,
+    sha: Sha,
+    depth: Option<NonZeroU32>,
+) -> Result<(), FetchError> {
+    let mut attempt: u32 = 0;
+    loop {
+        let result = fetch_once(store, semaphore, prefix, repo_dir, ref_name, sha, depth).await;
+        let missing_key = match result {
+            Ok(()) => return Ok(()),
+            Err(FetchError::Packchain(PackchainError::PackMissing { key })) => key,
+            Err(e) => return Err(e),
+        };
+        // PackMissing — distinguish concurrent GC (retryable) from
+        // genuine bucket inconsistency (data loss → fail fast).
+        // `load_chain` returning `Ok(None)` means the ref vanished
+        // mid-fetch — surface as ChainAbsent, NOT as PackMissing.
+        let reloaded = load_chain(store.as_ref(), prefix, ref_name)
+            .await
+            .map_err(FetchError::Packchain)?
+            .ok_or_else(|| {
+                FetchError::Packchain(PackchainError::ChainAbsent {
+                    ref_name: ref_name.as_str().to_owned(),
+                })
+            })?;
+        if chain_references_pack_key(&reloaded, prefix, &missing_key)
+            .map_err(FetchError::Packchain)?
+        {
+            // The reloaded chain still names this pack — the bucket
+            // is genuinely missing data the chain still references.
+            // Surface the original PackMissing without retrying.
+            return Err(FetchError::Packchain(PackchainError::PackMissing {
+                key: missing_key,
+            }));
+        }
+        if attempt >= PACK_MISSING_MAX_RETRIES {
+            warn!(
+                ref_name = %ref_name.as_str(),
+                last_missing_key = %missing_key,
+                attempts = attempt,
+                "fetch: exhausted pack-missing retries against concurrent GC"
+            );
+            return Err(FetchError::Packchain(
+                PackchainError::ConcurrentGcRetriesExhausted {
+                    last_missing_key: missing_key,
+                    attempts: attempt,
+                },
+            ));
+        }
+        debug!(
+            ref_name = %ref_name.as_str(),
+            missing_key = %missing_key,
+            attempt = attempt,
+            "fetch: PackMissing on chain no longer references the pack — retrying after GC race"
+        );
+        tokio::time::sleep(PACK_MISSING_RETRY_BACKOFFS[attempt as usize]).await;
+        attempt += 1;
+    }
+}
+
+/// One attempt at the chain-walk + parallel-or-sequential download +
+/// install pipeline. Factored out of `fetch_one` so
+/// [`fetch_with_pack_missing_retries`] can iterate it; each attempt
+/// re-reads `chain.json`, re-walks the local ODB (so previously
+/// installed segments are skipped under the shallow path), and
+/// allocates its own temp directory so a failed run leaves nothing on
+/// disk.
+async fn fetch_once(
+    store: &Arc<dyn ObjectStore>,
+    semaphore: &Arc<Semaphore>,
+    prefix: Option<&str>,
+    repo_dir: &Path,
+    ref_name: &RefName,
+    sha: Sha,
+    depth: Option<NonZeroU32>,
+) -> Result<(), FetchError> {
+    // Load chain.json. None → the bucket has no record of this ref
+    // under the packchain engine; surface as a typed PackchainError
+    // rather than an opaque NotFound.
+    let chain = load_chain(store.as_ref(), prefix, ref_name)
+        .await
+        .map_err(FetchError::Packchain)?
+        .ok_or_else(|| {
+            FetchError::Packchain(PackchainError::ChainAbsent {
+                ref_name: ref_name.as_str().to_owned(),
+            })
+        })?;
+
+    // Walk the chain once here so both the full and shallow paths
+    // share the same cut-point analysis. Doing this in
+    // spawn_blocking keeps the !Sync `gix::Repository` off any
+    // .await in the surrounding task.
+    //
+    // `??` works because `FetchError: From<JoinError>` (outer
+    // task error) and `From<FetchError>` for the inner result is
+    // identity — `?` propagates each layer with the appropriate
+    // From conversion. The same pattern applies to every
+    // spawn_blocking call below.
+    let chain_for_walk = chain.clone();
+    let repo_dir_owned = repo_dir.to_path_buf();
+    let (needed, need_baseline) = tokio::task::spawn_blocking(move || {
+        select_needed_segments(&repo_dir_owned, &chain_for_walk)
+    })
+    .await??;
+
+    let temp_dir = tempfile::Builder::new()
+        .prefix("git_remote_object_store_packchain_fetch_")
+        .tempdir()?;
+
+    // Resolve the baseline SHA up front. `Sha::from_hex` cannot
+    // fail here: `chain.full_at` is a `Sha40`, validated as
+    // exactly 40 lowercase-hex bytes at deserialise time
+    // (see `schema::Sha40::try_new`). Per
+    // `.claude/rules/rust.md`, document the invariant in-place
+    // rather than propagating an error path that the type
+    // system already rules out.
+    let baseline_sha = need_baseline.then(|| {
+        Sha::from_hex(chain.full_at.as_str())
+            .expect("chain.full_at is a Sha40 — guaranteed 40 lowercase hex bytes")
+    });
+
+    if let Some(depth) = depth {
+        // Shallow path: sequential newest-first download + install
+        // + BFS-after-each. Stops as soon as the boundary set is
+        // non-empty, so deeper segments and the baseline never
+        // leave the bucket. See the module doc on why this can't
+        // be parallelised.
+        fetch_shallow(
+            store.as_ref(),
+            prefix,
+            repo_dir,
+            temp_dir.path(),
+            ref_name,
+            sha,
+            &needed,
+            baseline_sha,
+            depth,
+        )
+        .await?;
+    } else {
+        // Full path: parallel-download every needed pack
+        // (and the baseline when applicable), install
+        // oldest-first.
+        fetch_full(
+            store,
+            semaphore,
+            prefix,
+            repo_dir,
+            temp_dir.path(),
+            ref_name,
+            &needed,
+            baseline_sha,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -870,6 +985,515 @@ mod tests {
     #[tokio::test]
     async fn fetch_shallow_rejects_non_hex_pack_key() {
         assert_fetch_shallow_rejects("packs/notahex.pack").await;
+    }
+
+    // -- Pack-missing retry (issue #148) --------------------------
+
+    /// Test-only [`ObjectStore`] decorator: on each `get_bytes` against
+    /// `chain_key`, serves the next body from `bodies` (saturating at
+    /// the last entry once exhausted) so a fetch retry observes an
+    /// evolving on-bucket chain without racing a real concurrent
+    /// writer. Mirrors `read::tests::EvolvingChainStore`.
+    struct EvolvingChainStore {
+        inner: MockStore,
+        chain_key: String,
+        bodies: std::sync::Mutex<Vec<Bytes>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl EvolvingChainStore {
+        fn new(inner: MockStore, chain_key: String, bodies: Vec<Bytes>) -> Self {
+            assert!(!bodies.is_empty(), "must supply at least one chain body");
+            Self {
+                inner,
+                chain_key,
+                bodies: std::sync::Mutex::new(bodies),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn chain_calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for EvolvingChainStore {
+        async fn list(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<crate::object_store::ObjectMeta>, ObjectStoreError> {
+            self.inner.list(prefix).await
+        }
+        async fn get_to_file(
+            &self,
+            key: &str,
+            dest: &Path,
+            opts: GetOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.get_to_file(key, dest, opts).await
+        }
+        async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+            if key == self.chain_key {
+                let idx = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let guard = self.bodies.lock().unwrap();
+                let pick = idx.min(guard.len() - 1);
+                return Ok(guard[pick].clone());
+            }
+            self.inner.get_bytes(key).await
+        }
+        async fn get_bytes_range(
+            &self,
+            key: &str,
+            range: std::ops::Range<u64>,
+        ) -> Result<Bytes, ObjectStoreError> {
+            self.inner.get_bytes_range(key, range).await
+        }
+        async fn put_bytes(
+            &self,
+            key: &str,
+            body: Bytes,
+            opts: crate::object_store::PutOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.put_bytes(key, body, opts).await
+        }
+        async fn put_path(
+            &self,
+            key: &str,
+            src: &Path,
+            opts: crate::object_store::PutOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.put_path(key, src, opts).await
+        }
+        async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
+            self.inner.put_if_absent(key, body).await
+        }
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<crate::object_store::ObjectMeta, ObjectStoreError> {
+            self.inner.head(key).await
+        }
+        async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
+            self.inner.copy(src, dst).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Variant of [`EvolvingChainStore`] that returns `NotFound` on the
+    /// SECOND `get_bytes(chain_key)` — simulates the ref being deleted
+    /// (chain.json vanishes) between the initial load and the retry
+    /// reload. The first call serves the seeded body so the fetch path
+    /// enters its download attempt before the disappearance.
+    struct VanishingChainStore {
+        inner: MockStore,
+        chain_key: String,
+        initial: Bytes,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for VanishingChainStore {
+        async fn list(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<crate::object_store::ObjectMeta>, ObjectStoreError> {
+            self.inner.list(prefix).await
+        }
+        async fn get_to_file(
+            &self,
+            key: &str,
+            dest: &Path,
+            opts: GetOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.get_to_file(key, dest, opts).await
+        }
+        async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+            if key == self.chain_key {
+                let idx = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if idx == 0 {
+                    return Ok(self.initial.clone());
+                }
+                return Err(ObjectStoreError::NotFound(key.to_owned()));
+            }
+            self.inner.get_bytes(key).await
+        }
+        async fn get_bytes_range(
+            &self,
+            key: &str,
+            range: std::ops::Range<u64>,
+        ) -> Result<Bytes, ObjectStoreError> {
+            self.inner.get_bytes_range(key, range).await
+        }
+        async fn put_bytes(
+            &self,
+            key: &str,
+            body: Bytes,
+            opts: crate::object_store::PutOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.put_bytes(key, body, opts).await
+        }
+        async fn put_path(
+            &self,
+            key: &str,
+            src: &Path,
+            opts: crate::object_store::PutOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.put_path(key, src, opts).await
+        }
+        async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
+            self.inner.put_if_absent(key, body).await
+        }
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<crate::object_store::ObjectMeta, ObjectStoreError> {
+            self.inner.head(key).await
+        }
+        async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
+            self.inner.copy(src, dst).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Construct a 1-segment chain referencing pack `pack_sha_hex` at
+    /// tip `tip_hex`. The pack is intentionally NOT seeded into the
+    /// store so the first download attempt yields `PackMissing`.
+    fn one_segment_chain(tip_hex: &str, pack_sha_hex: &str) -> ChainManifest {
+        ChainManifest {
+            v: 1,
+            tip: Sha40::try_new(tip_hex).unwrap(),
+            full_at: Sha40::try_new(tip_hex).unwrap(),
+            segments: vec![ChainSegment {
+                sha: Sha40::try_new(tip_hex).unwrap(),
+                parent_sha: None,
+                pack: format!("packs/{pack_sha_hex}.pack"),
+                bytes: 1_024,
+            }],
+        }
+    }
+
+    /// Seed a real commit in `repo_dir` and return its `Sha40`. Used
+    /// by the retry-success tests so the reload chain can reference a
+    /// SHA already present in the local ODB — `select_needed_segments`
+    /// stops at that segment, returns `(empty, false)`, and the
+    /// download/install phase has nothing to do.
+    fn seed_commit(repo_dir: &Path) -> Sha40 {
+        use gix::actor::SignatureRef;
+        use gix::bstr::BStr;
+        use gix_hash::ObjectId;
+        let repo = gix::open(repo_dir).unwrap();
+        let signature = SignatureRef {
+            name: BStr::new("Tester"),
+            email: BStr::new("t@example.com"),
+            time: "0 +0000",
+        };
+        let blob = repo.write_blob(b"hello").unwrap().detach();
+        let tree = repo
+            .write_object(&gix::objs::Tree {
+                entries: vec![gix::objs::tree::Entry {
+                    mode: gix::objs::tree::EntryKind::Blob.into(),
+                    filename: "f".into(),
+                    oid: blob,
+                }],
+            })
+            .unwrap()
+            .detach();
+        let oid = repo
+            .commit_as(
+                signature,
+                signature,
+                "refs/heads/main",
+                "seed",
+                tree,
+                std::iter::empty::<ObjectId>(),
+            )
+            .unwrap()
+            .detach();
+        Sha40::from_oid(&oid).unwrap()
+    }
+
+    /// Build a 1-segment chain referencing pack `pack_sha_hex` at tip
+    /// `tip` whose segment SHA equals `segment_sha` — used by the
+    /// retry-success tests to point the reloaded chain at a SHA the
+    /// local ODB already contains.
+    fn chain_with_known_segment(
+        tip: &Sha40,
+        segment_sha: &Sha40,
+        pack_sha_hex: &str,
+    ) -> ChainManifest {
+        ChainManifest {
+            v: 1,
+            tip: tip.clone(),
+            full_at: segment_sha.clone(),
+            segments: vec![ChainSegment {
+                sha: segment_sha.clone(),
+                parent_sha: None,
+                pack: format!("packs/{pack_sha_hex}.pack"),
+                bytes: 1_024,
+            }],
+        }
+    }
+
+    /// Fetch retries once after `PackMissing`: the initial chain
+    /// points at a pack absent from the bucket; the reload returns a
+    /// chain whose only segment is already in the local ODB (the
+    /// receiver's repo has been brought up to date by a sibling
+    /// fetch, or the sweep compacted the chain to a point the
+    /// receiver already covers). The retry observes no work left and
+    /// returns Ok, proving the retry layer recovers from the GC race
+    /// without requiring the original pack.
+    ///
+    /// Without the retry (pre-#148 behaviour), the call would surface
+    /// `PackMissing` on the first attempt — the existing
+    /// `fetch_surfaces_pack_missing_when_chain_references_absent_pack`
+    /// test pins that legacy behaviour for the genuine-corruption case.
+    #[tokio::test(start_paused = true)]
+    async fn fetch_retries_after_pack_missing_when_reload_drops_segment() {
+        // `start_paused = true` lets the runtime auto-advance through
+        // the backoff sleep so the test pays nanoseconds, not 100 ms.
+        let repo_dir = tempfile::tempdir().unwrap();
+        gix::init(repo_dir.path()).unwrap();
+        let known_sha = seed_commit(repo_dir.path());
+
+        let initial_pack = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let reload_pack = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let tip = "1111111111111111111111111111111111111111";
+
+        let inner = MockStore::new();
+        // Reload presents a chain whose only segment is the
+        // local-ODB-known commit (so `select_needed_segments` returns
+        // `(empty, false)` and the install step has nothing to do).
+        // The reload chain MUST reference a different pack key so the
+        // verify-step (`chain_references_pack_key(initial_pack)`)
+        // returns false and the retry proceeds instead of failing
+        // fast on the genuine-corruption branch.
+        let reload_chain =
+            chain_with_known_segment(&Sha40::try_new(tip).unwrap(), &known_sha, reload_pack);
+        let initial_bytes = Bytes::from(
+            one_segment_chain(tip, initial_pack)
+                .to_json_pretty()
+                .unwrap(),
+        );
+        let reload_bytes = Bytes::from(reload_chain.to_json_pretty().unwrap());
+        let key = chain_key(Some("repo"), ref_main());
+        inner.insert(&key, initial_bytes.clone());
+
+        let evolving = Arc::new(EvolvingChainStore::new(
+            inner,
+            key,
+            vec![initial_bytes, reload_bytes],
+        ));
+        let store: Arc<dyn ObjectStore> = Arc::clone(&evolving) as _;
+        let semaphore = Arc::new(Semaphore::new(MAX_FETCH_CONCURRENCY));
+        let fetched_refs = FetchedRefs::new();
+        let boundaries = ShallowBoundaries::new();
+        let ref_name = ref_main();
+        let tip_sha = Sha::from_hex(tip).unwrap();
+
+        let result = fetch_one(FetchOneCtx {
+            store,
+            semaphore,
+            prefix: Some("repo"),
+            repo_dir: repo_dir.path(),
+            sha: tip_sha,
+            ref_name: &ref_name,
+            fetched_refs: &fetched_refs,
+            depth: None,
+            boundaries: &boundaries,
+        })
+        .await;
+        result.expect("retry must succeed once reload drops the missing-pack reference");
+        // Pin the retry contract: at least two chain loads — one
+        // before the PackMissing, one to verify the missing key was
+        // dropped. (The retry attempt that follows itself loads
+        // chain.json again, for a total of three on this path.)
+        assert!(
+            evolving.chain_calls() >= 2,
+            "retry must reload chain.json at least once to verify the GC race; \
+             observed {} chain calls",
+            evolving.chain_calls()
+        );
+    }
+
+    /// When each reload still references a fresh missing pack, the
+    /// retry loop exhausts after `PACK_MISSING_MAX_RETRIES` and
+    /// surfaces `ConcurrentGcRetriesExhausted` with the last observed
+    /// key.
+    ///
+    /// The wrapper alternates `fetch_once` (load chain at the start
+    /// of each attempt) with the verify-reload that follows the
+    /// resulting `PackMissing`. With `PACK_MISSING_MAX_RETRIES=3`, we
+    /// run four `fetch_once` attempts (initial + 3 retries) before
+    /// the loop trips its exhausted check, so the store must serve
+    /// eight distinct chain bodies: indices 0,2,4,6 are the
+    /// per-attempt loads (each referencing a unique missing pack),
+    /// indices 1,3,5,7 are the verification reloads (each referencing
+    /// a DIFFERENT pack so `chain_references_pack_key` returns false
+    /// and the loop retries instead of failing fast).
+    #[tokio::test(start_paused = true)]
+    async fn fetch_surfaces_exhausted_after_max_retries() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        gix::init(repo_dir.path()).unwrap();
+
+        // Eight distinct pack SHAs, one per chain-body in the
+        // evolving sequence. Use the segment index as the dominant
+        // nibble so the values stay visually distinct in failure
+        // messages (each repeated 40 times to fill `Sha40`).
+        let pack_shas: [String; 8] = std::array::from_fn(|i| {
+            let nibble = char::from_digit(u32::try_from(i).unwrap(), 16).unwrap();
+            std::iter::repeat_n(nibble, 40).collect()
+        });
+        let tip = "ffffffffffffffffffffffffffffffffffffffff";
+        let bodies: Vec<Bytes> = pack_shas
+            .iter()
+            .map(|p| Bytes::from(one_segment_chain(tip, p).to_json_pretty().unwrap()))
+            .collect();
+
+        let inner = MockStore::new();
+        let key = chain_key(Some("repo"), ref_main());
+        inner.insert(&key, bodies[0].clone());
+        let store: Arc<dyn ObjectStore> = Arc::new(EvolvingChainStore::new(inner, key, bodies));
+        let semaphore = Arc::new(Semaphore::new(MAX_FETCH_CONCURRENCY));
+        let fetched_refs = FetchedRefs::new();
+        let boundaries = ShallowBoundaries::new();
+        let ref_name = ref_main();
+        let tip_sha = Sha::from_hex(tip).unwrap();
+
+        let result = fetch_one(FetchOneCtx {
+            store,
+            semaphore,
+            prefix: Some("repo"),
+            repo_dir: repo_dir.path(),
+            sha: tip_sha,
+            ref_name: &ref_name,
+            fetched_refs: &fetched_refs,
+            depth: None,
+            boundaries: &boundaries,
+        })
+        .await;
+        match result {
+            Err(FetchError::Packchain(PackchainError::ConcurrentGcRetriesExhausted {
+                last_missing_key,
+                attempts,
+            })) => {
+                assert_eq!(attempts, PACK_MISSING_MAX_RETRIES);
+                // The 4th and last fetch_once attempt loaded body
+                // index 6 (refs pack_shas[6]) and surfaced
+                // PackMissing for that pack.
+                assert!(
+                    last_missing_key.contains(&pack_shas[6]),
+                    "last missing key should name pack_shas[6], got {last_missing_key}"
+                );
+            }
+            other => panic!("expected ConcurrentGcRetriesExhausted, got {other:?}"),
+        }
+    }
+
+    /// chain.json vanishing between the first download and the retry
+    /// reload (ref deleted out from under the fetch) must surface as
+    /// `ChainAbsent` — NOT as `PackMissing` and NOT as the retries-
+    /// exhausted variant.
+    #[tokio::test(start_paused = true)]
+    async fn fetch_surfaces_chain_absent_when_chain_vanishes_mid_fetch() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        gix::init(repo_dir.path()).unwrap();
+
+        let pack_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let tip = "1111111111111111111111111111111111111111";
+        let inner = MockStore::new();
+        let initial = Bytes::from(one_segment_chain(tip, pack_sha).to_json_pretty().unwrap());
+        let key = chain_key(Some("repo"), ref_main());
+        inner.insert(&key, initial.clone());
+        let store: Arc<dyn ObjectStore> = Arc::new(VanishingChainStore {
+            inner,
+            chain_key: key,
+            initial,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let semaphore = Arc::new(Semaphore::new(MAX_FETCH_CONCURRENCY));
+        let fetched_refs = FetchedRefs::new();
+        let boundaries = ShallowBoundaries::new();
+        let ref_name = ref_main();
+        let tip_sha = Sha::from_hex(tip).unwrap();
+
+        let result = fetch_one(FetchOneCtx {
+            store,
+            semaphore,
+            prefix: Some("repo"),
+            repo_dir: repo_dir.path(),
+            sha: tip_sha,
+            ref_name: &ref_name,
+            fetched_refs: &fetched_refs,
+            depth: None,
+            boundaries: &boundaries,
+        })
+        .await;
+        match result {
+            Err(FetchError::Packchain(PackchainError::ChainAbsent { ref_name: r })) => {
+                assert_eq!(r, "refs/heads/main");
+            }
+            other => panic!("expected ChainAbsent, got {other:?}"),
+        }
+    }
+
+    /// Shallow fetch must take the same retry path as the full fetch:
+    /// initial chain references an absent pack, reload presents a
+    /// chain whose only segment is already in the local ODB so the
+    /// retry returns Ok. Pins that `fetch_shallow` is exercised
+    /// through the retry wrapper.
+    #[tokio::test(start_paused = true)]
+    async fn fetch_shallow_retries_after_pack_missing_when_reload_drops_segment() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        gix::init(repo_dir.path()).unwrap();
+        let known_sha = seed_commit(repo_dir.path());
+
+        let initial_pack = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let reload_pack = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let tip = "1111111111111111111111111111111111111111";
+
+        let inner = MockStore::new();
+        let initial_bytes = Bytes::from(
+            one_segment_chain(tip, initial_pack)
+                .to_json_pretty()
+                .unwrap(),
+        );
+        let reload_bytes = Bytes::from(
+            chain_with_known_segment(&Sha40::try_new(tip).unwrap(), &known_sha, reload_pack)
+                .to_json_pretty()
+                .unwrap(),
+        );
+        let key = chain_key(Some("repo"), ref_main());
+        inner.insert(&key, initial_bytes.clone());
+        let store: Arc<dyn ObjectStore> = Arc::new(EvolvingChainStore::new(
+            inner,
+            key,
+            vec![initial_bytes, reload_bytes],
+        ));
+        let semaphore = Arc::new(Semaphore::new(MAX_FETCH_CONCURRENCY));
+        let fetched_refs = FetchedRefs::new();
+        let boundaries = ShallowBoundaries::new();
+        let ref_name = ref_main();
+        let tip_sha = Sha::from_hex(known_sha.as_str()).unwrap();
+        let depth = NonZeroU32::new(1);
+
+        let result = fetch_one(FetchOneCtx {
+            store,
+            semaphore,
+            prefix: Some("repo"),
+            repo_dir: repo_dir.path(),
+            sha: tip_sha,
+            ref_name: &ref_name,
+            fetched_refs: &fetched_refs,
+            depth,
+            boundaries: &boundaries,
+        })
+        .await;
+        result.expect("shallow retry must succeed once reload drops the missing-pack reference");
     }
 
     #[tokio::test]

@@ -82,6 +82,7 @@ pub(crate) mod push;
 // below (`packchain::PackIndexCache`, `packchain::read_blob`) remain
 // the canonical short paths.
 pub mod read;
+pub(crate) mod retry;
 pub(crate) mod schema;
 
 pub use read::{PackIndexCache, read_blob};
