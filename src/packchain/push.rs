@@ -1468,14 +1468,16 @@ mod tests {
     }
 
     /// Regression for #130: closes the TOCTOU window where a concurrent
-    /// `protect` lands the marker between `acquire_lock` and the
-    /// listing. The synchronous mock cannot reproduce a true race
-    /// in-process, but the production code reads the marker from the
-    /// under-lock listing rather than a pre-lock snapshot — so any
-    /// marker present at list time is observed. Seeding the marker
-    /// before invoking delete simulates that "lands during the lock
-    /// window" timing: the head probe for `chain.json` succeeds, the
-    /// listing then surfaces the marker, and the sweep is suppressed.
+    /// `protect` lands the marker between the under-lock `head` probe
+    /// of `chain.json` and the under-lock `list` of the ref prefix.
+    ///
+    /// Uses [`PostHeadHookStore`] to deterministically inject the
+    /// PROTECTED# marker between the two calls: the listing is seeded
+    /// WITHOUT the marker, the hook fires after `head(chain.json)`
+    /// returns successfully, and inserts the marker before the
+    /// downstream `list` runs. The under-lock `list` therefore sees
+    /// the freshly-arrived marker and the delete is rejected with the
+    /// canonical protection message. Mirrors the issue-#144 fix.
     ///
     /// What this pins separately from
     /// [`delete_rejects_when_protected_marker_present_with_chain`]: that
@@ -1483,20 +1485,29 @@ mod tests {
     /// the head probe's snapshot), so a marker that arrives strictly
     /// AFTER the head probe is still caught. A regression that
     /// pre-computed `has_protected_marker` from a snapshot read before
-    /// the list would let this scenario slip through.
+    /// the list would let this scenario slip through — without the
+    /// hook the listing would never observe the marker and the sweep
+    /// would silently complete.
     #[tokio::test]
     async fn delete_rejects_when_protected_marker_lands_after_lock_acquire() {
-        let store = Arc::new(MockStore::new());
+        let inner = MockStore::new();
         let prefix = Some("repo");
         let remote = rn("refs/heads/main");
         let chain = chain_key(prefix, &remote);
         let protected = "repo/refs/heads/main/PROTECTED#";
 
-        // Chain present (head probe will succeed); marker also present,
-        // representing a concurrent `protect` that landed before we
-        // listed entries under the lock.
-        store.insert(&chain, Bytes::from_static(b"{}"));
-        store.insert(protected, Bytes::new());
+        // Chain present so the head probe succeeds; marker is
+        // explicitly ABSENT in the initial state — it lands only when
+        // the hook fires, after `head(chain.json)` returns.
+        inner.insert(&chain, Bytes::from_static(b"{}"));
+
+        let protected_key = protected.to_owned();
+        let store = Arc::new(PostHeadHookStore::new(inner, &chain, move |inner| {
+            // Simulate the concurrent `protect` landing in the gap
+            // between the under-lock `head(chain.json)` and the
+            // under-lock `list(ref_prefix)`.
+            inner.insert(&protected_key, Bytes::new());
+        }));
 
         let config = delete_test_config();
         let outcome = delete_remote_ref_packchain(
@@ -1518,12 +1529,23 @@ mod tests {
             "TOCTOU-window protect must reject with the canonical message, got {outcome:?}",
         );
 
+        // Witness: the hook fired exactly once on the chain.json head.
+        // If a regression dropped the under-lock head probe (or scoped
+        // it to a different key), the hook would never fire and the
+        // marker would never land — surfacing here as a non-rejection
+        // outcome above OR as a remaining-hook witness below.
+        assert!(
+            store.hook_fired(),
+            "post-head hook must have fired on the chain.json head probe",
+        );
+
         // No keys swept — exhaustive check across every key under the
         // ref prefix (other than the now-released lock). A regression
         // that swept any subset before bailing would leave one of these
         // assertions failing.
         let ref_prefix = "repo/refs/heads/main/";
         let surviving: Vec<String> = store
+            .inner
             .keys()
             .into_iter()
             .filter(|k| k.starts_with(ref_prefix))
@@ -1822,6 +1844,135 @@ mod tests {
                 !e.to_string().contains("not ancestor"),
                 "non-force push must not hit the protection rejection: {e}",
             ),
+        }
+    }
+
+    // --- mark head→list race injection (issue #144) -------------------
+
+    /// One-shot post-`head` hook used by [`PostHeadHookStore`].
+    type PostHeadHook = Box<dyn FnOnce(&MockStore) + Send>;
+
+    /// Test-only [`ObjectStore`] decorator that runs a one-shot
+    /// callback the first time `head()` succeeds on `trigger_key`,
+    /// *after* the inner head completes but before the call returns
+    /// to the consumer. Used to deterministically simulate a
+    /// concurrent operation landing in the gap between two
+    /// successive calls — e.g. a `protect` that writes the
+    /// `PROTECTED#` marker after the under-lock `head(chain.json)`
+    /// probe but before the under-lock `list(ref_prefix)`.
+    ///
+    /// Mirrors the shape of `PostDeleteHookStore` and
+    /// `PostListHookStore` in [`super::super::gc`]: every other
+    /// trait method forwards to the inner store unchanged, the hook
+    /// is consumed exactly once, and the inner [`MockStore`] is
+    /// accessible via the `inner` field for test seeding and
+    /// post-call assertions.
+    ///
+    /// The `trigger_key` filter is exact-match (not prefix) because
+    /// the head probe in `delete_remote_ref_packchain` shares the
+    /// surface with `acquire_lock`, which itself may `head()` the
+    /// lock key on contention — scoping by exact key keeps the hook
+    /// from misfiring on lock-related probes.
+    struct PostHeadHookStore {
+        inner: MockStore,
+        hook: std::sync::Mutex<Option<PostHeadHook>>,
+        trigger_key: String,
+    }
+
+    impl PostHeadHookStore {
+        fn new(
+            inner: MockStore,
+            trigger_key: impl Into<String>,
+            hook: impl FnOnce(&MockStore) + Send + 'static,
+        ) -> Self {
+            Self {
+                inner,
+                hook: std::sync::Mutex::new(Some(Box::new(hook))),
+                trigger_key: trigger_key.into(),
+            }
+        }
+
+        /// `true` once the hook has been consumed — used by tests to
+        /// witness that the production code reached the targeted
+        /// head call rather than skipping past it on a different
+        /// branch.
+        fn hook_fired(&self) -> bool {
+            self.hook.lock().unwrap().is_none()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for PostHeadHookStore {
+        async fn list(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<crate::object_store::ObjectMeta>, ObjectStoreError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn get_to_file(
+            &self,
+            key: &str,
+            dest: &std::path::Path,
+            opts: crate::object_store::GetOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.get_to_file(key, dest, opts).await
+        }
+
+        async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+            self.inner.get_bytes(key).await
+        }
+
+        async fn get_bytes_range(
+            &self,
+            key: &str,
+            range: std::ops::Range<u64>,
+        ) -> Result<Bytes, ObjectStoreError> {
+            self.inner.get_bytes_range(key, range).await
+        }
+
+        async fn put_bytes(
+            &self,
+            key: &str,
+            body: Bytes,
+            opts: PutOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.put_bytes(key, body, opts).await
+        }
+
+        async fn put_path(
+            &self,
+            key: &str,
+            src: &std::path::Path,
+            opts: PutOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.put_path(key, src, opts).await
+        }
+
+        async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
+            self.inner.put_if_absent(key, body).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<crate::object_store::ObjectMeta, ObjectStoreError> {
+            let result = self.inner.head(key).await;
+            if result.is_ok()
+                && key == self.trigger_key
+                && let Some(hook) = self.hook.lock().unwrap().take()
+            {
+                hook(&self.inner);
+            }
+            result
+        }
+
+        async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
+            self.inner.copy(src, dst).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
+            self.inner.delete(key).await
         }
     }
 }
