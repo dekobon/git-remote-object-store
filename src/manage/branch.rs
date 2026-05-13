@@ -14,14 +14,16 @@ use std::io::Write;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use time::OffsetDateTime;
 use tracing::{info, warn};
 
 use super::{ManageError, Prompter};
 use crate::git::RefName;
 use crate::keys;
-use crate::object_store::{ObjectStore, ObjectStoreError, PutOpts};
+use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
 use crate::packchain::gc::write_baseline_tombstone_for_orphan;
 use crate::packchain::manifest::load_chain;
+use crate::protocol::push::{acquire_lock, lock_key, lock_ttl_from_env, release_lock};
 
 /// Operations on a single branch within a repository.
 pub struct ManageBranch<'a> {
@@ -98,19 +100,39 @@ impl<'a> ManageBranch<'a> {
     /// against a protected ref and a management-CLI `delete-branch` of
     /// the same ref fail the same way.
     ///
+    /// # Per-ref lock (#158)
+    ///
+    /// After the operator confirms the prompt, `delete-branch` acquires
+    /// the same `<prefix>/<ref>/LOCK#.lock` the helper-protocol push
+    /// and delete paths take. The lock is held across the fresh re-list,
+    /// the baseline tombstone write (#143), and the synchronous sweep.
+    /// Without it a concurrent `git push` could land a new bundle after
+    /// the post-prompt re-list, the sweep would delete only the stale
+    /// snapshot, and the ref would survive with the just-pushed bundle
+    /// even though delete-branch reported success.
+    ///
+    /// Lock acquisition runs AFTER the prompt — the prompt is
+    /// interactive and could block indefinitely, and holding the lock
+    /// across user input would make every other writer wait on the
+    /// operator's keyboard. If the lock is contended at acquisition
+    /// time the function returns [`ManageError::LockContended`] and
+    /// makes no changes. Release failures are downgraded to a `warn!`
+    /// because the lock's TTL guarantees a stale lock is recovered by
+    /// the next acquirer; matches the protocol-push pattern.
+    ///
     /// The prompt-display and protection-marker check use a first listing
     /// for accuracy of the displayed object count, then a **second
-    /// listing is taken immediately before the deletion loop**. The
-    /// fresh listing drives the sweep so that any concurrent push
-    /// landing under the branch prefix during the prompt window is
-    /// caught and deleted rather than left as a zombie object (#139).
-    /// The protection-marker check is re-evaluated on the fresh listing
-    /// so a `protect` racing with the prompt is honoured (#131) — the
-    /// post-prompt re-check is what closes the TOCTOU window between
-    /// the initial marker check and the deletion loop. If the fresh
-    /// listing is empty (a concurrent delete won the race) the function
-    /// reports it and returns `Ok(())` rather than silently claiming
-    /// success.
+    /// listing is taken under the lock immediately before the deletion
+    /// loop**. The fresh listing drives the sweep so that any concurrent
+    /// push landing under the branch prefix during the prompt window —
+    /// before the lock window opens — is caught and deleted rather than
+    /// left as a zombie object (#139). The protection-marker check is
+    /// re-evaluated on the fresh listing so a `protect` racing with the
+    /// prompt is honoured (#131) — the post-prompt re-check is what
+    /// closes the TOCTOU window between the initial marker check and
+    /// the deletion loop. If the fresh listing is empty (a concurrent
+    /// delete won the race) the function reports it and returns
+    /// `Ok(())` rather than silently claiming success.
     ///
     /// `NotFound` errors observed during the sweep are tolerated — they
     /// mean a concurrent deleter swept the key first, which still
@@ -140,6 +162,8 @@ impl<'a> ManageBranch<'a> {
     ///
     /// Returns [`ManageError::Protected`] if the branch carries a
     /// `PROTECTED#` marker (checked on both listings),
+    /// [`ManageError::LockContended`] if another writer holds the
+    /// per-ref lock at acquisition time,
     /// [`ManageError::Cancelled`] if the user cancels the prompt,
     /// [`ManageError::Io`] for prompt or write I/O failures,
     /// [`ManageError::Store`] if a list operation fails, or
@@ -161,8 +185,8 @@ impl<'a> ManageBranch<'a> {
     /// Same as [`delete`](Self::delete), plus [`ManageError::Io`] if a
     /// write to `out` fails.
     pub(crate) async fn delete_into<W: Write>(&self, out: &mut W) -> Result<(), ManageError> {
-        let prefix = self.branch_prefix();
-        let initial = self.store.list(&prefix).await?;
+        let listing_prefix = self.branch_prefix();
+        let initial = self.store.list(&listing_prefix).await?;
         if keys::entries_have_protected_marker(&initial) {
             return Err(ManageError::Protected(self.branch.clone()));
         }
@@ -172,12 +196,79 @@ impl<'a> ManageBranch<'a> {
             return Ok(());
         }
 
-        // Re-list immediately before the sweep so concurrent pushes that
-        // landed during the prompt window are included in the deletion
-        // set. The first listing can be arbitrarily stale once the user
-        // has had time to answer; #139 was filed because pushes during
-        // that window left zombie objects.
-        let fresh = self.store.list(&prefix).await?;
+        // Acquire the per-ref lock AFTER the prompt and BEFORE the
+        // fresh re-list / tombstone / sweep. Holding the lock across
+        // the prompt would block every concurrent writer on the
+        // operator's keyboard; the lock window starts only once the
+        // operator has confirmed the intent (#158). The protocol push
+        // / delete paths and `packchain::compact` use the same lock
+        // key, so a concurrent `git push` or `compact` racing this
+        // delete is mutually excluded.
+        let ref_name = self.validated_ref_name()?;
+        let prefix_opt = (!self.prefix.is_empty()).then_some(self.prefix.as_str());
+        let lock = lock_key(prefix_opt, &ref_name);
+        let ttl = lock_ttl_from_env();
+        let now = OffsetDateTime::now_utc();
+        let Some(guard) = acquire_lock(Arc::clone(&self.store), &lock, ttl, now).await? else {
+            warn!(
+                branch = %self.branch,
+                key = %lock,
+                "delete-branch: per-ref lock is held by another writer; refusing to race",
+            );
+            return Err(ManageError::LockContended {
+                branch: self.branch.clone(),
+                lock,
+                ttl_seconds: ttl.whole_seconds(),
+            });
+        };
+
+        // Everything from here to the matching `release_lock` must
+        // route exits through `release_lock_or_warn` so the lock is
+        // freed regardless of outcome. A leaked guard is recovered by
+        // the next acquirer's stale-lock branch after `ttl` elapses,
+        // but explicit release is the well-behaved path and matches
+        // the helper-protocol delete release tail.
+        let work = self
+            .delete_under_lock(out, &listing_prefix, &lock, &initial)
+            .await;
+        let release_result = release_lock(guard).await;
+        if let Err(e) = release_result {
+            warn!(
+                branch = %self.branch,
+                key = %lock,
+                error = %e,
+                "delete-branch: failed to release per-ref lock; will age out by TTL",
+            );
+        }
+        work
+    }
+
+    /// The lock-held body of [`Self::delete_into`]: fresh re-list,
+    /// protection re-check, tombstone write, sweep. Extracted so the
+    /// caller's `release_lock` runs unconditionally on every exit
+    /// path. The lock key is filtered from the fresh listing so the
+    /// sweep does not delete the very lock we hold.
+    async fn delete_under_lock<W: Write>(
+        &self,
+        out: &mut W,
+        listing_prefix: &str,
+        lock: &str,
+        initial: &[ObjectMeta],
+    ) -> Result<(), ManageError> {
+        // Re-list under the lock so concurrent pushes that landed
+        // during the prompt window — before the lock window opened —
+        // are included in the deletion set. With the lock now held,
+        // no further writes can sneak in between this listing and the
+        // sweep. Filter out the lock key itself: we hold it and the
+        // release tail removes it; sweeping it mid-critical-section
+        // would let another acquirer take the lock under us.
+        let fresh: Vec<ObjectMeta> = self
+            .store
+            .list(listing_prefix)
+            .await?
+            .into_iter()
+            .filter(|m| m.key != lock)
+            .collect();
         if fresh.is_empty() {
             writeln!(
                 out,
@@ -221,6 +312,12 @@ impl<'a> ManageBranch<'a> {
         // an unparseable chain fall through to the immediate-delete
         // path: there is nothing for `sweep` to reconcile against, so
         // deferral would just orphan the bundle.
+        //
+        // The tombstone write runs UNDER the lock (#158): a concurrent
+        // push that landed between the tombstone and the chain.json
+        // delete would otherwise leave the bucket with a tombstone
+        // referencing a SHA no longer in the chain, and `gc sweep`
+        // would reclaim a live bundle.
         let deferred_bundle_key = self.try_tombstone_baseline(&fresh).await;
         if let Some(ref key) = deferred_bundle_key {
             info!(
@@ -241,8 +338,9 @@ impl<'a> ManageBranch<'a> {
         for object in &fresh {
             // The baseline bundle (if any) is left for `gc sweep` —
             // see the tombstone block above. Other keys (chain.json,
-            // path-index.json, lock files, PROTECTED# is already
-            // refused earlier) are deleted synchronously.
+            // path-index.json, PROTECTED# is already refused earlier)
+            // are deleted synchronously. The lock key was filtered
+            // from `fresh` above, so it is not in the iteration.
             if deferred_bundle_key.as_deref() == Some(object.key.as_str()) {
                 continue;
             }
@@ -269,6 +367,17 @@ impl<'a> ManageBranch<'a> {
         writeln!(out, "Branch {} has been deleted", self.branch)?;
         info!(branch = %self.branch, count = fresh.len(), "branch deleted");
         Ok(())
+    }
+
+    /// Build a validated `RefName` for `refs/heads/<branch>`. `open`
+    /// already accepted this value, so the parse is effectively
+    /// infallible — but we surface a parse failure as
+    /// [`ManageError::InvalidBranch`] rather than panicking so a
+    /// future loosening of `open`'s validator cannot turn delete-branch
+    /// into a panic surface.
+    fn validated_ref_name(&self) -> Result<RefName, ManageError> {
+        RefName::new(format!("refs/heads/{}", self.branch))
+            .map_err(|_| ManageError::InvalidBranch(self.branch.clone()))
     }
 
     /// Attempt to tombstone the baseline bundle for a packchain ref so
@@ -422,10 +531,10 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_every_key_when_confirmed() {
-        // No PROTECTED# marker — the lock file and bundle are the only
-        // residue, and a confirmed delete must clear them.
+        // No PROTECTED# marker — only the bundle. A confirmed delete
+        // must clear it AND release the per-ref lock it acquires
+        // (#158), leaving the bucket empty.
         let mock = seed_with_branch("main");
-        mock.insert("myrepo/refs/heads/main/LOCK#.lock", Bytes::new());
         let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
         let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
 
@@ -435,7 +544,7 @@ mod tests {
         mb.delete().await.expect("delete");
         assert!(
             mock.keys().is_empty(),
-            "all keys removed: {:?}",
+            "all keys removed (including the LOCK#.lock that delete-branch acquired and released): {:?}",
             mock.keys()
         );
         assert_eq!(prompter.remaining(), 0);
@@ -1231,9 +1340,11 @@ mod tests {
         // No PROTECTED# marker is seeded — protected-ref refusal is
         // covered separately by
         // `root_prefix_delete_refuses_when_protected_marker_present`.
+        // The `LOCK#.lock` is created and removed by `delete`'s own
+        // acquire/release tail (#158) — pre-seeding a fresh lock here
+        // would (correctly) surface as `LockContended`.
         let mock = MockStore::new();
         mock.insert("refs/heads/main/abc.bundle", Bytes::from("body"));
-        mock.insert("refs/heads/main/LOCK#.lock", Bytes::new());
         let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
         let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
 
@@ -1611,5 +1722,246 @@ mod tests {
             tomb_keys.is_empty(),
             "no tombstone for a chain whose bundle is already absent: {tomb_keys:?}",
         );
+    }
+
+    // --- Per-ref lock acquisition / release (#158) ----------------------
+
+    #[tokio::test]
+    async fn delete_refuses_when_per_ref_lock_is_held_by_another_writer() {
+        // Issue #158: pre-fix, `delete-branch` performed a fresh
+        // listing + sweep without taking the per-ref `LOCK#.lock`. A
+        // concurrent `git push` that acquired the lock and started
+        // uploading a new bundle after the listing would land that
+        // bundle AFTER the delete sweep, leaving the ref alive while
+        // delete-branch reported success.
+        //
+        // The fix takes the same lock the helper-protocol push and
+        // delete paths take. This test seeds a FRESH lock (matching a
+        // concurrent push holding it) and asserts that delete-branch
+        // returns `LockContended` and makes NO changes — the bundle
+        // and the lock both survive verbatim.
+        let mock = seed_with_branch("main");
+        // Fresh `last_modified` = now → `acquire_lock` sees
+        // `age <= ttl` and reports contention (Ok(None)).
+        mock.insert("myrepo/refs/heads/main/LOCK#.lock", Bytes::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        let err = mb
+            .delete()
+            .await
+            .expect_err("delete must refuse to race a fresh lock holder");
+        match &err {
+            ManageError::LockContended {
+                branch,
+                lock,
+                ttl_seconds,
+            } => {
+                assert_eq!(branch, "main");
+                assert_eq!(lock, "myrepo/refs/heads/main/LOCK#.lock");
+                assert!(
+                    *ttl_seconds > 0,
+                    "ttl_seconds must be positive, got {ttl_seconds}",
+                );
+            }
+            other => panic!("expected LockContended, got {other:?}"),
+        }
+        // The operator-facing wording must name the lock key (so a
+        // doctor invocation can copy it) and surface the TTL.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("myrepo/refs/heads/main/LOCK#.lock"),
+            "error must name the lock key, got: {rendered}",
+        );
+        assert!(
+            rendered.contains("doctor"),
+            "error must point operators at doctor, got: {rendered}",
+        );
+        // NOTHING was deleted: the bundle, the lock, and the prompt's
+        // confirmation are all preserved. Pre-#158 this exact race
+        // produced a "success" with the bundle missing.
+        assert!(
+            mock.contains("myrepo/refs/heads/main/abc.bundle"),
+            "bundle must survive a contended-lock refusal",
+        );
+        assert!(
+            mock.contains("myrepo/refs/heads/main/LOCK#.lock"),
+            "the racing writer's lock must NOT be deleted",
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_recovers_stale_lock_and_proceeds() {
+        // A `LOCK#.lock` older than the TTL means a previous writer
+        // crashed before releasing it. `acquire_lock` recovers it by
+        // deleting and re-acquiring. The delete must then complete
+        // normally — refusing on a stale lock would let a crashed
+        // writer block the bucket forever.
+        //
+        // This pins the staleness boundary by seeding a lock dated
+        // well in the past (sufficient for any reasonable TTL up to
+        // hours) and asserting both the sweep and the final release
+        // ran.
+        let mock = MockStore::new();
+        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("body"));
+        let stale = OffsetDateTime::now_utc() - time::Duration::days(1);
+        mock.insert_with(
+            "myrepo/refs/heads/main/LOCK#.lock",
+            Bytes::new(),
+            stale,
+            PutOpts::default(),
+        );
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        mb.delete().await.expect("stale lock must be recovered");
+        assert!(
+            mock.keys().is_empty(),
+            "bundle and lock both gone after stale-lock recovery + release: {:?}",
+            mock.keys(),
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_releases_lock_after_successful_sweep() {
+        // A successful delete must clean up the LOCK#.lock it
+        // acquired. Without release, a subsequent operation would
+        // see a fresh (just-released) lock and report contention
+        // until the TTL elapses — defeating the point of explicit
+        // release.
+        let mock = seed_with_branch("main");
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(
+            Arc::clone(&store),
+            "myrepo",
+            "main",
+            &prompter as &dyn Prompter,
+        )
+        .await
+        .expect("open");
+        mb.delete().await.expect("delete");
+        assert!(
+            !mock.contains("myrepo/refs/heads/main/LOCK#.lock"),
+            "lock must be released (deleted) after a successful sweep: {:?}",
+            mock.keys(),
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_releases_lock_even_when_sweep_returns_partial_delete() {
+        // The lock must be released regardless of how the lock-held
+        // body returned. A `PartialDelete` error means one per-key
+        // delete failed; the lock is still released so a retry isn't
+        // gated on TTL recovery.
+        let mock = MockStore::new();
+        mock.insert("myrepo/refs/heads/main/aaa.bundle", Bytes::from("a"));
+        mock.insert("myrepo/refs/heads/main/bbb.bundle", Bytes::from("b"));
+        mock.arm(crate::object_store::mock::Fault::NetworkOnDelete {
+            key: "myrepo/refs/heads/main/bbb.bundle".to_owned(),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        let err = mb
+            .delete()
+            .await
+            .expect_err("partial delete must still surface its error");
+        assert!(matches!(err, ManageError::PartialDelete { .. }));
+        assert!(
+            !mock.contains("myrepo/refs/heads/main/LOCK#.lock"),
+            "lock must be released even when sweep returns PartialDelete: {:?}",
+            mock.keys(),
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_does_not_iterate_over_its_own_lock_key() {
+        // Mirrors `protocol::push::delete_remote_ref_under_lock`'s
+        // lock-key filter (#133): the fresh under-lock listing must
+        // exclude the lock we hold so the sweep does not delete our
+        // own coordination key mid-critical-section. The expression
+        // of this guarantee in the test: a stale lock that the
+        // acquire path recovered is replaced by OUR fresh lock; the
+        // sweep must NOT report `attempted = 2` (the lock + the
+        // bundle) but `attempted = 1` (the bundle only).
+        //
+        // Indirect proof: we arm a fault on the lock key. If the
+        // sweep iterates over the lock, the fault fires and the
+        // delete returns `PartialDelete { undeleted: [lock] }`. The
+        // test asserts the fault is NOT consumed — the sweep skipped
+        // the lock as expected.
+        let mock = MockStore::new();
+        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("body"));
+        // Arm a fault on the lock key; if `delete` iterates over the
+        // lock the fault fires.
+        mock.arm(crate::object_store::mock::Fault::NetworkOnDelete {
+            key: "myrepo/refs/heads/main/LOCK#.lock".to_owned(),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        // Note: `release_lock`'s delete also goes through the mock
+        // and will trip the fault. We accept either outcome here —
+        // the load-bearing assertion is that the sweep loop did not
+        // iterate over the lock (which would have produced a
+        // `PartialDelete`). The release-delete simply returns a
+        // warn-logged error and is swallowed; the sweep success path
+        // surfaces as `Ok(())`.
+        let result = mb.delete().await;
+        assert!(
+            !matches!(result, Err(ManageError::PartialDelete { .. })),
+            "sweep must not iterate over the lock key (no PartialDelete on the lock): {result:?}",
+        );
+        // The bundle was deleted by the sweep.
+        assert!(
+            !mock.contains("myrepo/refs/heads/main/abc.bundle"),
+            "bundle must still be swept: {:?}",
+            mock.keys(),
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_release_failure_does_not_mask_sweep_success() {
+        // Issue #158: release failures are downgraded to `warn!` —
+        // the operator's "ref is gone" intent is satisfied as soon
+        // as the sweep succeeds, and an orphan lock will age out via
+        // the next acquirer's TTL recovery. A regression that
+        // propagated the release error would surface a spurious
+        // failure for a delete that actually succeeded.
+        //
+        // Arm a fault on the lock-key delete (which is exactly what
+        // `release_lock` calls). The sweep is unaffected (bundle is
+        // a different key); the delete must return `Ok(())`.
+        let mock = MockStore::new();
+        mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("body"));
+        mock.arm(crate::object_store::mock::Fault::NetworkOnDelete {
+            key: "myrepo/refs/heads/main/LOCK#.lock".to_owned(),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        mb.delete()
+            .await
+            .expect("release failure must not mask sweep success");
+        // The bundle was deleted; only the now-orphan lock survives
+        // (the release fault consumed the lock's delete).
+        assert!(!mock.contains("myrepo/refs/heads/main/abc.bundle"));
     }
 }

@@ -99,6 +99,29 @@ pub enum ManageError {
     )]
     Protected(String),
 
+    /// `delete-branch` could not acquire the per-ref `LOCK#.lock`
+    /// because another writer (a concurrent `git push` / delete /
+    /// compact) currently holds it. Mirrors the helper-protocol
+    /// push path's contention surface so both delete surfaces
+    /// converge on the same "another operation in progress" wording.
+    /// Issue #158: without this lock, a concurrent push that lands
+    /// between the post-prompt re-list and the sweep is silently
+    /// missed and the ref survives despite an apparent success.
+    #[error(
+        "could not acquire ref lock at {lock}. Another client may be pushing or deleting. If this persists beyond {ttl_seconds}s, run git-remote-object-store doctor to inspect and optionally clear stale locks."
+    )]
+    LockContended {
+        /// Branch the lock guards.
+        branch: String,
+        /// Full lock key on the bucket (`<prefix>/<ref>/LOCK#.lock`).
+        /// Operators copy this into a doctor invocation.
+        lock: String,
+        /// Lock TTL in seconds at the time of attempted acquisition,
+        /// rendered into the operator-facing message so a tuned
+        /// `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` is visible.
+        ttl_seconds: i64,
+    },
+
     /// `delete-branch` swept the fresh listing but one or more per-key
     /// deletes failed with a non-`NotFound` error. The loop continues
     /// past each transient failure so the caller has a complete
