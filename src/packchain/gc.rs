@@ -126,7 +126,7 @@ use futures::stream::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::git::RefName;
@@ -803,17 +803,25 @@ async fn sweep_one_baseline_tombstone(
     let ref_name = match RefName::new(tombstone.ref_name.clone()) {
         Ok(r) => r,
         Err(e) => {
-            warn!(
+            // Issue #146: a tombstone whose recorded ref_name no longer
+            // parses as a RefName cannot be turned into a bundle key, so
+            // deleting the tombstone would orphan the bundle with no
+            // record on the bucket. Preserve both records and surface
+            // the ref_name + tombstone key at error! so an operator can
+            // locate and reconcile the corruption manually. Reachable
+            // today only via manual bucket tampering or a future schema
+            // tweak that loosens what BaselineTombstone::ref_name
+            // accepts at write time relative to RefName::new at read
+            // time.
+            error!(
                 key = %tombstone_key,
                 ref_name = %tombstone.ref_name,
+                sha = %tombstone.sha.as_str(),
                 error = %e,
-                "gc sweep: baseline tombstone names invalid ref; dropping tombstone",
+                "gc sweep: baseline tombstone names invalid ref; preserving \
+                 tombstone and bundle for operator review",
             );
-            delete_idempotent(store, tombstone_key).await?;
-            return Ok(SweepStep::Swept {
-                deleted_objects: 0,
-                skipped_repointed_packs: 0,
-            });
+            return Ok(SweepStep::Deferred);
         }
     };
     let prefix_opt = (!prefix.is_empty()).then_some(prefix);
@@ -1842,6 +1850,63 @@ mod tests {
         assert_eq!(post_grace.deleted_objects, 1);
         let err = store.get_bytes(&bundle_key).await.unwrap_err();
         assert!(matches!(err, ObjectStoreError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn sweep_preserves_corrupt_baseline_tombstone_for_diagnosis() {
+        // Issue #146: a baseline tombstone whose `ref_name` no longer
+        // passes `RefName::new` cannot be turned into a bundle key, so
+        // deleting the tombstone would orphan the bundle on the bucket
+        // with no record. Sweep must preserve BOTH records (tombstone
+        // and any bundle it would have named under the raw string), and
+        // signal `Deferred` so an operator can reconcile manually.
+        let store = MockStore::new();
+        // Seed a "bundle" at the raw-string path the tombstone names,
+        // so a regression that reconstructs a key from the raw ref_name
+        // and deletes it would also be caught here.
+        let bad_ref = "refs/heads/[bad]";
+        assert!(
+            RefName::new(bad_ref).is_err(),
+            "fixture relies on this ref_name failing RefName::new",
+        );
+        let bundle_key = format!("repo/{bad_ref}/{SHA_FULL}.bundle");
+        store.insert(&bundle_key, Bytes::from_static(b"BUNDLE"));
+
+        let stale = (OffsetDateTime::now_utc() - time::Duration::hours(48))
+            .format(&Rfc3339)
+            .unwrap();
+        let tomb_key = baseline_tombstone_key("repo", &Uuid::new_v4().to_string());
+        let body = BaselineTombstone {
+            v: TOMBSTONE_SCHEMA_VERSION,
+            marked_at: stale,
+            ref_name: bad_ref.to_owned(),
+            sha: sha40(SHA_FULL),
+        }
+        .to_json_pretty()
+        .unwrap();
+        store.insert(&tomb_key, Bytes::from(body));
+
+        let outcome = sweep(&store, "repo", SweepOpts::default()).await.unwrap();
+        assert_eq!(
+            outcome.deferred_tombstones, 1,
+            "corrupt tombstone counts as deferred, not swept",
+        );
+        assert_eq!(outcome.swept_tombstones, 0);
+        assert_eq!(outcome.deleted_objects, 0);
+        // Tombstone survives (operator must inspect).
+        let surviving = store
+            .get_bytes(&tomb_key)
+            .await
+            .expect("corrupt tombstone must survive sweep");
+        let parsed = BaselineTombstone::from_json_bytes(&surviving).unwrap();
+        assert_eq!(parsed.ref_name, bad_ref);
+        // Bundle at the would-be key survives (the key was unreachable
+        // through the normal RefName path, but sweep must not have
+        // reconstructed it from the raw string either).
+        store
+            .get_bytes(&bundle_key)
+            .await
+            .expect("orphan bundle must survive corrupt-tombstone sweep");
     }
 
     // --- per-tombstone live-pack recompute (issue #140) --------------
