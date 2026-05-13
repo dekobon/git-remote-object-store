@@ -28,6 +28,7 @@ use crate::protocol::push::{
     self as bundle_push, DELETE_PROTECTION_MESSAGE, LockGuard, PushError, PushOutcome, PushSpec,
     acquire_lock, bundle_progress_sink, delete_idempotent, head_key, is_protected, lock_key,
     lock_ttl_from_env, not_ancestor_wire_message, parse_push_args, ref_listing_prefix,
+    verify_no_orphan_protected_after_delete,
 };
 use crate::url::StorageEngine;
 
@@ -1029,6 +1030,17 @@ async fn delete_remote_ref_packchain(
         Ok(())
     }
     .await;
+
+    // Issue #151 defence-in-depth: belt-and-suspenders post-sweep
+    // probe. The lock is still held — `protect`/`unprotect` racing the
+    // sweep would have blocked on the same `<prefix>/<ref>/LOCK#.lock`
+    // per #159. An orphan marker here would indicate the lock contract
+    // was bypassed; the helper logs at `error!` (no rollback). Run only
+    // on the success path: a sweep that errored is reported as-is, and
+    // the surviving listing is the operator's recovery signal.
+    if sweep_result.is_ok() {
+        verify_no_orphan_protected_after_delete(store_ref, prefix, remote_ref).await;
+    }
 
     let release_result = bundle_push::release_lock(guard).await;
 

@@ -311,15 +311,73 @@ pub(crate) async fn is_protected(
     prefix: Option<&str>,
     remote_ref: &RefName,
 ) -> Result<bool, ObjectStoreError> {
-    let key = format!(
-        "{}{}",
-        ref_listing_prefix(prefix, remote_ref),
-        keys::PROTECTED_MARKER_SEGMENT,
-    );
+    let key = protected_marker_key(prefix, remote_ref);
     match store.head(&key).await {
         Ok(_) => Ok(true),
         Err(ObjectStoreError::NotFound(_)) => Ok(false),
         Err(e) => Err(e),
+    }
+}
+
+/// Build the `<prefix>/<ref>/PROTECTED#` key. Pulled out so the
+/// pre-delete protection probe ([`is_protected`]) and the post-sweep
+/// integrity verification ([`verify_no_orphan_protected_after_delete`])
+/// share one source of truth for the marker key shape.
+pub(crate) fn protected_marker_key(prefix: Option<&str>, remote_ref: &RefName) -> String {
+    format!(
+        "{}{}",
+        ref_listing_prefix(prefix, remote_ref),
+        keys::PROTECTED_MARKER_SEGMENT,
+    )
+}
+
+/// Issue #151 defence-in-depth: after a delete-path sweep completes,
+/// confirm no `PROTECTED#` marker exists for `remote_ref`. The primary
+/// defence is the per-ref lock (#158, #159): every delete path acquires
+/// `<prefix>/<ref>/LOCK#.lock` before its under-lock listing and the
+/// sweep, and both `protect` and `unprotect` acquire the same key —
+/// so a marker landing between the under-lock listing and the sweep is
+/// mechanically impossible.
+///
+/// This helper is the belt to the lock's suspenders: if the marker is
+/// observed here, the contract was violated (a lock bypass, bucket-level
+/// inconsistency, or a misbehaving sibling tool), and we surface it as
+/// a structured `tracing::error!` so operators can investigate. The
+/// delete is NOT rolled back — the operator-visible "ref is gone"
+/// outcome stands; the orphan marker, if real, will block any future
+/// recreation of the same ref until `unprotect` removes it.
+///
+/// Uses one `head` (not a `list`) — cheap, exact-key, identical shape
+/// to [`is_protected`]. The caller passes the same `prefix` / `remote_ref`
+/// it used to compute the listing prefix so the marker key matches the
+/// sweep's namespace byte-for-byte.
+pub(crate) async fn verify_no_orphan_protected_after_delete(
+    store: &dyn ObjectStore,
+    prefix: Option<&str>,
+    remote_ref: &RefName,
+) {
+    let key = protected_marker_key(prefix, remote_ref);
+    match store.head(&key).await {
+        Ok(_) => {
+            tracing::error!(
+                key = %key,
+                remote_ref = %remote_ref.as_str(),
+                "delete path observed a PROTECTED# marker after sweep; the per-ref lock contract (#158, #159) should make this impossible — investigate for lock bypass or bucket-level inconsistency",
+            );
+        }
+        Err(ObjectStoreError::NotFound(_)) => {}
+        Err(e) => {
+            // The probe itself failed; this is not the integrity
+            // violation we are guarding against. Log at `debug!` so
+            // operators have the trail if a future incident needs it,
+            // but do not promote a transient `head` failure to an
+            // error — the delete already succeeded under the lock.
+            tracing::debug!(
+                key = %key,
+                error = %e,
+                "post-sweep PROTECTED# probe failed; cannot verify orphan-marker invariant for this delete",
+            );
+        }
     }
 }
 
@@ -1606,6 +1664,14 @@ async fn delete_remote_ref_under_lock(
         for entry in &entries {
             delete_idempotent(store, &entry.key).await?;
         }
+        // Issue #151 defence-in-depth: confirm no `PROTECTED#` marker
+        // sneaked in. The lock window is still open (the caller releases
+        // it after we return), so a `protect`/`unprotect` racing this
+        // delete would be blocked on the lock per #159. Finding a marker
+        // here would indicate a contract violation; the helper logs at
+        // `error!` and the delete still reports `ok` — see the helper
+        // doc for the rationale.
+        verify_no_orphan_protected_after_delete(store, prefix, remote_ref).await;
         Ok(PushOutcome::Ok {
             remote_ref: remote_ref_str,
         })
@@ -3866,6 +3932,87 @@ mod tests {
         assert!(
             matches!(&outcome, PushOutcome::Ok { remote_ref } if remote_ref == "refs/heads/main"),
             "non-force push must pass regardless of protection: {outcome:?}",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #151 — bundle-engine delete must not miss a `PROTECTED#`
+    // marker written after the under-lock listing. The primary defence
+    // is the per-ref lock (#159 made `protect`/`unprotect` acquire the
+    // same key the delete holds). These tests pin the post-sweep
+    // defensive verification (`verify_no_orphan_protected_after_delete`)
+    // behaves correctly on the happy path and is silent there.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn issue_151_clean_delete_passes_post_sweep_verification() {
+        // Happy path with the lock contract honoured: bundle present,
+        // no marker, lock held. The sweep removes the bundle and the
+        // post-sweep `head(PROTECTED#)` returns NotFound — silently —
+        // and the delete reports `ok`. A regression that promoted the
+        // post-sweep probe into a hard error would surface here.
+        let store = MockStore::new();
+        let r = rn("refs/heads/main");
+        let bundle = format!("repo/refs/heads/main/{SHA}.bundle");
+        let lock_key = "repo/refs/heads/main/LOCK#.lock";
+        store.insert(&bundle, Bytes::from_static(b"b"));
+        store.insert(lock_key, Bytes::from_static(b"held-lock-payload"));
+
+        let outcome = delete_remote_ref_under_lock(&store, Some("repo"), &r, false, lock_key)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            PushOutcome::Ok {
+                remote_ref: "refs/heads/main".into()
+            },
+            "clean delete must report ok after the post-sweep probe",
+        );
+        assert!(!store.contains(&bundle), "bundle must be swept");
+        assert!(
+            store.contains(lock_key),
+            "lock survives the sweep (release removes it)",
+        );
+    }
+
+    /// Helper unit test for [`verify_no_orphan_protected_after_delete`]:
+    /// the helper itself must not error or panic when the marker is
+    /// absent, and the call must be cheap (a single `head`). Pinned
+    /// here so a future refactor of the helper cannot regress its
+    /// contract — the delete paths rely on this being a no-op on
+    /// the happy path.
+    #[tokio::test]
+    async fn verify_no_orphan_protected_after_delete_is_noop_when_marker_absent() {
+        let store = MockStore::new();
+        let r = rn("refs/heads/main");
+        // No marker on bucket. Helper must silently return.
+        verify_no_orphan_protected_after_delete(&store, Some("repo"), &r).await;
+        // Witness: the bucket is unchanged.
+        assert!(
+            !store.contains("repo/refs/heads/main/PROTECTED#"),
+            "helper must not touch the bucket",
+        );
+    }
+
+    /// When the helper observes a marker — the lock-contract-violation
+    /// branch — it logs at `error!` and returns silently. The bucket
+    /// state must be unchanged (no rollback). This is the
+    /// belt-and-suspenders branch the issue's race scenario would
+    /// reach if a future regression bypassed the lock.
+    #[tokio::test]
+    async fn verify_no_orphan_protected_after_delete_does_not_mutate_when_marker_present() {
+        let store = MockStore::new();
+        let r = rn("refs/heads/main");
+        let marker = "repo/refs/heads/main/PROTECTED#";
+        store.insert(marker, Bytes::new());
+        verify_no_orphan_protected_after_delete(&store, Some("repo"), &r).await;
+        // The helper logs but does NOT delete the marker: rollback is
+        // not the helper's job (the delete is already complete; the
+        // operator-visible "ref is gone" outcome stands; the orphan
+        // marker is surveillance telemetry).
+        assert!(
+            store.contains(marker),
+            "helper must not delete the orphan marker — surveillance only",
         );
     }
 }

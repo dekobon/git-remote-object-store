@@ -167,6 +167,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Delete paths now perform a post-sweep `head(<prefix>/<ref>/PROTECTED#)`
+  probe as belt-and-suspenders surveillance for #151. The primary defence
+  remains the per-ref lock: `delete-branch` (#158), the helper-protocol
+  bundle and packchain delete handlers (#125, #133), and `protect` /
+  `unprotect` (#159) all acquire `<prefix>/<ref>/LOCK#.lock`, so a
+  `protect` cannot land a marker between the under-lock listing and the
+  sweep. The post-sweep probe surfaces a structured `error!` if the
+  marker is ever observed — that would indicate a lock-contract violation
+  (a bypass, bucket inconsistency, or misbehaving sibling tool) — and is
+  a no-op on the happy path. Pinned by a regression test that asserts
+  `protect` returns `LockContended` while delete-branch holds the lock,
+  proving the race window is mechanically closed.
 - Azure `?zip=1` pushes now land the zip artifact (#161). The
   zip-only `put_path` previously attached a
   `codepipeline-artifact-revision-summary` user-metadata entry whose

@@ -25,7 +25,10 @@ use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
 use crate::packchain::gc::write_baseline_tombstone_for_orphan;
 use crate::packchain::manifest::load_chain;
-use crate::protocol::push::{LockGuard, acquire_lock, lock_key, lock_ttl_from_env, release_lock};
+use crate::protocol::push::{
+    LockGuard, acquire_lock, lock_key, lock_ttl_from_env, release_lock,
+    verify_no_orphan_protected_after_delete,
+};
 
 /// Operations on a single branch within a repository.
 pub struct ManageBranch<'a> {
@@ -371,6 +374,20 @@ impl<'a> ManageBranch<'a> {
                 attempted,
             });
         }
+        // Issue #151 defence-in-depth: post-sweep, with the lock still
+        // held, confirm no `PROTECTED#` marker is present for this ref.
+        // The primary defence is the per-ref lock — `protect` /
+        // `unprotect` both acquire the same `<prefix>/<ref>/LOCK#.lock`
+        // per #159, so a marker cannot land between the under-lock
+        // listing and the sweep. This `head` probe is belt-and-suspenders
+        // surveillance: an orphan marker observed here would indicate a
+        // contract violation (lock bypass, bucket inconsistency, or
+        // misbehaving sibling tool). The helper logs at `error!` and
+        // does NOT change the delete's success outcome — the branch's
+        // bundle artefacts are gone, so the operator's intent stands.
+        let ref_name = self.validated_ref_name()?;
+        verify_no_orphan_protected_after_delete(self.store.as_ref(), self.prefix_opt(), &ref_name)
+            .await;
         writeln!(out, "Branch {} has been deleted", self.branch)?;
         info!(branch = %self.branch, count = attempted, "branch deleted");
         Ok(())
@@ -2402,6 +2419,96 @@ mod tests {
         assert!(
             mock.contains("myrepo/refs/heads/main/LOCK#.lock"),
             "the writer's LOCK#.lock must survive a contended protect attempt",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #151 — delete paths must not miss a `PROTECTED#` marker
+    // written after the under-lock listing. Closed mechanically by the
+    // per-ref lock (#158 for delete-branch, #159 for protect/unprotect):
+    // `protect` blocks on the same key the delete acquired, so a marker
+    // cannot land between the under-lock listing and the sweep. These
+    // tests pin the lock-contract guarantee and the post-sweep
+    // defensive verification that surfaces a contract violation if one
+    // ever arises.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn issue_151_protect_cannot_inject_marker_during_active_delete() {
+        // The headline regression test for #151. Models the documented
+        // race verbatim:
+        //
+        //   1. delete-branch acquires LOCK#.lock and does its
+        //      under-lock listing (no marker).
+        //   2. operator runs `protect`, which (pre-#159) put_bytes the
+        //      marker without taking the lock — would succeed.
+        //   3. delete-branch sweeps the listing it took at step 1,
+        //      missing the marker entirely; delete reports success
+        //      while the marker is orphaned.
+        //
+        // The fix (#159) makes step 2 fail with `LockContended` because
+        // `protect` now serialises through the same per-ref lock
+        // delete-branch holds. The test seeds the lock directly
+        // (representing the delete-branch holder at step 1) and asserts
+        // step 2 fails — proving the race window is mechanically closed.
+        let mock = seed_with_branch("main");
+        mock.insert("myrepo/refs/heads/main/LOCK#.lock", Bytes::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        let err = mb
+            .protect()
+            .await
+            .expect_err("protect must not land during an active delete-branch");
+        assert!(
+            matches!(err, ManageError::LockContended { .. }),
+            "expected LockContended (lock held by delete-branch), got {err:?}",
+        );
+        // No marker landed — the delete's sweep will not encounter a
+        // mid-flow PROTECTED# the listing did not see.
+        assert!(
+            !mock.contains("myrepo/refs/heads/main/PROTECTED#"),
+            "no marker may be written while a delete holds the lock",
+        );
+        // The delete-branch holder's lock survives the contention
+        // refusal verbatim.
+        assert!(
+            mock.contains("myrepo/refs/heads/main/LOCK#.lock"),
+            "the delete-branch holder's lock must survive contention",
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_151_post_sweep_verification_passes_on_clean_delete() {
+        // The post-sweep `verify_no_orphan_protected_after_delete`
+        // probe is belt-and-suspenders telemetry: with the lock
+        // contract in place there is no way for a marker to appear
+        // post-sweep. The probe must be silent on the happy path so an
+        // operator reading logs is not chasing phantoms.
+        //
+        // This test exercises the success path end-to-end: seed only
+        // the bundle, confirm, sweep. The delete must return Ok and
+        // the bucket must be empty (including the lock the release
+        // step removed). A regression that flipped the post-sweep
+        // probe into a hard error (rather than telemetry) would surface
+        // here as an unexpected `Err`.
+        let mock = seed_with_branch("main");
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        mb.delete()
+            .await
+            .expect("clean delete must pass the post-sweep probe silently");
+        assert!(
+            mock.keys().is_empty(),
+            "bundle + lock both gone after a clean delete-and-release: {:?}",
+            mock.keys(),
         );
     }
 }
