@@ -166,8 +166,27 @@ pub(crate) async fn analyze_objects(
     list_prefix: &str,
     store: &dyn ObjectStore,
 ) -> Result<RepoSnapshot, ManageError> {
+    // Issue #157: tombstoned bundles (`<prefix>/gc/baseline-tomb-*.json`
+    // recorded by a force-push or compact) are pending reclamation by
+    // `gc sweep` — they are NOT live ref state and must not surface in
+    // the doctor snapshot's multi-bundle counts. Filtering at snapshot
+    // build time keeps every downstream consumer (multi-bundle fix
+    // pass, report, `is_head_valid`) consistently unaware of deferred
+    // orphans. The bucket keys themselves remain readable for any
+    // in-flight fetcher.
+    //
+    // `list_prefix` is `<prefix>/` (or empty for root buckets); strip
+    // the trailing slash so the tombstone helper's `Option<&str>`
+    // matches the production call shape.
+    let prefix_opt = list_prefix.strip_suffix('/').filter(|s| !s.is_empty());
+    let hidden = crate::packchain::gc::tombstoned_bundle_keys(store, prefix_opt)
+        .await
+        .map_err(ManageError::Store)?;
     let mut snapshot = RepoSnapshot::default();
     for object in objects {
+        if hidden.contains(&object.key) {
+            continue;
+        }
         classify_into(list_prefix, object, &mut snapshot, store).await?;
     }
     Ok(snapshot)

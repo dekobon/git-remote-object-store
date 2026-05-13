@@ -25,6 +25,8 @@ use tracing::{debug, info, warn};
 use crate::git::{self, GitError, RefName, RefNameError, Sha, ShaError, is_valid_ref_name};
 use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, ProgressSink, PutOpts};
+use crate::packchain::gc::{tombstoned_bundle_keys, write_baseline_tombstone_best_effort};
+use crate::packchain::schema::Sha40;
 use crate::url::{BackendKind, StorageEngine};
 
 /// Default per-ref lock TTL, in seconds.
@@ -260,8 +262,18 @@ fn is_bundle_candidate(key: &str) -> bool {
 }
 
 /// Returns every bundle object currently stored under `remote_ref`,
-/// filtered by [`is_bundle_candidate`]. The store's listing prefix is
-/// `<prefix>/<ref>/` so sibling-ref keys don't leak in.
+/// filtered by [`is_bundle_candidate`] and excluding bundles named by
+/// any `<prefix>/gc/baseline-tomb-*.json` (issue #157). The store's
+/// listing prefix is `<prefix>/<ref>/` so sibling-ref keys don't leak
+/// in.
+///
+/// Tombstoned bundles are filtered here because the bundle engine
+/// uses the bundle-key listing as its source of truth for "ref →
+/// current SHA". A force-push that deferred the prior bundle leaves
+/// two `<sha>.bundle` keys under the ref; without the tombstone
+/// filter the next push's under-lock multi-bundle guard would refuse
+/// it. The tombstoned bundle stays readable at its original key for
+/// in-flight fetchers — only the listing path hides it.
 async fn bundles_for_ref(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
@@ -269,9 +281,20 @@ async fn bundles_for_ref(
 ) -> Result<Vec<ObjectMeta>, ObjectStoreError> {
     let listing = ref_listing_prefix(prefix, remote_ref);
     let metas = store.list(&listing).await?;
-    Ok(metas
+    let bundles: Vec<ObjectMeta> = metas
         .into_iter()
         .filter(|m| is_bundle_candidate(&m.key))
+        .collect();
+    // Short-circuit the tombstone lookup when there is nothing that
+    // could be filtered. The common case (no force-push in the last
+    // grace window) pays no extra listing cost.
+    if bundles.is_empty() {
+        return Ok(bundles);
+    }
+    let hidden = tombstoned_bundle_keys(store, prefix).await?;
+    Ok(bundles
+        .into_iter()
+        .filter(|m| !hidden.contains(&m.key))
         .collect())
 }
 
@@ -639,6 +662,14 @@ pub(crate) async fn delete_idempotent(
 ///
 /// Mirrors `force_push_baseline_cleanup` in `packchain::push`
 /// (issue #113).
+///
+/// Issue #157: this is now the fallback path used only when the
+/// preferred deferred-via-tombstone path
+/// ([`defer_prior_bundle_via_tombstone`]) cannot be taken — namely a
+/// prior key whose stem does not parse as a [`Sha40`]. The on-bucket
+/// layout filter ([`is_bundle_candidate`]) already rejects malformed
+/// stems before they reach the push path, so this branch is reachable
+/// only via a future schema loosening or manual bucket tampering.
 async fn delete_prior_bundle_best_effort(
     store: &dyn ObjectStore,
     remote_ref: &RefName,
@@ -652,6 +683,102 @@ async fn delete_prior_bundle_best_effort(
             "prior-bundle cleanup failed (new bundle already committed); \
              orphan key left for manual cleanup",
         );
+    }
+}
+
+/// Defer the prior-bundle delete to `gc sweep` by writing a baseline
+/// tombstone naming the old SHA.
+///
+/// Issue #157: synchronously deleting the prior bundle from the push
+/// path created a race against in-flight fetches. A client that ran
+/// `list` and saw `refs/heads/main -> old_sha` then issued
+/// `fetch old_sha refs/heads/main` against the EXACT
+/// `<prefix>/<ref>/<old_sha>.bundle` path — [`fetch_one`] does not
+/// re-list or consult HEAD. If a concurrent force-push synchronously
+/// deleted that key between the `list` advertisement and the fetcher's
+/// GET, fetch failed with `NotFound`.
+///
+/// The fix mirrors the packchain force-push tombstone path (issue
+/// #134, `force_push_baseline_cleanup` in `packchain::push`): write a
+/// `<prefix>/gc/baseline-tomb-*.json` record naming the prior SHA, and
+/// let `gc sweep` reclaim the bundle after the configured grace
+/// window. Until grace expires the prior bundle remains readable, so
+/// any fetcher that advertised it from a stale list can still
+/// complete.
+///
+/// The tombstone format and key namespace are shared with the
+/// packchain engine because `gc sweep` is engine-agnostic at the
+/// reclamation layer: [`sweep_one_baseline_tombstone`] derives the
+/// bundle key from `(ref_name, sha)` and runs the same live-state
+/// recheck regardless of which engine wrote the tombstone.
+///
+/// **Fallback semantics on tombstone write failure**: `gc sweep` only
+/// reclaims keys it has a tombstone for, so a tombstone PUT failure
+/// would otherwise orphan the prior bundle indefinitely. To preserve
+/// the issue #121 "two-bundle state surfaces via the doctor message"
+/// recovery path, this helper falls back to the synchronous
+/// best-effort delete from [`delete_prior_bundle_best_effort`] on
+/// either:
+///
+/// - a prior key whose stem does not parse as a [`Sha40`] (no way to
+///   name it in the tombstone body), or
+/// - a [`write_baseline_tombstone_best_effort`] PUT failure (the
+///   helper already logged a warn naming the orphan).
+async fn defer_prior_bundle_via_tombstone(
+    store: &dyn ObjectStore,
+    prefix: Option<&str>,
+    remote_ref: &RefName,
+    prior_key: &str,
+    local_sha: Sha,
+) {
+    let Some(prior_sha) = parse_remote_sha_from_key(prior_key) else {
+        warn!(
+            ref_path = %remote_ref.as_str(),
+            key = %prior_key,
+            "prior bundle key does not parse as a valid SHA; falling back to synchronous delete",
+        );
+        delete_prior_bundle_best_effort(store, remote_ref, prior_key).await;
+        return;
+    };
+    // `parse_remote_sha_from_key` validated the stem against
+    // `is_valid_bundle_stem` (40 lowercase hex), so `Sha::to_string`
+    // emits exactly what `Sha40::try_new` expects. The conversion is
+    // therefore infallible in practice; surface a failure as the
+    // synchronous-delete fallback rather than panicking — a future
+    // tightening of `Sha40` validation must not crash the push.
+    let (Ok(prior_sha40), Ok(local_sha40)) = (
+        Sha40::try_new(prior_sha.to_string()),
+        Sha40::try_new(local_sha.to_string()),
+    ) else {
+        warn!(
+            ref_path = %remote_ref.as_str(),
+            key = %prior_key,
+            "prior or local sha failed Sha40 validation; falling back to synchronous delete",
+        );
+        delete_prior_bundle_best_effort(store, remote_ref, prior_key).await;
+        return;
+    };
+    let wrote = write_baseline_tombstone_best_effort(
+        store,
+        prefix,
+        remote_ref,
+        &prior_sha40,
+        &local_sha40,
+        "bundle-engine-force-push",
+    )
+    .await;
+    if wrote {
+        debug!(
+            ref_path = %remote_ref.as_str(),
+            key = %prior_key,
+            "prior bundle deferred to gc sweep via baseline tombstone",
+        );
+    } else {
+        // `write_baseline_tombstone_best_effort` already logged a warn
+        // naming the orphan key. Fall back to the synchronous delete
+        // so the next push's multi-bundle guard does not flag this
+        // case to the operator unnecessarily.
+        delete_prior_bundle_best_effort(store, remote_ref, prior_key).await;
     }
 }
 
@@ -1142,8 +1269,9 @@ enum UnderLockWork {
 }
 
 /// Re-list under the lock, upload the bundle, init HEAD, write the `FORMAT`
-/// key, delete the previous bundle, optionally upload `repo.zip`. Split out
-/// so the lock release in the caller is unconditional.
+/// key, defer the previous bundle's delete via a baseline tombstone (issue
+/// #157), optionally upload `repo.zip`. Split out so the lock release in
+/// the caller is unconditional.
 async fn perform_push_under_lock(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
@@ -1253,7 +1381,12 @@ async fn perform_push_under_lock(
     if let Some(prev) = current_key
         && prev != bundle_dest
     {
-        delete_prior_bundle_best_effort(store, &remote_ref, &prev).await;
+        // Issue #157: defer the prior-bundle delete to `gc sweep` via a
+        // baseline tombstone instead of deleting it synchronously. A
+        // concurrent fetcher that already advertised the prior SHA via
+        // `list` would otherwise race the GET against this DELETE; the
+        // tombstone gives `fetch_one` the grace window it needs.
+        defer_prior_bundle_via_tombstone(store, prefix, &remote_ref, &prev, local_sha).await;
     }
 
     if let Some(artifacts) = zip_artifacts {
@@ -2902,8 +3035,9 @@ mod tests {
     /// are deliberately different. The push must:
     ///   1. produce `Ok(remote_ref)`
     ///   2. upload the new bundle at `bundle_dest` (SHA = `local_sha`)
-    ///   3. delete the old bundle (SHA = `OTHER_SHA`) via the
-    ///      post-upload cleanup branch
+    ///   3. write a baseline tombstone naming `OTHER_SHA` (issue #157
+    ///      defers the prior-bundle delete to `gc sweep`) and leave
+    ///      the prior bundle in place until grace expires
     ///   4. write `HEAD` and `FORMAT`
     #[tokio::test]
     async fn perform_push_under_lock_passes_through_when_pre_existing_matches_current() {
@@ -2913,7 +3047,8 @@ mod tests {
         // The local push's `local_sha` is `SHA`, so `bundle_dest` is a
         // DIFFERENT key. The stale-remote check passes (pre_existing ==
         // current_key, both = pre_key); the function then uploads the
-        // new bundle at `bundle_dest` and deletes the old one.
+        // new bundle at `bundle_dest` and writes a baseline tombstone
+        // naming the old bundle's SHA.
         store.insert(&pre_key, Bytes::from_static(b"old bundle"));
         let state = push_state_with_pre_existing(Some(pre_key.clone()));
         let outcome = perform_push_under_lock(&store, Some("repo"), BackendKind::S3, state)
@@ -2935,11 +3070,36 @@ mod tests {
             b"fake bundle",
             "new bundle must contain the local payload",
         );
-        // The old bundle must be deleted by the post-upload cleanup
-        // branch (`if prev != bundle_dest { delete_idempotent }`).
+        // Issue #157: the old bundle must remain readable — fetchers
+        // that advertised it via an earlier `list` need the grace
+        // window. `gc sweep` will reclaim it later.
         assert!(
-            !store.contains(&pre_key),
-            "old bundle at pre_key must be deleted",
+            store.contains(&pre_key),
+            "old bundle at pre_key must survive the push (deferred via tombstone)",
+        );
+        // A single baseline tombstone naming the prior SHA must exist.
+        let metas = store.list("repo/gc/").await.unwrap();
+        let tombstones: Vec<_> = metas
+            .iter()
+            .filter(|m| m.key.starts_with("repo/gc/baseline-tomb-"))
+            .collect();
+        assert_eq!(
+            tombstones.len(),
+            1,
+            "exactly one baseline tombstone must be written; got keys: {:?}",
+            tombstones.iter().map(|m| &m.key).collect::<Vec<_>>(),
+        );
+        let body = store.get_bytes(&tombstones[0].key).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["ref_name"].as_str(),
+            Some("refs/heads/main"),
+            "tombstone must name the pushed ref",
+        );
+        assert_eq!(
+            parsed["sha"].as_str(),
+            Some(OTHER_SHA),
+            "tombstone must name the prior SHA so `gc sweep` reclaims OTHER_SHA.bundle",
         );
         assert!(
             store.contains("repo/FORMAT"),
@@ -2951,20 +3111,31 @@ mod tests {
         );
     }
 
-    /// Issue #121 regression: a non-NotFound delete error on the prior
-    /// bundle after the new bundle has been put must NOT fail the
-    /// push. The new bundle is already durable; reporting failure
-    /// misrepresents the remote state. Match the `compact` /
-    /// `force_push_baseline_cleanup` best-effort contract: log at warn
-    /// and report success. The two-bundle state remains on the bucket
-    /// so the next push's under-lock multi-bundle guard surfaces it
-    /// to the operator.
+    /// Issue #121 + #157 regression: the prior-bundle cleanup must
+    /// never fail the push. The new bundle is already durable;
+    /// reporting failure misrepresents the remote state. Match the
+    /// `compact` / `force_push_baseline_cleanup` best-effort contract:
+    /// log at warn and report success.
+    ///
+    /// Under issue #157 the preferred cleanup path is a baseline
+    /// tombstone (deferred reclamation). When the tombstone PUT
+    /// itself fails, the fallback synchronous delete runs — so this
+    /// test arms a fault on BOTH the tombstone PUT and the prior
+    /// bundle's delete to exercise the worst-case orphan path. The
+    /// two-bundle state remains on the bucket so the next push's
+    /// under-lock multi-bundle guard surfaces it to the operator.
     #[tokio::test]
-    async fn perform_push_under_lock_succeeds_when_prior_delete_fails() {
+    async fn perform_push_under_lock_succeeds_when_prior_cleanup_fails() {
         use crate::object_store::mock::Fault;
         let store = MockStore::new();
         let pre_key = format!("repo/refs/heads/main/{OTHER_SHA}.bundle");
         store.insert(&pre_key, Bytes::from_static(b"old bundle"));
+        // Fail the tombstone PUT (any key under `repo/gc/baseline-tomb-`)
+        // AND the fallback synchronous delete of the prior bundle. The
+        // push must still report Ok.
+        store.arm(Fault::NetworkOnPutBytesPrefix {
+            prefix: "repo/gc/baseline-tomb-".to_owned(),
+        });
         store.arm(Fault::NetworkOnDelete {
             key: pre_key.clone(),
         });
@@ -2972,7 +3143,7 @@ mod tests {
         let state = push_state_with_pre_existing(Some(pre_key.clone()));
         let outcome = perform_push_under_lock(&store, Some("repo"), BackendKind::S3, state)
             .await
-            .expect("push must succeed even when prior-bundle delete fails");
+            .expect("push must succeed even when prior-bundle cleanup fails");
         assert!(
             matches!(&outcome, PushOutcome::Ok { remote_ref } if remote_ref == "refs/heads/main"),
             "expected Ok(refs/heads/main), got {outcome:?}",
@@ -2983,13 +3154,73 @@ mod tests {
             store.contains(&bundle_dest),
             "new bundle must be uploaded at bundle_dest",
         );
-        // The fault armed against the delete fired exactly once.
+        // Both faults fired: tombstone PUT first, fallback delete
+        // second. None should remain pending.
         assert_eq!(store.pending_faults(), 0);
         // Orphan remains on the bucket — operator sees the warn log and
         // the next push's multi-bundle guard will direct them to doctor.
         assert!(
             store.contains(&pre_key),
-            "delete fault must leave the prior bundle in place",
+            "cleanup faults must leave the prior bundle in place",
+        );
+        // No tombstone was written (the PUT failed); the operator path
+        // is the multi-bundle guard, not deferred reclamation.
+        let metas = store.list("repo/gc/").await.unwrap();
+        assert!(
+            !metas
+                .iter()
+                .any(|m| m.key.starts_with("repo/gc/baseline-tomb-")),
+            "no baseline tombstone must remain after a failed PUT",
+        );
+    }
+
+    /// Issue #157 fallback path: when the baseline tombstone PUT fails
+    /// but the synchronous delete succeeds, the prior bundle is
+    /// reclaimed immediately. This is the recovery shape that
+    /// preserves the issue #121 "two-bundle state surfaces via doctor"
+    /// invariant — without the fallback delete, a tombstone PUT
+    /// failure would orphan the prior bundle indefinitely (gc sweep
+    /// has no tombstone to act on).
+    #[tokio::test]
+    async fn perform_push_under_lock_falls_back_to_sync_delete_on_tombstone_put_failure() {
+        use crate::object_store::mock::Fault;
+        let store = MockStore::new();
+        let pre_key = format!("repo/refs/heads/main/{OTHER_SHA}.bundle");
+        store.insert(&pre_key, Bytes::from_static(b"old bundle"));
+        // Fail only the tombstone PUT — the prior-bundle delete is
+        // left armable-free so the fallback path completes.
+        store.arm(Fault::NetworkOnPutBytesPrefix {
+            prefix: "repo/gc/baseline-tomb-".to_owned(),
+        });
+
+        let state = push_state_with_pre_existing(Some(pre_key.clone()));
+        let outcome = perform_push_under_lock(&store, Some("repo"), BackendKind::S3, state)
+            .await
+            .expect("push must succeed when tombstone PUT fails but fallback delete succeeds");
+        assert!(
+            matches!(&outcome, PushOutcome::Ok { remote_ref } if remote_ref == "refs/heads/main"),
+            "expected Ok(refs/heads/main), got {outcome:?}",
+        );
+
+        // The fault on the tombstone PUT fired; no tombstone remains.
+        assert_eq!(store.pending_faults(), 0);
+        let metas = store.list("repo/gc/").await.unwrap();
+        assert!(
+            !metas
+                .iter()
+                .any(|m| m.key.starts_with("repo/gc/baseline-tomb-")),
+            "tombstone PUT failed, so no baseline-tomb key may exist",
+        );
+        // The fallback synchronous delete succeeded — prior bundle gone.
+        assert!(
+            !store.contains(&pre_key),
+            "fallback synchronous delete must reclaim the prior bundle",
+        );
+        // The new bundle is durable.
+        let bundle_dest = format!("repo/refs/heads/main/{SHA}.bundle");
+        assert!(
+            store.contains(&bundle_dest),
+            "new bundle must be uploaded at bundle_dest",
         );
     }
 

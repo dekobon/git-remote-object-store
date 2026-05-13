@@ -83,7 +83,34 @@ async fn push_fast_forward_replaces_old_bundle() {
     result.expect("push should succeed");
     assert_eq!(std::str::from_utf8(&out).unwrap(), "ok refs/heads/main\n\n");
     assert!(store.contains(&format!("repo/refs/heads/main/{new_sha}.bundle")));
-    assert!(!store.contains(&format!("repo/refs/heads/main/{old_sha}.bundle")));
+    // Issue #157: the prior bundle stays readable during the gc grace
+    // window so an in-flight `fetch` (which uses the SHA from a prior
+    // `list` directly as the bundle key) does not race the push and
+    // see a NotFound. A baseline tombstone records the SHA for `gc
+    // sweep` to reclaim later.
+    assert!(
+        store.contains(&format!("repo/refs/heads/main/{old_sha}.bundle")),
+        "old bundle must remain during the grace window",
+    );
+    let metas = store.list("repo/gc/").await.unwrap();
+    let tombstones: Vec<_> = metas
+        .iter()
+        .filter(|m| m.key.starts_with("repo/gc/baseline-tomb-"))
+        .collect();
+    assert_eq!(
+        tombstones.len(),
+        1,
+        "exactly one baseline tombstone must be written; got {:?}",
+        tombstones.iter().map(|m| &m.key).collect::<Vec<_>>(),
+    );
+    let body = store.get_bytes(&tombstones[0].key).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["ref_name"].as_str(), Some("refs/heads/main"));
+    assert_eq!(
+        parsed["sha"].as_str(),
+        Some(old_sha.as_str()),
+        "tombstone must name the prior bundle's SHA",
+    );
 }
 
 #[tokio::test]
@@ -155,7 +182,20 @@ async fn force_push_overwrites_unrelated_remote() {
     result.expect("force push should succeed");
     assert_eq!(std::str::from_utf8(&out).unwrap(), "ok refs/heads/main\n\n");
     assert!(store.contains(&format!("repo/refs/heads/main/{local_sha}.bundle")));
-    assert!(!store.contains(&format!("repo/refs/heads/main/{unrelated_sha}.bundle")));
+    // Issue #157: prior bundle survives the force-push and is
+    // tombstoned for deferred reclamation by `gc sweep`. This protects
+    // any in-flight fetcher that already advertised the prior SHA.
+    assert!(
+        store.contains(&format!("repo/refs/heads/main/{unrelated_sha}.bundle")),
+        "force-pushed-over bundle must remain readable during the grace window",
+    );
+    let metas = store.list("repo/gc/").await.unwrap();
+    assert!(
+        metas
+            .iter()
+            .any(|m| m.key.starts_with("repo/gc/baseline-tomb-")),
+        "force-push must write a baseline tombstone for the prior bundle",
+    );
 }
 
 #[tokio::test]
@@ -639,8 +679,19 @@ async fn force_push_protected_with_ancestor_remote_proceeds() {
     result.expect("force-protected fast-forward should succeed");
     assert_eq!(std::str::from_utf8(&out).unwrap(), "ok refs/heads/main\n\n");
     assert!(store.contains(&format!("repo/refs/heads/main/{descendant}.bundle")));
-    // Old bundle replaced.
-    assert!(!store.contains(&format!("repo/refs/heads/main/{ancestor}.bundle")));
+    // Issue #157: old bundle survives the push; `gc sweep` reclaims
+    // it after the grace window. The tombstone records the SHA.
+    assert!(
+        store.contains(&format!("repo/refs/heads/main/{ancestor}.bundle")),
+        "old bundle must remain readable during the grace window",
+    );
+    let metas = store.list("repo/gc/").await.unwrap();
+    assert!(
+        metas
+            .iter()
+            .any(|m| m.key.starts_with("repo/gc/baseline-tomb-")),
+        "push must write a baseline tombstone for the prior bundle",
+    );
     // PROTECTED# marker untouched.
     assert!(store.contains("repo/refs/heads/main/PROTECTED#"));
 }

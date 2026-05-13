@@ -421,6 +421,85 @@ pub(crate) async fn write_baseline_tombstone_for_orphan(
     write_baseline_tombstone_unconditional(store, prefix, ref_name, orphan_sha).await
 }
 
+/// Return the set of bundle keys (full `<prefix>/<ref>/<sha>.bundle`
+/// paths) currently named by any baseline tombstone under
+/// `<prefix>/gc/baseline-tomb-*.json`.
+///
+/// Issue #157: the bundle engine derives `list`'s per-ref `<sha>`
+/// from the bundle keys themselves (unlike packchain, which reads
+/// `chain.tip`). Once a force-push tombstones the prior bundle, the
+/// listing must hide that bundle so:
+///
+/// 1. The `list` wire output does not advertise two SHAs for the
+///    same ref (which would emit two `<sha> <ref>\n` lines and
+///    confuse git), and
+/// 2. The under-lock multi-bundle guard in
+///    `crate::protocol::push::perform_push_under_lock` does not
+///    refuse the next push with the "multiple bundles" wire error.
+///
+/// The bundle keys themselves remain readable at their original
+/// paths — fetchers that already advertised the tombstoned SHA
+/// (issue #157's race) complete normally. `gc sweep` reclaims them
+/// after the grace window.
+///
+/// Returns full bucket keys, not stems, so callers can compare
+/// directly against `ObjectMeta::key` without re-deriving the prefix.
+/// A tombstone whose `ref_name` no longer parses as a `RefName` is
+/// skipped with a warn (mirrors `sweep_one_baseline_tombstone`'s
+/// invalid-ref handling) — the bundle key is unknowable but the
+/// tombstone itself remains for operator review.
+///
+/// # Errors
+///
+/// Propagates [`ObjectStoreError`] from the listing call. Per-tombstone
+/// parse failures are skipped with a warn — a single malformed
+/// tombstone must not block every listing.
+pub(crate) async fn tombstoned_bundle_keys(
+    store: &dyn ObjectStore,
+    prefix: Option<&str>,
+) -> Result<HashSet<String>, ObjectStoreError> {
+    let gc_listing = gc_listing_prefix(prefix.unwrap_or(""));
+    let metas = match store.list(&gc_listing).await {
+        Ok(m) => m,
+        // NotFound on an unsupported listing prefix on a fresh bucket
+        // is normal — no tombstones to hide.
+        Err(ObjectStoreError::NotFound(_)) => return Ok(HashSet::new()),
+        Err(e) => return Err(e),
+    };
+    let mut keys = HashSet::new();
+    for meta in metas {
+        if !is_baseline_tombstone_key(&meta.key, prefix.unwrap_or("")) {
+            continue;
+        }
+        let body = match store.get_bytes(&meta.key).await {
+            Ok(b) => b,
+            Err(ObjectStoreError::NotFound(_)) => continue, // raced delete
+            Err(e) => return Err(e),
+        };
+        let tombstone = match BaselineTombstone::from_json_bytes(&body) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(
+                    key = %meta.key,
+                    error = %e,
+                    "tombstoned_bundle_keys: skipping unparseable baseline tombstone",
+                );
+                continue;
+            }
+        };
+        let Ok(ref_name) = RefName::new(tombstone.ref_name.clone()) else {
+            warn!(
+                key = %meta.key,
+                ref_name = %tombstone.ref_name,
+                "tombstoned_bundle_keys: skipping tombstone with invalid ref_name",
+            );
+            continue;
+        };
+        keys.insert(keys::bundle_key(prefix, &ref_name, tombstone.sha.as_str()));
+    }
+    Ok(keys)
+}
+
 /// Shared body of [`write_baseline_tombstone`] and
 /// [`write_baseline_tombstone_for_orphan`]: emit a
 /// `<prefix>/gc/baseline-tomb-<uuid>.json` record naming
@@ -1644,6 +1723,62 @@ mod tests {
         .unwrap();
         store.insert(&key, Bytes::from(body));
         key
+    }
+
+    /// Issue #157: [`tombstoned_bundle_keys`] enumerates every bundle
+    /// key currently named by a baseline tombstone, regardless of
+    /// which engine wrote the tombstone. The bundle engine relies on
+    /// this set to hide tombstoned bundles from `list` and from the
+    /// under-lock multi-bundle guard.
+    #[tokio::test]
+    async fn tombstoned_bundle_keys_returns_bundle_paths_for_each_tombstone() {
+        let store = MockStore::new();
+        // Two tombstones for distinct (ref, sha) pairs.
+        write_baseline_tombstone_for_orphan(&store, Some("repo"), &ref_main(), &sha40(SHA_FULL))
+            .await
+            .unwrap();
+        let other_ref = RefName::new("refs/heads/feature").unwrap();
+        write_baseline_tombstone_for_orphan(&store, Some("repo"), &other_ref, &sha40(SHA_TIP))
+            .await
+            .unwrap();
+
+        let keys = tombstoned_bundle_keys(&store, Some("repo")).await.unwrap();
+        assert_eq!(keys.len(), 2, "one bundle key per tombstone (got {keys:?})");
+        assert!(keys.contains(&format!("repo/refs/heads/main/{SHA_FULL}.bundle")));
+        assert!(keys.contains(&format!("repo/refs/heads/feature/{SHA_TIP}.bundle")));
+    }
+
+    /// A fresh bucket with no `gc/` directory must not error — empty
+    /// set is the right answer.
+    #[tokio::test]
+    async fn tombstoned_bundle_keys_empty_when_no_tombstones() {
+        let store = MockStore::new();
+        let keys = tombstoned_bundle_keys(&store, Some("repo")).await.unwrap();
+        assert!(keys.is_empty(), "empty bucket yields no tombstoned keys");
+    }
+
+    /// An unparseable tombstone must not block the rest. Mirrors
+    /// `sweep_one_baseline_tombstone`'s tolerance for bad records:
+    /// the sweep loop logs a warn and continues.
+    #[tokio::test]
+    async fn tombstoned_bundle_keys_skips_unparseable_tombstones() {
+        let store = MockStore::new();
+        // One good tombstone + one garbage tombstone-keyed file.
+        write_baseline_tombstone_for_orphan(&store, Some("repo"), &ref_main(), &sha40(SHA_FULL))
+            .await
+            .unwrap();
+        store.insert(
+            "repo/gc/baseline-tomb-garbage.json",
+            Bytes::from_static(b"not json"),
+        );
+
+        let keys = tombstoned_bundle_keys(&store, Some("repo")).await.unwrap();
+        assert_eq!(
+            keys.len(),
+            1,
+            "good tombstone must still be returned despite garbage sibling",
+        );
+        assert!(keys.contains(&format!("repo/refs/heads/main/{SHA_FULL}.bundle")));
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ use tracing::warn;
 use crate::git::RefName;
 use crate::keys;
 use crate::object_store::{ObjectStore, ObjectStoreError};
+use crate::packchain::gc::tombstoned_bundle_keys;
 use crate::packchain::list as packchain_list;
 use crate::url::StorageEngine;
 
@@ -113,11 +114,28 @@ async fn collect_bundles(
     // below disambiguates sibling-prefix collisions.
     let listed = store.list(prefix.unwrap_or("")).await?;
 
+    // Skip the tombstone listing entirely when nothing was found —
+    // an empty bucket and packchain-only buckets pay nothing for the
+    // bundle-engine hide-set on every `git ls-remote`.
+    if listed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Issue #157: bundles named by a baseline tombstone are pending
+    // reclamation by `gc sweep` — the bundle key stays readable so
+    // an in-flight fetcher that already advertised it can finish, but
+    // `list` must not advertise it again (it would emit a second
+    // `<sha> <ref>\n` line for the same ref and confuse git).
+    let hidden = tombstoned_bundle_keys(store, prefix).await?;
+
     // Parse every match exactly once, carrying the timestamp alongside
     // the parsed entry so the sort below doesn't force a re-parse.
     let mut parsed: Vec<(time::OffsetDateTime, ListedRef)> = listed
         .into_iter()
         .filter_map(|m| {
+            if hidden.contains(&m.key) {
+                return None;
+            }
             let rel = relative_key(prefix, &m.key)?;
             let (ref_path, sha) = parse_bundle_key(rel)?;
             Some((
@@ -355,5 +373,61 @@ mod tests {
     fn relative_key_rejects_exact_prefix_match() {
         // "<prefix>" alone (no trailing key) is not a child key.
         assert_eq!(relative_key(Some("repo"), "repo"), None);
+    }
+
+    /// Issue #157: `collect_bundles` must hide bundles named by a
+    /// `<prefix>/gc/baseline-tomb-*.json` record. Without this filter
+    /// a force-push that deferred the prior bundle would cause `list`
+    /// to advertise TWO `<sha> refs/heads/main\n` lines, confusing git.
+    /// The bundle key itself remains readable at its path — only the
+    /// listing path hides it.
+    #[tokio::test]
+    async fn collect_bundles_hides_tombstoned_bundles() {
+        use crate::object_store::mock::MockStore;
+        use bytes::Bytes;
+
+        const OLD_SHA: &str = "ffffffffffffffffffffffffffffffffffffffff";
+        let store = MockStore::new();
+
+        // Seed two bundles for the same ref: a live one (SHA) and a
+        // tombstoned one (OLD_SHA). The tombstone references OLD_SHA's
+        // bundle key.
+        let live_key = format!("repo/refs/heads/main/{SHA}.bundle");
+        let old_key = format!("repo/refs/heads/main/{OLD_SHA}.bundle");
+        store.insert(&live_key, Bytes::from_static(b"live"));
+        store.insert(&old_key, Bytes::from_static(b"old"));
+
+        // Hand-written tombstone body matching the BaselineTombstone
+        // schema (v=1, marked_at, ref_name, sha). Pinned literally so a
+        // future schema change does not silently break this assertion.
+        let tomb_body = serde_json::json!({
+            "v": 1,
+            "marked_at": "2026-01-01T00:00:00Z",
+            "ref_name": "refs/heads/main",
+            "sha": OLD_SHA,
+        });
+        store.insert(
+            "repo/gc/baseline-tomb-fixture.json",
+            Bytes::from(serde_json::to_vec(&tomb_body).unwrap()),
+        );
+
+        let entries = collect_bundles(&store, Some("repo")).await.unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "tombstoned bundle must be filtered out of the listing",
+        );
+        assert_eq!(
+            entries[0].sha, SHA,
+            "remaining entry must be the live (non-tombstoned) bundle",
+        );
+        assert_eq!(entries[0].ref_path, "refs/heads/main");
+        // The bundle key itself must still be readable on the bucket —
+        // fetchers that advertised OLD_SHA via an earlier `list` need
+        // the key to remain until `gc sweep` reclaims it.
+        assert!(
+            store.contains(&old_key),
+            "tombstoned bundle must remain on the bucket during the grace window",
+        );
     }
 }
