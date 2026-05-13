@@ -68,6 +68,27 @@ pub(crate) struct RefSnapshot {
     pub(crate) has_chain: bool,
 }
 
+impl RefSnapshot {
+    /// `true` iff this ref carries user-visible branch data — at least
+    /// one bundle or a `chain.json` manifest. A ref whose only residue
+    /// is a `PROTECTED#` marker returns `false`: the marker is
+    /// operational metadata, not branch contents, and a branch that has
+    /// shed every bundle / chain is gone for the purposes of HEAD
+    /// validity and the doctor's repair path (issue #154). This mirrors
+    /// the `key`-level [`super::has_branch_data`] predicate that the
+    /// race-detection checks in `Doctor::fix_head` and
+    /// `ManageBranch::protect` already use.
+    ///
+    /// Note: lock-file keys (`*.lock`) are filtered out in
+    /// [`classify_into`] before they reach a `RefSnapshot`, so the
+    /// in-snapshot view is naturally lock-free. Operational metadata in
+    /// the snapshot reduces to `is_protected`.
+    #[must_use]
+    pub(crate) fn has_branch_data(&self) -> bool {
+        !self.bundles.is_empty() || self.has_chain
+    }
+}
+
 /// Whole-repository snapshot.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RepoSnapshot {
@@ -85,14 +106,22 @@ pub(crate) struct RepoSnapshot {
 }
 
 impl RepoSnapshot {
-    /// `true` iff [`head`](Self::head) names a ref that exists in
-    /// [`refs`](Self::refs). A `None` HEAD or a HEAD pointing at a ref
-    /// with no listed keys is "invalid" and triggers `fix_head`.
+    /// `true` iff [`head`](Self::head) names a ref in [`refs`](Self::refs)
+    /// that carries actual branch data (at least one bundle, or a
+    /// `chain.json` manifest).
+    ///
+    /// A `None` HEAD, a HEAD pointing at an unknown ref, OR a HEAD
+    /// pointing at a ref whose only residue is a `PROTECTED#` marker
+    /// (issue #154) is "invalid" and triggers `fix_head`. The
+    /// `is_protected`-only case matters because `classify_into` creates
+    /// a `RefSnapshot` entry for a bare `PROTECTED#` key — a bare entry
+    /// alone is operational metadata, not branch contents.
     #[must_use]
     pub(crate) fn is_head_valid(&self) -> bool {
         self.head
             .as_ref()
-            .is_some_and(|h| self.refs.contains_key(h))
+            .and_then(|h| self.refs.get(h))
+            .is_some_and(RefSnapshot::has_branch_data)
     }
 }
 
@@ -375,6 +404,65 @@ mod tests {
         let snap = analyze(&s, "myrepo").await.expect("analyze");
         assert_eq!(snap.head.as_deref(), Some("refs/heads/missing"));
         assert!(!snap.is_head_valid());
+    }
+
+    #[tokio::test]
+    async fn head_pointing_at_protected_only_ref_is_invalid() {
+        // Issue #154: a ref whose only on-bucket residue is a
+        // `PROTECTED#` marker has no user-visible branch data. The
+        // marker is operational metadata, so HEAD pointing at such a
+        // ref must classify as invalid — otherwise the doctor skips the
+        // repair path and leaves HEAD silently dangling.
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("myrepo/refs/heads/main/PROTECTED#", Bytes::new());
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+        // The ref entry exists (the marker was recognised) but has no
+        // branch data — `is_head_valid` must still report false.
+        let main = snap.refs.get("refs/heads/main").expect("ref present");
+        assert!(main.is_protected);
+        assert!(main.bundles.is_empty());
+        assert!(!main.has_chain);
+        assert!(
+            !snap.is_head_valid(),
+            "HEAD pointing at a PROTECTED#-only ref must be invalid (#154)",
+        );
+    }
+
+    #[tokio::test]
+    async fn head_pointing_at_protected_ref_with_bundle_is_valid() {
+        // Negative control for #154: protection by itself does not
+        // invalidate HEAD. A protected branch with at least one bundle
+        // (or chain.json) is structurally healthy — the doctor must
+        // not offer to rewrite HEAD just because the marker is present.
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("myrepo/refs/heads/main/PROTECTED#", Bytes::new());
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("body"),
+        );
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+        assert!(snap.refs["refs/heads/main"].is_protected);
+        assert!(snap.is_head_valid());
+    }
+
+    #[tokio::test]
+    async fn head_pointing_at_chain_only_ref_is_valid() {
+        // Negative control for #154: a packchain branch is valid even
+        // without a `.bundle` — `chain.json` plus `packs/*` is the
+        // canonical packchain on-bucket shape.
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert(
+            "myrepo/refs/heads/main/chain.json",
+            Bytes::from(r#"{"v":1}"#),
+        );
+        let s: Arc<dyn ObjectStore> = Arc::new(mock);
+        let snap = analyze(&s, "myrepo").await.expect("analyze");
+        assert!(snap.is_head_valid());
     }
 
     #[tokio::test]

@@ -25,7 +25,9 @@ use time::OffsetDateTime;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::snapshot::{BundleEntry, MalformedBundleKey, RepoSnapshot, analyze_objects};
+use super::snapshot::{
+    BundleEntry, MalformedBundleKey, RefSnapshot, RepoSnapshot, analyze_objects,
+};
 use super::{DEFAULT_LOCK_TTL_SECONDS, ManageError, Prompter};
 use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
@@ -215,10 +217,20 @@ impl<'a> Doctor<'a> {
             };
             let _ = writeln!(out, " {star} {ref_path}: {status}");
         }
+        // Match `is_head_valid`'s predicate (issue #154): a ref whose
+        // only residue is a `PROTECTED#` marker counts as "no branch
+        // data", so the report must show `HEAD: Invalid` for that case
+        // — otherwise the report would contradict the repair path that
+        // follows in `run_into`.
         let head_label = snapshot
             .head
             .as_deref()
-            .filter(|h| snapshot.refs.contains_key(*h))
+            .filter(|h| {
+                snapshot
+                    .refs
+                    .get(*h)
+                    .is_some_and(RefSnapshot::has_branch_data)
+            })
             .unwrap_or("Invalid");
         let _ = writeln!(out, "  HEAD: {head_label}");
         out
@@ -2247,6 +2259,85 @@ mod tests {
             output.contains("Setting refs/heads/main as HEAD"),
             "HEAD assignment line missing: {output:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn fix_head_offered_when_head_points_at_protected_only_ref() {
+        // Issue #154: HEAD points at `refs/heads/main`, but the only
+        // residue under that ref is a `PROTECTED#` marker — no bundles,
+        // no chain. The previous implementation classified this HEAD as
+        // valid (because the ref entry existed in the snapshot) and
+        // skipped the repair path, leaving HEAD silently dangling.
+        //
+        // Drive the fix end-to-end: the report must read `HEAD: Invalid`
+        // and the runner must offer `fix_head`, pointing HEAD at the
+        // only branch that carries actual data (`refs/heads/dev`).
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("myrepo/refs/heads/main/PROTECTED#", Bytes::new());
+        mock.insert(
+            format!("myrepo/refs/heads/dev/{SHA_C}.bundle"),
+            Bytes::from("c"),
+        );
+        // Lexicographic order: `[refs/heads/dev, refs/heads/main]`,
+        // index 0 == `refs/heads/dev` (the only branch with real data).
+        let prompter = ScriptedPrompter::new([Answer::Select(0)]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let (result, output) = capture_run(&doctor).await;
+        result.expect("doctor.run");
+
+        // Report shows `Invalid`, not the stale `refs/heads/main`.
+        assert!(
+            output.contains("HEAD: Invalid"),
+            "expected `HEAD: Invalid` in report; got:\n{output}",
+        );
+        // Repair path ran and rewrote HEAD to the only ref with data.
+        assert!(
+            output.contains("Fix invalid HEAD for repo myrepo"),
+            "fix_head header missing; got:\n{output}",
+        );
+        assert!(
+            output.contains("Setting refs/heads/dev as HEAD"),
+            "HEAD reassignment line missing; got:\n{output}",
+        );
+        // And the bucket reflects the new HEAD.
+        let head_bytes = mock.get_bytes("myrepo/HEAD").await.expect("HEAD written");
+        assert_eq!(&head_bytes[..], b"refs/heads/dev");
+        assert_eq!(prompter.remaining(), 0);
+    }
+
+    #[tokio::test]
+    async fn fix_head_skipped_when_head_points_at_protected_ref_with_bundle() {
+        // Negative control for #154: protection does NOT invalidate a
+        // HEAD that points at a ref with real branch data. A protected
+        // branch with a bundle is structurally healthy — the doctor
+        // must NOT offer `fix_head`. A regression that broadened the
+        // invalidation check would trip the empty-script prompter on
+        // an unexpected `select` call.
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("myrepo/refs/heads/main/PROTECTED#", Bytes::new());
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("b"),
+        );
+        let initial_keys = mock.keys();
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let (result, output) = capture_run(&doctor).await;
+        result.expect("doctor.run");
+
+        // No HEAD-fix attempted; bucket unchanged.
+        assert!(
+            !output.contains("Fix invalid HEAD"),
+            "fix_head fired against a protected ref with real data: {output}",
+        );
+        assert!(
+            output.contains("HEAD: refs/heads/main"),
+            "expected valid HEAD label in report; got:\n{output}",
+        );
+        assert_eq!(mock.keys(), initial_keys);
+        assert_eq!(prompter.remaining(), 0);
     }
 
     #[tokio::test]
