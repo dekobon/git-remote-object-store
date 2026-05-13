@@ -4,10 +4,12 @@
 //! key space the protocol REPL writes bundles into. When the URL has no
 //! repository prefix (root-of-bucket repos, `<prefix>` is empty), keys
 //! collapse to `refs/heads/<branch>/...` with no leading slash.
-
-// User-facing output is owned by the management CLI; see the matching
-// note in `doctor.rs` for the rationale behind the lint exception.
-#![allow(clippy::disallowed_macros)]
+//!
+//! All operator-visible output goes through a `Write`-bound writer (the
+//! `*_into` entry points) so tests can capture and assert on the
+//! messages. The public `delete()`, `protect()`, `unprotect()` methods
+//! wrap their `*_into` siblings with `std::io::stdout()` for the
+//! management CLI.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -23,7 +25,7 @@ use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
 use crate::packchain::gc::write_baseline_tombstone_for_orphan;
 use crate::packchain::manifest::load_chain;
-use crate::protocol::push::{acquire_lock, lock_key, lock_ttl_from_env, release_lock};
+use crate::protocol::push::{LockGuard, acquire_lock, lock_key, lock_ttl_from_env, release_lock};
 
 /// Operations on a single branch within a repository.
 pub struct ManageBranch<'a> {
@@ -464,9 +466,28 @@ impl<'a> ManageBranch<'a> {
     /// Mark the branch as protected by writing the `PROTECTED#` sentinel.
     /// Idempotent — overwrites any existing marker.
     ///
-    /// Re-lists the branch prefix immediately before the put so a
-    /// concurrent `delete-branch` (or last-bundle removal) that landed
-    /// between [`ManageBranch::open`] and this call is caught and the
+    /// # Per-ref lock (#159)
+    ///
+    /// `protect` acquires the same `<prefix>/<ref>/LOCK#.lock` the
+    /// helper-protocol push, helper-protocol delete, and `delete-branch`
+    /// take. Pre-#159, the push path's pre-bundle `is_protected` check
+    /// could race a concurrent `protect`: a force-push that observed no
+    /// marker would still overwrite the bundle even if `protect` landed
+    /// between the under-lock `is_protected` and the bundle upload —
+    /// because `protect` was a lockless `put_bytes`. Taking the same
+    /// lock serialises protection state changes against the writers
+    /// that consult it, closing the entire write window rather than
+    /// narrowing it to a second sample.
+    ///
+    /// If the lock is contended (a push, delete, or compact holds it),
+    /// `protect` returns [`ManageError::LockContended`] and makes no
+    /// changes. Operators can retry. Stale-lock recovery is inherited
+    /// from `acquire_lock` (a previous holder that crashed without
+    /// releasing).
+    ///
+    /// Re-lists the branch prefix under the lock so a concurrent
+    /// `delete-branch` (or last-bundle removal) that landed between
+    /// [`ManageBranch::open`] and the lock window is caught and the
     /// marker is NOT written for a non-existent branch (#137). Without
     /// this re-check the orphaned `PROTECTED#` would persist with no
     /// automated cleanup and would silently block a future recreation
@@ -477,10 +498,37 @@ impl<'a> ManageBranch<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`ManageError::BranchNotFound`] if the fresh listing
+    /// Returns [`ManageError::BranchNotFound`] if the under-lock listing
     /// shows the branch was deleted concurrently. Returns
-    /// [`ManageError::Store`] if a list or put operation fails.
+    /// [`ManageError::LockContended`] if another writer holds the
+    /// per-ref lock at acquisition time. Returns [`ManageError::Store`]
+    /// if a list or put operation fails.
     pub async fn protect(&self) -> Result<(), ManageError> {
+        self.protect_into(&mut std::io::stdout()).await
+    }
+
+    /// Writer-injecting variant of [`Self::protect`] so tests can
+    /// capture the "now protected" operator message. Mirrors the
+    /// pattern established by [`Self::delete_into`] (#145) and the
+    /// management CLI's other writer-aware entry points.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::protect`], plus [`ManageError::Io`] if a write
+    /// to `out` fails.
+    pub(crate) async fn protect_into<W: Write>(&self, out: &mut W) -> Result<(), ManageError> {
+        let (lock, guard) = self.acquire_ref_lock("protect").await?;
+        let work = self.protect_under_lock(out).await;
+        self.release_or_warn(guard, &lock, "protect").await;
+        work
+    }
+
+    /// Lock-held body of [`Self::protect_into`]: re-list under the
+    /// lock, reject if the branch has been deleted concurrently,
+    /// otherwise write the `PROTECTED#` sentinel. Extracted so the
+    /// acquire/release tail in `protect_into` runs unconditionally on
+    /// every exit path — including the `BranchNotFound` early return.
+    async fn protect_under_lock<W: Write>(&self, out: &mut W) -> Result<(), ManageError> {
         let fresh = self.store.list(&self.branch_prefix()).await?;
         if !super::has_branch_data(&fresh) {
             warn!(
@@ -492,24 +540,109 @@ impl<'a> ManageBranch<'a> {
         self.store
             .put_bytes(&self.protected_key(), Bytes::new(), PutOpts::default())
             .await?;
-        println!("Branch {} is now protected", self.branch);
+        writeln!(out, "Branch {} is now protected", self.branch)?;
         Ok(())
     }
 
     /// Remove the `PROTECTED#` sentinel. A missing marker is treated as
     /// already-unprotected rather than an error.
     ///
+    /// # Per-ref lock (#159)
+    ///
+    /// `unprotect` acquires the same per-ref lock as [`Self::protect`]
+    /// so ALL protection state changes serialise against pushes,
+    /// deletes, and compactions. Without taking the lock here a
+    /// concurrent push observing `is_protected() == true` could
+    /// otherwise commit to the protected refusal path just as
+    /// `unprotect` landed, leaving the writer's behaviour out of step
+    /// with operator intent. Symmetry with `protect` keeps the lock the
+    /// single point of serialisation for protection state.
+    ///
     /// # Errors
     ///
-    /// Returns [`ManageError::Store`] for object-store failures other than
+    /// Returns [`ManageError::LockContended`] if another writer holds
+    /// the per-ref lock at acquisition time. Returns
+    /// [`ManageError::Store`] for object-store failures other than
     /// `NotFound`.
     pub async fn unprotect(&self) -> Result<(), ManageError> {
+        self.unprotect_into(&mut std::io::stdout()).await
+    }
+
+    /// Writer-injecting variant of [`Self::unprotect`] so tests can
+    /// capture the "now unprotected" operator message.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::unprotect`], plus [`ManageError::Io`] if a
+    /// write to `out` fails.
+    pub(crate) async fn unprotect_into<W: Write>(&self, out: &mut W) -> Result<(), ManageError> {
+        let (lock, guard) = self.acquire_ref_lock("unprotect").await?;
+        let work = self.unprotect_under_lock(out).await;
+        self.release_or_warn(guard, &lock, "unprotect").await;
+        work
+    }
+
+    /// Lock-held body of [`Self::unprotect_into`]: delete the
+    /// `PROTECTED#` marker, treating `NotFound` as
+    /// already-unprotected. The lock scope is mechanical (no listing
+    /// or recovery work needed); we still hold it so a concurrent
+    /// `protect` cannot land between here and the delete and leave
+    /// the operator's "unprotect" intent silently overridden.
+    async fn unprotect_under_lock<W: Write>(&self, out: &mut W) -> Result<(), ManageError> {
         match self.store.delete(&self.protected_key()).await {
             Ok(()) | Err(ObjectStoreError::NotFound(_)) => {
-                println!("Branch {} is now unprotected", self.branch);
+                writeln!(out, "Branch {} is now unprotected", self.branch)?;
                 Ok(())
             }
             Err(other) => Err(other.into()),
+        }
+    }
+
+    /// Acquire the per-ref lock for `op` (`protect`, `unprotect`, or
+    /// any future protection-state caller). Returns the resolved lock
+    /// key alongside the guard so the matching `release_or_warn` tail
+    /// can name the key in its log line without re-deriving it.
+    ///
+    /// Contention surfaces as [`ManageError::LockContended`] with the
+    /// branch name, lock key, and current TTL — matching the wording
+    /// `delete-branch` (#158) uses so operators see one shape of error
+    /// across the management surface.
+    async fn acquire_ref_lock(&self, op: &'static str) -> Result<(String, LockGuard), ManageError> {
+        let ref_name = self.validated_ref_name()?;
+        let prefix_opt = self.prefix_opt();
+        let lock = lock_key(prefix_opt, &ref_name);
+        let ttl = lock_ttl_from_env();
+        let now = OffsetDateTime::now_utc();
+        let Some(guard) = acquire_lock(Arc::clone(&self.store), &lock, ttl, now).await? else {
+            warn!(
+                branch = %self.branch,
+                op = op,
+                key = %lock,
+                "{op}: per-ref lock is held by another writer; refusing to race",
+            );
+            return Err(ManageError::LockContended {
+                branch: self.branch.clone(),
+                lock,
+                ttl_seconds: ttl.whole_seconds(),
+            });
+        };
+        Ok((lock, guard))
+    }
+
+    /// Release a previously acquired lock, downgrading release failures
+    /// to a `warn!` so the caller's primary error (or success) is what
+    /// surfaces. The lock's TTL recovers a leaked key on the next
+    /// acquirer (#150), so the worst case is a delayed retry rather
+    /// than a permanently stuck ref.
+    async fn release_or_warn(&self, guard: LockGuard, lock: &str, op: &'static str) {
+        if let Err(e) = release_lock(guard).await {
+            warn!(
+                branch = %self.branch,
+                op = op,
+                key = %lock,
+                error = %e,
+                "{op}: failed to release per-ref lock; will age out by TTL",
+            );
         }
     }
 }
@@ -691,16 +824,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protect_refuses_when_only_lock_key_remains() {
-        // A stale `LOCK#.lock` key is operational metadata, not branch
-        // data. Treating a lock-only listing as "branch exists" would
-        // let a `protect` write a marker for a branch that has no
-        // bundles — the same orphan-marker pathology #137 describes,
-        // just with a lock as the misleading residue instead of an
-        // empty listing.
+    async fn protect_refuses_when_only_stale_lock_key_remains() {
+        // A `LOCK#.lock` key is operational metadata, not branch data.
+        // Treating a lock-only listing as "branch exists" would let a
+        // `protect` write a marker for a branch that has no bundles —
+        // the same orphan-marker pathology #137 describes, just with a
+        // lock as the misleading residue instead of an empty listing.
+        //
+        // The lock is seeded stale (older than TTL) so #159's lock
+        // acquisition recovers it rather than reporting contention —
+        // otherwise we would assert the wrong error. The data-presence
+        // re-check then runs and refuses the orphan write.
         let mock = MockStore::new();
         mock.insert("myrepo/refs/heads/main/abc.bundle", Bytes::from("body"));
-        mock.insert("myrepo/refs/heads/main/LOCK#.lock", Bytes::new());
+        let stale = OffsetDateTime::now_utc() - time::Duration::days(1);
+        mock.insert_with(
+            "myrepo/refs/heads/main/LOCK#.lock",
+            Bytes::new(),
+            stale,
+            PutOpts::default(),
+        );
         let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
         let prompter = ScriptedPrompter::new([]);
 
@@ -739,6 +882,46 @@ mod tests {
             .expect("protect must remain idempotent over an existing marker");
         assert!(mock.contains("myrepo/refs/heads/main/PROTECTED#"));
         assert!(mock.contains("myrepo/refs/heads/main/abc.bundle"));
+    }
+
+    #[tokio::test]
+    async fn protect_into_writes_operator_message_to_writer() {
+        // Mirror the delete_into pattern (#145): the writer-injecting
+        // variant must emit the operator-visible message through `out`,
+        // not via stdout. A regression that dropped the message — or
+        // emitted it on stdout instead of the writer — would slip past
+        // any test calling `protect()` because that wraps stdout.
+        let mock = seed_with_branch("main");
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([]);
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        let mut out: Vec<u8> = Vec::new();
+        mb.protect_into(&mut out).await.expect("protect_into");
+        let captured = String::from_utf8(out).expect("utf8");
+        assert!(
+            captured.contains("Branch main is now protected"),
+            "protect_into must emit the operator message; got: {captured:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn unprotect_into_writes_operator_message_to_writer() {
+        let mock = seed_with_branch("main");
+        mock.insert("myrepo/refs/heads/main/PROTECTED#", Bytes::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([]);
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        let mut out: Vec<u8> = Vec::new();
+        mb.unprotect_into(&mut out).await.expect("unprotect_into");
+        let captured = String::from_utf8(out).expect("utf8");
+        assert!(
+            captured.contains("Branch main is now unprotected"),
+            "unprotect_into must emit the operator message; got: {captured:?}",
+        );
     }
 
     #[tokio::test]
@@ -1976,5 +2159,235 @@ mod tests {
         // The bundle was deleted; only the now-orphan lock survives
         // (the release fault consumed the lock's delete).
         assert!(!mock.contains("myrepo/refs/heads/main/abc.bundle"));
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #159 — protect / unprotect must acquire the per-ref lock so
+    // a concurrent push-in-progress cannot land a force-push between
+    // the under-lock `is_protected` sample and the bundle upload.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn protect_refuses_when_per_ref_lock_is_held_by_another_writer() {
+        // Issue #159: pre-fix, `protect` was a lockless `put_bytes`. A
+        // concurrent `git push` that had taken the per-ref lock and
+        // already passed its under-lock `is_protected()` check could
+        // overwrite the bundle even if `protect` landed between that
+        // check and the bundle upload. The fix takes the same lock the
+        // push path takes; this test seeds a fresh lock (matching a
+        // push holding it) and asserts `protect` returns
+        // `LockContended` and writes NO marker.
+        let mock = seed_with_branch("main");
+        mock.insert("myrepo/refs/heads/main/LOCK#.lock", Bytes::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        let err = mb
+            .protect()
+            .await
+            .expect_err("protect must refuse to race a fresh lock holder");
+        match &err {
+            ManageError::LockContended {
+                branch,
+                lock,
+                ttl_seconds,
+            } => {
+                assert_eq!(branch, "main");
+                assert_eq!(lock, "myrepo/refs/heads/main/LOCK#.lock");
+                assert!(*ttl_seconds > 0);
+            }
+            other => panic!("expected LockContended, got {other:?}"),
+        }
+        // The marker must NOT be written and the racing writer's lock
+        // must NOT be deleted. Pre-#159 this exact race let `protect`
+        // land its marker AFTER the push's `is_protected` check, with
+        // the push completing the force-push anyway.
+        assert!(
+            !mock.contains("myrepo/refs/heads/main/PROTECTED#"),
+            "no marker may be written under a contended lock",
+        );
+        assert!(
+            mock.contains("myrepo/refs/heads/main/LOCK#.lock"),
+            "the racing writer's lock must survive a contention refusal",
+        );
+        assert!(mock.contains("myrepo/refs/heads/main/abc.bundle"));
+    }
+
+    #[tokio::test]
+    async fn unprotect_refuses_when_per_ref_lock_is_held_by_another_writer() {
+        // Symmetry with the protect contention test: `unprotect` must
+        // also block on a held lock so protection state changes are
+        // serialised against every other writer. Pre-#159, `unprotect`
+        // was a lockless `delete`; a concurrent push observing
+        // `is_protected() == true` and a racing `unprotect` could land
+        // with the push still on the protected-refusal path.
+        let mock = seed_with_branch("main");
+        mock.insert("myrepo/refs/heads/main/PROTECTED#", Bytes::new());
+        mock.insert("myrepo/refs/heads/main/LOCK#.lock", Bytes::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        let err = mb
+            .unprotect()
+            .await
+            .expect_err("unprotect must refuse to race a fresh lock holder");
+        assert!(
+            matches!(err, ManageError::LockContended { ref branch, .. } if branch == "main"),
+            "expected LockContended, got {err:?}",
+        );
+        // The marker must remain — `unprotect` did not get to remove it.
+        assert!(mock.contains("myrepo/refs/heads/main/PROTECTED#"));
+        assert!(mock.contains("myrepo/refs/heads/main/LOCK#.lock"));
+    }
+
+    #[tokio::test]
+    async fn protect_releases_lock_after_successful_write() {
+        // A successful protect must release the LOCK#.lock it acquired.
+        // Without release, a subsequent push or unprotect would see a
+        // fresh lock and report contention until TTL — defeating the
+        // point of an explicit release.
+        let mock = seed_with_branch("main");
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        mb.protect().await.expect("protect");
+        assert!(mock.contains("myrepo/refs/heads/main/PROTECTED#"));
+        assert!(
+            !mock.contains("myrepo/refs/heads/main/LOCK#.lock"),
+            "lock must be released after a successful protect: {:?}",
+            mock.keys(),
+        );
+    }
+
+    #[tokio::test]
+    async fn unprotect_releases_lock_after_successful_delete() {
+        // Mirror of `protect_releases_lock_after_successful_write`: the
+        // unprotect path must release its lock on the success branch.
+        let mock = seed_with_branch("main");
+        mock.insert("myrepo/refs/heads/main/PROTECTED#", Bytes::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        mb.unprotect().await.expect("unprotect");
+        assert!(!mock.contains("myrepo/refs/heads/main/PROTECTED#"));
+        assert!(
+            !mock.contains("myrepo/refs/heads/main/LOCK#.lock"),
+            "lock must be released after a successful unprotect: {:?}",
+            mock.keys(),
+        );
+    }
+
+    #[tokio::test]
+    async fn protect_recovers_stale_lock_and_proceeds() {
+        // A `LOCK#.lock` older than the TTL means a previous writer
+        // crashed before releasing it. `acquire_lock` recovers it by
+        // deleting and re-acquiring. The protect must then complete
+        // normally — refusing on a stale lock would let a crashed
+        // writer block protection state changes forever.
+        let mock = seed_with_branch("main");
+        let stale = OffsetDateTime::now_utc() - time::Duration::days(1);
+        mock.insert_with(
+            "myrepo/refs/heads/main/LOCK#.lock",
+            Bytes::new(),
+            stale,
+            PutOpts::default(),
+        );
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        mb.protect().await.expect("stale lock must be recovered");
+        assert!(mock.contains("myrepo/refs/heads/main/PROTECTED#"));
+        assert!(
+            !mock.contains("myrepo/refs/heads/main/LOCK#.lock"),
+            "stale lock recovered and our fresh lock released: {:?}",
+            mock.keys(),
+        );
+    }
+
+    #[tokio::test]
+    async fn protect_release_failure_does_not_mask_marker_write_success() {
+        // Issue #159 / #158 symmetry: release failures are downgraded
+        // to `warn!`. A regression that propagated the release error
+        // would lie to the operator about a `protect` that actually
+        // succeeded — the marker is on the bucket; the orphan lock
+        // ages out via the next acquirer's TTL recovery.
+        let mock = seed_with_branch("main");
+        mock.arm(crate::object_store::mock::Fault::NetworkOnDelete {
+            key: "myrepo/refs/heads/main/LOCK#.lock".to_owned(),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        mb.protect()
+            .await
+            .expect("release failure must not mask marker-write success");
+        assert!(
+            mock.contains("myrepo/refs/heads/main/PROTECTED#"),
+            "marker must be written even when lock release fails",
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_159_protect_cannot_land_during_active_push() {
+        // The headline regression test for #159. Models the documented
+        // race verbatim:
+        //
+        //   1. push acquires LOCK#.lock
+        //   2. push reads is_protected -> NotFound
+        //   3. operator runs `protect`, which (pre-#159) put_bytes the
+        //      marker without taking the lock — succeeds
+        //   4. push uploads the new bundle, force-overwriting a now
+        //      "protected" ref
+        //
+        // The fix makes step 3 fail with `LockContended`. With the
+        // lock still on the bucket from step 1, `protect` cannot run
+        // until the push releases — at which point the push has
+        // already either committed or refused on its under-lock
+        // `is_protected` check, with no half-state in between.
+        //
+        // The test seeds the lock directly (representing step 1's
+        // holder) and asserts step 3 fails. The push's actual upload
+        // is not exercised here because it is covered by the
+        // helper-protocol push tests; the load-bearing claim is "no
+        // mid-push protect can sneak in".
+        let mock = seed_with_branch("main");
+        mock.insert("myrepo/refs/heads/main/LOCK#.lock", Bytes::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        let err = mb
+            .protect()
+            .await
+            .expect_err("protect must not land during an active push");
+        assert!(
+            matches!(err, ManageError::LockContended { .. }),
+            "expected LockContended, got {err:?}",
+        );
+        // Marker NOT written: the under-lock push (when it eventually
+        // releases) will see no marker, take whichever branch
+        // is_protected dictates, and operator intent never crosses
+        // streams with the writer's snapshot.
+        assert!(!mock.contains("myrepo/refs/heads/main/PROTECTED#"));
     }
 }

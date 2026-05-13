@@ -2624,6 +2624,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fix_head_reports_no_candidates_when_all_refs_are_protected_only() {
+        // Wave 3 hygiene (cross-wave /review T3): when HEAD is invalid
+        // AND every `refs/heads/*` ref in the snapshot fails the
+        // `has_branch_data` predicate (e.g., all PROTECTED#-only
+        // residue), the candidate picker must be empty and the
+        // operator-visible message must say so. Without the filter on
+        // `r.has_branch_data()`, the picker would offer dead refs that
+        // would fail the keeper-recheck anyway — a usability trap.
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert("myrepo/refs/heads/main/PROTECTED#", Bytes::new());
+        mock.insert("myrepo/refs/heads/dev/PROTECTED#", Bytes::new());
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let (result, output) = capture_run(&doctor).await;
+        result.expect("doctor.run");
+
+        assert!(
+            output.contains("HEAD: Invalid"),
+            "expected `HEAD: Invalid` in report; got:\n{output}",
+        );
+        assert!(
+            output.contains("Fix invalid HEAD for repo myrepo"),
+            "fix_head header missing; got:\n{output}",
+        );
+        // Load-bearing assertion: the picker must NOT offer a
+        // protected-only ref. The skipping message proves the filter
+        // ran. An empty-script prompter would also catch a regression
+        // that fell through to `select` against a now-stale candidate.
+        assert!(
+            output.contains("No `refs/heads/*` available to assign as HEAD"),
+            "candidate picker must surface the no-candidates message: {output}",
+        );
+        assert_eq!(prompter.remaining(), 0);
+    }
+
+    #[tokio::test]
     async fn run_into_captures_stale_lock_output() {
         // Exercises the stale-lock listing + deletion path and pins
         // the report lines in the capture buffer.
