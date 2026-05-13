@@ -20,6 +20,8 @@ use super::{ManageError, Prompter};
 use crate::git::RefName;
 use crate::keys;
 use crate::object_store::{ObjectStore, ObjectStoreError, PutOpts};
+use crate::packchain::gc::write_baseline_tombstone_for_orphan;
+use crate::packchain::manifest::load_chain;
 
 /// Operations on a single branch within a repository.
 pub struct ManageBranch<'a> {
@@ -120,6 +122,20 @@ impl<'a> ManageBranch<'a> {
     /// list-call failure still propagates immediately because there is
     /// nothing to recover — without a listing the sweep cannot proceed.
     ///
+    /// Packchain refs with a parseable `chain.json` skip immediate
+    /// deletion of the baseline bundle (`<full_at>.bundle`): a
+    /// baseline tombstone is written first and the bundle is left for
+    /// `gc sweep` to reclaim after the grace window (#143). The
+    /// synchronous sweep still removes `chain.json`,
+    /// `path-index.json`, and any other residue. The deferral protects
+    /// an in-flight fetcher that already read the prior `chain.json`
+    /// from a `BaselineMissing` range-GET failure; a fresh reader
+    /// sees the missing chain and the ref is gone from its
+    /// perspective. Bundle-engine refs, refs with an unparseable
+    /// chain, and any tombstone PUT failure fall through to immediate
+    /// bundle deletion so the operator's "ref is gone" intent is
+    /// never blocked on the tombstone path.
+    ///
     /// # Errors
     ///
     /// Returns [`ManageError::Protected`] if the branch carries a
@@ -191,6 +207,29 @@ impl<'a> ManageBranch<'a> {
             );
         }
 
+        // Issue #143: if the ref is a packchain ref with a parseable
+        // `chain.json`, write a baseline tombstone naming the current
+        // `full_at` bundle BEFORE the synchronous sweep, then exclude
+        // that bundle key from the delete loop. A concurrent fetcher
+        // that read the prior `chain.json` (t₀) and is mid-range-GET
+        // on `<full_at>.bundle` then completes against the still-live
+        // bundle; `gc sweep` reclaims it after the grace window. The
+        // synchronous sweep still removes `chain.json`,
+        // `path-index.json`, and every other key — from a fresh
+        // reader's perspective the ref is gone the moment those
+        // commit. Bundle-engine refs (no `chain.json`) and refs with
+        // an unparseable chain fall through to the immediate-delete
+        // path: there is nothing for `sweep` to reconcile against, so
+        // deferral would just orphan the bundle.
+        let deferred_bundle_key = self.try_tombstone_baseline(&fresh).await;
+        if let Some(ref key) = deferred_bundle_key {
+            info!(
+                branch = %self.branch,
+                key = %key,
+                "delete-branch: deferred baseline bundle delete via tombstone",
+            );
+        }
+
         // Collect, don't short-circuit: a transient failure on key #2
         // of a 4-key listing must not leave #3 and #4 standing with no
         // inventory of what survived. NotFound continues to be tolerated
@@ -200,6 +239,13 @@ impl<'a> ManageBranch<'a> {
         // surviving key so a retry can converge (#122).
         let mut undeleted: Vec<String> = Vec::new();
         for object in &fresh {
+            // The baseline bundle (if any) is left for `gc sweep` —
+            // see the tombstone block above. Other keys (chain.json,
+            // path-index.json, lock files, PROTECTED# is already
+            // refused earlier) are deleted synchronously.
+            if deferred_bundle_key.as_deref() == Some(object.key.as_str()) {
+                continue;
+            }
             match self.store.delete(&object.key).await {
                 Ok(()) | Err(ObjectStoreError::NotFound(_)) => {}
                 Err(err) => {
@@ -223,6 +269,74 @@ impl<'a> ManageBranch<'a> {
         writeln!(out, "Branch {} has been deleted", self.branch)?;
         info!(branch = %self.branch, count = fresh.len(), "branch deleted");
         Ok(())
+    }
+
+    /// Attempt to tombstone the baseline bundle for a packchain ref so
+    /// the synchronous delete loop can skip it (issue #143). Returns
+    /// the bundle key that was deferred, or `None` if no deferral is
+    /// possible (bundle-engine ref with no `chain.json`, unparseable
+    /// chain, no `<full_at>.bundle` in the listing, or a tombstone PUT
+    /// failure).
+    ///
+    /// The `None` fall-through is the correct behaviour for every
+    /// "deferral is not actionable" case: with no tombstone, `gc sweep`
+    /// has nothing to reclaim, so the sweep loop must remove the
+    /// bundle synchronously instead. A logged warning surfaces the
+    /// rarer load/parse/PUT failures for operator review without
+    /// blocking the delete.
+    async fn try_tombstone_baseline(
+        &self,
+        fresh: &[crate::object_store::ObjectMeta],
+    ) -> Option<String> {
+        let ref_path = format!("refs/heads/{}", self.branch);
+        // `RefName::new` re-runs the same `gix-validate` check `open`
+        // already accepted, so this is effectively infallible. Surface
+        // a parse failure as "no tombstone" rather than panicking — a
+        // future loosening of `open`'s validator must not make
+        // delete-branch unsafe.
+        let ref_name = RefName::new(ref_path).ok()?;
+        let prefix_opt = (!self.prefix.is_empty()).then_some(self.prefix.as_str());
+        let chain = match load_chain(self.store.as_ref(), prefix_opt, &ref_name).await {
+            Ok(Some(chain)) => chain,
+            Ok(None) => return None,
+            Err(err) => {
+                warn!(
+                    branch = %self.branch,
+                    error = %err,
+                    "delete-branch: chain.json read/parse failed; falling back to synchronous bundle delete",
+                );
+                return None;
+            }
+        };
+        let bundle_key = keys::bundle_key(prefix_opt, ref_name.as_str(), chain.full_at.as_str());
+        // The baseline bundle must actually be in the fresh listing —
+        // otherwise the deferred delete has nothing to defer (it was
+        // already gone, or the chain points outside our prefix). A
+        // mismatched `full_at` against listing reality is the
+        // canonical "chain.json points at a missing bundle" doctor
+        // case; immediate sweep is the right fallback there too.
+        if !fresh.iter().any(|m| m.key == bundle_key) {
+            return None;
+        }
+        match write_baseline_tombstone_for_orphan(
+            self.store.as_ref(),
+            prefix_opt,
+            &ref_name,
+            &chain.full_at,
+        )
+        .await
+        {
+            Ok(()) => Some(bundle_key),
+            Err(err) => {
+                warn!(
+                    branch = %self.branch,
+                    key = %bundle_key,
+                    error = %err,
+                    "delete-branch: baseline tombstone write failed; falling back to synchronous bundle delete",
+                );
+                None
+            }
+        }
     }
 
     /// Mark the branch as protected by writing the `PROTECTED#` sentinel.
@@ -1201,5 +1315,301 @@ mod tests {
             Err(other) => panic!("expected BranchNotFound, got {other:?}"),
             Ok(_) => panic!("expected open at root to fail with BranchNotFound"),
         }
+    }
+
+    // --- Baseline-bundle tombstone on delete-branch (#143) ---------------
+
+    /// SHA used as `<full_at>` in the seeded `chain.json` for the
+    /// tombstone tests below. The exact value is irrelevant — the
+    /// tests assert that whatever SHA the chain names is the SHA the
+    /// tombstone references and the SHA whose `<sha>.bundle` survives
+    /// the synchronous sweep.
+    const TOMBSTONE_TEST_FULL_AT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// Seed a packchain-style branch at `<prefix>/refs/heads/<branch>/`
+    /// with a baseline bundle, a `chain.json` naming that bundle as
+    /// `full_at`, and a `path-index.json`. Returns the bundle's
+    /// full key so tests can pin survival/deletion against the
+    /// exact byte string.
+    async fn seed_packchain_branch(
+        store: &crate::object_store::mock::MockStore,
+        prefix: &str,
+        branch: &str,
+    ) -> String {
+        use crate::packchain::manifest::write_chain;
+        use crate::packchain::schema::{ChainManifest, ChainSegment, Sha40};
+
+        let ref_name = RefName::new(format!("refs/heads/{branch}")).unwrap();
+        let prefix_opt = (!prefix.is_empty()).then_some(prefix);
+        let full_at = Sha40::try_new(TOMBSTONE_TEST_FULL_AT).unwrap();
+        let chain = ChainManifest {
+            v: 1,
+            tip: full_at.clone(),
+            full_at: full_at.clone(),
+            segments: vec![ChainSegment {
+                sha: full_at.clone(),
+                parent_sha: None,
+                pack: format!("packs/{TOMBSTONE_TEST_FULL_AT}.pack"),
+                bytes: 1_024,
+            }],
+        };
+        write_chain(store, prefix_opt, &ref_name, &chain)
+            .await
+            .unwrap();
+        // path-index.json — written verbatim so we can assert the
+        // synchronous sweep removes it alongside chain.json.
+        let path_index_key = crate::packchain::keys::path_index_key(prefix_opt, &ref_name);
+        store.insert(path_index_key, Bytes::from_static(b"{\"v\":1,\"root\":{}}"));
+        let bundle_key = keys::bundle_key(prefix_opt, ref_name.as_str(), full_at.as_str());
+        store.insert(bundle_key.clone(), Bytes::from_static(b"PACKBUNDLE"));
+        bundle_key
+    }
+
+    #[tokio::test]
+    async fn delete_writes_baseline_tombstone_and_defers_bundle() {
+        // Issue #143: a packchain delete-branch must write a
+        // `<prefix>/gc/baseline-tomb-*.json` tombstone naming the
+        // current `full_at` SHA, and the synchronous sweep must
+        // leave that bundle in place. chain.json and path-index.json
+        // ARE removed synchronously — from a fresh reader's
+        // perspective the ref is gone the moment the chain commits
+        // its deletion; the bundle stays only so an in-flight
+        // fetcher that already loaded the prior chain can finish.
+        let mock = crate::object_store::mock::MockStore::new();
+        let bundle_key = seed_packchain_branch(&mock, "repo", "main").await;
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(store, "repo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        mb.delete().await.expect("delete");
+
+        // chain.json and path-index.json are deleted synchronously.
+        assert!(
+            !mock.contains("repo/refs/heads/main/chain.json"),
+            "chain.json must be removed synchronously: {:?}",
+            mock.keys(),
+        );
+        assert!(
+            !mock.contains("repo/refs/heads/main/path-index.json"),
+            "path-index.json must be removed synchronously: {:?}",
+            mock.keys(),
+        );
+        // The baseline bundle is NOT removed — it is left for `gc sweep`.
+        assert!(
+            mock.contains(&bundle_key),
+            "baseline bundle must survive synchronous delete: {:?}",
+            mock.keys(),
+        );
+        // Exactly one baseline tombstone is written under
+        // `<prefix>/gc/baseline-tomb-*.json`, and it names the
+        // bundle's SHA. The shape (UUID-named JSON body) belongs to
+        // `BaselineTombstone`; this test pins only the listing
+        // prefix and the SHA inside, since the UUID is intentionally
+        // non-deterministic.
+        let tomb_keys: Vec<String> = mock
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .collect();
+        assert_eq!(
+            tomb_keys.len(),
+            1,
+            "exactly one baseline tombstone must exist: {tomb_keys:?}",
+        );
+        let body = mock
+            .get_bytes(&tomb_keys[0])
+            .await
+            .expect("tombstone body present");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("tombstone is valid JSON");
+        assert_eq!(parsed["v"], 1);
+        assert_eq!(parsed["sha"], TOMBSTONE_TEST_FULL_AT);
+        assert_eq!(parsed["ref_name"], "refs/heads/main");
+    }
+
+    #[tokio::test]
+    async fn gc_sweep_after_grace_window_reclaims_deferred_bundle() {
+        // Round-trip the #143 contract: write a tombstone via
+        // delete-branch, then run `gc sweep --force` (skips the
+        // grace window). The bundle must now be gone. This proves
+        // the tombstone's body is shaped exactly the way the
+        // existing sweep code expects — a regression in the
+        // delete-branch tombstone shape would surface as a deferred
+        // sweep step rather than a reclaim.
+        let mock = crate::object_store::mock::MockStore::new();
+        let bundle_key = seed_packchain_branch(&mock, "repo", "main").await;
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(
+            Arc::clone(&store),
+            "repo",
+            "main",
+            &prompter as &dyn Prompter,
+        )
+        .await
+        .expect("open");
+        mb.delete().await.expect("delete");
+        // Pre-condition: bundle still present, tombstone written.
+        assert!(mock.contains(&bundle_key));
+
+        // `--force` skips the grace window. The sweep finds a
+        // chain.json-less ref (delete-branch removed it) and so
+        // proceeds with the bundle delete.
+        let outcome = crate::packchain::gc::sweep(
+            store.as_ref(),
+            "repo",
+            crate::packchain::gc::SweepOpts {
+                grace_hours: 0,
+                force: true,
+            },
+        )
+        .await
+        .expect("sweep");
+        assert_eq!(
+            outcome.swept_tombstones, 1,
+            "sweep must reclaim exactly the tombstone delete-branch wrote",
+        );
+        assert!(
+            !mock.contains(&bundle_key),
+            "baseline bundle must be deleted by sweep: surviving keys = {:?}",
+            mock.keys(),
+        );
+        // The tombstone itself is also gone after a successful sweep.
+        let surviving_tombs: Vec<String> = mock
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .collect();
+        assert!(
+            surviving_tombs.is_empty(),
+            "tombstone must be deleted by sweep: {surviving_tombs:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_bundle_engine_ref_with_no_chain_uses_immediate_delete() {
+        // Bundle-engine refs (no `chain.json`) have no baseline to
+        // tombstone. The function must fall through to the existing
+        // immediate-delete path — no tombstone written, every key
+        // swept synchronously. This guards against a regression that
+        // would write a spurious tombstone naming a non-existent
+        // SHA, or that would leave a bundle-engine ref's `.bundle`
+        // standing.
+        let mock = seed_with_branch("main");
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        mb.delete().await.expect("delete");
+        assert!(
+            mock.keys().is_empty(),
+            "bundle-engine ref must be fully swept synchronously: {:?}",
+            mock.keys(),
+        );
+        // No baseline tombstone written.
+        let tomb_keys: Vec<String> = mock
+            .keys()
+            .into_iter()
+            .filter(|k| k.contains("/gc/baseline-tomb-"))
+            .collect();
+        assert!(
+            tomb_keys.is_empty(),
+            "no tombstone must be written for a chain-less ref: {tomb_keys:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_unparseable_chain_falls_back_to_synchronous_bundle_delete() {
+        // A malformed `chain.json` (truncated, wrong schema version,
+        // etc.) means `load_chain` fails. The delete path must NOT
+        // block on this — the operator already confirmed the delete;
+        // the ref is going away. The fallback is the existing
+        // immediate-delete behaviour: sweep every key including any
+        // bundles. Without the fallback an operator could be stuck
+        // unable to delete a corrupted ref.
+        let mock = crate::object_store::mock::MockStore::new();
+        // Hand-craft an unparseable `chain.json` body (not JSON).
+        mock.insert(
+            "repo/refs/heads/main/chain.json",
+            Bytes::from_static(b"not a json"),
+        );
+        // Seed a bundle whose name matches what a chain.json MIGHT
+        // have pointed at — must still be swept synchronously since
+        // we have no tombstone protection.
+        let bundle_key = format!("repo/refs/heads/main/{TOMBSTONE_TEST_FULL_AT}.bundle");
+        mock.insert(bundle_key.clone(), Bytes::from_static(b"BUNDLE"));
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(store, "repo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        mb.delete().await.expect("delete");
+
+        assert!(
+            mock.keys().is_empty(),
+            "unparseable chain must fall back to immediate sweep: {:?}",
+            mock.keys(),
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_chain_pointing_at_missing_bundle_sweeps_remaining_keys() {
+        // Pathological case: `chain.json` parses and names a
+        // `full_at`, but the corresponding `<sha>.bundle` is NOT in
+        // the fresh listing (already deleted, or never written).
+        // `try_tombstone_baseline` returns None on this branch —
+        // there is nothing to defer. The synchronous sweep must
+        // still remove chain.json and any other residue.
+        use crate::packchain::manifest::write_chain;
+        use crate::packchain::schema::{ChainManifest, ChainSegment, Sha40};
+        let mock = crate::object_store::mock::MockStore::new();
+        // Seed chain.json + path-index.json but NOT the bundle.
+        let ref_name = RefName::new("refs/heads/main").unwrap();
+        let full_at = Sha40::try_new(TOMBSTONE_TEST_FULL_AT).unwrap();
+        let chain = ChainManifest {
+            v: 1,
+            tip: full_at.clone(),
+            full_at: full_at.clone(),
+            segments: vec![ChainSegment {
+                sha: full_at.clone(),
+                parent_sha: None,
+                pack: format!("packs/{TOMBSTONE_TEST_FULL_AT}.pack"),
+                bytes: 1_024,
+            }],
+        };
+        write_chain(&mock, Some("repo"), &ref_name, &chain)
+            .await
+            .unwrap();
+
+        let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
+        let prompter = ScriptedPrompter::new([Answer::Confirm(true)]);
+
+        let mb = ManageBranch::open(store, "repo", "main", &prompter as &dyn Prompter)
+            .await
+            .expect("open");
+        mb.delete().await.expect("delete");
+
+        // chain.json removed; no bundle was ever there; no
+        // tombstone written (deferring nothing is pointless).
+        assert!(
+            !mock.contains("repo/refs/heads/main/chain.json"),
+            "chain.json must be removed: {:?}",
+            mock.keys(),
+        );
+        let tomb_keys: Vec<String> = mock
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .collect();
+        assert!(
+            tomb_keys.is_empty(),
+            "no tombstone for a chain whose bundle is already absent: {tomb_keys:?}",
+        );
     }
 }

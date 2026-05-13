@@ -14,7 +14,12 @@
 //!   `path-index.json` but does not touch `<prefix>/packs/`. The
 //!   issue umbrella's "exclusively owned by that branch" claim is
 //!   wrong under content-hash dedup; pack keys can be shared across
-//!   branches that ever pushed identical object sets.
+//!   branches that ever pushed identical object sets. The baseline
+//!   bundle (`<prefix>/<ref>/<full_at>.bundle`) is tombstoned rather
+//!   than deleted synchronously (issue #143), so an in-flight fetcher
+//!   that already read the prior `chain.json` can still complete its
+//!   range GET; the bundle is reclaimed by [`sweep`] after the grace
+//!   window.
 //! - **Compaction** (when implemented): a chain rewrite leaves the
 //!   superseded segment packs orphan.
 //! - **Missing `.idx`** (rare): a `.pack` whose sibling `.idx` was
@@ -61,14 +66,14 @@
 //!    - Delete the tombstone itself.
 //! 3. Younger tombstones survive for the next sweep.
 //!
-//! ### Baseline-bundle tombstones (issue #134)
+//! ### Baseline-bundle tombstones (issues #134, #143)
 //!
 //! Baseline bundles at `<prefix>/<ref>/<full_at>.bundle` are NOT
 //! reapable by the mark/sweep flow above — they live outside
 //! `<prefix>/packs/`, so [`list_pack_shas`] never sees them. The
-//! compact and force-push code paths instead enqueue a baseline
-//! tombstone at `<prefix>/gc/baseline-tomb-<uuid>.json` whenever they
-//! supersede a baseline. Sweep processes those alongside pack
+//! compact, force-push, and `delete-branch` code paths instead enqueue
+//! a baseline tombstone at `<prefix>/gc/baseline-tomb-<uuid>.json`
+//! whenever they supersede or remove a baseline. Sweep processes those alongside pack
 //! tombstones: after the grace window expires it re-checks the
 //! current `chain.json` for the ref (skipping the delete if a later
 //! push re-baselined to the same SHA), then deletes the bundle and
@@ -307,11 +312,12 @@ impl Tombstone {
     }
 }
 
-/// On-bucket tombstone for a superseded baseline bundle (issue #134).
+/// On-bucket tombstone for a superseded baseline bundle (issues #134, #143).
 ///
 /// Lives at `<prefix>/gc/baseline-tomb-<uuid>.json`. Written by
-/// [`super::compact`] and [`super::push`] whenever a chain rewrite
-/// makes a `<prefix>/<ref>/<sha>.bundle` unreachable. Unlike pack
+/// [`super::compact`], [`super::push`], and the management
+/// `delete-branch` flow whenever a chain rewrite or ref removal makes
+/// a `<prefix>/<ref>/<sha>.bundle` unreachable. Unlike pack
 /// tombstones the body names a specific (ref, sha) — there is exactly
 /// one bundle key per record — so [`sweep`] does not need to re-derive
 /// an orphan set from listings.
@@ -386,12 +392,53 @@ pub(crate) async fn write_baseline_tombstone(
     if prior_full_sha == current_full_sha {
         return Ok(());
     }
+    write_baseline_tombstone_unconditional(store, prefix, ref_name, prior_full_sha).await
+}
+
+/// Write a baseline tombstone naming `orphan_sha` regardless of any
+/// successor SHA — used by `delete-branch` (issue #143), which
+/// removes the chain entirely and has no replacement baseline to
+/// compare against. Otherwise identical in shape to
+/// [`write_baseline_tombstone`]: the body is parsed by
+/// [`sweep_one_baseline_tombstone`], which sees a `chain.json`-less
+/// ref (the synchronous sweep deletes it) and proceeds with the
+/// deferred bundle delete after the grace window.
+///
+/// # Errors
+///
+/// Returns [`PackchainError::Store`] on a PUT failure. Callers run
+/// this BEFORE the synchronous sweep that removes the rest of the
+/// ref's objects; a failure here should fall back to immediate
+/// bundle deletion so the operator's "ref is gone" intent is still
+/// satisfied, rather than leaving a half-tombstoned half-deleted
+/// state behind.
+pub(crate) async fn write_baseline_tombstone_for_orphan(
+    store: &dyn ObjectStore,
+    prefix: Option<&str>,
+    ref_name: &RefName,
+    orphan_sha: &Sha40,
+) -> Result<(), PackchainError> {
+    write_baseline_tombstone_unconditional(store, prefix, ref_name, orphan_sha).await
+}
+
+/// Shared body of [`write_baseline_tombstone`] and
+/// [`write_baseline_tombstone_for_orphan`]: emit a
+/// `<prefix>/gc/baseline-tomb-<uuid>.json` record naming
+/// `(ref_name, orphan_sha)`. Centralised so the two call shapes
+/// (with-successor and unconditional) cannot drift on the JSON body
+/// shape or the key namespace.
+async fn write_baseline_tombstone_unconditional(
+    store: &dyn ObjectStore,
+    prefix: Option<&str>,
+    ref_name: &RefName,
+    orphan_sha: &Sha40,
+) -> Result<(), PackchainError> {
     let marked_at = rfc3339_now()?;
     let tombstone = BaselineTombstone {
         v: TOMBSTONE_SCHEMA_VERSION,
         marked_at,
         ref_name: ref_name.as_str().to_owned(),
-        sha: prior_full_sha.clone(),
+        sha: orphan_sha.clone(),
     };
     let key = baseline_tombstone_key(prefix.unwrap_or(""), &Uuid::new_v4().to_string());
     let body = Bytes::from(tombstone.to_json_pretty()?);
@@ -399,7 +446,7 @@ pub(crate) async fn write_baseline_tombstone(
     debug!(
         key = %key,
         ref_path = %ref_name.as_str(),
-        sha = %prior_full_sha.as_str(),
+        sha = %orphan_sha.as_str(),
         "gc: baseline tombstone written",
     );
     Ok(())
