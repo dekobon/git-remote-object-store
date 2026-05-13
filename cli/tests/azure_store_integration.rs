@@ -1415,3 +1415,54 @@ async fn presigned_get_url_round_trips_against_azurite() {
     );
     assert_eq!(body_resp, body.as_ref(), "body mismatch via SAS URL");
 }
+
+// ---------------------------------------------------------------------------
+// Best-effort zip-artifact upload (issue #127 / #142)
+// ---------------------------------------------------------------------------
+
+/// Build a `?zip=1` URL pointing at a fresh Azurite container under the
+/// `repo` prefix and return the parsed URL + a trait-object store
+/// connected to it. Shared between the fault-injection test and the
+/// happy-path test below.
+async fn fresh_zip_container() -> (Arc<dyn ObjectStore>, RemoteUrl) {
+    let (port, container) = fresh_container_endpoint().await;
+    let url_str = format!("{base}&zip=1", base = helper_url(port, &container));
+    let url = parse(&url_str).expect("URL parses");
+    let RemoteUrl::Azure { .. } = &url else {
+        panic!("parse returned non-Azure variant for {url_str}");
+    };
+    let store = AzureStore::from_remote_url(&url)
+        .await
+        .expect("AzureStore::from_remote_url");
+    (Arc::new(store) as Arc<dyn ObjectStore>, url)
+}
+
+/// A transient `put_path` failure on the zip-only key must NOT fail the
+/// push: the bundle, `HEAD`, and `FORMAT` are already durable. The
+/// unit test
+/// `perform_push_under_lock_succeeds_when_zip_upload_fails` in
+/// `src/protocol/push.rs` pins this contract against `MockStore`; this
+/// integration test confirms the same shape end-to-end against
+/// Azurite, where the real bundle put goes through a block-blob
+/// commit and the zip put goes through the
+/// content-disposition + `x-ms-meta-*` user-metadata path. Issue #142.
+#[tokio::test]
+async fn push_with_zip_put_fault_succeeds_and_omits_zip() {
+    let (store, url) = fresh_zip_container().await;
+    common::zip_fault::push_with_zip_put_fault_succeeds_and_omits_zip(store, url).await;
+}
+
+// NOTE: the happy-path counterpart that lives on the S3 side
+// (`push_with_zip_uploads_artifact` in `s3_store_integration.rs`) is
+// not currently mirrored here. `upload_zip_artifact_best_effort` in
+// `src/protocol/push.rs` sets a `user_metadata` entry keyed
+// `codepipeline-artifact-revision-summary`; Azure rejects metadata
+// keys that are not valid C# identifiers (no hyphens — see the doc
+// comment on the metadata-survival test above at the `customkey`
+// example). The production swallow path catches the resulting
+// put_path error and reports success, so the push works correctly —
+// but the zip artifact never lands on Azure. A live happy-path test
+// that asserts `zip key present` would therefore fail every run.
+// Tracked in issue #161; until the metadata key is made
+// Azure-friendly (or its emission gated on the backend), only the
+// fault-injection test runs here.

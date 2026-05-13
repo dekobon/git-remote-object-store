@@ -1893,6 +1893,7 @@ name = "git-remote-object-store-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "aws-config",
  "aws-sdk-s3",
  "azure_core",

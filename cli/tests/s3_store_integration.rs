@@ -1428,3 +1428,51 @@ async fn presigned_get_url_round_trips_against_rustfs() {
     let downloaded = resp.bytes().await.expect("body").to_vec();
     assert_eq!(downloaded, body.as_ref(), "body mismatch via presigned URL");
 }
+
+// ---------------------------------------------------------------------------
+// Best-effort zip-artifact upload (issue #127 / #142)
+// ---------------------------------------------------------------------------
+
+/// Build a `?zip=1` URL pointing at a fresh `RustFS` bucket and the
+/// `repo` prefix, returning the parsed URL + a trait-object store
+/// connected to it. Shared between the fault-injection test and the
+/// happy-path test below.
+async fn fresh_zip_bucket() -> (Arc<dyn ObjectStore>, RemoteUrl) {
+    let (store, bucket) = fresh_bucket().await;
+    let fixture = fixture();
+    let url_str = format!(
+        "s3+http://127.0.0.1:{port}/{bucket}/repo?addressing=path&zip=1",
+        port = fixture.port,
+    );
+    let url = parse(&url_str).expect("URL parses");
+    let RemoteUrl::S3 { .. } = &url else {
+        panic!("parse returned non-S3 variant for {url_str}");
+    };
+    (Arc::new(store) as Arc<dyn ObjectStore>, url)
+}
+
+/// A transient `put_path` failure on the zip-only key must NOT fail the
+/// push: the bundle, `HEAD`, and `FORMAT` are already durable. The
+/// unit test
+/// `perform_push_under_lock_succeeds_when_zip_upload_fails` in
+/// `src/protocol/push.rs` pins this contract against `MockStore`; this
+/// integration test confirms the same shape end-to-end against
+/// `RustFS`, where the real bundle put goes through a multipart-or-
+/// single-PUT dispatch and the zip put goes through the
+/// content-disposition + user-metadata path. Issue #142.
+#[tokio::test]
+async fn push_with_zip_put_fault_succeeds_and_omits_zip() {
+    let (store, url) = fresh_zip_bucket().await;
+    common::zip_fault::push_with_zip_put_fault_succeeds_and_omits_zip(store, url).await;
+}
+
+/// Happy-path counterpart of the fault test above: a clean `?zip=1`
+/// push against `RustFS` must land both the bundle and the zip artifact
+/// at their documented keys. Closes the live-backend coverage gap that
+/// `tests/protocol_push.rs::zip_variant_uploads_repo_zip_with_metadata`
+/// (MockStore-only) leaves. Issue #142.
+#[tokio::test]
+async fn push_with_zip_uploads_artifact() {
+    let (store, url) = fresh_zip_bucket().await;
+    common::zip_fault::push_with_zip_uploads_artifact(store, url).await;
+}

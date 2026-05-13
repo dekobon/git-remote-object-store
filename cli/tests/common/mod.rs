@@ -18,6 +18,11 @@
 /// `packchain_live_s3.rs` and `packchain_live_azure.rs`. Issue #69.
 pub mod packchain_live;
 
+/// Cross-backend coverage for the best-effort zip-artifact upload
+/// (issue #127). Driven by `s3_store_integration.rs` and
+/// `azure_store_integration.rs`. Issue #142.
+pub mod zip_fault;
+
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;

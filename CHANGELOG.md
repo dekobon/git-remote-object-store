@@ -48,6 +48,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cross-backend integration coverage for the best-effort zip-artifact
+  upload (#142).** A new `ZipPutFaultStore` decorator in
+  `cli/tests/common/zip_fault.rs` wraps any `Arc<dyn ObjectStore>` and
+  injects a one-shot `Network` error on `put_path(<zip-key>, …)`,
+  letting the bundle, `HEAD`, and `FORMAT` writes go through to the
+  real backend while the zip-only put fails. The shared scenario
+  `push_with_zip_put_fault_succeeds_and_omits_zip` then drives a
+  `?zip=1` push and asserts the issue #127 contract end-to-end: helper
+  exits `ok refs/heads/main\n\n`, the bundle key is durable on the
+  backend, the zip key is absent, and the fault fired exactly once
+  (so a regression that quietly retried under the swallow path would
+  still surface). A symmetric happy-path scenario
+  `push_with_zip_uploads_artifact` covers the no-fault case (bundle +
+  zip both present at their documented keys) on S3 (RustFS); the
+  Azure mirror is deferred to #161 because the hyphen-laden
+  `codepipeline-artifact-revision-summary` user-metadata key is
+  rejected by Azure's "valid C# identifier" rule, causing every
+  Azure `?zip=1` push to take the swallow path. Sibling of the
+  `MockStore` unit pin
+  `perform_push_under_lock_succeeds_when_zip_upload_fails` in
+  `src/protocol/push.rs`.
+
 - **Cross-backend integration coverage for delete-path protection and
   lock serialization (#141).** New shellspec cases pin the delete-path
   guards introduced in #128 / #130 (PROTECTED# marker rejects an

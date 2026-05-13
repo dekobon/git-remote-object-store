@@ -99,6 +99,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+# `async_trait::async_trait` proc macro — required by the
+# `cli/tests/common/zip_fault.rs` `ZipPutFaultStore` decorator's
+# `impl ObjectStore for ...` (the trait is declared with the same
+# macro, so impls outside the lib crate need it too). Pinned to the
+# same major version the library crate uses.
+async-trait = "0.1"
+
 # AWS config — `tests/s3_store_integration.rs` builds `aws_config::defaults`
 # directly for the S3 client setup. The library enables additional features
 # (`credentials-login` for IAM Identity Center support) via the workspace
