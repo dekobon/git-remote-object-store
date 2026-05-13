@@ -48,6 +48,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cross-backend integration coverage for delete-path protection and
+  lock serialization (#141).** New shellspec cases pin the delete-path
+  guards introduced in #128 / #130 (PROTECTED# marker rejects an
+  empty-source push for both engines) and the under-lock delete
+  serialization from #133 (pre-seeded fresh `LOCK#.lock` produces a
+  `failed to acquire ref lock` refusal and leaves the bundle in place),
+  plus a packchain mirror of the force-push-with-PROTECTED# refusal from
+  #129. Adds `assert_chain_present` / `assert_chain_absent` to
+  `spec/support/bucket_assertions.sh` and new
+  `spec/integration/{s3,az}/packchain_protected_spec.sh` files that
+  drive the packchain engine end-to-end via `?engine=packchain` against
+  rustfs and Azurite, so any real listing-semantics regression surfaces
+  here instead of only against MockStore.
+
 - `cargo xtask install` workspace automation that runs `cargo install
   --path cli` and creates the four `+`-form helper symlinks
   (`git-remote-s3+https`, `git-remote-s3+http`, `git-remote-az+https`,

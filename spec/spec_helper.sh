@@ -57,6 +57,16 @@ if [[ "${LIVE_AZ:-0}" != "1" ]]; then
 	unset VAR
 fi
 
+# Helper-specific tunables that, if left exported by the operator's
+# shell, would bend test semantics. Always unset here; specific specs
+# that need a non-default value (e.g. `concurrent_push_spec.sh`) set the
+# var inline on the command they invoke. Notably, the bundle/packchain
+# held-lock tests (#133) seed `LOCK#.lock` and rely on the production
+# code seeing the lock as fresh — a host with
+# `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS=1` exported would otherwise
+# let the helper reclaim the lock as stale and pass the delete through.
+unset GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS
+
 # Per-run scratch directory; the runtime cleans this up by way of the OS.
 # `HOME` is preserved when ANY live suite is active so the operator's
 # `~/.aws/credentials` / Azure config / SSO cache remain visible to the

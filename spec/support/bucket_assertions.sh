@@ -131,6 +131,58 @@ assert_lock_absent() {
 	fi
 }
 
+# assert_chain_present <lister> <bucket> <prefix> <ref>
+# Fail unless <prefix>/<ref>/chain.json is present. Packchain engine's
+# per-ref manifest — the "engine equivalent" of the bundle key under
+# `<prefix>/<ref>/<sha>.bundle` for white-box assertions on packchain
+# spec runs.
+assert_chain_present() {
+	local lister="$1"
+	local bucket="$2"
+	local prefix="$3"
+	local ref="$4"
+	local key="${prefix}/${ref}/chain.json"
+	if ! "$lister" "$bucket" "$prefix" | grep -Fxq "$key"; then
+		echo "assert_chain_present: $key not found" >&2
+		"$lister" "$bucket" "$prefix" >&2 || true
+		return 1
+	fi
+}
+
+# assert_chain_absent <lister> <bucket> <prefix> <ref>
+# Symmetric to `assert_chain_present`.
+assert_chain_absent() {
+	local lister="$1"
+	local bucket="$2"
+	local prefix="$3"
+	local ref="$4"
+	local key="${prefix}/${ref}/chain.json"
+	if "$lister" "$bucket" "$prefix" | grep -Fxq "$key"; then
+		echo "assert_chain_absent: $key unexpectedly present" >&2
+		return 1
+	fi
+}
+
+# assert_path_index_present <lister> <bucket> <prefix> <ref>
+# Fail unless <prefix>/<ref>/path-index.json is present. Companion to
+# `assert_chain_present` — packchain writes chain.json AND
+# path-index.json side-by-side, and a successful delete sweeps both
+# together (see tests/protocol_push_packchain.rs::delete_remote_ref_removes_chain_and_path_index).
+# Asserting both on refusal pins that a partial-sweep regression
+# (e.g. one key swept but not the other) is caught.
+assert_path_index_present() {
+	local lister="$1"
+	local bucket="$2"
+	local prefix="$3"
+	local ref="$4"
+	local key="${prefix}/${ref}/path-index.json"
+	if ! "$lister" "$bucket" "$prefix" | grep -Fxq "$key"; then
+		echo "assert_path_index_present: $key not found" >&2
+		"$lister" "$bucket" "$prefix" >&2 || true
+		return 1
+	fi
+}
+
 # assert_lfs_object_exists <lister> <bucket> <prefix> <oid>
 # Fail unless <prefix>/lfs/<oid> is present.
 assert_lfs_object_exists() {

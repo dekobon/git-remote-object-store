@@ -91,4 +91,103 @@ Describe "S3 helper: force-push and protected refs"
 				refs/heads/main "$SHA_A"
 		End
 	End
+
+	# Issue #141: cross-backend coverage for the delete-path protection
+	# guard (#128) and the under-lock delete serialization (#133). The
+	# MockStore unit tests in src/protocol/push.rs pin the byte-exact wire
+	# output; these tests confirm the same guards fire against a real S3
+	# backend's listing semantics, where read-after-write and listing
+	# ordering quirks are observable only here.
+	setup_with_feature() {
+		BUCKET=$(rustfs_unique_bucket)
+		PREFIX="myrepo"
+		rustfs_make_bucket "$BUCKET"
+		URL=$(rustfs_url "$BUCKET" "$PREFIX")
+		SRC="$SHELLSPEC_TMPDIR/src-$$-$RANDOM"
+		mk_local_repo "$SRC"
+		commit_in_repo "$SRC" hello.txt "hi" "first" >/dev/null
+		add_remote "$SRC" origin "$URL"
+		push_branch "$SRC" origin refs/heads/main:refs/heads/main
+		git -C "$SRC" checkout -q -b feature
+		SHA_FEATURE=$(commit_in_repo "$SRC" feature.txt "ff" "feature")
+		push_branch "$SRC" origin refs/heads/feature:refs/heads/feature
+	}
+
+	Describe "bundle delete refused when PROTECTED# present (#128)"
+		BeforeEach 'setup_with_feature'
+		BeforeEach 'git-remote-object-store protect "$URL" feature >/dev/null 2>&1'
+
+		quiet_delete() {
+			push_branch "$SRC" origin ":refs/heads/feature" >/dev/null 2>&1
+		}
+
+		It "rejects the delete and leaves the bundle untouched"
+			# Pre-condition: bundle is present (the precondition fails
+			# loudly if the setup push silently produced no bundle, so a
+			# vacuous "bundle still present" post-condition can't pass).
+			assert_bundle_sha_for_ref rustfs_list "$BUCKET" "$PREFIX" \
+				refs/heads/feature "$SHA_FEATURE"
+			assert_protected_marker rustfs_list "$BUCKET" "$PREFIX" \
+				refs/heads/feature
+
+			When call quiet_delete
+			The status should not equal 0
+			# "protected" is the contract substring from
+			# DELETE_PROTECTION_MESSAGE in src/protocol/push.rs. Asserted
+			# to distinguish this rejection from unrelated push failures.
+			The variable LAST_GIT_OUTPUT should include "protected"
+
+			assert_bundle_sha_for_ref rustfs_list "$BUCKET" "$PREFIX" \
+				refs/heads/feature "$SHA_FEATURE"
+			assert_protected_marker rustfs_list "$BUCKET" "$PREFIX" \
+				refs/heads/feature
+			# Mirrors the unit test `delete_rejects_when_protected_marker_present_with_chain`
+			# in src/packchain/push.rs and `release_lock` semantics in
+			# src/protocol/push.rs:push_one: the lock is released on the
+			# refusal arm, so no `LOCK#.lock` should survive. A regression
+			# that returned from the protection branch without releasing
+			# would leave a stray lock here.
+			assert_lock_absent rustfs_list "$BUCKET" "$PREFIX" \
+				refs/heads/feature
+		End
+	End
+
+	Describe "bundle delete refused when LOCK#.lock held (#133)"
+		# Pre-seed a fresh LOCK#.lock directly via aws-cli (same pattern
+		# as doctor --delete-stale-locks). With the post-#133 fix the
+		# bundle delete must acquire this lock before sweeping; a held
+		# fresh lock therefore yields a "failed to acquire ref lock"
+		# refusal and the bundle survives. A regression that swept under
+		# a stale pre-lock listing would delete the bundle here.
+		BeforeEach 'setup_with_feature'
+		setup_held_lock() {
+			LOCK_FILE="$SHELLSPEC_TMPDIR/lockbody.$$"
+			: >"$LOCK_FILE"
+			rustfs_put_object "$BUCKET" \
+				"$PREFIX/refs/heads/feature/LOCK#.lock" "$LOCK_FILE"
+		}
+		BeforeEach 'setup_held_lock'
+
+		quiet_delete() {
+			push_branch "$SRC" origin ":refs/heads/feature" >/dev/null 2>&1
+		}
+
+		It "rejects the delete and leaves the bundle and lock in place"
+			assert_bundle_sha_for_ref rustfs_list "$BUCKET" "$PREFIX" \
+				refs/heads/feature "$SHA_FEATURE"
+			assert_lock_present rustfs_list "$BUCKET" "$PREFIX" \
+				refs/heads/feature
+
+			When call quiet_delete
+			The status should not equal 0
+			# Contract token from acquire_lock contention path
+			# (tests/protocol_push.rs:delete_with_held_lock_returns_contention_error).
+			The variable LAST_GIT_OUTPUT should include "failed to acquire ref lock"
+
+			assert_bundle_sha_for_ref rustfs_list "$BUCKET" "$PREFIX" \
+				refs/heads/feature "$SHA_FEATURE"
+			assert_lock_present rustfs_list "$BUCKET" "$PREFIX" \
+				refs/heads/feature
+		End
+	End
 End
