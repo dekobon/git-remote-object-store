@@ -221,8 +221,7 @@ assert_head_pointer() {
 	local actual
 	actual=$(<"$tmp")
 	rm -f "$tmp"
-	# `HEAD` body is the bare ref name per upstream layout
-	# (`git_remote_s3/remote.py` writes `refs/heads/<branch>`).
+	# `HEAD` body is the bare ref name (e.g. `refs/heads/main`).
 	if [[ "$actual" != "$ref" ]]; then
 		echo "assert_head_pointer: HEAD is '$actual', expected '$ref'" >&2
 		return 1
