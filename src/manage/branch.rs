@@ -861,6 +861,13 @@ mod tests {
             "expected BranchNotFound, got {err:?}",
         );
         assert!(!mock.contains("myrepo/refs/heads/main/PROTECTED#"));
+        // protect must recover the stale lock AND release the fresh one
+        // it acquired. A regression that leaked the lock would still
+        // pass the BranchNotFound assertion above.
+        assert!(
+            !mock.contains("myrepo/refs/heads/main/LOCK#.lock"),
+            "stale lock must be recovered and the acquired lock released",
+        );
     }
 
     #[tokio::test]
@@ -2389,5 +2396,12 @@ mod tests {
         // is_protected dictates, and operator intent never crosses
         // streams with the writer's snapshot.
         assert!(!mock.contains("myrepo/refs/heads/main/PROTECTED#"));
+        // The racing writer's lock must survive the contention refusal —
+        // protect must not have touched LOCK#.lock owned by another
+        // operation. Pinning this directly makes the test self-sufficient.
+        assert!(
+            mock.contains("myrepo/refs/heads/main/LOCK#.lock"),
+            "the writer's LOCK#.lock must survive a contended protect attempt",
+        );
     }
 }

@@ -458,7 +458,8 @@ pub(crate) async fn tombstoned_bundle_keys(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
 ) -> Result<HashSet<String>, ObjectStoreError> {
-    let gc_listing = gc_listing_prefix(prefix.unwrap_or(""));
+    let prefix_str = prefix.unwrap_or("");
+    let gc_listing = gc_listing_prefix(prefix_str);
     let metas = match store.list(&gc_listing).await {
         Ok(m) => m,
         // NotFound on an unsupported listing prefix on a fresh bucket
@@ -468,7 +469,7 @@ pub(crate) async fn tombstoned_bundle_keys(
     };
     let mut keys = HashSet::new();
     for meta in metas {
-        if !is_baseline_tombstone_key(&meta.key, prefix.unwrap_or("")) {
+        if !is_baseline_tombstone_key(&meta.key, prefix_str) {
             continue;
         }
         let body = match store.get_bytes(&meta.key).await {
