@@ -30,7 +30,7 @@ use tracing::warn;
 
 use crate::git::RefName;
 use crate::keys;
-use crate::object_store::ObjectStore;
+use crate::object_store::{ObjectStore, ObjectStoreError};
 use crate::protocol::fetch::MAX_FETCH_CONCURRENCY;
 
 use super::PackchainError;
@@ -108,22 +108,38 @@ pub(crate) async fn list_refs(
     // pack downloads. `buffer_unordered` doesn't preserve order, but
     // we re-sort by `last_modified` desc afterwards anyway.
     //
-    // A transport failure on any single GET aborts the whole list
-    // (consistent with the previous sequential `?` propagation).
-    // Parse failures are warn-and-skipped per entry — a corrupt
+    // A `NotFound` on any single GET is treated as benign: a concurrent
+    // `delete-branch` (or compact/gc sweep) may remove a ref's
+    // `chain.json` between the `store.list()` snapshot and the
+    // per-entry GET. Without this carve-out, a single missing key
+    // would abort discovery for every OTHER ref the operator
+    // legitimately holds (issue #149). All other transport / auth
+    // failures still abort — a 403/AccessDenied or DNS error means
+    // the listing itself is untrustworthy, not just one ref. Parse
+    // failures are warn-and-skipped per entry below — a corrupt
     // chain.json on one branch must not blackhole the others.
     let bodies: Vec<(String, String, OffsetDateTime, bytes::Bytes)> =
         futures::stream::iter(candidates)
             .map(|(key, ref_path, last_modified)| async move {
-                store
-                    .get_bytes(&key)
-                    .await
-                    .map(|body| (key, ref_path, last_modified, body))
+                match store.get_bytes(&key).await {
+                    Ok(body) => Ok(Some((key, ref_path, last_modified, body))),
+                    Err(ObjectStoreError::NotFound(_)) => {
+                        warn!(
+                            key = %key,
+                            "packchain list: chain.json vanished between list and get \
+                             (concurrent delete?); skipping",
+                        );
+                        Ok(None)
+                    }
+                    Err(e) => Err(PackchainError::Store(e)),
+                }
             })
             .buffer_unordered(MAX_FETCH_CONCURRENCY)
             .try_collect::<Vec<_>>()
-            .await
-            .map_err(PackchainError::Store)?;
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
 
     let mut out: Vec<ChainRef> = bodies
         .into_iter()
@@ -565,6 +581,155 @@ mod tests {
         let entries = list_refs(&store, Some("repo")).await.unwrap();
         assert_eq!(entries.len(), 1, "exactly one chain.json processed");
         assert_eq!(entries[0].ref_path, "refs/tags/v1");
+        assert_eq!(entries[0].sha, SHA_TIP);
+    }
+
+    /// One-shot post-`list` callback used by [`PostListDeleteStore`].
+    type PostListHook = Box<dyn FnOnce(&MockStore) + Send>;
+
+    /// One-shot post-`list` decorator that fires after the inner
+    /// `list()` returns and before any subsequent `get_bytes`. Used to
+    /// simulate a concurrent `delete-branch` removing one ref's
+    /// `chain.json` in the gap between `list_refs`' list snapshot and
+    /// its parallel GET phase (issue #149).
+    struct PostListDeleteStore {
+        inner: MockStore,
+        hook: std::sync::Mutex<Option<PostListHook>>,
+    }
+
+    impl PostListDeleteStore {
+        fn new(inner: MockStore, hook: impl FnOnce(&MockStore) + Send + 'static) -> Self {
+            Self {
+                inner,
+                hook: std::sync::Mutex::new(Some(Box::new(hook))),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::object_store::ObjectStore for PostListDeleteStore {
+        async fn list(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<crate::object_store::ObjectMeta>, ObjectStoreError> {
+            let result = self.inner.list(prefix).await;
+            if result.is_ok()
+                && let Some(hook) = self.hook.lock().unwrap().take()
+            {
+                hook(&self.inner);
+            }
+            result
+        }
+
+        async fn get_to_file(
+            &self,
+            key: &str,
+            dest: &std::path::Path,
+            opts: crate::object_store::GetOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.get_to_file(key, dest, opts).await
+        }
+
+        async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+            self.inner.get_bytes(key).await
+        }
+
+        async fn get_bytes_range(
+            &self,
+            key: &str,
+            range: std::ops::Range<u64>,
+        ) -> Result<Bytes, ObjectStoreError> {
+            self.inner.get_bytes_range(key, range).await
+        }
+
+        async fn put_bytes(
+            &self,
+            key: &str,
+            body: Bytes,
+            opts: crate::object_store::PutOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.put_bytes(key, body, opts).await
+        }
+
+        async fn put_path(
+            &self,
+            key: &str,
+            src: &std::path::Path,
+            opts: crate::object_store::PutOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.put_path(key, src, opts).await
+        }
+
+        async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
+            self.inner.put_if_absent(key, body).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<crate::object_store::ObjectMeta, ObjectStoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
+            self.inner.copy(src, dst).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn list_refs_skips_chain_json_vanished_between_list_and_get() {
+        // Issue #149 regression: a concurrent `delete-branch` that
+        // removes a ref's `chain.json` between `store.list()` and the
+        // parallel `get_bytes()` phase must not abort discovery for
+        // the surviving refs. Pre-fix, `try_collect` propagated the
+        // `NotFound` and killed the listing for ALL refs.
+        //
+        // Layout: two refs (main, dev). The hook fires AFTER `list()`
+        // returns both keys but BEFORE the parallel GETs run, deleting
+        // `dev`'s chain.json. The fix's `NotFound` carve-out warns and
+        // skips `dev`; `main` must still surface with its real tip.
+        let inner = MockStore::new();
+        write_test_chain(
+            &inner,
+            Some("repo"),
+            &ref_("refs/heads/main"),
+            SHA_TIP,
+            SHA_TIP,
+        )
+        .await;
+        write_test_chain(
+            &inner,
+            Some("repo"),
+            &ref_("refs/heads/dev"),
+            SHA_TIP_DEV,
+            SHA_TIP_DEV,
+        )
+        .await;
+
+        let dev_key = "repo/refs/heads/dev/chain.json";
+        let store = PostListDeleteStore::new(inner, move |inner| {
+            assert!(
+                inner.remove_key(dev_key),
+                "concurrent delete must remove the targeted chain.json",
+            );
+        });
+
+        let entries = list_refs(&store, Some("repo"))
+            .await
+            .expect("NotFound on one ref must not abort the listing");
+        assert_eq!(
+            entries.len(),
+            1,
+            "surviving ref must still surface; vanished ref is silently skipped",
+        );
+        assert_eq!(
+            entries[0].ref_path, "refs/heads/main",
+            "main must be the surviving entry — dev's chain.json was deleted mid-list",
+        );
         assert_eq!(entries[0].sha, SHA_TIP);
     }
 
