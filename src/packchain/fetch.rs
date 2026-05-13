@@ -1308,15 +1308,14 @@ mod tests {
         })
         .await;
         result.expect("retry must succeed once reload drops the missing-pack reference");
-        // Pin the retry contract: at least two chain loads — one
-        // before the PackMissing, one to verify the missing key was
-        // dropped. (The retry attempt that follows itself loads
-        // chain.json again, for a total of three on this path.)
-        assert!(
-            evolving.chain_calls() >= 2,
-            "retry must reload chain.json at least once to verify the GC race; \
-             observed {} chain calls",
-            evolving.chain_calls()
+        // Pin the retry contract exactly: three chain loads — the
+        // initial fetch_once load, the verification reload that
+        // confirms the missing key was dropped, and the retry
+        // fetch_once load itself.
+        assert_eq!(
+            evolving.chain_calls(),
+            3,
+            "retry must perform the full reload-verify-retry sequence",
         );
     }
 
@@ -1469,11 +1468,12 @@ mod tests {
         );
         let key = chain_key(Some("repo"), ref_main());
         inner.insert(&key, initial_bytes.clone());
-        let store: Arc<dyn ObjectStore> = Arc::new(EvolvingChainStore::new(
+        let evolving = Arc::new(EvolvingChainStore::new(
             inner,
             key,
             vec![initial_bytes, reload_bytes],
         ));
+        let store: Arc<dyn ObjectStore> = evolving.clone();
         let semaphore = Arc::new(Semaphore::new(MAX_FETCH_CONCURRENCY));
         let fetched_refs = FetchedRefs::new();
         let boundaries = ShallowBoundaries::new();
@@ -1494,6 +1494,14 @@ mod tests {
         })
         .await;
         result.expect("shallow retry must succeed once reload drops the missing-pack reference");
+        // Witness that the shallow path exercised the retry wrapper —
+        // mirrors the full-fetch test above. Three chain loads:
+        // initial, verification reload, retry attempt.
+        assert_eq!(
+            evolving.chain_calls(),
+            3,
+            "shallow retry must perform the full reload-verify-retry sequence",
+        );
     }
 
     #[tokio::test]

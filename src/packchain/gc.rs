@@ -989,7 +989,11 @@ async fn list_pack_shas(
     let metas = store.list(&packs_prefix).await?;
     let mut shas: HashSet<Sha40> = HashSet::new();
     for meta in metas {
-        let basename = meta.key.rsplit('/').next().unwrap_or(meta.key.as_str());
+        let basename = meta
+            .key
+            .rsplit('/')
+            .next()
+            .expect("rsplit('/') on a non-empty key yields at least one element");
         let candidate = basename
             .strip_suffix(".pack")
             .or_else(|| basename.strip_suffix(".idx"));
