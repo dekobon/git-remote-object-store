@@ -10,6 +10,7 @@
 #![allow(clippy::disallowed_macros)]
 
 use std::collections::HashSet;
+use std::io::Write;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -124,12 +125,26 @@ impl<'a> ManageBranch<'a> {
     /// Returns [`ManageError::Protected`] if the branch carries a
     /// `PROTECTED#` marker (checked on both listings),
     /// [`ManageError::Cancelled`] if the user cancels the prompt,
-    /// [`ManageError::Io`] for prompt I/O failures,
+    /// [`ManageError::Io`] for prompt or write I/O failures,
     /// [`ManageError::Store`] if a list operation fails, or
     /// [`ManageError::PartialDelete`] when one or more per-key deletes
     /// fail with a non-`NotFound` error after every key in the fresh
     /// listing has been attempted.
     pub async fn delete(&self) -> Result<(), ManageError> {
+        self.delete_into(&mut std::io::stdout()).await
+    }
+
+    /// Same contract as [`delete`](Self::delete) but writes human-readable
+    /// output to `out`. Tests use this to capture the operator messages
+    /// (e.g. the "already gone" race notice from #139) so a regression
+    /// that drops the message — silently turning a concurrent race into
+    /// an apparent success — is caught.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`delete`](Self::delete), plus [`ManageError::Io`] if a
+    /// write to `out` fails.
+    pub(crate) async fn delete_into<W: Write>(&self, out: &mut W) -> Result<(), ManageError> {
         let prefix = self.branch_prefix();
         let initial = self.store.list(&prefix).await?;
         if keys::entries_have_protected_marker(&initial) {
@@ -137,7 +152,7 @@ impl<'a> ManageBranch<'a> {
         }
         let prompt = format!("Delete branch {} ({} objects)?", self.branch, initial.len());
         if !self.prompter.confirm(&prompt)? {
-            println!("Aborted");
+            writeln!(out, "Aborted")?;
             return Ok(());
         }
 
@@ -148,10 +163,11 @@ impl<'a> ManageBranch<'a> {
         // that window left zombie objects.
         let fresh = self.store.list(&prefix).await?;
         if fresh.is_empty() {
-            println!(
+            writeln!(
+                out,
                 "Branch {} is already gone (concurrent delete during prompt); nothing to do",
                 self.branch,
-            );
+            )?;
             info!(
                 branch = %self.branch,
                 "branch already deleted by concurrent operation",
@@ -204,7 +220,7 @@ impl<'a> ManageBranch<'a> {
                 attempted: fresh.len(),
             });
         }
-        println!("Branch {} has been deleted", self.branch);
+        writeln!(out, "Branch {} has been deleted", self.branch)?;
         info!(branch = %self.branch, count = fresh.len(), "branch deleted");
         Ok(())
     }
@@ -1017,6 +1033,14 @@ mod tests {
         // window. The fresh listing is empty; the function must report
         // the race and return Ok(()), not claim success without doing
         // anything.
+        //
+        // The store-state asserts here are intentionally weak: the
+        // ConcurrentPrompter side effect already cleared the store
+        // before `delete()` resumed from the prompt, so `keys()` is
+        // empty regardless of which production branch was taken
+        // (#145). The load-bearing assert is the captured-stdout
+        // substring — without the "already gone" notice the operator
+        // cannot tell a successful delete from a no-op race-loss.
         let mock = seed_with_branch("main");
         let store: Arc<dyn ObjectStore> = Arc::new(mock.clone());
         let prompter = ConcurrentPrompter::new(
@@ -1030,9 +1054,19 @@ mod tests {
         let mb = ManageBranch::open(store, "myrepo", "main", &prompter as &dyn Prompter)
             .await
             .expect("open");
-        mb.delete()
+        let mut out: Vec<u8> = Vec::new();
+        mb.delete_into(&mut out)
             .await
             .expect("empty fresh listing must return Ok, not silent success");
+        let captured = String::from_utf8(out).expect("captured output must be UTF-8");
+        assert!(
+            captured.contains("is already gone"),
+            "operator message must announce the concurrent race; got: {captured:?}",
+        );
+        assert!(
+            !captured.contains("has been deleted"),
+            "must not claim a successful delete when nothing was swept; got: {captured:?}",
+        );
         assert!(mock.keys().is_empty(), "store remains empty");
     }
 
