@@ -190,11 +190,23 @@ async fn force_push_overwrites_unrelated_remote() {
         "force-pushed-over bundle must remain readable during the grace window",
     );
     let metas = store.list("repo/gc/").await.unwrap();
-    assert!(
-        metas
-            .iter()
-            .any(|m| m.key.starts_with("repo/gc/baseline-tomb-")),
-        "force-push must write a baseline tombstone for the prior bundle",
+    let tombstones: Vec<_> = metas
+        .iter()
+        .filter(|m| m.key.starts_with("repo/gc/baseline-tomb-"))
+        .collect();
+    assert_eq!(
+        tombstones.len(),
+        1,
+        "exactly one baseline tombstone must be written; got {:?}",
+        tombstones.iter().map(|m| &m.key).collect::<Vec<_>>(),
+    );
+    let body = store.get_bytes(&tombstones[0].key).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["ref_name"].as_str(), Some("refs/heads/main"));
+    assert_eq!(
+        parsed["sha"].as_str(),
+        Some(unrelated_sha.as_str()),
+        "tombstone must name the prior (force-pushed-over) bundle's SHA",
     );
 }
 
@@ -686,11 +698,23 @@ async fn force_push_protected_with_ancestor_remote_proceeds() {
         "old bundle must remain readable during the grace window",
     );
     let metas = store.list("repo/gc/").await.unwrap();
-    assert!(
-        metas
-            .iter()
-            .any(|m| m.key.starts_with("repo/gc/baseline-tomb-")),
-        "push must write a baseline tombstone for the prior bundle",
+    let tombstones: Vec<_> = metas
+        .iter()
+        .filter(|m| m.key.starts_with("repo/gc/baseline-tomb-"))
+        .collect();
+    assert_eq!(
+        tombstones.len(),
+        1,
+        "exactly one baseline tombstone must be written; got {:?}",
+        tombstones.iter().map(|m| &m.key).collect::<Vec<_>>(),
+    );
+    let body = store.get_bytes(&tombstones[0].key).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["ref_name"].as_str(), Some("refs/heads/main"));
+    assert_eq!(
+        parsed["sha"].as_str(),
+        Some(ancestor.as_str()),
+        "tombstone must name the prior (ancestor) bundle's SHA",
     );
     // PROTECTED# marker untouched.
     assert!(store.contains("repo/refs/heads/main/PROTECTED#"));

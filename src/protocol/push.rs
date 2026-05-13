@@ -3983,11 +3983,26 @@ mod tests {
     /// the happy path.
     #[tokio::test]
     async fn verify_no_orphan_protected_after_delete_is_noop_when_marker_absent() {
+        use crate::object_store::mock::Fault;
         let store = MockStore::new();
         let r = rn("refs/heads/main");
-        // No marker on bucket. Helper must silently return.
+        // Arm a one-shot transient HEAD fault on the marker key. The
+        // helper MUST issue a `head()` on that key; the fault is the
+        // witness. A regression that turned the helper into a literal
+        // no-op would leave the fault unconsumed and fail the
+        // pending-faults assertion below. Without this witness, the
+        // "marker absent → marker absent" assertion is vacuous.
+        store.arm(Fault::NetworkOnHead {
+            key: "repo/refs/heads/main/PROTECTED#".to_owned(),
+        });
         verify_no_orphan_protected_after_delete(&store, Some("repo"), &r).await;
-        // Witness: the bucket is unchanged.
+        assert_eq!(
+            store.pending_faults(),
+            0,
+            "helper must call head() on the marker key — fault unconsumed",
+        );
+        // The transient HEAD error goes through the `debug!` branch and
+        // the helper returns silently; the bucket stays unchanged.
         assert!(
             !store.contains("repo/refs/heads/main/PROTECTED#"),
             "helper must not touch the bucket",
