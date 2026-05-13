@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use time::{Duration, OffsetDateTime};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -346,19 +347,24 @@ pub(crate) fn lock_ttl_from_env() -> Duration {
 /// ## Release
 ///
 /// Call [`release_lock`] (or [`Self::release`]) to relinquish: this
-/// aborts the heartbeat first, then deletes the lock key. The release
-/// returns the delete result so callers can surface it to operators
-/// the same way they did with the old `release_lock(store, &key)`.
+/// signals cooperative shutdown to the heartbeat, awaits its exit so
+/// any in-flight heartbeat PUT completes (or errors) on the server
+/// BEFORE the DELETE is issued, then deletes the lock key. Without
+/// the await-then-delete ordering, an in-flight heartbeat PUT could
+/// settle on the server after the DELETE and resurrect the lock key
+/// as an orphan (issue #150).
 ///
 /// ## Drop
 ///
 /// If a guard is dropped without an explicit release (panic, early
-/// return without the post-result match, etc.) its heartbeat task is
-/// aborted — the lock key remains on the bucket and will be picked up
-/// by the next acquire attempt's stale-recovery path after `ttl`
-/// elapses (bounded by `ttl + heartbeat_interval` since the last
-/// heartbeat). Callers should still prefer explicit release so the
-/// lock is freed immediately.
+/// return without the post-result match, etc.) the heartbeat is told
+/// to stop via the same shutdown signal and the join handle is
+/// aborted (we cannot `.await` in `Drop`). The lock key remains on
+/// the bucket and will be picked up by the next acquire attempt's
+/// stale-recovery path after `ttl` elapses (bounded by
+/// `ttl + heartbeat_interval` since the last heartbeat). Callers
+/// should still prefer explicit release so the lock is freed
+/// immediately.
 #[must_use = "lock guards must be released; dropping leaks the lock until TTL"]
 pub(crate) struct LockGuard {
     /// Bucket key of the lock. `pub(crate)` so call sites can format
@@ -368,34 +374,80 @@ pub(crate) struct LockGuard {
     /// key without callers re-passing it. Also given to the heartbeat
     /// task via clone.
     store: Arc<dyn ObjectStore>,
+    /// Cooperative shutdown signal. The heartbeat task watches this
+    /// receiver via [`tokio::select!`]: a `send(true)` wakes the loop
+    /// at any await point inside the `select!` (between ticks) AND is
+    /// checked synchronously before issuing each `put_bytes`, so no
+    /// PUT can be dispatched after [`Self::release`] has begun.
+    shutdown: watch::Sender<bool>,
     /// Heartbeat task handle. `Some` while the guard owns a live
-    /// heartbeat; taken (and aborted) by release or drop.
+    /// heartbeat; taken by release (awaited) or drop (aborted as a
+    /// fallback since `Drop` cannot await).
     heartbeat: Option<JoinHandle<()>>,
 }
 
+/// Upper bound on how long [`LockGuard::release`] waits for the
+/// heartbeat task to exit cooperatively before falling back to abort.
+///
+/// The heartbeat task wakes from its `select!` immediately on
+/// shutdown and only issues a PUT if it had already passed the
+/// shutdown re-check, so the worst-case wait is one in-flight
+/// `put_bytes` RTT. Five seconds is well above any healthy RTT but
+/// well below any reasonable user-visible push timeout — if the
+/// network is wedged hard enough to outlast it, the fallback abort
+/// keeps `release` from hanging and the orphan key just regresses to
+/// the pre-fix behaviour (stale-lock recovery after TTL).
+const HEARTBEAT_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl LockGuard {
-    /// Release the lock: abort the heartbeat, then delete the lock
-    /// key. `NotFound` is mapped to `Ok(())` (the heartbeat may have
-    /// raced a stale-recovery delete, or an operator may have cleared
-    /// the lock manually); every other delete failure is propagated.
+    /// Release the lock: cooperatively stop the heartbeat (awaiting
+    /// the task's exit so any in-flight PUT settles first), then
+    /// delete the lock key. `NotFound` is mapped to `Ok(())` (the
+    /// heartbeat may have raced a stale-recovery delete, or an
+    /// operator may have cleared the lock manually); every other
+    /// delete failure is propagated.
     pub(crate) async fn release(mut self) -> Result<(), ObjectStoreError> {
-        // ORDER IS LOAD-BEARING: abort the heartbeat BEFORE deleting
-        // the lock key. The reverse order would let the heartbeat tick
-        // between the delete and the abort (on multi-threaded runtimes
-        // or any future yield in `delete_idempotent`) and re-create the
-        // key after we removed it, leaving an orphaned lock. The single-
-        // threaded paused-clock test runtime makes this ordering
-        // invariant-by-construction, so it cannot be asserted at
-        // runtime — it is enforced here by the source order.
-        self.stop_heartbeat();
+        // ORDER IS LOAD-BEARING: stop the heartbeat AND wait for its
+        // join handle BEFORE deleting the lock key. The previous
+        // implementation called `handle.abort()` and then DELETE
+        // synchronously, but `abort()` only cancels the future at its
+        // next await point — a `put_bytes` already in flight on the
+        // server completes regardless of cancellation and can settle
+        // AFTER our DELETE, resurrecting the lock key as an orphan
+        // (issue #150). Cooperative shutdown via `watch` + join-await
+        // makes the worst case "one in-flight PUT completes before
+        // DELETE" instead of "one in-flight PUT completes after
+        // DELETE".
+        self.stop_heartbeat().await;
         delete_idempotent(self.store.as_ref(), &self.lock_key).await
     }
 
-    /// Abort the heartbeat task without awaiting its completion. The
-    /// task is cooperative; abort + drop is sufficient to stop further
-    /// PUTs on the lock key.
-    fn stop_heartbeat(&mut self) {
-        if let Some(handle) = self.heartbeat.take() {
+    /// Signal cooperative shutdown to the heartbeat task and await
+    /// its exit (bounded by [`HEARTBEAT_JOIN_TIMEOUT`]). On timeout
+    /// the handle is `abort()`-ed, restoring the pre-#150 behaviour
+    /// for the pathological case of a `put_bytes` hung past the
+    /// timeout.
+    async fn stop_heartbeat(&mut self) {
+        // `send` only fails when there are no receivers — i.e. the
+        // heartbeat task has already exited. Either way, there's no
+        // PUT we can still prevent, so we ignore the result.
+        let _ = self.shutdown.send(true);
+        let Some(mut handle) = self.heartbeat.take() else {
+            return;
+        };
+        // Borrow the handle into `timeout` so we can still call
+        // `abort()` on it after the wait fails.
+        if tokio::time::timeout(HEARTBEAT_JOIN_TIMEOUT, &mut handle)
+            .await
+            .is_err()
+        {
+            warn!(
+                key = %self.lock_key,
+                timeout_secs = HEARTBEAT_JOIN_TIMEOUT.as_secs(),
+                "lock heartbeat did not exit within join timeout; \
+                 falling back to abort (in-flight PUT may still race \
+                 the upcoming DELETE)",
+            );
             handle.abort();
         }
     }
@@ -403,7 +455,18 @@ impl LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        self.stop_heartbeat();
+        // `Drop` cannot `.await`, so we cannot mirror the release
+        // path's "wait for in-flight PUT to settle" guarantee here.
+        // The best we can do is (a) signal shutdown so the heartbeat
+        // task exits at its next await point, and (b) abort the
+        // JoinHandle so a future PUT issued while we were dropping
+        // doesn't keep racing forever. The lock key may briefly
+        // outlive the holder; the stale-lock recovery path
+        // (`acquire_lock`) reclaims it after TTL.
+        let _ = self.shutdown.send(true);
+        if let Some(handle) = self.heartbeat.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -477,10 +540,20 @@ pub(crate) async fn acquire_lock(
 /// correctly excludes still-held locks. Heartbeat failures are logged
 /// at `warn` and retried on the next tick — a transient blip should
 /// not surface as a critical-section-aborting error.
+///
+/// The task watches a [`watch::Receiver<bool>`]: `release` flips it to
+/// `true` and the loop exits at the next `select!` await point.
+/// Critically, the loop also re-checks the flag synchronously after
+/// waking from the tick and BEFORE issuing `put_bytes`, so once
+/// `release` has signalled shutdown no further PUT can be dispatched
+/// — closing the issue #150 race where an `abort()`-cancelled task
+/// had an in-flight `put_bytes` that settled on the server after
+/// `release`'s DELETE.
 fn spawn_lock_guard(store: Arc<dyn ObjectStore>, lock_key: String, ttl: Duration) -> LockGuard {
     let interval = heartbeat_interval(ttl);
     let task_store = Arc::clone(&store);
     let task_key = lock_key.clone();
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let handle = tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         // Skip the immediate first tick — the acquire just wrote the
@@ -489,7 +562,26 @@ fn spawn_lock_guard(store: Arc<dyn ObjectStore>, lock_key: String, ttl: Duration
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await; // immediate
         loop {
-            tick.tick().await;
+            tokio::select! {
+                // `biased` so shutdown is checked first on every
+                // wake: a tick and a shutdown that fire on the same
+                // poll must resolve to shutdown, otherwise the tick
+                // arm could win and issue one final PUT after release
+                // has begun.
+                biased;
+                _ = shutdown_rx.changed() => break,
+                _ = tick.tick() => {}
+            }
+            // Re-check the shutdown flag synchronously between the
+            // tick and the `put_bytes` await. Without this, a
+            // `release` that signals shutdown AFTER `tick.tick()`
+            // resolved but BEFORE we issued `put_bytes` would still
+            // let the PUT through and race the DELETE — exactly the
+            // issue #150 failure mode the `select!` alone does not
+            // close.
+            if *shutdown_rx.borrow() {
+                break;
+            }
             match task_store
                 .put_bytes(&task_key, Bytes::new(), PutOpts::default())
                 .await
@@ -506,6 +598,7 @@ fn spawn_lock_guard(store: Arc<dyn ObjectStore>, lock_key: String, ttl: Duration
     LockGuard {
         lock_key,
         store,
+        shutdown: shutdown_tx,
         heartbeat: Some(handle),
     }
 }
@@ -2005,6 +2098,217 @@ mod tests {
             .unwrap();
         assert!(recovered.is_some(), "orphaned lock must be reclaimable");
         drop(recovered);
+    }
+
+    /// Issue #150 regression: a heartbeat `put_bytes` already in
+    /// flight when `release` is called must complete BEFORE the
+    /// release issues its DELETE. The pre-fix code did
+    /// `handle.abort(); delete`, which only cancelled the future at
+    /// its next await point — an in-flight network PUT continued on
+    /// the server and could settle AFTER the DELETE, resurrecting the
+    /// lock key as an orphan.
+    ///
+    /// The test wraps the mock store in a barrier-gated `put_bytes`
+    /// (the first PUT records its start, then waits on a notify) so
+    /// the heartbeat tick lands in a state where the PUT has been
+    /// issued but not yet completed when `release` runs. The
+    /// post-condition is the sequence of recorded operations: the
+    /// in-flight PUT's completion must precede the DELETE's start.
+    /// Expected sequence is derived from the invariant in the
+    /// `LockGuard::release` doc comment (the spec), not from the
+    /// code's current output (lesson #5).
+    // The test body inlines a small `ObjectStore` decorator
+    // (`GatedPutStore`) so the trait wiring inflates the line count
+    // past clippy's default budget. Splitting the decorator into a
+    // sibling helper would obscure the test's single behaviour
+    // contract, so we accept the lint locally.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test(start_paused = true)]
+    async fn release_awaits_in_flight_heartbeat_put_before_delete() {
+        use std::sync::Mutex;
+        use tokio::sync::Notify;
+
+        /// Op-log entry recording the relative order of `put_bytes`
+        /// and `delete` events. The release contract requires
+        /// `PutEnd` to precede `DeleteStart`.
+        #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+        enum Op {
+            PutStart,
+            PutEnd,
+            DeleteStart,
+            DeleteEnd,
+        }
+
+        /// Decorator that gates the FIRST `put_bytes` on a notify
+        /// barrier. Subsequent `put_bytes` calls pass through (they
+        /// should not happen — once we hold the gate, release should
+        /// stop the heartbeat before another tick fires).
+        struct GatedPutStore {
+            inner: Arc<MockStore>,
+            put_gate: Arc<Notify>,
+            log: Arc<Mutex<Vec<Op>>>,
+            gated_key: String,
+            gate_consumed: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl ObjectStore for GatedPutStore {
+            async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, ObjectStoreError> {
+                self.inner.list(prefix).await
+            }
+            async fn get_to_file(
+                &self,
+                key: &str,
+                dest: &std::path::Path,
+                opts: crate::object_store::GetOpts,
+            ) -> Result<(), ObjectStoreError> {
+                self.inner.get_to_file(key, dest, opts).await
+            }
+            async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+                self.inner.get_bytes(key).await
+            }
+            async fn get_bytes_range(
+                &self,
+                key: &str,
+                range: std::ops::Range<u64>,
+            ) -> Result<Bytes, ObjectStoreError> {
+                self.inner.get_bytes_range(key, range).await
+            }
+            async fn put_bytes(
+                &self,
+                key: &str,
+                body: Bytes,
+                opts: PutOpts,
+            ) -> Result<(), ObjectStoreError> {
+                let is_gated = key == self.gated_key
+                    && !self
+                        .gate_consumed
+                        .swap(true, std::sync::atomic::Ordering::SeqCst);
+                if is_gated {
+                    self.log.lock().unwrap().push(Op::PutStart);
+                    self.put_gate.notified().await;
+                }
+                let result = self.inner.put_bytes(key, body, opts).await;
+                if is_gated {
+                    self.log.lock().unwrap().push(Op::PutEnd);
+                }
+                result
+            }
+            async fn put_path(
+                &self,
+                key: &str,
+                src: &std::path::Path,
+                opts: PutOpts,
+            ) -> Result<(), ObjectStoreError> {
+                self.inner.put_path(key, src, opts).await
+            }
+            async fn put_if_absent(
+                &self,
+                key: &str,
+                body: Bytes,
+            ) -> Result<bool, ObjectStoreError> {
+                self.inner.put_if_absent(key, body).await
+            }
+            async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
+                self.inner.head(key).await
+            }
+            async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
+                self.inner.copy(src, dst).await
+            }
+            async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
+                self.log.lock().unwrap().push(Op::DeleteStart);
+                let result = self.inner.delete(key).await;
+                self.log.lock().unwrap().push(Op::DeleteEnd);
+                result
+            }
+        }
+
+        let inner = Arc::new(MockStore::new());
+        let put_gate = Arc::new(Notify::new());
+        let log = Arc::new(Mutex::new(Vec::<Op>::new()));
+        let store = Arc::new(GatedPutStore {
+            inner: Arc::clone(&inner),
+            put_gate: Arc::clone(&put_gate),
+            log: Arc::clone(&log),
+            gated_key: "k".to_owned(),
+            gate_consumed: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        let now = OffsetDateTime::now_utc();
+        let ttl = Duration::seconds(4);
+        let guard = acquire_lock(Arc::clone(&store) as Arc<dyn ObjectStore>, "k", ttl, now)
+            .await
+            .unwrap()
+            .expect("acquire must succeed");
+
+        // Yield so the heartbeat task is polled and consumes its
+        // immediate (zero-duration) first `tick.tick()`. Without this
+        // yield, the next `advance` would fire the immediate tick
+        // first and then the periodic tick, but the task still
+        // wouldn't be polled until the test yields again — we want
+        // to be inside the loop body before advancing time.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        // Drive one heartbeat tick. The heartbeat task issues
+        // `put_bytes`, which the gate intercepts and parks before the
+        // inner write completes. The interval is `ttl/3 = 1s` so any
+        // advance >= 1s is sufficient.
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        // Yield repeatedly so the spawned heartbeat task is polled
+        // and reaches the gate.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+            if !log.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &[Op::PutStart],
+            "heartbeat PUT must be in flight before release fires",
+        );
+
+        // Begin release on a separate task so we can observe the
+        // ordering: release blocks on `stop_heartbeat`'s join-await,
+        // which can only complete after the gated PUT finishes.
+        let release_store = Arc::clone(&store);
+        let release_handle = tokio::spawn(async move {
+            let _ = release_store; // borrow check: keep store alive
+            release_lock(guard).await
+        });
+
+        // Let the release task get as far as it can — up to the
+        // join-await on the heartbeat task.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // No DELETE may have fired yet: the heartbeat task is still
+        // inside the gated `put_bytes`.
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &[Op::PutStart],
+            "release must NOT issue DELETE while heartbeat PUT is in flight",
+        );
+
+        // Open the gate: the in-flight PUT completes, the heartbeat
+        // task exits the loop on its next shutdown re-check, and
+        // release proceeds to DELETE.
+        put_gate.notify_one();
+        let result = release_handle.await.expect("release task panicked");
+        result.expect("release_lock");
+
+        let final_log = log.lock().unwrap().clone();
+        assert_eq!(
+            final_log,
+            vec![Op::PutStart, Op::PutEnd, Op::DeleteStart, Op::DeleteEnd],
+            "operation order must be: heartbeat PUT completes, THEN release DELETE",
+        );
+        assert!(
+            !inner.contains("k"),
+            "lock key must be deleted after release"
+        );
     }
 
     // --- delete_remote_ref_under_lock ---------------------------------
