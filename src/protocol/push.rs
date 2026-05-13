@@ -1720,12 +1720,12 @@ mod tests {
         store.arm(Fault::AccessDeniedOnAnyList);
         let got = is_protected(&store, Some("repo"), &r).await.unwrap();
         assert!(!got);
-        assert_eq!(store.pending_faults(), 1, "is_protected must not call list",);
+        assert_eq!(store.pending_faults(), 1, "is_protected must not call list");
         // And the positive case too — still no list.
         store.insert("repo/refs/heads/main/PROTECTED#", Bytes::from_static(b""));
         let got = is_protected(&store, Some("repo"), &r).await.unwrap();
         assert!(got);
-        assert_eq!(store.pending_faults(), 1, "is_protected must not call list",);
+        assert_eq!(store.pending_faults(), 1, "is_protected must not call list");
     }
 
     // --- acquire_lock / release_lock ----------------------------------

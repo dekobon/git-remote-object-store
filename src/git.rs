@@ -1276,7 +1276,7 @@ mod tests {
             assert!(RefName::is_valid(name), "expected is_valid({name:?})");
         }
         for name in INVALID_REF_NAMES {
-            assert!(!RefName::is_valid(name), "expected !is_valid({name:?})",);
+            assert!(!RefName::is_valid(name), "expected !is_valid({name:?})");
         }
     }
 

@@ -427,7 +427,7 @@ mod tests {
             tag_chain: Vec::new(),
         };
         let result = extract_path_index(&repo, &peeled, Sha::from_object_id(blob)).unwrap();
-        assert!(result.is_none(), "blob-tipped chains have no tree to index",);
+        assert!(result.is_none(), "blob-tipped chains have no tree to index");
     }
 
     #[test]
@@ -522,7 +522,7 @@ mod tests {
             .detach();
         let oids = enumerate_tree_closure(&repo, root_tree).unwrap();
         // 3 trees (root, src, inner) + 3 blobs (Cargo.toml, main.rs, deep.rs)
-        assert_eq!(oids.len(), 6, "fixture has 3 trees + 3 blobs, got {oids:?}",);
+        assert_eq!(oids.len(), 6, "fixture has 3 trees + 3 blobs, got {oids:?}");
         assert!(oids.contains(&root_tree), "root tree must be included");
     }
 

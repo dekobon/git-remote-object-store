@@ -1221,7 +1221,7 @@ mod tests {
                 message,
                 remote_ref,
             } => {
-                assert_eq!(message, &expected, "contention wire message must be exact",);
+                assert_eq!(message, &expected, "contention wire message must be exact");
                 assert_eq!(remote_ref, remote.as_str());
             }
             PushOutcome::Ok { .. } => panic!("expected contention Error, got {outcome:?}"),

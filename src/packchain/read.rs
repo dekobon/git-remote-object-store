@@ -105,7 +105,7 @@ const PACK_MISSING_MAX_RETRIES: u32 = 3;
 const PACK_MISSING_RETRY_BACKOFFS: [Duration; PACK_MISSING_MAX_RETRIES as usize] = [
     Duration::from_millis(100),
     Duration::from_millis(500),
-    Duration::from_millis(2_000),
+    Duration::from_secs(2),
 ];
 
 /// Compile-time pin: the backoff schedule must have exactly one entry
