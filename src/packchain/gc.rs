@@ -842,6 +842,30 @@ async fn sweep_one_baseline_tombstone(
             "gc sweep: baseline re-referenced; skipping delete",
         );
     } else {
+        // Issue #153: re-read the chain IMMEDIATELY before deleting the
+        // bundle. The earlier `load_chain` above closes the common
+        // stale-tombstone path, but a concurrent force-push or compact
+        // can re-baseline the ref to the tombstoned SHA between that
+        // read and the delete that follows; without this recheck, sweep
+        // would erase a now-live bundle and then drop the tombstone.
+        // The window between this recheck and the bundle delete is
+        // bounded by a single network round-trip — the same bound the
+        // pack-tombstone path uses (issues #140, #152). When the
+        // recheck catches the race, return `Deferred` so the tombstone
+        // is preserved for a future sweep (mirrors #146's
+        // operator-review pattern) — the chain may flip back to a
+        // different SHA before then, in which case the tombstone
+        // becomes actionable again.
+        let recheck = load_chain(store, prefix_opt, &ref_name).await?;
+        if recheck.as_ref().is_some_and(|c| c.full_at == tombstone.sha) {
+            debug!(
+                key = %tombstone_key,
+                ref_path = %ref_name.as_str(),
+                sha = %tombstone.sha.as_str(),
+                "gc sweep: baseline re-referenced between checks; deferring",
+            );
+            return Ok(SweepStep::Deferred);
+        }
         let bundle_key = keys::bundle_key(prefix_opt, &ref_name, tombstone.sha.as_str());
         if delete_idempotent(store, &bundle_key).await? {
             deleted_objects += 1;
@@ -2532,5 +2556,216 @@ mod tests {
         // No tombstone object emitted for an empty orphan set.
         let gc_metas = store.inner.list("repo/gc/").await.unwrap();
         assert!(gc_metas.is_empty(), "no tombstone for empty orphan set");
+    }
+
+    // --- baseline-tombstone post-recheck race (issue #153) -----------
+
+    /// One-shot post-`get_bytes` hook used by [`PostGetHookStore`].
+    type PostGetHook = Box<dyn FnOnce(&MockStore) + Send>;
+
+    /// Test-only [`ObjectStore`] decorator that runs a one-shot
+    /// callback the first time `get_bytes()` succeeds on `trigger_key`,
+    /// *after* the inner read completes. Used to deterministically
+    /// simulate a concurrent force-push landing between the initial
+    /// `load_chain` in `sweep_one_baseline_tombstone` and the
+    /// immediate-pre-delete recheck added by issue #153.
+    ///
+    /// The `trigger_key` filter is exact-match so the hook fires only
+    /// on the targeted chain.json read, not on the tombstone-body
+    /// `get_bytes` that runs earlier in the same sweep.
+    struct PostGetHookStore {
+        inner: MockStore,
+        hook: std::sync::Mutex<Option<PostGetHook>>,
+        trigger_key: String,
+    }
+
+    impl PostGetHookStore {
+        fn new(
+            inner: MockStore,
+            trigger_key: impl Into<String>,
+            hook: impl FnOnce(&MockStore) + Send + 'static,
+        ) -> Self {
+            Self {
+                inner,
+                hook: std::sync::Mutex::new(Some(Box::new(hook))),
+                trigger_key: trigger_key.into(),
+            }
+        }
+
+        /// `true` once the hook has been consumed — used to witness
+        /// that the production code reached the targeted read rather
+        /// than skipping past it on a different branch.
+        fn hook_fired(&self) -> bool {
+            self.hook.lock().unwrap().is_none()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for PostGetHookStore {
+        async fn list(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<crate::object_store::ObjectMeta>, ObjectStoreError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn get_to_file(
+            &self,
+            key: &str,
+            dest: &std::path::Path,
+            opts: crate::object_store::GetOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.get_to_file(key, dest, opts).await
+        }
+
+        async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+            let result = self.inner.get_bytes(key).await;
+            if result.is_ok()
+                && key == self.trigger_key
+                && let Some(hook) = self.hook.lock().unwrap().take()
+            {
+                hook(&self.inner);
+            }
+            result
+        }
+
+        async fn get_bytes_range(
+            &self,
+            key: &str,
+            range: std::ops::Range<u64>,
+        ) -> Result<Bytes, ObjectStoreError> {
+            self.inner.get_bytes_range(key, range).await
+        }
+
+        async fn put_bytes(
+            &self,
+            key: &str,
+            body: Bytes,
+            opts: PutOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.put_bytes(key, body, opts).await
+        }
+
+        async fn put_path(
+            &self,
+            key: &str,
+            src: &std::path::Path,
+            opts: PutOpts,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.put_path(key, src, opts).await
+        }
+
+        async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
+            self.inner.put_if_absent(key, body).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<crate::object_store::ObjectMeta, ObjectStoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
+            self.inner.copy(src, dst).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_baseline_defers_when_recheck_observes_re_baseline() {
+        // Issue #153 regression: a concurrent force-push or compact may
+        // re-baseline the ref to the tombstoned SHA between the initial
+        // `load_chain` and the bundle delete that follows. Without the
+        // immediate-pre-delete recheck, sweep would erase a now-live
+        // bundle and then drop its tombstone.
+        //
+        // Layout: a baseline bundle at SHA_FULL, a stale baseline
+        // tombstone naming SHA_FULL, and an initial chain.json with
+        // `full_at = SHA_TIP` (different from SHA_FULL) so the initial
+        // check sees `still_live = false` and proceeds toward the
+        // delete. The PostGetHookStore fires AFTER the first read of
+        // `chain.json` (the initial `load_chain`) and overwrites it
+        // with a chain whose `full_at = SHA_FULL` — modelling the
+        // concurrent force-push landing in the gap.
+        //
+        // With the fix in place: the immediate-pre-delete recheck
+        // observes the new state, `still_live` flips to true, and
+        // sweep returns `Deferred` — preserving BOTH the bundle and
+        // the tombstone so a future sweep can retry.
+        let inner = MockStore::new();
+        let bundle_key = insert_baseline_bundle(&inner, Some("repo"), SHA_FULL);
+        // Initial chain points at a different SHA, so the first
+        // `still_live` check is false and the code falls into the
+        // delete branch where the recheck now lives.
+        let initial_chain = ChainManifest {
+            v: 1,
+            tip: sha40(SHA_TIP),
+            full_at: sha40(SHA_TIP),
+            segments: vec![segment(SHA_PACK_LIVE, None)],
+        };
+        write_chain(&inner, Some("repo"), &ref_main(), &initial_chain)
+            .await
+            .unwrap();
+        let stale = (OffsetDateTime::now_utc() - time::Duration::hours(48))
+            .format(&Rfc3339)
+            .unwrap();
+        let tomb_key = write_baseline_tombstone_at(&inner, "repo", &stale, SHA_FULL);
+
+        // Hook fires AFTER the FIRST get_bytes of chain.json (the
+        // initial load_chain). Before the fix, that was the only
+        // chain read; the bundle delete that followed would erase a
+        // live bundle. After the fix, a second get_bytes (the
+        // immediate-pre-delete recheck) sees this updated state.
+        let chain_key = "repo/refs/heads/main/chain.json";
+        let store = PostGetHookStore::new(inner, chain_key, move |inner| {
+            let re_baselined = ChainManifest {
+                v: 1,
+                tip: sha40(SHA_TIP),
+                full_at: sha40(SHA_FULL),
+                segments: vec![segment(SHA_PACK_LIVE, None)],
+            };
+            let body = serde_json::to_vec_pretty(&re_baselined)
+                .expect("chain.json serializes for the test");
+            inner.insert(chain_key, Bytes::from(body));
+        });
+
+        let outcome = sweep(&store, "repo", SweepOpts::default()).await.unwrap();
+        // The recheck caught the race: tombstone deferred for a
+        // future sweep.
+        assert_eq!(
+            outcome.deferred_tombstones, 1,
+            "recheck must defer when the chain re-baselined to the \
+             tombstoned SHA between checks",
+        );
+        assert_eq!(outcome.swept_tombstones, 0);
+        assert_eq!(outcome.deleted_objects, 0);
+        assert_eq!(outcome.skipped_repointed_packs, 0);
+
+        // Witness that the production code actually executed the
+        // recheck branch (otherwise the hook would still be armed and
+        // the test would be vacuously passing).
+        assert!(
+            store.hook_fired(),
+            "production code must have read chain.json so the hook \
+             could inject the concurrent re-baseline",
+        );
+
+        // Bundle MUST survive — the whole point of the fix.
+        store
+            .inner
+            .get_bytes(&bundle_key)
+            .await
+            .expect("re-baselined bundle must survive sweep");
+        // Tombstone MUST survive — preserved for a future sweep to
+        // retry once the race settles.
+        store
+            .inner
+            .get_bytes(&tomb_key)
+            .await
+            .expect("tombstone must survive deferred path");
     }
 }
