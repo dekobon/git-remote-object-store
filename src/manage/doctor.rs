@@ -279,17 +279,14 @@ impl<'a> Doctor<'a> {
         // before returning, so out-of-range here means a test prompter
         // queued an invalid script. Propagate as a structured internal
         // error so the helper doesn't abort the whole run.
-        let keeper_sha = ref_entry
-            .bundles
-            .get(keep_idx)
-            .ok_or_else(|| {
-                ManageError::Internal(format!(
-                    "prompter returned out-of-range index {keep_idx} for {} bundle(s)",
-                    ref_entry.bundles.len()
-                ))
-            })?
-            .sha
-            .clone();
+        let keeper = ref_entry.bundles.get(keep_idx).ok_or_else(|| {
+            ManageError::Internal(format!(
+                "prompter returned out-of-range index {keep_idx} for {} bundle(s)",
+                ref_entry.bundles.len()
+            ))
+        })?;
+        let keeper_sha = keeper.sha.clone();
+        let keeper_key = keeper.key.clone();
 
         if !self.prompter.confirm("Confirm and apply changes")? {
             // Match `ManageBranch::delete`: an interactive "no" is the user
@@ -297,6 +294,39 @@ impl<'a> Doctor<'a> {
             // continues to the next ref / stale-lock scan with exit 0.
             writeln!(out, "Aborted")?;
             return Ok(());
+        }
+
+        // Re-verify the keeper bundle still exists on the bucket before
+        // evicting any losers. The bundle list above is taken from the
+        // top-of-run snapshot, which can be minutes old after the
+        // interactive prompt; a concurrent `git push` / `manage
+        // delete-branch` / another `doctor` run may have removed the
+        // keeper in between. Without this re-check, partitioning and
+        // deleting losers on the stale snapshot can evict the last live
+        // bundle for the ref (issue #155).
+        //
+        // We HEAD the keeper's exact key (rather than re-listing the
+        // ref prefix) because the question here is precisely "does
+        // this one object still exist?". A targeted HEAD is the
+        // cheapest unambiguous existence check and matches the
+        // singleton-marker pattern documented in lesson #12.
+        match self.store.head(&keeper_key).await {
+            Ok(_) => {}
+            Err(ObjectStoreError::NotFound(_)) => {
+                writeln!(
+                    out,
+                    "Selected keeper bundle {keeper_sha} for {ref_path} is no longer \
+                     present on the bucket; refusing to evict losers. Re-run doctor."
+                )?;
+                warn!(
+                    ref_path,
+                    keeper = %keeper_sha,
+                    key = %keeper_key,
+                    "doctor fix_multiple_bundles: keeper disappeared between snapshot and eviction",
+                );
+                return Err(ManageError::StaleSnapshot(ref_path.to_owned()));
+            }
+            Err(e) => return Err(e.into()),
         }
 
         writeln!(out, "Keeping {keeper_sha}")?;
@@ -327,6 +357,14 @@ impl<'a> Doctor<'a> {
         // "preserve in place" branch here must NOT fall through to the
         // unconditional delete below — keep the delete inside the
         // appropriate branch when adding new modes.
+        //
+        // Loser-side `NotFound` is treated as success in both branches.
+        // The bundle list reflects the top-of-run snapshot; a
+        // concurrent push, delete-branch, or doctor run can sweep a
+        // loser between the snapshot and the eviction. The keeper
+        // re-check in `fix_multiple_bundles` already proved the keeper
+        // survived — once that holds, an already-gone loser is the
+        // desired end state, not a failure (issue #155).
         if self.opts.delete_bundle {
             writeln!(out, "Removing {}", losing.sha)?;
         } else {
@@ -343,10 +381,31 @@ impl<'a> Doctor<'a> {
             // and root-of-bucket cases without an explicit branch.
             let dst_key = keys::bundle_key(Some(&self.prefix), &new_ref, &losing.sha);
             writeln!(out, "Moving {} to new branch {new_ref}", losing.sha)?;
-            self.store.copy(&losing.key, &dst_key).await?;
+            match self.store.copy(&losing.key, &dst_key).await {
+                Ok(()) => {}
+                Err(ObjectStoreError::NotFound(_)) => {
+                    writeln!(
+                        out,
+                        "Skipping {}: loser bundle already gone before quarantine copy",
+                        losing.sha,
+                    )?;
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
-        self.store.delete(&losing.key).await?;
-        Ok(())
+        match self.store.delete(&losing.key).await {
+            Ok(()) => Ok(()),
+            Err(ObjectStoreError::NotFound(_)) => {
+                writeln!(
+                    out,
+                    "Skipping {}: loser bundle already gone before delete",
+                    losing.sha,
+                )?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn fix_head<W: Write>(
@@ -880,6 +939,219 @@ mod tests {
         assert!(
             matches!(err, ManageError::Internal(ref msg) if msg.contains("out-of-range")),
             "expected ManageError::Internal, got {err:?}",
+        );
+    }
+
+    /// Prompter that runs a one-shot side effect immediately before
+    /// returning its first `confirm` answer. The bundle-fixer's
+    /// keeper re-verification fires *after* the operator confirms
+    /// (issue #155), so simulating a concurrent delete that lands
+    /// between the prompt and the eviction requires firing the side
+    /// effect in `confirm`, not `select`.
+    struct DeleteOnConfirmPrompter {
+        select_index: usize,
+        confirm_answer: bool,
+        mock: MockStore,
+        keys_to_delete: Vec<String>,
+        fired: std::sync::Mutex<bool>,
+    }
+
+    impl Prompter for DeleteOnConfirmPrompter {
+        fn select(&self, _prompt: &str, _options: &[String]) -> Result<usize, ManageError> {
+            Ok(self.select_index)
+        }
+
+        fn confirm(&self, _prompt: &str) -> Result<bool, ManageError> {
+            let mut fired = self.fired.lock().expect("fired mutex poisoned");
+            if !*fired {
+                for key in &self.keys_to_delete {
+                    let _ = self.mock.remove_key(key);
+                }
+                *fired = true;
+            }
+            Ok(self.confirm_answer)
+        }
+    }
+
+    #[tokio::test]
+    async fn fix_multiple_bundles_refuses_when_keeper_disappears_after_confirm() {
+        // Issue #155: `fix_multiple_bundles` partitions the top-of-run
+        // snapshot and evicts losers without revalidating that the
+        // chosen keeper still exists. A concurrent push / delete-branch
+        // / another doctor that removes the keeper between the prompt
+        // and the eviction would otherwise leave the ref with no live
+        // bundle. The fix re-HEADs the keeper's exact key after the
+        // operator confirms; on `NotFound` it aborts the run with a
+        // typed `StaleSnapshot` and does NOT delete any losers.
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("a"),
+        );
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_B}.bundle"),
+            Bytes::from("b"),
+        );
+        let initial_keys = mock.keys();
+        // Snapshot order is listing order: SHA_A comes before SHA_B
+        // (lexicographic), so index 0 is the SHA_A bundle — that's
+        // the one we delete out from under the doctor.
+        let prompter = DeleteOnConfirmPrompter {
+            select_index: 0,
+            confirm_answer: true,
+            mock: mock.clone(),
+            keys_to_delete: vec![format!("myrepo/refs/heads/main/{SHA_A}.bundle")],
+            fired: std::sync::Mutex::new(false),
+        };
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let mut out = Vec::new();
+        let err = doctor
+            .run_into(&mut out)
+            .await
+            .expect_err("missing keeper must surface as stale snapshot");
+        assert!(
+            matches!(err, ManageError::StaleSnapshot(ref r) if r == "refs/heads/main"),
+            "expected ManageError::StaleSnapshot(refs/heads/main), got {err:?}",
+        );
+
+        // Critical invariant: the loser must NOT have been evicted.
+        // Before the fix, the doctor partitioned the stale snapshot
+        // and deleted the loser, leaving the ref with no live bundle.
+        // Now: keeper is gone (the prompter deleted it to simulate the
+        // race), but the loser must remain so the ref still has at
+        // least one bundle.
+        assert!(
+            mock.contains(&format!("myrepo/refs/heads/main/{SHA_B}.bundle")),
+            "loser must NOT be evicted when keeper recheck fails (bucket: {:?})",
+            mock.keys(),
+        );
+        // Pin the strongest invariant: only the simulated concurrent
+        // delete of SHA_A changed the bucket. No quarantine ref, no
+        // copy, no extra delete fired.
+        let mut expected = initial_keys.clone();
+        expected.retain(|k| k != &format!("myrepo/refs/heads/main/{SHA_A}.bundle"));
+        let mut actual = mock.keys();
+        expected.sort();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "doctor mutated bucket beyond the simulated concurrent delete",
+        );
+
+        // Operator-facing message names the keeper SHA, the ref, and
+        // tells the operator to re-run.
+        let output = String::from_utf8(out).expect("doctor output is utf-8");
+        assert!(
+            output.contains(SHA_A),
+            "expected keeper SHA in operator output:\n{output}",
+        );
+        assert!(
+            output.contains("no longer present"),
+            "expected 'no longer present' message:\n{output}",
+        );
+        assert!(
+            output.contains("Re-run doctor"),
+            "expected re-run instruction:\n{output}",
+        );
+        // The "Keeping" line MUST NOT appear — we aborted before
+        // committing to the eviction plan.
+        assert!(
+            !output.contains(&format!("Keeping {SHA_A}")),
+            "doctor printed keeper announcement despite aborting:\n{output}",
+        );
+        // And the eviction "Moving ..." line MUST NOT appear either.
+        assert!(
+            !output.contains(&format!("Moving {SHA_B}")),
+            "doctor printed eviction line despite aborting:\n{output}",
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_multiple_bundles_proceeds_when_keeper_still_present_after_confirm() {
+        // Negative control for #155: if the concurrent delete removes
+        // a non-keeper bundle between the prompt and the eviction,
+        // the keeper re-verification passes and the doctor proceeds
+        // normally. This pins the recheck to the keeper only — it
+        // does not re-list everything and abort on any drift.
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("a"),
+        );
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_B}.bundle"),
+            Bytes::from("b"),
+        );
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_C}.bundle"),
+            Bytes::from("c"),
+        );
+        // Keep SHA_A (index 0). Concurrent delete removes SHA_B (a
+        // non-keeper loser) between prompt and recheck. The doctor
+        // must still proceed: SHA_A survives (it is the keeper) and
+        // SHA_C is the only loser to evict — SHA_B is already gone.
+        let prompter = DeleteOnConfirmPrompter {
+            select_index: 0,
+            confirm_answer: true,
+            mock: mock.clone(),
+            keys_to_delete: vec![format!("myrepo/refs/heads/main/{SHA_B}.bundle")],
+            fired: std::sync::Mutex::new(false),
+        };
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        doctor
+            .run_into(&mut std::io::sink())
+            .await
+            .expect("unrelated concurrent delete must not block keeper-survival path");
+
+        // Keeper survived.
+        assert!(mock.contains(&format!("myrepo/refs/heads/main/{SHA_A}.bundle")));
+        // The non-keeper that the simulated race deleted is gone.
+        assert!(!mock.contains(&format!("myrepo/refs/heads/main/{SHA_B}.bundle")));
+    }
+
+    #[tokio::test]
+    async fn fix_multiple_bundles_propagates_transient_head_failure_on_keeper() {
+        // A non-`NotFound` `head` failure on the keeper re-check must
+        // propagate as a `Store` error rather than silently proceed
+        // with the eviction on the stale snapshot. The strongest
+        // invariant: no losers are evicted when the recheck is
+        // inconclusive — proceeding would risk deleting the last
+        // live bundle on a transient blip.
+        let mock = MockStore::new();
+        mock.insert("myrepo/HEAD", Bytes::from("refs/heads/main"));
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_A}.bundle"),
+            Bytes::from("a"),
+        );
+        mock.insert(
+            format!("myrepo/refs/heads/main/{SHA_B}.bundle"),
+            Bytes::from("b"),
+        );
+        let initial_keys = mock.keys();
+        let keeper_key = format!("myrepo/refs/heads/main/{SHA_A}.bundle");
+        mock.arm(Fault::NetworkOnHead {
+            key: keeper_key.clone(),
+        });
+        let prompter = ScriptedPrompter::new([Answer::Select(0), Answer::Confirm(true)]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+        let err = doctor
+            .run_into(&mut std::io::sink())
+            .await
+            .expect_err("transient HEAD failure must propagate, not silently succeed");
+        assert!(
+            matches!(err, ManageError::Store(_)),
+            "expected ManageError::Store from the head-fault, got {err:?}",
+        );
+        // No losers evicted on an inconclusive HEAD.
+        let mut actual = mock.keys();
+        let mut expected = initial_keys.clone();
+        actual.sort();
+        expected.sort();
+        assert_eq!(
+            actual, expected,
+            "doctor mutated bucket despite inconclusive keeper recheck",
         );
     }
 
