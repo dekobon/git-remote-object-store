@@ -703,27 +703,31 @@ async fn sweep_one_tombstone(
         return Ok(SweepStep::Deferred);
     }
 
-    // Re-derive the live referenced set per tombstone, AFTER the
-    // grace check passes — never cache across iterations (issue #140).
-    // A concurrent push committing chain.json after a sweep-wide
-    // snapshot would let sweep delete a pack the new chain references,
-    // permanently dangling the chain. Force-revert is the canonical
-    // trigger: gix pack emission is deterministic for the same object
-    // set, so the new pack key aliases the tombstoned one and the push
-    // skips upload, only touching chain.json. Per-tombstone re-listing
-    // costs one extra `list("refs/")` + bounded-parallel chain GETs
-    // per eligible tombstone vs once per sweep — for typical workloads
-    // with O(1) eligible tombstones this is negligible; correctness
-    // wins over the linear-in-tombstones overhead. The recompute also
+    // Re-derive the live referenced set per pack delete, AFTER the
+    // grace check passes — never cache across iterations (issue #140
+    // for the cross-tombstone race, issue #152 for the cross-pack
+    // race inside a single tombstone). A concurrent push committing
+    // chain.json after a per-tombstone snapshot still loses a live
+    // pack named later in the same tombstone's `orphan_packs` vector,
+    // because `mark()` packs all orphans for a run into one tombstone
+    // body. Force-revert is the canonical trigger: gix pack emission
+    // is deterministic for the same object set, so the new pack key
+    // aliases the tombstoned one and the push skips upload, only
+    // touching chain.json. Per-pack re-listing costs one extra
+    // `list("refs/")` + bounded-parallel chain GETs per orphan pack;
+    // for the rare GC maintenance path this is acceptable overhead in
+    // exchange for closing the cross-pack window. The recompute also
     // runs under --force: that flag suppresses the grace window only,
-    // NOT this guard (issue #117).
-    let referenced = list_referenced_packs(store, prefix).await?;
-
+    // NOT this guard (issue #117). A residual TOCTOU window remains
+    // between this listing and the delete that follows; the fix
+    // shrinks the window from "one snapshot per tombstone" to "one
+    // snapshot per pack", which is the bound the issue asks for.
     let mut deleted_objects = 0usize;
     let mut skipped_repointed_packs = 0usize;
     for sha in &tombstone.orphan_packs {
         // Always honour the live-pack guard, including under --force.
         // See the recompute comment above and issue #117 for why.
+        let referenced = list_referenced_packs(store, prefix).await?;
         if referenced.contains(sha) {
             skipped_repointed_packs += 1;
             debug!(
@@ -2105,6 +2109,103 @@ mod tests {
             "exactly one pack must survive: \
              first_survives={first_survives}, second_survives={second_survives}",
         );
+    }
+
+    #[tokio::test]
+    async fn sweep_re_derives_referenced_set_per_pack_within_tombstone() {
+        // Issue #152 regression: a concurrent push committing
+        // chain.json AFTER `sweep_one_tombstone`'s referenced-set
+        // snapshot but BEFORE a later pack in the SAME tombstone is
+        // reached must not let sweep delete the now-live pack.
+        //
+        // Layout: one stale tombstone naming TWO orphan packs (the
+        // shape `mark()` produces — every orphan SHA for a run goes
+        // into one tombstone body). The post-delete hook fires on
+        // the FIRST `packs/` delete (the first pack's `.pack` key,
+        // mid-iter-1) and writes a chain.json that references the
+        // SECOND pack — simulating a concurrent push that landed
+        // after the per-tombstone snapshot.
+        //
+        // Pre-fix (single snapshot per tombstone, taken before the
+        // loop): `referenced` is empty for both iterations and both
+        // packs are deleted (`deleted_objects = 4`,
+        // `skipped_repointed_packs = 0`). Post-fix (per-pack
+        // recompute): the second iteration's fresh recompute picks
+        // up the new chain and skips the delete
+        // (`deleted_objects = 2`, `skipped_repointed_packs = 1`).
+        //
+        // The pack order inside `orphan_packs` is the Vec insertion
+        // order — deterministic — so the assertion is on the EXACT
+        // surviving pack key (`SHA_PACK_ORPHAN_2`), not a generic
+        // "one of two survives". This catches a regression that
+        // dropped the recompute entirely (both deleted) AND a
+        // regression that kept the recompute but forgot to skip on
+        // re-reference (would also delete the second pack).
+        let inner = MockStore::new();
+        let stale = (OffsetDateTime::now_utc() - time::Duration::hours(48))
+            .format(&Rfc3339)
+            .unwrap();
+        write_tombstone(
+            &inner,
+            "repo",
+            &stale,
+            sha_set([SHA_PACK_ORPHAN, SHA_PACK_ORPHAN_2]),
+        );
+        insert_pack_pair(&inner, Some("repo"), SHA_PACK_ORPHAN);
+        insert_pack_pair(&inner, Some("repo"), SHA_PACK_ORPHAN_2);
+
+        // Fire on the first `packs/` delete (the first pack's `.pack`
+        // key) — strictly between the two `orphan_packs` iterations
+        // from the caller's perspective: iter-1's deletes complete,
+        // iter-2 has not yet run its `list_referenced_packs`. The
+        // hook writes a chain.json that re-references the SECOND
+        // pack, which the per-pack recompute must observe.
+        let store = PostDeleteHookStore::new(inner, "repo/packs/", |inner| {
+            let chain = ChainManifest {
+                v: 1,
+                tip: sha40(SHA_TIP),
+                full_at: sha40(SHA_FULL),
+                segments: vec![segment(SHA_PACK_ORPHAN_2, None)],
+            };
+            let body =
+                serde_json::to_vec_pretty(&chain).expect("chain.json serializes for the test");
+            inner.insert("repo/refs/heads/concurrent/chain.json", Bytes::from(body));
+        });
+
+        let outcome = sweep(&store, "repo", SweepOpts::default()).await.unwrap();
+        assert_eq!(outcome.swept_tombstones, 1);
+        // First pack: deleted (.pack + .idx = 2). Second pack: skipped
+        // because the per-pack recompute saw the freshly-committed
+        // chain referencing it.
+        assert_eq!(
+            outcome.deleted_objects, 2,
+            "only the first pack's pair deleted; the second was re-referenced",
+        );
+        assert_eq!(
+            outcome.skipped_repointed_packs, 1,
+            "second iteration's per-pack recompute must skip the re-referenced pack",
+        );
+        // Exact surviving pack: the second one (the one the
+        // concurrent push re-referenced). Asserting on the specific
+        // key — not a broad "one survives" — catches a regression
+        // that flipped the iteration order or skipped the wrong pack.
+        store
+            .inner
+            .get_bytes(&format!("repo/packs/{SHA_PACK_ORPHAN_2}.pack"))
+            .await
+            .expect("re-referenced pack must survive");
+        store
+            .inner
+            .get_bytes(&format!("repo/packs/{SHA_PACK_ORPHAN_2}.idx"))
+            .await
+            .expect("re-referenced pack idx must survive");
+        // First pack is gone.
+        let first_err = store
+            .inner
+            .get_bytes(&format!("repo/packs/{SHA_PACK_ORPHAN}.pack"))
+            .await
+            .unwrap_err();
+        assert!(matches!(first_err, ObjectStoreError::NotFound(_)));
     }
 
     #[tokio::test]
