@@ -17,19 +17,20 @@
 # bundle directly via the Rust test binary's entry point.
 # ---------------------------------------------------------------------------
 
-# build_bundle <repo_dir> <bundle_dir> <sha>
-# Create a bundle at <bundle_dir>/<sha>.bundle by running the Rust unit test
-# that exercises bundle::create. We delegate to `cargo test` to keep the
-# spec free of Rust-compilation setup.
+# _build_bundle_via_cargo
+# Run the Rust unit test that exercises bundle::create / unbundle. The
+# spec asserts BOTH that cargo exits 0 AND that the test name appears in
+# stdout, so a regression where cargo filters to zero tests (e.g. the
+# test is renamed and the spec's filter no longer matches) is caught
+# even though `cargo test` returns 0 with no matching tests.
+#
+# Stdout must therefore carry cargo's full output on success too — not
+# just on failure. The previous implementation only echoed on non-zero
+# exit, leaving the "output should include …" assertion comparing
+# against an empty string.
 _build_bundle_via_cargo() {
-    local out
-    out=$(cargo test --manifest-path "${BASE_DIR}/Cargo.toml" \
-        -- bundle_unbundle_round_trips_natively 2>&1)
-    local status=$?
-    if ((status != 0)); then
-        echo "$out" >&2
-    fi
-    return "$status"
+    cargo test --manifest-path "${BASE_DIR}/Cargo.toml" \
+        -- bundle_unbundle_round_trips_natively 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -82,6 +83,14 @@ Describe "git bundle v2 format (native implementation)"
     It "git bundle verify accepts the bundle"
       When run git bundle verify "$BUNDLE_DIR/test.bundle"
       The status should equal 0
+      # `git bundle verify` prints the ref list to stdout and a final
+      # `<path> is okay` line to stderr on success (stable wording
+      # since at least git 2.30). Pinning the stderr token catches a
+      # regression where the bundle is structurally invalid yet git
+      # somehow exits 0 (vacuous status-only assertion), and silences
+      # the shellspec "unmatched output" warning.
+      The stderr should include "is okay"
+      The stdout should include "complete history"
     End
   End
 End

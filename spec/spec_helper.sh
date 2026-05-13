@@ -75,6 +75,19 @@ unset GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS
 SHELLSPEC_TMP_HOME="$(mktemp -d)"
 export XDG_CONFIG_HOME="${SHELLSPEC_TMP_HOME}/config"
 export XDG_DATA_HOME="${SHELLSPEC_TMP_HOME}/data"
+# Pin RUSTUP_HOME / CARGO_HOME to the operator's real ones BEFORE the
+# HOME swap so a rustup-proxied `cargo` (as used by `bundle_format_spec.sh`)
+# can still find its toolchain config. Without this, `cargo` invoked
+# from a spec aborts with "rustup could not choose a version of cargo
+# to run, because one wasn't specified explicitly, and no default is
+# configured." Only export when the directories actually exist — on
+# system-cargo hosts (no rustup) the vars must stay unset.
+if [[ -z "${RUSTUP_HOME:-}" && -d "${HOME}/.rustup" ]]; then
+	export RUSTUP_HOME="${HOME}/.rustup"
+fi
+if [[ -z "${CARGO_HOME:-}" && -d "${HOME}/.cargo" ]]; then
+	export CARGO_HOME="${HOME}/.cargo"
+fi
 if [[ "${LIVE_S3:-0}" != "1" && "${LIVE_AZ:-0}" != "1" ]]; then
 	export HOME="${SHELLSPEC_TMP_HOME}"
 fi
