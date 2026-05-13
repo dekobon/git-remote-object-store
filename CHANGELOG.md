@@ -167,6 +167,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Azure `?zip=1` pushes now land the zip artifact (#161). The
+  zip-only `put_path` previously attached a
+  `codepipeline-artifact-revision-summary` user-metadata entry whose
+  hyphenated key is invalid on Azure (metadata names must be valid
+  C# identifiers). Azure rejected the upload, and the issue #127
+  best-effort swallow path hid the failure, so every `?zip=1` push
+  to an Azure remote reported success while silently omitting
+  `<prefix>/<ref>/repo.zip`. `perform_push_under_lock` now gates the
+  metadata on `BackendKind::S3` (where AWS CodePipeline consumes it);
+  Azure pushes attach only `Content-Disposition`. The deferred
+  happy-path mirror left open by the #142 cross-backend coverage
+  (`push_with_zip_uploads_artifact` against Azurite) is now wired up.
 - Bundle-engine `git push :<ref>` now serializes against concurrent
   pushes by listing and sweeping under the per-ref lock, eliminating a
   silent false-success race window (#133).

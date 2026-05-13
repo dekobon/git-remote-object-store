@@ -384,6 +384,15 @@ impl RemoteUrl {
             Self::S3 { flags, .. } | Self::Azure { flags, .. } => flags,
         }
     }
+
+    /// Returns the backend kind discriminant.
+    #[must_use]
+    pub const fn kind(&self) -> BackendKind {
+        match self {
+            Self::S3 { .. } => BackendKind::S3,
+            Self::Azure { .. } => BackendKind::Azure,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

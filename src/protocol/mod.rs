@@ -396,7 +396,8 @@ where
                             .await?;
                         }
                         (Mode::Push, StorageEngine::Bundle) => {
-                            let outcomes = push_batch(&ctx, zip, engine, cmds).await?;
+                            let outcomes =
+                                push_batch(&ctx, remote.kind(), zip, engine, cmds).await?;
                             write_push_outcomes(&mut writer, &outcomes).await?;
                         }
                         (Mode::Push, StorageEngine::Packchain) => {

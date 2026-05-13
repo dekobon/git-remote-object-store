@@ -24,7 +24,7 @@ use tracing::{debug, info, warn};
 use crate::git::{self, GitError, RefName, RefNameError, Sha, ShaError, is_valid_ref_name};
 use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, ProgressSink, PutOpts};
-use crate::url::StorageEngine;
+use crate::url::{BackendKind, StorageEngine};
 
 /// Default per-ref lock TTL, in seconds.
 /// Default lock TTL (seconds) when [`ENV_LOCK_TTL_SECONDS`] is unset
@@ -53,6 +53,14 @@ struct PushConfig {
     engine: StorageEngine,
     /// Per-ref lock TTL.
     ttl: Duration,
+    /// Backend kind of the destination. Used by the zip-artifact path to
+    /// decide whether to attach the `codepipeline-artifact-revision-summary`
+    /// user-metadata header — that header is meaningful only on S3
+    /// (AWS `CodePipeline` consumes it) and the hyphenated key is invalid on
+    /// Azure, where it would otherwise cause the entire zip upload to fail
+    /// silently under the issue #127 best-effort swallow contract.
+    /// See issue #161.
+    kind: BackendKind,
 }
 
 /// Environment override for the lock TTL, in seconds.
@@ -597,6 +605,7 @@ async fn upload_zip_artifact_best_effort(
 /// [`PushOutcome::Error`] and the batch continues.
 pub(crate) async fn push_batch(
     ctx: &super::BatchCtx,
+    kind: BackendKind,
     zip: bool,
     engine: StorageEngine,
     cmds: Vec<String>,
@@ -610,6 +619,7 @@ pub(crate) async fn push_batch(
         zip,
         engine,
         ttl: lock_ttl_from_env(),
+        kind,
     };
     let mut outcomes = Vec::with_capacity(cmds.len());
 
@@ -1001,7 +1011,9 @@ async fn push_one(
     };
 
     let result = match work {
-        UnderLockWork::Push(state) => perform_push_under_lock(store.as_ref(), prefix, *state).await,
+        UnderLockWork::Push(state) => {
+            perform_push_under_lock(store.as_ref(), prefix, config.kind, *state).await
+        }
         UnderLockWork::Delete { remote_ref, zip } => {
             delete_remote_ref_under_lock(store.as_ref(), prefix, &remote_ref, zip, &lock).await
         }
@@ -1042,6 +1054,7 @@ enum UnderLockWork {
 async fn perform_push_under_lock(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
+    kind: BackendKind,
     state: PushReadyState,
 ) -> Result<PushOutcome, PushError> {
     let PushReadyState {
@@ -1156,15 +1169,28 @@ async fn perform_push_under_lock(
             .await
             .map(|m| m.len())
             .ok();
+        // Issue #161: the `codepipeline-artifact-revision-summary` user
+        // metadata is only meaningful on S3 (AWS CodePipeline consumes it
+        // as `x-amz-meta-codepipeline-artifact-revision-summary`). Azure
+        // metadata names must be valid C# identifiers (no hyphens), so
+        // attaching the header on the Azure path causes the entire blob
+        // upload to fail with `InvalidMetadata` — and the issue #127
+        // best-effort swallow then hides the failure, leaving every
+        // `?zip=1` push silently missing `repo.zip`. Omit the header
+        // outside S3 so the zip artifact lands successfully.
+        let user_metadata = match kind {
+            BackendKind::S3 => vec![(
+                "codepipeline-artifact-revision-summary".to_owned(),
+                sanitize_metadata_value(&artifacts.commit_msg),
+            )],
+            BackendKind::Azure => Vec::new(),
+        };
         let opts = PutOpts {
             content_disposition: Some(format!(
                 "attachment; filename=repo-{}.zip",
                 artifacts.short_sha
             )),
-            user_metadata: vec![(
-                "codepipeline-artifact-revision-summary".to_owned(),
-                sanitize_metadata_value(&artifacts.commit_msg),
-            )],
+            user_metadata,
             progress: Some(bundle_progress_sink(&zip_dest, zip_total)),
         };
         upload_zip_artifact_best_effort(
@@ -2358,7 +2384,9 @@ mod tests {
             _temp_dir: temp_dir,
         };
 
-        perform_push_under_lock(store, prefix, state).await.unwrap()
+        perform_push_under_lock(store, prefix, BackendKind::S3, state)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -2460,7 +2488,7 @@ mod tests {
         let existing_key = format!("repo/refs/heads/main/{OTHER_SHA}.bundle");
         store.insert(&existing_key, Bytes::from_static(b"old bundle"));
         let state = push_state_with_pre_existing(None);
-        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+        let outcome = perform_push_under_lock(&store, Some("repo"), BackendKind::S3, state)
             .await
             .unwrap();
         assert!(
@@ -2482,7 +2510,7 @@ mod tests {
         let old_key = format!("repo/refs/heads/main/{SHA}.bundle");
         let state = push_state_with_pre_existing(Some(old_key.clone()));
         // Store is empty — the previously-seen bundle is gone.
-        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+        let outcome = perform_push_under_lock(&store, Some("repo"), BackendKind::S3, state)
             .await
             .unwrap();
         assert!(
@@ -2507,7 +2535,7 @@ mod tests {
         // Under-lock the store shows the *new* key.
         store.insert(&new_key, Bytes::from_static(b"new bundle"));
         let state = push_state_with_pre_existing(Some(old_key));
-        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+        let outcome = perform_push_under_lock(&store, Some("repo"), BackendKind::S3, state)
             .await
             .unwrap();
         assert!(
@@ -2539,7 +2567,7 @@ mod tests {
         );
         // Pre-lock snapshot saw zero bundles; under-lock sees two.
         let state = push_state_with_pre_existing(None);
-        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+        let outcome = perform_push_under_lock(&store, Some("repo"), BackendKind::S3, state)
             .await
             .unwrap();
         assert!(
@@ -2584,7 +2612,7 @@ mod tests {
         // new bundle at `bundle_dest` and deletes the old one.
         store.insert(&pre_key, Bytes::from_static(b"old bundle"));
         let state = push_state_with_pre_existing(Some(pre_key.clone()));
-        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+        let outcome = perform_push_under_lock(&store, Some("repo"), BackendKind::S3, state)
             .await
             .unwrap();
         assert!(
@@ -2638,7 +2666,7 @@ mod tests {
         });
 
         let state = push_state_with_pre_existing(Some(pre_key.clone()));
-        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+        let outcome = perform_push_under_lock(&store, Some("repo"), BackendKind::S3, state)
             .await
             .expect("push must succeed even when prior-bundle delete fails");
         assert!(
@@ -2716,7 +2744,7 @@ mod tests {
             key: zip_dest.clone(),
         });
 
-        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+        let outcome = perform_push_under_lock(&store, Some("repo"), BackendKind::S3, state)
             .await
             .expect("push must succeed even when zip upload fails");
         assert!(
@@ -2740,6 +2768,93 @@ mod tests {
             !store.contains(&zip_dest),
             "zip key must be absent when the upload fault fires",
         );
+    }
+
+    /// Issue #161: on S3 the zip-artifact upload must carry the
+    /// `codepipeline-artifact-revision-summary` user-metadata header so
+    /// AWS `CodePipeline` can consume the commit summary. On Azure the
+    /// same hyphenated key is rejected by the service (metadata names
+    /// must be valid C# identifiers), and the issue #127 swallow path
+    /// then hides the upload failure — silently dropping every zip
+    /// artifact. The fix only emits the metadata on S3; this pair of
+    /// tests pins both halves of the contract against `MockStore`,
+    /// which records `user_metadata` verbatim and lets us inspect it
+    /// without standing up a live backend.
+    #[tokio::test]
+    async fn perform_push_under_lock_emits_codepipeline_metadata_on_s3() {
+        let (store, zip_dest) = run_zip_push(BackendKind::S3).await;
+        let meta = store.metadata(&zip_dest).expect("zip stored");
+        let summary = meta
+            .user_metadata
+            .iter()
+            .find(|(k, _)| k == "codepipeline-artifact-revision-summary")
+            .expect("S3 push must attach the CodePipeline revision-summary metadata");
+        assert_eq!(summary.1, "test commit");
+    }
+
+    #[tokio::test]
+    async fn perform_push_under_lock_omits_codepipeline_metadata_on_azure() {
+        let (store, zip_dest) = run_zip_push(BackendKind::Azure).await;
+        let meta = store.metadata(&zip_dest).expect("zip stored");
+        assert!(
+            meta.user_metadata.is_empty(),
+            "Azure push must not attach hyphenated CodePipeline metadata; \
+             got {entries:?}",
+            entries = meta.user_metadata,
+        );
+    }
+
+    /// Drive a single `?zip=1` push through `perform_push_under_lock` for
+    /// the given backend kind, returning the store and the zip key so
+    /// each test can assert on `user_metadata` independently. Centralised
+    /// here so an accidental drift between the S3 and Azure variants
+    /// (different `commit_msg`, different prefix, different ref) cannot
+    /// hide a regression in the metadata wiring.
+    async fn run_zip_push(kind: BackendKind) -> (MockStore, String) {
+        let store = MockStore::new();
+        let r = rn("refs/heads/main");
+        let temp_dir = tempfile::Builder::new()
+            .prefix("test_push_")
+            .tempdir()
+            .unwrap();
+        let bundle_path = temp_dir.path().join("bundle");
+        std::fs::write(&bundle_path, b"fake bundle").unwrap();
+
+        let archive_tempdir = tempfile::Builder::new()
+            .prefix("test_zip_")
+            .tempdir()
+            .unwrap();
+        let archive_path = archive_tempdir.path().join("repo.zip");
+        std::fs::write(&archive_path, b"fake zip body").unwrap();
+
+        let state = PushReadyState {
+            remote_ref: r,
+            local_sha: Sha::from_hex(SHA).unwrap(),
+            pre_existing: None,
+            bundle_path,
+            zip_artifacts: Some(ZipArtifacts {
+                archive_path,
+                short_sha: "deadbeef".to_owned(),
+                commit_msg: "test commit".to_owned(),
+                _tempdir: archive_tempdir,
+            }),
+            engine: StorageEngine::Bundle,
+            force: false,
+            pre_existing_was_ancestor: true,
+            local_spec: "refs/heads/main".to_owned(),
+            _temp_dir: temp_dir,
+        };
+
+        let outcome = perform_push_under_lock(&store, Some("repo"), kind, state)
+            .await
+            .expect("push must succeed");
+        assert!(matches!(outcome, PushOutcome::Ok { .. }));
+        let zip_dest = "repo/refs/heads/main/repo.zip".to_owned();
+        assert!(
+            store.contains(&zip_dest),
+            "zip artifact must land on bucket"
+        );
+        (store, zip_dest)
     }
 
     // --- delete_remote_ref_under_lock ---------------------------------
@@ -2983,7 +3098,7 @@ mod tests {
             local_spec: "refs/heads/main".to_owned(),
             _temp_dir: temp_dir,
         };
-        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+        let outcome = perform_push_under_lock(&store, Some("repo"), BackendKind::S3, state)
             .await
             .unwrap();
         assert!(
@@ -3096,7 +3211,7 @@ mod tests {
         let mut state = push_state_with_pre_existing(Some(pre_key.clone()));
         state.force = true;
         state.pre_existing_was_ancestor = false;
-        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+        let outcome = perform_push_under_lock(&store, Some("repo"), BackendKind::S3, state)
             .await
             .unwrap();
         assert!(
@@ -3137,7 +3252,7 @@ mod tests {
         let mut state = push_state_with_pre_existing(Some(pre_key.clone()));
         state.force = true;
         state.pre_existing_was_ancestor = true; // FF case.
-        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+        let outcome = perform_push_under_lock(&store, Some("repo"), BackendKind::S3, state)
             .await
             .unwrap();
         assert!(
@@ -3163,7 +3278,7 @@ mod tests {
         let mut state = push_state_with_pre_existing(Some(pre_key.clone()));
         state.force = true;
         state.pre_existing_was_ancestor = false; // non-FF force-push.
-        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+        let outcome = perform_push_under_lock(&store, Some("repo"), BackendKind::S3, state)
             .await
             .unwrap();
         assert!(
@@ -3210,7 +3325,7 @@ mod tests {
         let mut state = push_state_with_pre_existing(None);
         state.force = false;
         state.pre_existing_was_ancestor = false;
-        let outcome = perform_push_under_lock(&store, Some("repo"), state)
+        let outcome = perform_push_under_lock(&store, Some("repo"), BackendKind::S3, state)
             .await
             .unwrap();
         assert!(

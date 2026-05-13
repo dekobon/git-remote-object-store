@@ -1452,17 +1452,19 @@ async fn push_with_zip_put_fault_succeeds_and_omits_zip() {
     common::zip_fault::push_with_zip_put_fault_succeeds_and_omits_zip(store, url).await;
 }
 
-// NOTE: the happy-path counterpart that lives on the S3 side
-// (`push_with_zip_uploads_artifact` in `s3_store_integration.rs`) is
-// not currently mirrored here. `upload_zip_artifact_best_effort` in
-// `src/protocol/push.rs` sets a `user_metadata` entry keyed
-// `codepipeline-artifact-revision-summary`; Azure rejects metadata
-// keys that are not valid C# identifiers (no hyphens — see the doc
-// comment on the metadata-survival test above at the `customkey`
-// example). The production swallow path catches the resulting
-// put_path error and reports success, so the push works correctly —
-// but the zip artifact never lands on Azure. A live happy-path test
-// that asserts `zip key present` would therefore fail every run.
-// Tracked in issue #161; until the metadata key is made
-// Azure-friendly (or its emission gated on the backend), only the
-// fault-injection test runs here.
+/// Happy-path counterpart of `push_with_zip_put_fault_succeeds_and_omits_zip`
+/// against Azurite. Issue #161: the `codepipeline-artifact-revision-summary`
+/// user-metadata header is only attached on S3 (where AWS `CodePipeline`
+/// consumes it). Attaching it on Azure failed every `?zip=1` upload
+/// because Azure metadata names must be valid C# identifiers (no hyphens),
+/// and the issue #127 swallow path hid the failure — every push silently
+/// dropped its zip artifact. This test pins the fixed behaviour: a clean
+/// `?zip=1` push against Azurite lands both the bundle and the zip
+/// artifact at their documented keys. A regression that reintroduced the
+/// hyphenated metadata key on Azure would surface here as
+/// `object not found: <prefix>/refs/heads/main/repo.zip`.
+#[tokio::test]
+async fn push_with_zip_uploads_artifact() {
+    let (store, url) = fresh_zip_container().await;
+    common::zip_fault::push_with_zip_uploads_artifact(store, url).await;
+}
