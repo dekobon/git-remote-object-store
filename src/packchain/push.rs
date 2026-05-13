@@ -33,7 +33,7 @@ use crate::url::StorageEngine;
 
 use super::PackchainError;
 use super::gc::write_baseline_tombstone_best_effort;
-use super::keys::{chain_key, pack_idx_key, pack_key};
+use super::keys::{chain_key, pack_idx_key, pack_key, path_index_key};
 use super::manifest::{load_chain, next_manifest, write_chain, write_path_index};
 use super::pack::{BuiltPack, build_baseline_pack, build_incremental_pack};
 use super::schema::{ChainManifest, ChainSegment, Sha40};
@@ -773,13 +773,21 @@ async fn perform_push_under_lock(
     //    via `path_index.tip == chain.tip` and surface
     //    `TransientChainPathIndexMismatch` (issue #114) — far less
     //    confusing than the `BlobNotInChain` the reverse ordering
-    //    would produce. Skipped for blob-tipped chains; readers detect
-    //    absence and fall back to "no path-index available," the
-    //    correct contract for a leaf blob.
-    if let Some(ref index) = path_index {
-        write_path_index(store, prefix, &remote_ref, index)
+    //    would produce. For blob-tipped chains there is no tree to
+    //    index, so the file must be ABSENT in the steady state. A
+    //    force-push from a tree/commit tip to a blob tip leaves a
+    //    stale `path-index.json` from the previous push that would
+    //    permanently trip `TransientChainPathIndexMismatch` for any
+    //    `read_blob` against this ref (issue #156). Delete it after
+    //    chain.json so the post-rewrite ordering remains
+    //    "chain.json then path-index.json" — a crash in the window
+    //    leaves the transient mismatch on the next read, not a
+    //    permanent inconsistency.
+    match path_index.as_ref() {
+        Some(index) => write_path_index(store, prefix, &remote_ref, index)
             .await
-            .map_err(PushError::Packchain)?;
+            .map_err(PushError::Packchain)?,
+        None => delete_idempotent(store, &path_index_key(prefix, &remote_ref)).await?,
     }
 
     // 9. Force-push old-baseline cleanup (best-effort, post-commit).

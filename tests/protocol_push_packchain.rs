@@ -1247,3 +1247,77 @@ async fn first_push_of_bare_blob_ref_lands_pack_with_blob_only() {
         "blob-tipped chains must not write path-index.json",
     );
 }
+
+#[tokio::test]
+async fn force_push_from_commit_to_blob_tip_removes_stale_path_index() {
+    // #156: A ref initially pushed as a commit/tree tip writes a
+    // `path-index.json`. If the same ref is later force-pushed to a
+    // blob-tipped object (a supported shape), the engine intentionally
+    // omits `path-index.json` on the new push. Without symmetric
+    // cleanup, the file from the prior push lingers forever — its
+    // `tip` field still names the old commit while `chain.tip` names
+    // the new blob, which permanently trips the #114
+    // `TransientChainPathIndexMismatch` guard on every `read_blob`
+    // against this ref. The push commit path must delete the stale
+    // file when the new tip has no path index.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let (seed, _shas) = make_seed_repo(1, "primary");
+
+    // Step 1: push the seed repo's `refs/heads/main` (commit-tipped).
+    let store = Arc::new(MockStore::new());
+    let (_, r1) = drive_in(
+        s3_url_packchain(Some("repo")),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push refs/heads/main:refs/heads/main\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    r1.expect("first push must succeed");
+
+    // Step 2: confirm path-index.json was written for the commit-tipped
+    // ref — without this precondition, the post-condition is vacuous.
+    let path_index_key = "repo/refs/heads/main/path-index.json";
+    assert!(
+        store.contains(path_index_key),
+        "commit-tipped first push must write path-index.json",
+    );
+
+    // Step 3: create a fresh blob in the seed repo and force-push the
+    // SAME remote ref (`refs/heads/main`) at the blob OID. The local
+    // side just needs an unrelated local ref that points at the blob;
+    // `update-ref refs/blob-ref <blob_oid>` is the shortest spelling.
+    std::fs::write(seed.path().join("blob-target"), b"force-target\n").unwrap();
+    let blob_oid = git_capture(&["hash-object", "-w", "blob-target"], seed.path())
+        .trim()
+        .to_owned();
+    git(&["update-ref", "refs/blob-ref", &blob_oid], seed.path());
+    let (out, r2) = drive_in(
+        s3_url_packchain(Some("repo")),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "push +refs/blob-ref:refs/heads/main\n\n",
+        seed.path().to_path_buf(),
+    )
+    .await;
+    r2.expect("force-push to blob tip must succeed");
+    assert_eq!(std::str::from_utf8(&out).unwrap(), "ok refs/heads/main\n\n");
+
+    // Step 4: chain.json reflects the blob tip — establishes the
+    // baseline against which a stale path-index.json would mismatch.
+    let chain = read_chain(&store, "repo");
+    assert_eq!(
+        chain["tip"], blob_oid,
+        "force-push must rewrite chain.tip to the blob OID",
+    );
+
+    // Step 5: the stale path-index.json must be gone. This is the
+    // bug fixed by #156: without symmetric cleanup the file remained,
+    // permanently desynchronised from chain.tip.
+    assert!(
+        !store.contains(path_index_key),
+        "force-push to blob tip must remove the stale path-index.json from \
+         the prior commit-tipped push",
+    );
+}
