@@ -436,7 +436,7 @@ mod tests {
         // turns the resulting error into a clean exit. RunError
         // must classify it as `is_broken_pipe()` so the bin's
         // `Err(other) if other.is_broken_pipe()` arm fires.
-        use tokio::io::{AsyncWrite, ErrorKind, duplex};
+        use tokio::io::duplex;
 
         // A writer that returns BrokenPipe immediately. A `duplex`
         // pair where the read half is dropped achieves this.
@@ -457,14 +457,6 @@ mod tests {
         assert!(
             err.is_broken_pipe(),
             "init-ack BrokenPipe must be classified as broken-pipe, got: {err:?}"
-        );
-
-        // Suppress the unused-import warning for AsyncWrite/ErrorKind
-        // when the expectations above already pass — the imports
-        // document the writer kind we're using.
-        let _ = (
-            std::marker::PhantomData::<dyn AsyncWrite>,
-            ErrorKind::BrokenPipe,
         );
     }
 

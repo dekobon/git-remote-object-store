@@ -268,16 +268,6 @@ pub enum GitError {
     /// `.git/config.lock`, `.git/shallow.lock`).
     #[error(transparent)]
     ConfigLock(Box<gix_lock::acquire::Error>),
-    /// Reading the `HEAD` reference failed.
-    #[error(transparent)]
-    HeadLookup(Box<gix::reference::find::existing::Error>),
-    /// `HEAD`'s referent name is not valid UTF-8.
-    #[error("HEAD ref name is not valid UTF-8")]
-    NonUtf8HeadRef {
-        /// Underlying decode error.
-        #[source]
-        source: std::str::Utf8Error,
-    },
     /// A tag chain visited the same OID twice — i.e. a cycle. Real git
     /// objects cannot form cycles (each tag's OID is determined by the
     /// SHA-1 of its content, which includes the target OID, so a cycle
@@ -335,12 +325,6 @@ impl From<gix_config_init::Error> for GitError {
 impl From<gix_lock::acquire::Error> for GitError {
     fn from(e: gix_lock::acquire::Error) -> Self {
         GitError::ConfigLock(Box::new(e))
-    }
-}
-
-impl From<gix::reference::find::existing::Error> for GitError {
-    fn from(e: gix::reference::find::existing::Error) -> Self {
-        GitError::HeadLookup(Box::new(e))
     }
 }
 
