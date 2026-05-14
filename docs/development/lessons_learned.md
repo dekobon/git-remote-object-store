@@ -137,7 +137,7 @@ was found by audit, not by the test suite. The strengthened test now
 pins the byte-exact line.
 
 **Shallow-boundary depth-reset test used a root commit that made the
-test vacuous** (#50, d32741cb). The `depth_resets_between_batches`
+test vacuous** (#50, d32741c). The `depth_resets_between_batches`
 integration test sent a second fetch batch targeting an orphan (root)
 commit — a commit with no parents. `shallow_boundaries` on a root
 commit always returns `[]` for any depth value because there are no
@@ -463,5 +463,139 @@ helper-consolidation half; this lesson covers the API-choice half
 on wire bytes; this one covers production-code existence and
 equality checks on bucket keys. Same family of trap, different
 surface.
+
+---
+
+## 13. Re-verify state under the lock, immediately before the destructive write
+
+When a code path lists or snapshots remote state at time T1 and
+performs a destructive operation (delete, overwrite, marker write)
+at time T2, the elapsed window — an operator prompt, an interactive
+selection, or another lock's worth of concurrent writes —
+invalidates whatever invariant the original check confirmed. The
+protection marker that wasn't there at T1 was written at T1 + 1s;
+the lock that was "stale" at T1 was reclaimed at T1 + 30s; the
+branch that existed at T1 was deleted at T1 + 5s. Every
+snapshot-driven destructive path that doesn't re-read under the lock
+immediately before the write is a TOCTOU bug waiting to be filed.
+The right shape is one re-list/re-HEAD under the per-ref lock,
+scoped to the exact key the next mutation touches, with no operator
+interaction or unrelated work between the re-read and the write.
+
+**Nine TOCTOU bugs filed in one batch-fix wave**
+(#128, #129, #130, #131, #132, #137, #138, #139, #140;
+commits a0ed694, 8836fd6, 27cd6d4, 3bc2ba6, 5539cbd, e9f20c6,
+9759015, a720cce, 808adbe, 50d9a8b). Several were labelled
+`security`. Representative shapes:
+
+- **`delete-branch` listed objects, prompted the user, then deleted
+  from the stale list** (#131, #139). A concurrent `protect`
+  between LIST and the deletion loop left the `PROTECTED#` marker
+  untouched while the bundles were destroyed; a concurrent push
+  added new bundle keys the deletion loop never saw, so the branch
+  survived the "delete" with the freshly-pushed content. Fix:
+  re-list under the per-ref lock after the user confirms.
+- **`doctor fix_head` wrote HEAD pointing to a branch that was
+  deleted across the operator prompt** (#138). The doctor's
+  analysis snapshot drove the candidate list; the selected branch
+  could be deleted by a concurrent `git push :main` while the
+  operator was reading the prompt. The doctor then "fixed" HEAD by
+  pointing it at the freshly-deleted branch — exactly the
+  invalid-HEAD condition it was supposed to repair. Fix: re-verify
+  branch existence right before the HEAD write.
+- **`doctor` stale-lock deletion deleted the active lock at the
+  same key** (#132). A lock seen as stale in the initial listing
+  was reclaimed by another client (via `acquire_lock` after stale
+  recovery) before the doctor reached its deletion phase, minutes
+  later. The doctor then unconditionally deleted the fresh lock —
+  same key, no HEAD/ETag check — breaking mutual exclusion. Fix:
+  re-HEAD each lock key immediately before deleting, comparing
+  live `last_modified` against the TTL.
+- **`gc sweep` reused a stale referenced-set across all
+  tombstones** (#140). `list_referenced_packs` ran once at the top
+  of `sweep()`; a concurrent push that committed a new
+  `chain.json` referencing a tombstoned pack (deterministic
+  baseline packs reproduce the same content SHA on force-push) was
+  invisible to subsequent tombstone-processing iterations, and
+  `sweep` deleted a live pack — permanent chain corruption. Fix:
+  re-derive `referenced` per tombstone inside
+  `sweep_one_tombstone`.
+
+**Lesson**: For any destructive write — delete, overwrite, marker
+put — the read that justifies it must happen under the same lock
+window and immediately before the write, with nothing in between
+(no operator prompts, no analysis, no iteration over a snapshot).
+When reviewing a snapshot-driven flow, find the LIST/HEAD that
+drives the decision and trace forward to the destructive call: if
+the path crosses a lock release, an interactive prompt, or a loop
+boundary, the invariant has expired. The fix shape is invariant
+across callers — re-read under the lock, scope the re-read to the
+exact key the next mutation will touch, and surface any divergence
+from the snapshot rather than papering over it. Related to
+lesson #11 (`--force` flag scope): that lesson is about flag
+bundling; this one is about temporal staleness — both manifest as
+"the safety check ran, but the destructive action no longer
+satisfies the safety it claimed to satisfy."
+
+---
+
+## 14. After the durable commit lands, subsidiary work is best-effort
+
+Once the contractual on-bucket write that defines "the operation
+happened" is durable (bundle uploaded, `chain.json` committed), any
+subsequent step in the same function — prior-bundle delete,
+baseline cleanup, optional artifact upload — is no longer
+load-bearing for the protocol's success contract. If those
+subsequent steps return errors via `?`, the protocol reports
+failure to the user even though git operations against the bucket
+would already succeed. The user sees "push failed" with the git
+data live on the backend; their retry succeeds because the durable
+write is idempotent at its key, but the message they read first
+lied about the remote state. The fix shape is to swallow
+non-protocol errors with a `warn!` containing the orphan key, log
+enough context for an operator to either re-push or run a future
+repair workflow, and return success to the protocol.
+
+**Three propagated-error bugs after the durable commit, one wave
+apart** (#113, #121, #127; commits b816ae8, 58d0ed1, dcce5e2). All
+three sit inside the same `perform_push_under_lock` (or
+`compact_under_lock`) function, one frame past the bundle /
+`chain.json` upload:
+
+- **Compact's prior baseline delete propagated transient store
+  errors** (#113, earlier wave). The new chain was already
+  durable; the old baseline delete (`delete_idempotent` on the
+  prior `<full_at>.bundle`) returned `?`, surfacing
+  `PushError::Store` and reporting compact as failed. The orphan
+  baseline survived; the next compact reattempt observed two
+  baselines and tripped invariant checks.
+- **Force-push old-bundle delete had the same shape, two frames
+  over** (#121, 58d0ed1). The same `delete_idempotent(store,
+  &prev).await?;` pattern in `perform_push_under_lock`, this time
+  for the prior ref-prefix bundle. Found during `/batch-fix` Wave
+  2 review of the #113 fix.
+- **Optional `?zip=1` CodePipeline artifact upload propagated
+  put_path errors** (#127, dcce5e2). The bundle, `HEAD`, and
+  `FORMAT` were all durable; the trailing
+  `store.put_path(&zip_dest, &artifacts.archive_path, opts).await?`
+  for the optional zip artifact propagated, failing the push for
+  what is explicitly a CodePipeline-side convenience surface (not
+  a git-protocol surface). Same shape, three frames over.
+
+**Lesson**: Identify the single line in each protocol entry
+function that constitutes the durable commit (the
+`put_path`/`put_bytes` whose success defines "the operation
+happened"). Everything after that line is best-effort: cleanup,
+optional artifacts, observability writes. Audit the `?` operators
+after that point — each one is a potential "succeeded on the
+bucket, failed to the user" bug. Replace them with a small
+`_best_effort` helper that logs `warn!` with the ref path and
+orphan key, and returns success to the protocol. Related to
+lesson #10 (multi-file manifest writes need ordered durability +
+typed mismatch error): #10 is about *write ordering* — what must
+be written first so a crash leaves a recoverable state; this one
+is about *error handling on the work that runs after the
+contractual write* — what must not fail-loud once the protocol
+contract is already met.
 
 ---
