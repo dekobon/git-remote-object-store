@@ -272,6 +272,73 @@ fn parse_command(line: &str) -> Option<Command> {
     None
 }
 
+/// Session-fixed values [`flush_batch`] needs for engine dispatch.
+/// Built once at the top of [`run`] so the flush call site doesn't have
+/// to repeat the borrow list.
+struct FlushCtx<'a> {
+    batch_ctx: &'a BatchCtx,
+    remote: &'a RemoteUrl,
+    engine: StorageEngine,
+    zip: bool,
+    fetched_refs: &'a FetchedRefs,
+}
+
+/// Drain `batch` (if non-empty), dispatching to the engine-specific
+/// fetch / push handler, then emit the mandatory blank-line ack. `depth`
+/// is consumed for fetches so it applies to *this* batch only — git
+/// re-issues `option depth` for each shallow operation.
+async fn flush_batch<W>(
+    flush: &FlushCtx<'_>,
+    batch: &mut BatchState,
+    depth: &mut Option<NonZeroU32>,
+    writer: &mut W,
+) -> Result<(), ProtocolError>
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Some((mode, cmds)) = batch.take_pending() {
+        match (mode, flush.engine) {
+            (Mode::Fetch, StorageEngine::Bundle) => {
+                fetch_batch(
+                    flush.batch_ctx,
+                    cmds,
+                    flush.fetched_refs.clone(),
+                    depth.take(),
+                )
+                .await?;
+            }
+            (Mode::Fetch, StorageEngine::Packchain) => {
+                crate::packchain::fetch::fetch_batch(
+                    flush.batch_ctx,
+                    cmds,
+                    flush.fetched_refs.clone(),
+                    depth.take(),
+                )
+                .await?;
+            }
+            (Mode::Push, StorageEngine::Bundle) => {
+                let outcomes = push_batch(
+                    flush.batch_ctx,
+                    flush.remote.kind(),
+                    flush.zip,
+                    flush.engine,
+                    cmds,
+                )
+                .await?;
+                write_push_outcomes(writer, &outcomes).await?;
+            }
+            (Mode::Push, StorageEngine::Packchain) => {
+                let outcomes =
+                    crate::packchain::push::push_batch(flush.batch_ctx, flush.engine, cmds).await?;
+                write_push_outcomes(writer, &outcomes).await?;
+            }
+        }
+    }
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
 /// Run the helper REPL until stdin closes (clean exit) or the writer
 /// breaks (`BrokenPipe` — also a clean exit).
 ///
@@ -329,6 +396,13 @@ where
         prefix: remote.prefix().map(Arc::from),
         repo_dir: Arc::new(repo_dir),
     };
+    let flush = FlushCtx {
+        batch_ctx: &ctx,
+        remote: &remote,
+        engine,
+        zip,
+        fetched_refs: &fetched_refs,
+    };
 
     while let Some(line) = lines.next_line().await? {
         debug!(cmd = %line, "received protocol command");
@@ -372,43 +446,7 @@ where
             Command::Fetch(args) => batch.accumulate(Mode::Fetch, args),
             Command::Push(args) => batch.accumulate(Mode::Push, args),
             Command::Empty => {
-                if let Some((mode, cmds)) = batch.take_pending() {
-                    match (mode, engine) {
-                        (Mode::Fetch, StorageEngine::Bundle) => {
-                            // Take depth so it applies to *this* batch only; a
-                            // subsequent fetch without a fresh `option depth`
-                            // line must clone fully, matching git's
-                            // per-operation depth contract.
-                            fetch_batch(&ctx, cmds, fetched_refs.clone(), depth.take()).await?;
-                        }
-                        (Mode::Fetch, StorageEngine::Packchain) => {
-                            // Take depth so it applies to *this* batch only,
-                            // matching the bundle path. Packchain's shallow
-                            // fetch is sequential newest-first with
-                            // BFS-after-each (see crate::packchain::fetch's
-                            // module doc).
-                            crate::packchain::fetch::fetch_batch(
-                                &ctx,
-                                cmds,
-                                fetched_refs.clone(),
-                                depth.take(),
-                            )
-                            .await?;
-                        }
-                        (Mode::Push, StorageEngine::Bundle) => {
-                            let outcomes =
-                                push_batch(&ctx, remote.kind(), zip, engine, cmds).await?;
-                            write_push_outcomes(&mut writer, &outcomes).await?;
-                        }
-                        (Mode::Push, StorageEngine::Packchain) => {
-                            let outcomes =
-                                crate::packchain::push::push_batch(&ctx, engine, cmds).await?;
-                            write_push_outcomes(&mut writer, &outcomes).await?;
-                        }
-                    }
-                }
-                writer.write_all(b"\n").await?;
-                writer.flush().await?;
+                flush_batch(&flush, &mut batch, &mut depth, &mut writer).await?;
             }
         }
     }
