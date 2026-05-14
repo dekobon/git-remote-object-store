@@ -16,15 +16,17 @@
 //!   to re-attempt deletions a previous sweep skipped.
 //!
 //! All output is human-readable on stdout; the management CLI may
-//! `println!` per `.claude/rules/protocol-stdout.md`.
+//! write to stdout per `.claude/rules/protocol-stdout.md`. The formatter
+//! lives in [`super::gc_output`] so this subcommand and
+//! `compact --with-gc` (see [`super::compact`]) cannot drift apart.
 
-#![allow(clippy::disallowed_macros)]
-
+use std::io::Write;
 use std::sync::Arc;
 
 use tracing::info;
 
 use super::ManageError;
+use super::gc_output::{format_mark_outcome, format_sweep_outcome};
 use crate::object_store::ObjectStore;
 use crate::packchain::gc;
 
@@ -83,17 +85,23 @@ impl Gc {
     /// [`ManageError::Packchain`] for engine-level failures (corrupt
     /// `chain.json`, schema-version mismatch).
     pub async fn run(&self) -> Result<(), ManageError> {
+        // Match `Compact::run` and the helper-protocol writers: pass
+        // an unlocked `Stdout` rather than holding a `StdoutLock`
+        // across `.await` points. Holding the lock through the
+        // mark/sweep network round-trips would (a) make this future
+        // `!Send` for no reason and (b) block any other `println!`
+        // for the duration of the I/O. `Write` on `Stdout` already
+        // takes the lock per-call.
+        self.run_with_writer(&mut std::io::stdout()).await
+    }
+
+    async fn run_with_writer<W: Write>(&self, out: &mut W) -> Result<(), ManageError> {
         let store_ref = self.store.as_ref();
 
         if !self.opts.sweep_only {
             let mark_outcome = gc::mark(store_ref, &self.prefix, gc::MarkOpts::default()).await?;
-            if mark_outcome.orphan_count == 0 {
-                println!("gc mark: no orphan packs.");
-            } else {
-                println!(
-                    "gc mark: {} orphan pack(s) tombstoned (run id {}).",
-                    mark_outcome.orphan_count, mark_outcome.run_id,
-                );
+            format_mark_outcome(out, &mark_outcome)?;
+            if mark_outcome.orphan_count != 0 {
                 info!(
                     run_id = %mark_outcome.run_id,
                     key = %mark_outcome.tombstone_key,
@@ -112,17 +120,7 @@ impl Gc {
                 },
             )
             .await?;
-            if sweep_outcome.swept_tombstones == 0 && sweep_outcome.deferred_tombstones == 0 {
-                println!("gc sweep: no tombstones present.");
-            } else {
-                println!(
-                    "gc sweep: {} tombstone(s) applied, {} object(s) deleted, {} repointed pack(s) skipped, {} tombstone(s) deferred.",
-                    sweep_outcome.swept_tombstones,
-                    sweep_outcome.deleted_objects,
-                    sweep_outcome.skipped_repointed_packs,
-                    sweep_outcome.deferred_tombstones,
-                );
-            }
+            format_sweep_outcome(out, &sweep_outcome)?;
         }
         Ok(())
     }

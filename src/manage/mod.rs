@@ -13,6 +13,7 @@ pub mod branch;
 pub mod compact;
 pub mod doctor;
 pub mod gc;
+pub(crate) mod gc_output;
 pub(crate) mod snapshot;
 
 use std::fmt;

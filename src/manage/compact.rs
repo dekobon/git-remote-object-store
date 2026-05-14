@@ -17,6 +17,7 @@ use std::sync::Arc;
 use time::Duration;
 use tracing::{info, warn};
 
+use super::gc_output::{format_mark_outcome, format_sweep_outcome};
 use super::{ManageError, Prompter};
 use crate::git::RefName;
 use crate::keys;
@@ -265,14 +266,8 @@ impl<'a> Compact<'a> {
     async fn run_gc<W: Write>(&self, out: &mut W) -> Result<(), ManageError> {
         let store_ref = self.store.as_ref();
         let mark = gc::mark(store_ref, &self.prefix, gc::MarkOpts::default()).await?;
-        if mark.orphan_count == 0 {
-            writeln!(out, "gc mark: no orphan packs.")?;
-        } else {
-            writeln!(
-                out,
-                "gc mark: {} orphan pack(s) tombstoned (run id {}).",
-                mark.orphan_count, mark.run_id,
-            )?;
+        format_mark_outcome(out, &mark)?;
+        if mark.orphan_count != 0 {
             info!(
                 run_id = %mark.run_id,
                 key = %mark.tombstone_key,
@@ -288,18 +283,7 @@ impl<'a> Compact<'a> {
             },
         )
         .await?;
-        if sweep.swept_tombstones == 0 && sweep.deferred_tombstones == 0 {
-            writeln!(out, "gc sweep: no tombstones present.")?;
-        } else {
-            writeln!(
-                out,
-                "gc sweep: {} tombstone(s) applied, {} object(s) deleted, {} repointed pack(s) skipped, {} tombstone(s) deferred.",
-                sweep.swept_tombstones,
-                sweep.deleted_objects,
-                sweep.skipped_repointed_packs,
-                sweep.deferred_tombstones,
-            )?;
-        }
+        format_sweep_outcome(out, &sweep)?;
         Ok(())
     }
 
