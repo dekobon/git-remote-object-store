@@ -375,3 +375,34 @@ assert_commit_count() {
 		return 1
 	fi
 }
+
+# race_force_pushes <result_dir> <refspec> <label1> <repo1> [<label2> <repo2> ...]
+# Fork a force-push from each <repo> into the background, recording its
+# stdout/stderr at <result_dir>/<label>.log and its exit status at
+# <result_dir>/<label>.exit; then wait for every push. The processes are
+# spawned in argument order, so the caller controls which side starts
+# first — typically by coin-flipping label/repo pairs to break the
+# scheduling bias the emulators exhibit under loose `If-None-Match`
+# semantics. The refspec is force-prefixed (`+`) inside the helper to
+# match the concurrent-push contract.
+race_force_pushes() {
+	local result_dir="$1"
+	local refspec="$2"
+	shift 2
+	if (($# < 2 || $# % 2 != 0)); then
+		echo "race_force_pushes: requires at least one <label> <repo> pair (got $# trailing args)" >&2
+		return 2
+	fi
+	local pids=()
+	while [[ $# -ge 2 ]]; do
+		local label="$1" repo="$2"
+		shift 2
+		(
+			git -C "$repo" push origin "+${refspec}" \
+				>"${result_dir}/${label}.log" 2>&1
+			echo $? >"${result_dir}/${label}.exit"
+		) &
+		pids+=($!)
+	done
+	wait "${pids[@]}"
+}

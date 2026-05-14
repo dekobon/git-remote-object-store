@@ -34,9 +34,16 @@ Describe "S3 helper: concurrent push and stale-lock recovery"
 
 		# Number of iterations to spin while waiting to observe both
 		# winners. With a fair (~50/50) race the expected number of
-		# iterations to see both is ~3; the cap lets a moderately
-		# biased race still pass while flagging a fully-stuck race.
-		RACE_MAX_TRIES=10
+		# iterations to see both is ~3 and the loop exits early; the
+		# cap only matters when a regression has fully stuck the race.
+		# Cap is generous (vs. the live tier's 6) because rustfs's
+		# loose `If-None-Match` semantics combined with B-side
+		# scheduling regularity leave a ~92/8 bias even after fork-order
+		# randomization. With that bias, the single-side-only
+		# probability is 0.92^60 ≈ 0.5%, which keeps the false-negative
+		# rate under 1% without exploding the wall-clock for a healthy
+		# run (which still exits in ~3 iterations).
+		RACE_MAX_TRIES=60
 
 		race_one_iteration() {
 			# Each iteration gets a fresh bucket so the previous
@@ -72,19 +79,20 @@ Describe "S3 helper: concurrent push and stale-lock recovery"
 
 			local result_dir a_exit b_exit
 			result_dir=$(mktemp -d -t race.XXXXXX)
-			(
-				git -C "$src_a" push origin '+refs/heads/main:refs/heads/main' \
-					>"$result_dir/A.log" 2>&1
-				echo $? >"$result_dir/A.exit"
-			) &
-			local a_pid=$!
-			(
-				git -C "$src_b" push origin '+refs/heads/main:refs/heads/main' \
-					>"$result_dir/B.log" 2>&1
-				echo $? >"$result_dir/B.exit"
-			) &
-			local b_pid=$!
-			wait "$a_pid" "$b_pid"
+			# Randomize which side is started first. Bash's fork
+			# ordering plus rustfs's loose `If-None-Match` semantics
+			# give the second-started side a near-deterministic edge
+			# (~93/7 in favour of B), starving the bias check that
+			# requires both winners to be observed. A coin flip per
+			# iteration restores the ~50/50 distribution the test
+			# design (commit 00fc355) assumed.
+			if (( RANDOM % 2 == 0 )); then
+				race_force_pushes "$result_dir" refs/heads/main \
+					A "$src_a" B "$src_b"
+			else
+				race_force_pushes "$result_dir" refs/heads/main \
+					B "$src_b" A "$src_a"
+			fi
 
 			a_exit=$(cat "$result_dir/A.exit" 2>/dev/null || echo "missing")
 			b_exit=$(cat "$result_dir/B.exit" 2>/dev/null || echo "missing")

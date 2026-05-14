@@ -72,19 +72,18 @@ Describe "S3 helper (live AWS): concurrent push contention"
 
 			local result_dir a_exit b_exit
 			result_dir=$(mktemp -d -t race.XXXXXX)
-			(
-				git -C "$src_a" push origin '+refs/heads/main:refs/heads/main' \
-					>"$result_dir/A.log" 2>&1
-				echo $? >"$result_dir/A.exit"
-			) &
-			local a_pid=$!
-			(
-				git -C "$src_b" push origin '+refs/heads/main:refs/heads/main' \
-					>"$result_dir/B.log" 2>&1
-				echo $? >"$result_dir/B.exit"
-			) &
-			local b_pid=$!
-			wait "$a_pid" "$b_pid"
+			# Coin-flip fork order. Live AWS is fair enough that a
+			# deterministic A-first start gave acceptable pass rates,
+			# but matching the integration tier's randomization shaves
+			# the residual ~3% false-negative rate at RACE_MAX_TRIES=6
+			# down further and keeps all four spec tiers symmetric.
+			if (( RANDOM % 2 == 0 )); then
+				race_force_pushes "$result_dir" refs/heads/main \
+					A "$src_a" B "$src_b"
+			else
+				race_force_pushes "$result_dir" refs/heads/main \
+					B "$src_b" A "$src_a"
+			fi
 
 			a_exit=$(cat "$result_dir/A.exit" 2>/dev/null || echo "missing")
 			b_exit=$(cat "$result_dir/B.exit" 2>/dev/null || echo "missing")

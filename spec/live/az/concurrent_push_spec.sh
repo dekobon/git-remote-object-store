@@ -54,19 +54,17 @@ Describe "Azure helper (live Azure Blob): concurrent push contention"
 		race_pushes() {
 			local result_dir
 			result_dir=$(mktemp -d -t race.XXXXXX)
-			(
-				git -C "$SRC_A" push origin '+refs/heads/main:refs/heads/main' \
-					>"$result_dir/A.log" 2>&1
-				echo $? >"$result_dir/A.exit"
-			) &
-			local a_pid=$!
-			(
-				git -C "$SRC_B" push origin '+refs/heads/main:refs/heads/main' \
-					>"$result_dir/B.log" 2>&1
-				echo $? >"$result_dir/B.exit"
-			) &
-			local b_pid=$!
-			wait "$a_pid" "$b_pid"
+			# Coin-flip fork order to match the integration tier; keeps
+			# every concurrent-push spec on the same randomization
+			# discipline regardless of how strict the backend's
+			# conditional-write semantics are.
+			if (( RANDOM % 2 == 0 )); then
+				race_force_pushes "$result_dir" refs/heads/main \
+					A "$SRC_A" B "$SRC_B"
+			else
+				race_force_pushes "$result_dir" refs/heads/main \
+					B "$SRC_B" A "$SRC_A"
+			fi
 
 			# At least one push must have succeeded — the race must
 			# actually run to completion. Without this check the
