@@ -87,6 +87,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **S3 multipart uploads abort on future drop (#169, #171).** A new
+  RAII `MultipartUploadGuard` in `src/object_store/s3.rs` owns the
+  `upload_id` returned by `CreateMultipartUpload` and, while armed,
+  fires a best-effort `AbortMultipartUpload` from its `Drop` impl via
+  `tokio::spawn`. `multipart_put_bytes`, `multipart_put_path`, and
+  `multipart_copy` all hand the guard end-to-end through
+  `finish_multipart_upload`, which disarms it after a successful
+  `CompleteMultipartUpload` or after the inline awaited abort on a
+  per-part error. If `CompleteMultipartUpload` itself fails, the
+  function `?`-returns with the guard still armed and `Drop` fires
+  the abort on a detached task. A caller that drops the upload
+  future mid-stream (cancellation, panic, the losing arm of a
+  `select!`) no longer orphans the upload-id and is no longer billed
+  for the parts already uploaded. Azure's commit-list model has no
+  equivalent need: uncommitted blocks auto-expire after seven days,
+  so this is an S3-only fix. Drop runs outside any tokio runtime
+  warn-logs and returns cleanly rather than panicking.
+
 - **Live packchain GC test tracks the baseline-tombstone sweep (#164).**
   `mark_then_sweep_after_grace_deletes_orphans` in
   `cli/tests/common/packchain_live.rs` asserted that a force-push +

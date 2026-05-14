@@ -87,6 +87,32 @@
 //! the gap relative to the Azure backend (which uses `reqwest` and
 //! gets keepalive for free) is documented in `CHANGELOG.md`.
 //!
+//! ## Multipart-upload lifetime safety
+//!
+//! S3 retains uncompleted multipart uploads indefinitely without an
+//! explicit lifecycle rule, so a future dropped between
+//! `CreateMultipartUpload` and `CompleteMultipartUpload` orphans the
+//! upload-id and bills the caller for the staged parts (issues #169,
+//! #171). [`S3Store::start_multipart_upload`] therefore hands back a
+//! [`MultipartUploadGuard`] that owns the upload-id and best-effort
+//! issues `AbortMultipartUpload` on `Drop`; [`finish_multipart_upload`]
+//! is the only call site that may [`disarm`] the guard.
+//!
+//! Future contributors must **not** introduce an early `?`-return
+//! between obtaining the upload-id and constructing the
+//! [`MultipartUploadGuard`] inside `start_multipart_upload`, nor
+//! between `start_multipart_upload` and the matching
+//! `finish_multipart_upload`: a bare upload-id outside the guard
+//! reintroduces the leak the guard exists to prevent. (The
+//! `ok_or_else` for a missing upload-id field on the SDK response is
+//! benign — there is no upload-id to abort.)
+//!
+//! Azure has no equivalent need — uncommitted blocks auto-expire after
+//! seven days (`azure.rs`).
+//!
+//! [`finish_multipart_upload`]: S3Store::finish_multipart_upload
+//! [`disarm`]: MultipartUploadGuard::disarm
+//!
 //! ## Stdout discipline
 //!
 //! Per `.claude/rules/protocol-stdout.md`, this module never writes to
@@ -1170,14 +1196,14 @@ impl S3Store {
         opts: PutOpts,
     ) -> Result<(), ObjectStoreError> {
         let parts = plan_upload_parts(size, MULTIPART_PUT_PART_SIZE, S3_MAX_PARTS);
-        let upload_id = self.start_multipart_upload(key, &opts).await?;
+        let guard = self.start_multipart_upload(key, &opts).await?;
         let progress = opts.progress.clone();
         let result = self
-            .upload_parts_with_bodies(key, &upload_id, &parts, progress, |part| {
+            .upload_parts_with_bodies(key, guard.upload_id(), &parts, progress, |part| {
                 slice_bytes_part(&body, part)
             })
             .await;
-        self.finish_multipart_upload(key, &upload_id, result).await
+        self.finish_multipart_upload(guard, result).await
     }
 
     /// Drive a multipart upload by streaming a local file part-by-part.
@@ -1198,13 +1224,13 @@ impl S3Store {
         opts: PutOpts,
     ) -> Result<(), ObjectStoreError> {
         let parts = plan_upload_parts(size, MULTIPART_PUT_PART_SIZE, S3_MAX_PARTS);
-        let upload_id = self.start_multipart_upload(key, &opts).await?;
+        let guard = self.start_multipart_upload(key, &opts).await?;
         let progress = opts.progress.clone();
         let file: Arc<std::fs::File> = Arc::new(file.into_std().await);
         let result = self
-            .upload_parts_from_file(key, &upload_id, file, &parts, progress)
+            .upload_parts_from_file(key, guard.upload_id(), file, &parts, progress)
             .await;
-        self.finish_multipart_upload(key, &upload_id, result).await
+        self.finish_multipart_upload(guard, result).await
     }
 
     /// Drive a multipart server-side copy via `UploadPartCopy`.
@@ -1233,32 +1259,46 @@ impl S3Store {
         // `copy()` uses default opts (no progress, no metadata) so the
         // create-call below also carries no metadata. That preserves
         // the "copy drops user metadata" contract.
-        let upload_id = self
+        let guard = self
             .start_multipart_upload(dst, &PutOpts::default())
             .await?;
         let copy_source = encode_copy_source(&self.bucket, src);
         let result = self
-            .upload_parts_via_copy(src, dst, &upload_id, &copy_source, src_etag, &parts)
+            .upload_parts_via_copy(src, dst, guard.upload_id(), &copy_source, src_etag, &parts)
             .await;
-        // Pass `dst` as the key for finish/abort: the upload_id lives
-        // under `dst` even though the bytes come from `src`. Errors
-        // mid-copy are reported with `src` as context inside the
-        // per-part task (matches single-call `copy()` at the trait
+        // The upload_id lives under `dst` even though the bytes come
+        // from `src`; the guard already carries `dst` as its key.
+        // Errors mid-copy are reported with `src` as context inside
+        // the per-part task (matches single-call `copy()` at the trait
         // surface).
-        self.finish_multipart_upload(dst, &upload_id, result).await
+        self.finish_multipart_upload(guard, result).await
     }
 
-    /// Begin a multipart upload, returning the upload-id.
+    /// Begin a multipart upload, returning a guard that owns the
+    /// upload-id and aborts the upload on drop.
     ///
     /// `content_disposition` and `user_metadata` from `PutOpts` flow
     /// onto `CreateMultipartUpload` — the destination object inherits
     /// them on `CompleteMultipartUpload` (`UploadPart`/`UploadPartCopy`
     /// have no metadata fields of their own).
+    ///
+    /// The returned [`MultipartUploadGuard`] keeps the upload-id alive
+    /// for the duration of the upload. If the calling future is
+    /// dropped (cancelled, panicked, or the caller picks the other arm
+    /// of a `select!`) before [`finish_multipart_upload`] runs, the
+    /// guard's [`Drop`] best-effort dispatches `AbortMultipartUpload`
+    /// so the upload-id is reclaimed and the caller is not billed for
+    /// orphaned parts (issues #169, #171). S3 retains uncompleted
+    /// multipart uploads indefinitely without an explicit lifecycle
+    /// rule; Azure has no equivalent need (uncommitted blocks auto-
+    /// expire after seven days).
+    ///
+    /// [`finish_multipart_upload`]: Self::finish_multipart_upload
     async fn start_multipart_upload(
         &self,
         key: &str,
         opts: &PutOpts,
-    ) -> Result<String, ObjectStoreError> {
+    ) -> Result<MultipartUploadGuard, ObjectStoreError> {
         let mut req = self
             .client
             .create_multipart_upload()
@@ -1271,11 +1311,17 @@ impl S3Store {
             req = req.metadata(k, v);
         }
         let resp = req.send().await.map_err(|e| classify(e, key))?;
-        resp.upload_id().map(str::to_owned).ok_or_else(|| {
+        let upload_id = resp.upload_id().map(str::to_owned).ok_or_else(|| {
             ObjectStoreError::Other(
                 format!("CreateMultipartUpload for `{key}` returned no upload-id").into(),
             )
-        })
+        })?;
+        Ok(MultipartUploadGuard::new(
+            self.client.clone(),
+            self.bucket.clone(),
+            key.to_owned(),
+            upload_id,
+        ))
     }
 
     /// Spawn parallel `UploadPart` tasks, one per planned part, with
@@ -1495,16 +1541,32 @@ impl S3Store {
     /// Finalize a multipart upload: complete on success, best-effort
     /// abort on error.
     ///
-    /// On any per-part error or join failure, issue
-    /// `AbortMultipartUpload` so the user is not billed for the
-    /// orphaned upload (S3 retains uncompleted parts indefinitely
-    /// without an explicit lifecycle rule). Abort failures are logged
-    /// via `tracing::warn` but the original error wins — surfacing
-    /// the abort error would mask the cause.
+    /// On success, `complete_multipart_upload` runs and the guard is
+    /// disarmed so its [`Drop`] does not fire a redundant abort.
+    ///
+    /// On a per-part error or join failure, the abort is issued
+    /// inline (awaited) so the call returns only after the upload-id
+    /// has been released — matching the synchronous error semantics
+    /// callers had before the RAII guard was introduced. The guard
+    /// is disarmed *after* the inline abort completes; if the inline
+    /// abort itself panics or is cancelled, the guard's [`Drop`]
+    /// fires the abort again on a detached task. A double-abort is
+    /// harmless — S3 returns `NoSuchUpload` on the second call.
+    ///
+    /// If `complete_multipart_upload` itself fails, the function
+    /// returns the classified error via `?` *before* `disarm()`;
+    /// the still-armed guard's [`Drop`] then dispatches the abort
+    /// on a detached task. This keeps the function short — no
+    /// extra inline-abort branch — and folds the rare
+    /// "Complete failed" case onto the same Drop path the
+    /// future-cancellation case exercises.
+    ///
+    /// Abort failures are logged via `tracing::warn` but the
+    /// original error wins; surfacing the abort error would mask
+    /// the cause.
     async fn finish_multipart_upload(
         &self,
-        key: &str,
-        upload_id: &str,
+        mut guard: MultipartUploadGuard,
         parts: Result<Vec<CompletedPart>, ObjectStoreError>,
     ) -> Result<(), ObjectStoreError> {
         match parts {
@@ -1515,12 +1577,13 @@ impl S3Store {
                 self.client
                     .complete_multipart_upload()
                     .bucket(&self.bucket)
-                    .key(key)
-                    .upload_id(upload_id)
+                    .key(guard.key())
+                    .upload_id(guard.upload_id())
                     .multipart_upload(multipart)
                     .send()
                     .await
-                    .map_err(|e| classify(e, key))?;
+                    .map_err(|e| classify(e, guard.key()))?;
+                guard.disarm();
                 Ok(())
             }
             Err(err) => {
@@ -1528,22 +1591,119 @@ impl S3Store {
                     .client
                     .abort_multipart_upload()
                     .bucket(&self.bucket)
-                    .key(key)
-                    .upload_id(upload_id)
+                    .key(guard.key())
+                    .upload_id(guard.upload_id())
                     .send()
                     .await
                 {
                     tracing::warn!(
-                        key,
-                        upload_id,
+                        key = %guard.key(),
+                        upload_id = %guard.upload_id(),
                         ?abort_err,
                         "AbortMultipartUpload failed; orphan upload may incur storage cost \
                          until lifecycle expiry",
                     );
                 }
+                guard.disarm();
                 Err(err)
             }
         }
+    }
+}
+
+/// RAII guard for an in-flight S3 multipart upload.
+///
+/// Owns the inputs needed to issue `AbortMultipartUpload` without
+/// re-borrowing the [`S3Store`]. While `armed`, the guard's [`Drop`]
+/// best-effort dispatches `AbortMultipartUpload` on a detached
+/// `tokio::spawn` task so a future dropped between
+/// `CreateMultipartUpload` and `CompleteMultipartUpload` does not
+/// orphan the upload-id on the bucket (issues #169, #171).
+///
+/// Call [`disarm`] once the upload has been completed or its abort
+/// has been issued synchronously so [`Drop`] becomes a no-op.
+///
+/// [`disarm`]: Self::disarm
+struct MultipartUploadGuard {
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    armed: bool,
+}
+
+impl MultipartUploadGuard {
+    fn new(client: aws_sdk_s3::Client, bucket: String, key: String, upload_id: String) -> Self {
+        Self {
+            client,
+            bucket,
+            key,
+            upload_id,
+            armed: true,
+        }
+    }
+
+    fn upload_id(&self) -> &str {
+        &self.upload_id
+    }
+
+    fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Mark the upload as resolved so [`Drop`] does not fire a
+    /// redundant `AbortMultipartUpload`.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for MultipartUploadGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // `Drop` cannot `.await`, so the abort is issued on a
+        // detached `tokio::spawn` task. `Handle::try_current()`
+        // returns `Err` if Drop runs outside any runtime (e.g. a
+        // test that constructs the guard and immediately drops it);
+        // in that case the best we can do is warn-log — panicking
+        // in Drop is forbidden by project rules.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                key = %self.key,
+                upload_id = %self.upload_id,
+                "MultipartUploadGuard dropped outside a tokio runtime; \
+                 cannot dispatch AbortMultipartUpload (orphan upload may \
+                 incur storage cost until S3 lifecycle expiry)",
+            );
+            return;
+        };
+        // Move owned fields into the detached task so the abort
+        // outlives the dropped future. `Client` clones cheaply
+        // (internal `Arc`); the strings move via `mem::take`.
+        let client = self.client.clone();
+        let bucket = std::mem::take(&mut self.bucket);
+        let key = std::mem::take(&mut self.key);
+        let upload_id = std::mem::take(&mut self.upload_id);
+        handle.spawn(async move {
+            if let Err(abort_err) = client
+                .abort_multipart_upload()
+                .bucket(&bucket)
+                .key(&key)
+                .upload_id(&upload_id)
+                .send()
+                .await
+            {
+                tracing::warn!(
+                    key = %key,
+                    upload_id = %upload_id,
+                    ?abort_err,
+                    "AbortMultipartUpload (drop-fire) failed; orphan upload may \
+                     incur storage cost until S3 lifecycle expiry",
+                );
+            }
+        });
     }
 }
 
@@ -2186,6 +2346,178 @@ mod tests {
             merged.read_timeout(),
             None,
             "upload override must disable read_timeout, not just leave it Unset",
+        );
+    }
+
+    // --- MultipartUploadGuard (#169, #171) ----------------------------
+
+    /// Build a no-network `Client` for guard tests. The Client is
+    /// only used to construct guards; no requests are issued from
+    /// within these tests (we never let an armed guard's spawned
+    /// abort actually reach the SDK).
+    fn test_client() -> aws_sdk_s3::Client {
+        let conf = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .endpoint_url("http://127.0.0.1:1/")
+            .build();
+        aws_sdk_s3::Client::from_conf(conf)
+    }
+
+    fn make_guard() -> MultipartUploadGuard {
+        MultipartUploadGuard::new(
+            test_client(),
+            "bkt".to_owned(),
+            "k".to_owned(),
+            "uid".to_owned(),
+        )
+    }
+
+    #[test]
+    fn multipart_upload_guard_exposes_constructor_fields() {
+        // The accessors are load-bearing: `finish_multipart_upload`
+        // reads them to address the complete/abort calls.
+        let mut guard = make_guard();
+        assert_eq!(guard.key(), "k");
+        assert_eq!(guard.upload_id(), "uid");
+        // Disarm so Drop is a no-op (the constructor-fields test
+        // should not exercise the spawn-on-Drop path).
+        guard.disarm();
+    }
+
+    #[test]
+    fn multipart_upload_guard_disarmed_drop_outside_runtime_is_silent() {
+        // Observable contract: a disarmed guard must Drop without
+        // attempting `Handle::try_current()` or `spawn`. We exercise
+        // this outside any tokio runtime — `spawn` would panic there
+        // and a `try_current()` lookup would warn-log. Neither must
+        // happen on the success path.
+        let mut guard = make_guard();
+        guard.disarm();
+        drop(guard);
+    }
+
+    #[test]
+    fn multipart_upload_guard_armed_drop_outside_runtime_does_not_panic() {
+        // Project rule: Drop must never panic. When dropped armed
+        // outside any tokio runtime, the guard logs a warn and
+        // returns cleanly rather than panicking on a missing
+        // runtime handle.
+        let guard = make_guard();
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn multipart_upload_guard_armed_drop_inside_runtime_spawns_abort_task() {
+        // Production failure mode: a future dropped between
+        // `start_multipart_upload` and `finish_multipart_upload`
+        // must dispatch `AbortMultipartUpload` on a detached
+        // tokio task. This test pins the cheap observable contract:
+        //
+        // 1. Drop neither panics nor blocks.
+        // 2. The spawned abort task makes forward progress (the
+        //    unreachable endpoint `127.0.0.1:1` forces a connect
+        //    failure inside `send().await`, exercising the spawned
+        //    closure's `Err`-arm warn-log).
+        //
+        // The companion test below
+        // (`..._drop_issues_abort_multipart_upload`) goes further
+        // and byte-equality-checks the captured HTTP request, so
+        // this test only needs to keep the no-panic / forward-
+        // progress contract on the warn-log path.
+        //
+        // Yielding `JoinSet`-style would let us join the task and
+        // observe completion, but Drop uses a detached `spawn` by
+        // design (a `JoinHandle` would require Drop to hold state
+        // for the lifetime of the runtime). Yielding the runtime
+        // a handful of times lets the spawned task reach its
+        // `send().await` before the test returns and the runtime
+        // tears down.
+        let guard = make_guard();
+        drop(guard);
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Build an `aws_sdk_s3::Client` whose HTTP layer is the
+    /// smithy `capture_request` handler — every request the SDK
+    /// emits is recorded on the returned `CaptureRequestReceiver`
+    /// instead of touching the network. Static test credentials
+    /// keep `SigV4` happy so the SDK actually reaches the HTTP
+    /// layer (an unsigned chain would short-circuit earlier).
+    fn capture_client() -> (
+        aws_sdk_s3::Client,
+        aws_smithy_http_client::test_util::CaptureRequestReceiver,
+    ) {
+        use aws_sdk_s3::config::Credentials;
+        let (http_client, rx) = aws_smithy_http_client::test_util::capture_request(None);
+        let conf = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new(
+                "AKIAIOSFODNN7EXAMPLE",
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                None,
+                None,
+                "test",
+            ))
+            .http_client(http_client)
+            .force_path_style(true)
+            .build();
+        (aws_sdk_s3::Client::from_conf(conf), rx)
+    }
+
+    #[tokio::test]
+    async fn multipart_upload_guard_drop_issues_abort_multipart_upload() {
+        // Byte-equality contract for issue #173: when an armed
+        // `MultipartUploadGuard` is dropped inside a tokio runtime,
+        // the detached abort task must issue an
+        // `AbortMultipartUpload` request addressing the exact
+        // (bucket, key, upload-id) the guard was constructed with.
+        //
+        // S3's wire form for `AbortMultipartUpload` is
+        //   `DELETE /<bucket>/<key>?uploadId=<id>` (path style)
+        // so we assert: method=DELETE, the captured URI contains
+        // the key, and `uploadId=<id>` appears in the query.
+        // We deliberately do NOT couple to the exact host, scheme,
+        // or full URL — those are SDK-internal details unrelated
+        // to the abort contract.
+        let (client, rx) = capture_client();
+        let guard = MultipartUploadGuard::new(
+            client,
+            "test-bucket".to_owned(),
+            "test/key.pack".to_owned(),
+            "test-upload-id-abc123".to_owned(),
+        );
+        drop(guard);
+
+        // The detached `tokio::spawn` task must run far enough to
+        // submit the request through the capture client. Yielding
+        // a handful of times lets the SDK's signing + request
+        // pipeline complete; `capture_request` resolves the call
+        // synchronously once it sees the request, so no real
+        // network wait is needed.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        let request = rx.expect_request();
+        assert_eq!(
+            request.method(),
+            "DELETE",
+            "AbortMultipartUpload must be DELETE; got {}",
+            request.method(),
+        );
+        let uri = request.uri();
+        assert!(
+            uri.contains("test/key.pack"),
+            "captured URI must address the guard's key; got {uri}",
+        );
+        assert!(
+            uri.contains("uploadId=test-upload-id-abc123"),
+            "captured URI must carry the guard's upload-id in the \
+             query string; got {uri}",
         );
     }
 }

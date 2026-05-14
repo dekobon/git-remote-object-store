@@ -203,6 +203,14 @@ reqwest = { version = "0.13", default-features = false, features = [
 # Property-based testing for URL round-trip parse/format.
 proptest = "1"
 
+# `test-util` exposes `capture_request`, which the `MultipartUploadGuard`
+# Drop-fires-AbortMultipartUpload test (#173) wires into the SDK's
+# `http_client` slot to byte-equality-check the request the detached
+# abort task issues. The crate itself is already a regular dep (above);
+# this dev-only entry only flips the `test-util` feature on for test
+# builds.
+aws-smithy-http-client = { version = "1", features = ["test-util"] }
+
 # `tokio` `test-util` feature gates `tokio::time::pause`, `advance`, and
 # `#[tokio::test(start_paused = true)]`. Issue #118's lock-heartbeat
 # tests advance virtual time across multiple TTLs without actually
