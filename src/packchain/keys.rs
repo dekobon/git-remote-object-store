@@ -69,16 +69,29 @@ pub(crate) fn ref_path_from_chain_key(prefix: Option<&str>, key: &str) -> Option
 
 /// Extract the content SHA from a chain segment's `pack` field.
 ///
-/// `pack` is `[<prefix>/]packs/<sha>.pack` per the chain.json
+/// `pack` must match `[<prefix>/]packs/<sha>.pack` per the chain.json
 /// schema. Returns `None` for keys that don't fit the shape; the
 /// caller wraps the `None` into its preferred error variant
 /// (`MalformedPackEntry` for `read::decode_entry`'s call site,
 /// `ParseJson` via `serde_json::Error::custom` for
 /// `gc::list_referenced_packs`).
+///
+/// Defense-in-depth: the parent component is required to be `packs`
+/// so a tampered or corrupt `chain.json` cannot surface a SHA whose
+/// composed bucket key (via [`pack_key_from_relative`]) escapes the
+/// `<prefix>/packs/` namespace.
 #[must_use]
 pub(crate) fn sha_from_pack_key(pack: &str) -> Option<Sha40> {
-    let basename = pack.rsplit('/').next().unwrap_or(pack);
+    // Require the parent component to be `packs` — either as the
+    // sole leading directory (`packs/<sha>.pack`) or as the last
+    // segment of a prefix chain (`<...>/packs/<sha>.pack`). The
+    // `rsplit_once` short-circuit also rejects bare `<sha>.pack`
+    // values with no parent at all.
+    let (parent, basename) = pack.rsplit_once('/')?;
     let sha = basename.strip_suffix(".pack")?;
+    if parent != "packs" && !parent.ends_with("/packs") {
+        return None;
+    }
     Sha40::try_new(sha).ok()
 }
 
@@ -279,6 +292,22 @@ mod tests {
         assert!(sha_from_pack_key("packs/abcdef0123456789abcdef0123456789abcdef0.pack").is_none());
         // Non-hex character in sha.
         assert!(sha_from_pack_key("packs/zbcdef0123456789abcdef0123456789abcdef01.pack").is_none());
+    }
+
+    #[test]
+    fn sha_from_pack_key_rejects_non_packs_parent() {
+        // Defense-in-depth: a tampered or corrupt chain.json with a
+        // pack field whose parent component is NOT `packs` must not
+        // surface a SHA. Otherwise `pack_key_from_relative` would
+        // compose a GET key outside `<prefix>/packs/`.
+        assert!(sha_from_pack_key(&format!("{SHA}.pack")).is_none());
+        assert!(sha_from_pack_key(&format!("../{SHA}.pack")).is_none());
+        assert!(sha_from_pack_key(&format!("../etc/{SHA}.pack")).is_none());
+        assert!(sha_from_pack_key(&format!("evil/{SHA}.pack")).is_none());
+        assert!(sha_from_pack_key(&format!("packs-other/{SHA}.pack")).is_none());
+        assert!(sha_from_pack_key(&format!("acme/packsfake/{SHA}.pack")).is_none());
+        // Sibling-style prefix that does not end in a `packs` segment.
+        assert!(sha_from_pack_key(&format!("acme/repo/{SHA}.pack")).is_none());
     }
 
     #[test]
