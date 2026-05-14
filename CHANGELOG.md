@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Split `Doctor::list_and_handle_stale_locks` (#167).** Extracted
+  the per-key HEAD-recheck + delete loop into a free
+  `delete_stale_lock_if_still_stale` helper returning a
+  `DeleteOutcome` enum, and lifted the stale-scan filter into a
+  `scan_stale_locks` helper. `list_and_handle_stale_locks` is now a
+  ~40-line orchestrator covering scan, report, and outcome
+  aggregation. Operator-visible output text and the `tracing` call
+  shape are preserved byte-for-byte. Added unit coverage for each
+  `DeleteOutcome` variant through `MockStore`.
+
+- **Consolidated `ObjectStore` test decorators (#166).** A new
+  `delegate_to_inner_impl!` macro under
+  `object_store::test_support` (test-only) emits the
+  `#[async_trait::async_trait] impl ObjectStore` block alongside
+  per-method forwarders to `self.inner`, so each per-test decorator
+  collapses from ~80 lines of hand-written forwarders to ~15 lines:
+  the struct, one or more overrides, and a `forward:` clause naming
+  the methods to delegate. Migrated `PostHeadHookStore`,
+  `PostListDeleteStore`, `PostDeleteHookStore`, `PostListHookStore`,
+  `PostGetHookStore`, both `EvolvingChainStore`s (fetch + read),
+  `VanishingChainStore`, and `CountingStore`. Behavior preserved
+  byte-for-byte; no production code touched.
+
 - **Push reuses the pre-lock tombstone set under the per-ref lock
   (#165).** `protocol::push::prepare_push` now calls
   `packchain::gc::tombstoned_bundle_keys` once and stashes the result
