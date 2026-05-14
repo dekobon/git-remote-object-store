@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Live packchain GC test tracks the baseline-tombstone sweep (#164).**
+  `mark_then_sweep_after_grace_deletes_orphans` in
+  `cli/tests/common/packchain_live.rs` asserted that a force-push +
+  `mark` + `sweep` cycle reclaimed exactly one tombstone and two
+  objects (pack + idx). Since #134 / commit `21a9ccd`, a force-push
+  also writes a *baseline tombstone* via
+  `force_push_baseline_cleanup` so an in-flight fetch reading the
+  prior `chain.json` can still download the bundle through the
+  operator-configured grace window; `sweep` walks both tombstone
+  namespaces, so the real outcome is two swept tombstones and three
+  deleted objects (pack + idx + prior baseline bundle). The test
+  failed against live S3 / Azure backends (`integration-s3`,
+  `integration-azure`) under the default zero-grace assertion. The
+  assertions and the post-sweep absence check now cover the prior
+  baseline bundle as well, and the post-condition checks were
+  extracted into an `assert_not_found` helper to keep the scenario
+  under clippy's per-function ceiling.
+
 ### Changed
 
 - **packchain gc mark scales with parallel chain.json fetches.**

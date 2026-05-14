@@ -645,7 +645,16 @@ pub async fn read_blob_returns_byte_equal_content_and_cache_survives_idx_delete(
 /// age-vs-grace comparison in
 /// [`crate::packchain::gc::sweep_one_tombstone`] instead of the
 /// operator-asserted bypass.
-/// Issue #69 phase 5.
+///
+/// A force-push also writes a *baseline tombstone* for the prior
+/// baseline bundle (issue #134 / commit 21a9ccd) so that an in-flight
+/// fetch reading the prior chain.json can still download the bundle
+/// it expects through the same operator-configured grace window.
+/// Sweep walks both tombstone namespaces, so the expected outcome is
+/// two swept tombstones (orphan-pack + baseline) and three deleted
+/// objects (pack + idx + prior baseline bundle).
+///
+/// Issue #69 phase 5; updated for #164 / #134 baseline-tombstone path.
 pub async fn mark_then_sweep_after_grace_deletes_orphans(
     store: Arc<dyn ObjectStore>,
     remote: &RemoteUrl,
@@ -667,7 +676,9 @@ pub async fn mark_then_sweep_after_grace_deletes_orphans(
     .expect("first push");
 
     // Capture the pack key the first push wrote — it's what we want to
-    // see deleted by sweep.
+    // see deleted by sweep. Also capture the prior `full_at` so we can
+    // assert the baseline-tombstone path reclaims the prior baseline
+    // bundle the force-push leaves behind (issue #134).
     let chain_key = join(prefix, "refs/heads/main/chain.json");
     let pre_chain: serde_json::Value =
         serde_json::from_slice(&store.get_bytes(&chain_key).await.expect("chain.json"))
@@ -678,9 +689,16 @@ pub async fn mark_then_sweep_after_grace_deletes_orphans(
         .to_owned();
     let orphan_pack_key = join(prefix, &orphan_pack_path);
     let orphan_idx_key = join(prefix, &orphan_pack_path.replace(".pack", ".idx"));
+    let prior_full_at = pre_chain["full_at"]
+        .as_str()
+        .expect("chain.full_at")
+        .to_owned();
+    let prior_baseline_key = join(prefix, &format!("refs/heads/main/{prior_full_at}.bundle"));
 
     // Drop second commit, force push: leaves first push's pack as
-    // an unreferenced orphan (the new full-baseline pack supersedes it).
+    // an unreferenced orphan (the new full-baseline pack supersedes it)
+    // AND leaves the prior baseline bundle covered by a baseline
+    // tombstone written by `force_push_baseline_cleanup` (issue #134).
     git(&["reset", "--hard", "HEAD~1"], seed.path());
     drive_in(
         remote.clone(),
@@ -692,16 +710,23 @@ pub async fn mark_then_sweep_after_grace_deletes_orphans(
     .1
     .expect("force push");
 
-    // Pre-condition for sweep: the orphan must still be on the bucket.
+    // Pre-condition for sweep: the orphan pack and the now-tombstoned
+    // prior baseline bundle must still be on the bucket.
     store
         .get_bytes(&orphan_pack_key)
         .await
         .expect("orphan pack present pre-mark");
+    store
+        .get_bytes(&prior_baseline_key)
+        .await
+        .expect("prior baseline bundle present pre-sweep");
 
     // Mark must record exactly one orphan: the deterministic setup
     // produces one chain segment pre-force-push, so a clean force push
     // leaves exactly one orphan pack. Equality assertion would catch a
-    // runaway-mark regression that recorded extra orphans.
+    // runaway-mark regression that recorded extra orphans. Mark only
+    // covers pack orphans — the baseline tombstone is independently
+    // written by the force-push code path, so the count here stays 1.
     let mark_outcome = mark(store.as_ref(), prefix, MarkOpts::default())
         .await
         .expect("mark must succeed");
@@ -711,12 +736,14 @@ pub async fn mark_then_sweep_after_grace_deletes_orphans(
         mark_outcome.orphan_count,
     );
 
-    // Sweep with zero-grace: the tombstone was written milliseconds
-    // ago, so its age (rounded by `whole_hours`) is 0. With
+    // Sweep with zero-grace: tombstones were written milliseconds ago,
+    // so their age (rounded by `whole_hours`) is 0. With
     // `grace_hours = 0`, the `age < grace` comparison is `0 < 0 ==
-    // false`, so the tombstone is not deferred and the orphan packs
-    // are deleted. This exercises the production grace-comparison
-    // path rather than the `force=true` bypass.
+    // false`, so neither tombstone is deferred. Sweep walks both
+    // tombstone namespaces — the orphan-pack tombstone `mark()` wrote
+    // and the baseline tombstone the force-push wrote — so two
+    // tombstones are applied and three objects are deleted
+    // (pack + idx + prior baseline bundle).
     let sweep_outcome = sweep(
         store.as_ref(),
         prefix,
@@ -728,19 +755,22 @@ pub async fn mark_then_sweep_after_grace_deletes_orphans(
     .await
     .expect("sweep must succeed");
     assert_eq!(
-        sweep_outcome.swept_tombstones, 1,
-        "sweep must apply exactly 1 tombstone (mark wrote one)",
+        sweep_outcome.swept_tombstones, 2,
+        "sweep must apply exactly 2 tombstones (mark + force-push \
+         baseline), got {}",
+        sweep_outcome.swept_tombstones,
     );
-    // One orphan pack ⇒ exactly two object deletions (pack + idx).
+    // Pack + idx + prior baseline bundle ⇒ exactly three deletions.
     // Equality (vs `>=`) catches a runaway-delete regression.
     assert_eq!(
-        sweep_outcome.deleted_objects, 2,
-        "sweep must delete exactly the pack + idx pair (2 objects), got {}",
+        sweep_outcome.deleted_objects, 3,
+        "sweep must delete pack + idx + prior baseline bundle (3 \
+         objects), got {}",
         sweep_outcome.deleted_objects,
     );
     assert_eq!(
         sweep_outcome.deferred_tombstones, 0,
-        "tombstone should not be deferred at grace_hours=0",
+        "tombstones should not be deferred at grace_hours=0",
     );
     assert_eq!(
         sweep_outcome.skipped_repointed_packs, 0,
@@ -748,23 +778,27 @@ pub async fn mark_then_sweep_after_grace_deletes_orphans(
         sweep_outcome.skipped_repointed_packs,
     );
 
-    // Post-condition: the orphan pack and its idx are gone, and the
-    // tombstone itself was cleaned up by sweep.
-    let pack_after = store.get_bytes(&orphan_pack_key).await;
+    // Post-condition: the orphan pack, its idx, and the prior baseline
+    // bundle are all gone — the tombstones themselves are cleaned up
+    // by sweep (verified indirectly: a second sweep would see no
+    // tombstones to apply).
+    assert_not_found(store.as_ref(), &orphan_pack_key, "orphan pack").await;
+    assert_not_found(store.as_ref(), &orphan_idx_key, "orphan idx").await;
+    assert_not_found(store.as_ref(), &prior_baseline_key, "prior baseline bundle").await;
+}
+
+/// Helper: assert a key is absent (`NotFound`) on the bucket. Used by
+/// post-sweep verification to keep the calling scenarios under clippy's
+/// 100-line per-function ceiling without sacrificing diagnostic clarity
+/// in the failure message.
+async fn assert_not_found(store: &dyn ObjectStore, key: &str, label: &str) {
+    let got = store.get_bytes(key).await;
     assert!(
         matches!(
-            pack_after,
+            got,
             Err(git_remote_object_store::ObjectStoreError::NotFound(_))
         ),
-        "orphan pack must be gone after sweep, got {pack_after:?}",
-    );
-    let idx_after = store.get_bytes(&orphan_idx_key).await;
-    assert!(
-        matches!(
-            idx_after,
-            Err(git_remote_object_store::ObjectStoreError::NotFound(_))
-        ),
-        "orphan idx must be gone after sweep, got {idx_after:?}",
+        "{label} ({key}) must be gone after sweep, got {got:?}",
     );
 }
 
