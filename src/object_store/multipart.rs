@@ -14,7 +14,8 @@
 //! single-call paths so small bundles, lock files, and HEAD writes do
 //! not pay the `CreateMultipartUpload` round-trip cost.
 
-use std::os::unix::fs::FileExt;
+use std::fs::File;
+use std::io;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -137,17 +138,56 @@ pub(crate) async fn read_file_part(
     part: UploadPart,
 ) -> Result<Bytes, ObjectStoreError> {
     let length = usize::try_from(part.length).map_err(other_boxed)?;
-    // `read_exact_at` is blocking; offload to the blocking pool so
+    // Positional read is blocking; offload to the blocking pool so
     // we don't stall the runtime for 16 MiB syscalls.
     let buf = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
         let mut buf = vec![0u8; length];
-        file.read_exact_at(&mut buf, part.offset)?;
+        pread_exact(&file, &mut buf, part.offset)?;
         Ok(buf)
     })
     .await
     .map_err(other_boxed)?
     .map_err(other_boxed)?;
     Ok(Bytes::from(buf))
+}
+
+/// Cross-platform positional read: fill `buf` from `file` starting at
+/// the given `offset`.
+///
+/// Unix uses `pread(2)` via `FileExt::read_exact_at`, which is
+/// kernel-defined to be atomic with respect to the seek offset and
+/// does not modify the file's seek pointer. Windows uses `seek_read`
+/// from `std::os::windows::fs::FileExt`, which reads from an
+/// absolute offset (independent of the current cursor) but as a
+/// side effect *does* set the cursor to the end of the read. That
+/// side effect is harmless for our use here because every read is
+/// addressed by its own absolute `offset`, and no caller of
+/// `read_file_part` consults the file's seek position. Unlike
+/// `read_exact_at`, `seek_read` may return a short read or `0` at
+/// EOF, so we loop until `buf` is filled and treat a zero-byte read
+/// as `UnexpectedEof`.
+///
+/// The Windows path is reviewed for correctness against the stdlib
+/// docs but is not exercised by CI; issue #176 tracks adding a
+/// Windows runner.
+#[cfg(unix)]
+fn pread_exact(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn pread_exact(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = file.seek_read(&mut buf[filled..], offset + filled as u64)?;
+        if n == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        filled += n;
+    }
+    Ok(())
 }
 
 /// Zero-copy slice of an in-memory body for a single part. The
