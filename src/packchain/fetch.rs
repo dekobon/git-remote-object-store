@@ -47,6 +47,7 @@
 //! The trailing blank-line terminator is the REPL's responsibility
 //! (`.claude/rules/protocol-stdout.md`).
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -455,9 +456,63 @@ async fn fetch_full(
         return Ok(());
     }
 
-    // Stage all downloads (segment packs + baseline) in parallel.
-    // Each download takes one permit so the global concurrency cap
-    // applies across refs.
+    let downloads = spawn_full_downloads(
+        store,
+        semaphore,
+        prefix,
+        ref_name,
+        needed,
+        baseline_sha,
+        temp_path,
+    )?;
+    let mut drained = drain_full_downloads(downloads, needed.len()).await?;
+
+    // Install oldest-first: baseline (if any), then segment[N-1] down
+    // to segment[0]. Each install runs in spawn_blocking because
+    // gix's pack writers block on disk I/O and aren't `async`.
+    if let Some((sha, _bundle_path)) = drained.baseline {
+        // _bundle_path is rooted in `temp_path`; tempdir cleanup drops
+        // the file after this scope. `git::unbundle_at` clones cwd /
+        // folder / ref_name internally before its spawn_blocking, so
+        // there's no need to pre-own them here.
+        git::unbundle_at(repo_dir, temp_path, sha, ref_name).await?;
+    }
+    for segment in needed.iter().rev() {
+        let pack_path = drained.segments.remove(&segment.sha).ok_or_else(|| {
+            FetchError::Packchain(PackchainError::PackBuild(
+                "segment download succeeded but path is missing".to_owned(),
+            ))
+        })?;
+        let repo_dir = repo_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || install_pack(&repo_dir, &pack_path)).await??;
+    }
+    Ok(())
+}
+
+/// Output of [`drain_full_downloads`]: per-segment pack paths keyed by
+/// segment SHA (so install order is decoupled from completion order),
+/// plus the optional baseline bundle and its tip SHA.
+struct DrainedDownloads {
+    segments: HashMap<Sha40, PathBuf>,
+    baseline: Option<(Sha, PathBuf)>,
+}
+
+/// Spawn one download task per needed segment (plus the baseline when
+/// present). Each task takes one semaphore permit so the global
+/// concurrency cap applies across refs.
+#[allow(clippy::too_many_arguments)]
+fn spawn_full_downloads(
+    store: &Arc<dyn ObjectStore>,
+    semaphore: &Arc<Semaphore>,
+    prefix: Option<&str>,
+    ref_name: &RefName,
+    needed: &[ChainSegment],
+    baseline_sha: Option<Sha>,
+    temp_path: &Path,
+) -> Result<JoinSet<Result<DownloadedArtifact, FetchError>>, FetchError> {
+    // Annotation required: when `needed.is_empty()` and `baseline_sha`
+    // is `None`, no `.spawn()` runs and Rust has no other site to infer
+    // the task output type from.
     let mut downloads: JoinSet<Result<DownloadedArtifact, FetchError>> = JoinSet::new();
     for segment in needed {
         // Validate `segment.pack` before deriving a bucket key — a
@@ -470,7 +525,7 @@ async fn fetch_full(
         let permit_pool = Arc::clone(semaphore);
         let key = super::keys::pack_key_from_relative(prefix, &segment.pack);
         let dest = temp_path.join(format!("{}.pack", content_sha.as_str()));
-        let segment_clone = segment.clone();
+        let segment_sha = segment.sha.clone();
         downloads.spawn(async move {
             let _permit = permit_pool
                 .acquire_owned()
@@ -478,7 +533,7 @@ async fn fetch_full(
                 .expect("fetch semaphore is owned by this batch and never closed");
             download_pack(store.as_ref(), &key, &dest).await?;
             Ok(DownloadedArtifact::Segment {
-                segment: segment_clone,
+                sha: segment_sha,
                 pack_path: dest,
             })
         });
@@ -500,24 +555,28 @@ async fn fetch_full(
             })
         });
     }
+    Ok(downloads)
+}
 
-    // Drain downloads. Collect into segment-keyed map for ordered
-    // install; surface the first error after every task drains.
-    // Subsequent errors are logged at debug! so multi-task failures
-    // remain visible to operators (the wire only renders the first).
-    let mut downloaded_segments: std::collections::HashMap<Sha40, PathBuf> =
-        std::collections::HashMap::with_capacity(needed.len());
-    let mut downloaded_baseline: Option<(Sha, PathBuf)> = None;
+/// Drain `downloads`. Returns a segment-SHA-keyed map for ordered
+/// install + the baseline pair when present. Surfaces the first error
+/// after every task drains; subsequent errors are logged at `debug!`
+/// so multi-task failures remain visible to operators (the wire only
+/// renders the first).
+async fn drain_full_downloads(
+    mut downloads: JoinSet<Result<DownloadedArtifact, FetchError>>,
+    needed_len: usize,
+) -> Result<DrainedDownloads, FetchError> {
+    let mut segments = HashMap::<Sha40, PathBuf>::with_capacity(needed_len);
+    let mut baseline: Option<(Sha, PathBuf)> = None;
     let mut first_err: Option<FetchError> = None;
     while let Some(joined) = downloads.join_next().await {
-        let res: Result<DownloadedArtifact, FetchError> =
-            joined.unwrap_or_else(|je| Err(je.into()));
-        match res {
-            Ok(DownloadedArtifact::Segment { segment, pack_path }) => {
-                downloaded_segments.insert(segment.sha, pack_path);
+        match joined.unwrap_or_else(|je| Err(je.into())) {
+            Ok(DownloadedArtifact::Segment { sha, pack_path }) => {
+                segments.insert(sha, pack_path);
             }
             Ok(DownloadedArtifact::Baseline { sha, bundle_path }) => {
-                downloaded_baseline = Some((sha, bundle_path));
+                baseline = Some((sha, bundle_path));
             }
             Err(e) => {
                 if first_err.is_none() {
@@ -531,27 +590,7 @@ async fn fetch_full(
     if let Some(e) = first_err {
         return Err(e);
     }
-
-    // Install oldest-first: baseline (if any), then segment[N-1] down
-    // to segment[0]. Each install runs in spawn_blocking because
-    // gix's pack writers block on disk I/O and aren't `async`.
-    if let Some((sha, _bundle_path)) = downloaded_baseline {
-        // _bundle_path is rooted in `temp_path`; tempdir cleanup drops
-        // the file after this scope. `git::unbundle_at` clones cwd /
-        // folder / ref_name internally before its spawn_blocking, so
-        // there's no need to pre-own them here.
-        git::unbundle_at(repo_dir, temp_path, sha, ref_name).await?;
-    }
-    for segment in needed.iter().rev() {
-        let pack_path = downloaded_segments.remove(&segment.sha).ok_or_else(|| {
-            FetchError::Packchain(PackchainError::PackBuild(
-                "segment download succeeded but path is missing".to_owned(),
-            ))
-        })?;
-        let repo_dir = repo_dir.to_path_buf();
-        tokio::task::spawn_blocking(move || install_pack(&repo_dir, &pack_path)).await??;
-    }
-    Ok(())
+    Ok(DrainedDownloads { segments, baseline })
 }
 
 /// Shallow-fetch path: sequential newest-first install with
@@ -617,14 +656,8 @@ async fn fetch_shallow(
 /// One downloaded artefact ready for installation. Ordered installs
 /// happen in [`fetch_full`] after all downloads drain.
 enum DownloadedArtifact {
-    Segment {
-        segment: ChainSegment,
-        pack_path: PathBuf,
-    },
-    Baseline {
-        sha: Sha,
-        bundle_path: PathBuf,
-    },
+    Segment { sha: Sha40, pack_path: PathBuf },
+    Baseline { sha: Sha, bundle_path: PathBuf },
 }
 
 /// Stream a pack body to `dest`, mapping `NotFound` to a typed
