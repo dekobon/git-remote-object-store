@@ -2862,11 +2862,13 @@ mod tests {
 
     /// Issue #128: simulate the TOCTOU sequence the bug describes.
     /// Client A starts a delete; between `acquire_lock` and the
-    /// under-lock listing, client B writes a PROTECTED# marker
-    /// (`protect` takes no per-ref lock — it's a single `put_bytes`).
-    /// The fresh under-lock listing reflects the marker, so the
-    /// canonical guard rejects the delete. Both the bundle and the
-    /// marker survive.
+    /// under-lock listing, a marker appears at PROTECTED#. After #159
+    /// `protect` itself acquires the same lock and cannot race here,
+    /// but the under-lock listing remains the canonical guard against
+    /// any other source of a same-key marker (a lock-bypass bug, a
+    /// non-cooperating client). The fresh under-lock listing reflects
+    /// the marker, so the canonical guard rejects the delete. Both the
+    /// bundle and the marker survive.
     #[tokio::test]
     async fn delete_remote_ref_rejects_protect_landed_between_acquire_and_list() {
         let store = MockStore::new();
@@ -2877,9 +2879,12 @@ mod tests {
         // Client A acquired the lock; bundle was already present.
         store.insert(&bundle, Bytes::from_static(b"b"));
         store.insert(lock_key, Bytes::from_static(b"held-lock-payload"));
-        // Client B's concurrent `protect` lands AFTER our lock-acquire
-        // but BEFORE our under-lock listing — exactly the window the
-        // pre-#128 ordering left open.
+        // A PROTECTED# marker appears AFTER our lock-acquire but BEFORE
+        // our under-lock listing — exactly the window the pre-#128
+        // ordering left open. Post-#159 `protect` cannot reach this
+        // window itself, but the under-lock listing must still catch
+        // markers from any other source (lock-bypass bug, non-cooperating
+        // client).
         store.insert(protected, Bytes::from_static(b""));
 
         let outcome = delete_remote_ref_under_lock(&store, Some("repo"), &r, false, lock_key)

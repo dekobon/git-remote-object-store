@@ -922,11 +922,14 @@ async fn force_push_baseline_cleanup(
 /// checks for a `PROTECTED#` marker segment in any entry's last path
 /// segment and refuses the delete with the canonical wire-format
 /// protection message. Mirrors the bundle engine's first-guard check in
-/// [`crate::protocol::push::delete_remote_ref_under_lock`]. Because
-/// `protect` is a lockless `put_if_absent` on the marker key, the
-/// concurrent-`protect` TOCTOU window between `acquire_lock` and the
-/// listing is closed by running the check against the under-lock
-/// listing rather than a pre-lock snapshot.
+/// [`crate::protocol::push::delete_remote_ref_under_lock`]. Per #159,
+/// `protect` and `unprotect` acquire the same `<prefix>/<ref>/LOCK#.lock`
+/// per-ref lock as push/delete/compact, so concurrent
+/// protect-vs-delete is already mutually excluded at the lock layer.
+/// The under-lock listing check is therefore defence-in-depth — mirroring
+/// [`crate::protocol::push::verify_no_orphan_protected_after_delete`] —
+/// guarding against a lock bypass or bucket-level inconsistency rather
+/// than serving as the primary defence against a concurrent `protect`.
 /// Release `guard` and downgrade any release failure to a structured
 /// `warn!`. The `after` argument names the early-exit context the
 /// release follows (e.g. "not-found probe", "list failure",
