@@ -11,6 +11,7 @@
 //! outcome and the trailing blank-line terminator (see
 //! `.claude/rules/protocol-stdout.md`).
 
+use std::collections::HashSet;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -267,10 +268,22 @@ fn is_bundle_candidate(key: &str) -> bool {
 /// filter the next push's under-lock multi-bundle guard would refuse
 /// it. The tombstoned bundle stays readable at its original key for
 /// in-flight fetchers — only the listing path hides it.
+///
+/// Issue #165: `cached_hidden` lets the caller supply a tombstone set
+/// computed earlier in the same push (e.g. by [`prepare_push`]) and
+/// reused under the per-ref lock by [`perform_push_under_lock`]. The
+/// cached set is sound because all tombstone writers for a given ref
+/// (push's `defer_prior_bundle_via_tombstone`, compact's
+/// `tombstone_prior_baseline_bundle`, delete-branch's orphan path)
+/// run under the same per-ref lock — so no new tombstone for this
+/// ref can land between the pre-lock and under-lock calls within one
+/// `push_one` invocation. `None` keeps the original "fetch on demand"
+/// shape used by call sites that don't have a cache to share.
 async fn bundles_for_ref(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
     remote_ref: &RefName,
+    cached_hidden: Option<&HashSet<String>>,
 ) -> Result<Vec<ObjectMeta>, ObjectStoreError> {
     let listing = ref_listing_prefix(prefix, remote_ref);
     let metas = store.list(&listing).await?;
@@ -284,7 +297,16 @@ async fn bundles_for_ref(
     if bundles.is_empty() {
         return Ok(bundles);
     }
-    let hidden = tombstoned_bundle_keys(store, prefix).await?;
+    // Reuse the caller-supplied set when present; otherwise fetch
+    // on demand. The owned binding outlives the borrow so a single
+    // `&HashSet` covers both paths without an `Option`/`expect` dance.
+    let fetched;
+    let hidden: &HashSet<String> = if let Some(h) = cached_hidden {
+        h
+    } else {
+        fetched = tombstoned_bundle_keys(store, prefix).await?;
+        &fetched
+    };
     Ok(bundles
         .into_iter()
         .filter(|m| !hidden.contains(&m.key))
@@ -1035,6 +1057,14 @@ struct PushReadyState {
     /// Original local refspec, kept so the under-lock `NotAncestor` error
     /// message renders the same text the pre-lock arm would have used.
     local_spec: String,
+    /// Issue #165: tombstone set captured during [`prepare_push`] so the
+    /// under-lock [`bundles_for_ref`] call inside
+    /// [`perform_push_under_lock`] does not re-list `<prefix>/gc/` and
+    /// re-fetch every baseline tombstone. Sound because all tombstone
+    /// writers for this ref serialize through the same per-ref lock —
+    /// no new tombstone for this ref can land in the pre-lock /
+    /// under-lock window.
+    hidden_bundles: HashSet<String>,
     /// Keeps the temp directory (and `bundle_path`) alive until the bundle
     /// is uploaded inside `perform_push_under_lock`.
     _temp_dir: tempfile::TempDir,
@@ -1054,7 +1084,10 @@ struct PushReadyState {
 ///   (multi-bundle corruption, ancestry failure, …); caller returns it
 ///   directly without taking the lock.
 enum PrepareOutcome {
-    Ready(PushReadyState),
+    // `PushReadyState` is the largest variant (paths, temp dir guard,
+    // hidden-bundle hash set added in #165); boxing keeps the enum's
+    // discriminant compact regardless of variant.
+    Ready(Box<PushReadyState>),
     Delete { remote_ref: RefName, zip: bool },
     Done(PushOutcome),
 }
@@ -1166,7 +1199,15 @@ async fn prepare_push(
     let force_push = force;
     debug!(local = %local_spec, remote = %remote_ref, force_push, "push");
 
-    let pre_bundles = bundles_for_ref(store, prefix, &remote_ref).await?;
+    // Issue #165: compute the tombstone set once here and reuse it under
+    // the per-ref lock in [`perform_push_under_lock`]. The lock ensures
+    // no concurrent writer can publish a tombstone for this ref between
+    // the two `bundles_for_ref` calls. The cached set is unused on the
+    // multi-bundle / delete / parse-error early-return paths — a wasted
+    // listing — but each path already terminates the push, so the
+    // ~one-call overhead is bounded.
+    let hidden_bundles = tombstoned_bundle_keys(store, prefix).await?;
+    let pre_bundles = bundles_for_ref(store, prefix, &remote_ref, Some(&hidden_bundles)).await?;
     if pre_bundles.len() > 1 {
         return Ok(PrepareOutcome::Done(PushOutcome::Error {
             remote_ref: remote_ref_str,
@@ -1224,7 +1265,7 @@ async fn prepare_push(
     let bundle_path =
         git::bundle_at(&local.cwd, temp_dir.path(), local.local_sha, &local_spec).await?;
 
-    Ok(PrepareOutcome::Ready(PushReadyState {
+    Ok(PrepareOutcome::Ready(Box::new(PushReadyState {
         remote_ref,
         local_sha: local.local_sha,
         pre_existing,
@@ -1234,8 +1275,9 @@ async fn prepare_push(
         force,
         pre_existing_was_ancestor: local.pre_existing_was_ancestor,
         local_spec,
+        hidden_bundles,
         _temp_dir: temp_dir,
-    }))
+    })))
 }
 
 /// Execute one push or delete: prepare, lock, do work, release.
@@ -1269,7 +1311,10 @@ async fn push_one(
             PrepareOutcome::Done(o) => return Ok(o),
             PrepareOutcome::Ready(state) => (
                 state.remote_ref.as_str().to_owned(),
-                UnderLockWork::Push(Box::new(state)),
+                // `state` is already `Box<PushReadyState>` (`PrepareOutcome::Ready`
+                // is boxed to keep the enum's largest variant compact); reuse the
+                // existing allocation instead of re-boxing.
+                UnderLockWork::Push(state),
             ),
             PrepareOutcome::Delete { remote_ref, zip } => (
                 remote_ref.as_str().to_owned(),
@@ -1350,6 +1395,7 @@ async fn perform_push_under_lock(
         force,
         pre_existing_was_ancestor,
         local_spec,
+        hidden_bundles,
         _temp_dir,
     } = state;
     let remote_ref_str = remote_ref.as_str().to_owned();
@@ -1372,7 +1418,10 @@ async fn perform_push_under_lock(
         });
     }
 
-    let current = bundles_for_ref(store, prefix, &remote_ref).await?;
+    // Issue #165: reuse the tombstone set captured in `prepare_push`.
+    // The per-ref lock prevents any new tombstone for this ref from
+    // landing between then and now.
+    let current = bundles_for_ref(store, prefix, &remote_ref, Some(&hidden_bundles)).await?;
     if current.len() > 1 {
         return Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
@@ -1950,7 +1999,9 @@ mod tests {
         store.insert("repo/refs/heads/main/PROTECTED#", Bytes::from_static(b""));
         store.insert("repo/refs/heads/main/repo.zip", Bytes::from_static(b""));
         store.insert("repo/refs/heads/main/LOCK#.lock", Bytes::from_static(b""));
-        let bundles = bundles_for_ref(&store, Some("repo"), &r).await.unwrap();
+        let bundles = bundles_for_ref(&store, Some("repo"), &r, None)
+            .await
+            .unwrap();
         assert_eq!(bundles.len(), 1);
         assert!(bundles[0].key.ends_with(".bundle"));
     }
@@ -1963,7 +2014,9 @@ mod tests {
         let r = rn("refs/heads/v1.zip-rc1");
         let bundle_key = format!("repo/refs/heads/v1.zip-rc1/{SHA}.bundle");
         store.insert(bundle_key.clone(), Bytes::from_static(b"b"));
-        let bundles = bundles_for_ref(&store, Some("repo"), &r).await.unwrap();
+        let bundles = bundles_for_ref(&store, Some("repo"), &r, None)
+            .await
+            .unwrap();
         assert_eq!(bundles.len(), 1);
         assert_eq!(bundles[0].key, bundle_key);
     }
@@ -1976,9 +2029,143 @@ mod tests {
         let r = rn("refs/heads/LOCKS-feature/x");
         let bundle_key = format!("repo/refs/heads/LOCKS-feature/x/{SHA}.bundle");
         store.insert(bundle_key.clone(), Bytes::from_static(b"b"));
-        let bundles = bundles_for_ref(&store, Some("repo"), &r).await.unwrap();
+        let bundles = bundles_for_ref(&store, Some("repo"), &r, None)
+            .await
+            .unwrap();
         assert_eq!(bundles.len(), 1);
         assert_eq!(bundles[0].key, bundle_key);
+    }
+
+    /// Issue #165: a caller-supplied `cached_hidden` set must satisfy
+    /// the tombstone lookup — `bundles_for_ref` must NOT re-list
+    /// `<prefix>/gc/` or fetch any tombstone body. Counts every `list`
+    /// + `get_bytes` call so a regression that drops the cache and
+    /// re-walks the tombstone set fails this test.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "inline counting-store decorator")]
+    async fn bundles_for_ref_skips_tombstone_lookup_when_cache_provided() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingStore {
+            inner: MockStore,
+            gc_lists: AtomicUsize,
+            tombstone_gets: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl ObjectStore for CountingStore {
+            async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, ObjectStoreError> {
+                if prefix == "repo/gc/" {
+                    self.gc_lists.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.list(prefix).await
+            }
+            async fn get_to_file(
+                &self,
+                key: &str,
+                dest: &std::path::Path,
+                opts: crate::object_store::GetOpts,
+            ) -> Result<(), ObjectStoreError> {
+                self.inner.get_to_file(key, dest, opts).await
+            }
+            async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+                if key.starts_with("repo/gc/baseline-tomb-") {
+                    self.tombstone_gets.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.get_bytes(key).await
+            }
+            async fn get_bytes_range(
+                &self,
+                key: &str,
+                range: std::ops::Range<u64>,
+            ) -> Result<Bytes, ObjectStoreError> {
+                self.inner.get_bytes_range(key, range).await
+            }
+            async fn put_bytes(
+                &self,
+                key: &str,
+                body: Bytes,
+                opts: PutOpts,
+            ) -> Result<(), ObjectStoreError> {
+                self.inner.put_bytes(key, body, opts).await
+            }
+            async fn put_if_absent(
+                &self,
+                key: &str,
+                body: Bytes,
+            ) -> Result<bool, ObjectStoreError> {
+                self.inner.put_if_absent(key, body).await
+            }
+            async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
+                self.inner.head(key).await
+            }
+            async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
+                self.inner.copy(src, dst).await
+            }
+            async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
+                self.inner.delete(key).await
+            }
+        }
+
+        let inner = MockStore::new();
+        let r = rn("refs/heads/main");
+        // Seed: a bundle for the ref plus a baseline tombstone naming a
+        // *different* SHA. The tombstone exists so a non-cached call
+        // would have to fetch & parse it to compute the hide set.
+        inner.insert(
+            format!("repo/refs/heads/main/{SHA}.bundle"),
+            Bytes::from_static(b"b"),
+        );
+        // Plausible tombstone body — `tombstoned_bundle_keys` parses it
+        // as `BaselineTombstone` JSON. Body shape mirrors the one
+        // written by `write_baseline_tombstone_unconditional`; `v`
+        // must be `TOMBSTONE_SCHEMA_VERSION` or the parser rejects it
+        // and the tombstone is silently skipped (defeating the test).
+        let tomb_body = format!(
+            r#"{{"v":1,"ref_name":"refs/heads/main","sha":"{OTHER_SHA}","marked_at":"2024-01-01T00:00:00Z"}}"#
+        );
+        inner.insert(
+            "repo/gc/baseline-tomb-test.json".to_owned(),
+            Bytes::from(tomb_body),
+        );
+
+        let store = CountingStore {
+            inner,
+            gc_lists: AtomicUsize::new(0),
+            tombstone_gets: AtomicUsize::new(0),
+        };
+
+        // Baseline: a `None` cache pays for one `gc/` list + one
+        // tombstone GET. Asserting these counts pins the un-optimised
+        // shape so the contrast with the cached path is meaningful.
+        let bundles_uncached = bundles_for_ref(&store, Some("repo"), &r, None)
+            .await
+            .unwrap();
+        assert_eq!(bundles_uncached.len(), 1);
+        assert_eq!(store.gc_lists.load(Ordering::SeqCst), 1);
+        assert_eq!(store.tombstone_gets.load(Ordering::SeqCst), 1);
+
+        // Cached path: hand the same hide set we already paid for.
+        // `bundles_for_ref` must consult it and skip the `gc/` walk
+        // entirely. A regression that drops the cache and re-lists
+        // would bump these counters past 1.
+        let hidden: HashSet<String> = [format!("repo/refs/heads/main/{OTHER_SHA}.bundle")]
+            .into_iter()
+            .collect();
+        let bundles_cached = bundles_for_ref(&store, Some("repo"), &r, Some(&hidden))
+            .await
+            .unwrap();
+        assert_eq!(bundles_cached.len(), 1);
+        assert_eq!(
+            store.gc_lists.load(Ordering::SeqCst),
+            1,
+            "cached call must not re-list gc/",
+        );
+        assert_eq!(
+            store.tombstone_gets.load(Ordering::SeqCst),
+            1,
+            "cached call must not refetch any tombstone body",
+        );
     }
 
     #[tokio::test]
@@ -2888,6 +3075,7 @@ mod tests {
             force: false,
             pre_existing_was_ancestor: true,
             local_spec: "refs/heads/main".to_owned(),
+            hidden_bundles: HashSet::new(),
             _temp_dir: temp_dir,
         };
 
@@ -2973,6 +3161,7 @@ mod tests {
             force: false,
             pre_existing_was_ancestor: true,
             local_spec: "refs/heads/main".to_owned(),
+            hidden_bundles: HashSet::new(),
             _temp_dir: temp_dir,
         }
     }
@@ -3341,6 +3530,7 @@ mod tests {
             force: false,
             pre_existing_was_ancestor: true,
             local_spec: "refs/heads/main".to_owned(),
+            hidden_bundles: HashSet::new(),
             _temp_dir: temp_dir,
         };
 
@@ -3447,6 +3637,7 @@ mod tests {
             force: false,
             pre_existing_was_ancestor: true,
             local_spec: "refs/heads/main".to_owned(),
+            hidden_bundles: HashSet::new(),
             _temp_dir: temp_dir,
         };
 
@@ -3701,6 +3892,7 @@ mod tests {
             force: false,
             pre_existing_was_ancestor: true,
             local_spec: "refs/heads/main".to_owned(),
+            hidden_bundles: HashSet::new(),
             _temp_dir: temp_dir,
         };
         let outcome = perform_push_under_lock(&store, Some("repo"), BackendKind::S3, state)
