@@ -572,8 +572,8 @@ impl<'a> Doctor<'a> {
 }
 
 /// Stale-lock scan result: each entry pairs the original listing's key
-/// with the elapsed age (relative to the scan's `now`) that exceeded
-/// the TTL. The age is preserved for the operator-visible report;
+/// with the age (relative to the scan's `now`) that exceeded the TTL.
+/// The age is preserved for the operator-visible report;
 /// `delete_stale_lock_if_still_stale` re-derives staleness from a
 /// fresh HEAD before any destructive action.
 fn scan_stale_locks(objects: &[ObjectMeta], ttl: Duration) -> Vec<(&str, Duration)> {
@@ -582,8 +582,8 @@ fn scan_stale_locks(objects: &[ObjectMeta], ttl: Duration) -> Vec<(&str, Duratio
         .iter()
         .filter(|o| super::is_lock_key(&o.key))
         .filter_map(|o| {
-            let elapsed = Duration::try_from(now - o.last_modified).ok()?;
-            (elapsed > ttl).then_some((o.key.as_str(), elapsed))
+            let age = Duration::try_from(now - o.last_modified).ok()?;
+            (age > ttl).then_some((o.key.as_str(), age))
         })
         .collect()
 }
@@ -631,7 +631,7 @@ async fn delete_stale_lock_if_still_stale<W: Write>(
     match store.head(key).await {
         Ok(meta) => {
             let still_stale = Duration::try_from(OffsetDateTime::now_utc() - meta.last_modified)
-                .is_ok_and(|elapsed| elapsed > ttl);
+                .is_ok_and(|age| age > ttl);
             if !still_stale {
                 writeln!(
                     out,
