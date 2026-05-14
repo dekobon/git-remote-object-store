@@ -1015,64 +1015,13 @@ fn apply_delta(base: &ResolvedObject, delta: &[u8]) -> Result<ResolvedObject, Pa
         let op = delta[cursor];
         cursor += 1;
         if op & 0x80 != 0 {
-            // Copy-from-base instruction. The flag byte's low 4 bits
-            // signal which offset bytes follow; the next 3 bits signal
-            // which size bytes follow.
-            let mut copy_offset = 0u32;
-            for shift in 0..4 {
-                if op & (1 << shift) != 0 {
-                    copy_offset |=
-                        u32::from(*delta.get(cursor).ok_or(PackchainError::MalformedDelta {
-                            reason: "truncated delta copy offset",
-                        })?) << (shift * 8);
-                    cursor += 1;
-                }
-            }
-            let mut copy_size = 0u32;
-            for shift in 0..3 {
-                if op & (1 << (4 + shift)) != 0 {
-                    copy_size |=
-                        u32::from(*delta.get(cursor).ok_or(PackchainError::MalformedDelta {
-                            reason: "truncated delta copy size",
-                        })?) << (shift * 8);
-                    cursor += 1;
-                }
-            }
-            if copy_size == 0 {
-                copy_size = 0x10000; // Git's documented default size.
-            }
-            let start = copy_offset as usize;
-            let end =
-                start
-                    .checked_add(copy_size as usize)
-                    .ok_or(PackchainError::MalformedDelta {
-                        reason: "copy span overflow",
-                    })?;
-            if end > base.payload.len() {
-                return Err(PackchainError::MalformedDelta {
-                    reason: "copy span exceeds base object",
-                });
-            }
-            out.extend_from_slice(&base.payload[start..end]);
+            apply_delta_copy_op(op, delta, &mut cursor, &base.payload, &mut out)?;
         } else if op == 0 {
             return Err(PackchainError::MalformedDelta {
                 reason: "reserved zero opcode",
             });
         } else {
-            // Insert opcode: low 7 bits are the literal length.
-            let len = op as usize;
-            let end = cursor
-                .checked_add(len)
-                .ok_or(PackchainError::MalformedDelta {
-                    reason: "insert span overflow",
-                })?;
-            if end > delta.len() {
-                return Err(PackchainError::MalformedDelta {
-                    reason: "insert span exceeds delta payload",
-                });
-            }
-            out.extend_from_slice(&delta[cursor..end]);
-            cursor = end;
+            apply_delta_insert_op(op, delta, &mut cursor, &mut out)?;
         }
     }
     if out.len() as u64 != dst_size {
@@ -1084,6 +1033,89 @@ fn apply_delta(base: &ResolvedObject, delta: &[u8]) -> Result<ResolvedObject, Pa
         payload: out,
         kind: base.kind,
     })
+}
+
+/// Decode a packed-bitfield operand: for each set bit in `bitmask`,
+/// consume the next byte of `delta` and OR it in at `bit_index * 8`.
+fn read_packed_operand(
+    delta: &[u8],
+    cursor: &mut usize,
+    bitmask: u8,
+    bits: u8,
+    truncated_reason: &'static str,
+) -> Result<u32, PackchainError> {
+    let mut value = 0u32;
+    for shift in 0..bits {
+        if bitmask & (1 << shift) != 0 {
+            let byte = *delta.get(*cursor).ok_or(PackchainError::MalformedDelta {
+                reason: truncated_reason,
+            })?;
+            value |= u32::from(byte) << (u32::from(shift) * 8);
+            *cursor += 1;
+        }
+    }
+    Ok(value)
+}
+
+/// Git's documented default copy size when the delta's size operand is
+/// zero (`pack-format.txt`: "if the size is zero, it is assumed to be
+/// 0x10000").
+const GIT_DELTA_DEFAULT_COPY_SIZE: u32 = 0x1_0000;
+
+/// Handle a copy-from-base opcode (high bit set). Low 4 bits of `op`
+/// signal which offset bytes follow; the next 3 bits signal which size
+/// bytes follow. A zero size means git's documented default
+/// ([`GIT_DELTA_DEFAULT_COPY_SIZE`]).
+fn apply_delta_copy_op(
+    op: u8,
+    delta: &[u8],
+    cursor: &mut usize,
+    base: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), PackchainError> {
+    let copy_offset = read_packed_operand(delta, cursor, op, 4, "truncated delta copy offset")?;
+    let mut copy_size =
+        read_packed_operand(delta, cursor, op >> 4, 3, "truncated delta copy size")?;
+    if copy_size == 0 {
+        copy_size = GIT_DELTA_DEFAULT_COPY_SIZE;
+    }
+    let start = copy_offset as usize;
+    let end = start
+        .checked_add(copy_size as usize)
+        .ok_or(PackchainError::MalformedDelta {
+            reason: "copy span overflow",
+        })?;
+    if end > base.len() {
+        return Err(PackchainError::MalformedDelta {
+            reason: "copy span exceeds base object",
+        });
+    }
+    out.extend_from_slice(&base[start..end]);
+    Ok(())
+}
+
+/// Handle an insert opcode. Low 7 bits of `op` are the literal length;
+/// that many bytes follow and are copied verbatim into `out`.
+fn apply_delta_insert_op(
+    op: u8,
+    delta: &[u8],
+    cursor: &mut usize,
+    out: &mut Vec<u8>,
+) -> Result<(), PackchainError> {
+    let len = op as usize;
+    let end = cursor
+        .checked_add(len)
+        .ok_or(PackchainError::MalformedDelta {
+            reason: "insert span overflow",
+        })?;
+    if end > delta.len() {
+        return Err(PackchainError::MalformedDelta {
+            reason: "insert span exceeds delta payload",
+        });
+    }
+    out.extend_from_slice(&delta[*cursor..end]);
+    *cursor = end;
+    Ok(())
 }
 
 /// Read the variable-length size encoding used at the head of a delta
@@ -1532,6 +1564,34 @@ mod tests {
         assert!(
             matches!(err, PackchainError::MalformedDelta { reason } if reason.contains("zero opcode")),
             "expected MalformedDelta reserved-opcode error, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn apply_delta_copy_size_zero_substitutes_default() {
+        // Copy opcode with NO size operand bytes (high bits 4..6 of op
+        // all zero) — the decoded size is zero, which per git's spec
+        // must be substituted with `GIT_DELTA_DEFAULT_COPY_SIZE`
+        // (0x10000). We can't easily verify the produced length without
+        // a >=64 KiB base, so use a small base and check the substitution
+        // fires by observing the bounds-check failure: with the default
+        // substituted, the span (offset 0, size 0x10000) overshoots the
+        // 1-byte base and triggers "copy span exceeds base object". If
+        // the substitution were skipped, the span would be empty and
+        // the post-loop "destination size" check would fire instead.
+        let base = base_blob(b"x");
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&varint(1));
+        delta.extend_from_slice(&varint(2)); // dst_size irrelevant; copy errors first
+        // Copy opcode: MSB=1, bit0 set (1 byte of offset follows), all
+        // size bits (4..6) cleared.
+        delta.push(0b1000_0001);
+        delta.push(0); // offset = 0
+        let err = apply_delta(&base, &delta)
+            .expect_err("default-size substitution must fail bounds check");
+        assert!(
+            matches!(&err, PackchainError::MalformedDelta { reason } if reason.contains("copy span exceeds base")),
+            "expected copy-span-exceeds-base (proves default size was substituted), got {err:?}",
         );
     }
 
