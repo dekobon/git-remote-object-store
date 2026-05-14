@@ -528,17 +528,8 @@ impl<'a> Doctor<'a> {
         objects: &[ObjectMeta],
     ) -> Result<(), ManageError> {
         writeln!(out, "\nScanning for stale locks...")?;
-        let now = OffsetDateTime::now_utc();
         let ttl = Duration::from_secs(self.opts.lock_ttl_seconds);
-
-        let stale: Vec<(&str, Duration)> = objects
-            .iter()
-            .filter(|o| super::is_lock_key(&o.key))
-            .filter_map(|o| {
-                let elapsed = Duration::try_from(now - o.last_modified).ok()?;
-                (elapsed > ttl).then_some((o.key.as_str(), elapsed))
-            })
-            .collect();
+        let stale = scan_stale_locks(objects, ttl);
 
         if stale.is_empty() {
             writeln!(out, "No stale locks found.")?;
@@ -562,64 +553,12 @@ impl<'a> Doctor<'a> {
         let mut deleted = 0usize;
         let mut skipped = 0usize;
         for (key, _) in &stale {
-            // Re-HEAD the lock immediately before deleting it. The
-            // listing fed into this function originates from the
-            // top-of-run `list` call and can be minutes old after the
-            // interactive duplicate-bundle / HEAD-fix prompts. Without
-            // this re-check the lock at `key` may have been cleaned up
-            // and replaced by a fresh, active lock at the same key —
-            // and an unconditional `delete` would silently revoke
-            // another client's mutual exclusion (issue #132).
-            //
-            // The `ObjectStore` trait exposes no conditional delete
-            // primitive (no `If-Unmodified-Since` / `If-Match`), so a
-            // residual HEAD→delete window of a few milliseconds
-            // remains. Adding conditional delete is a broader trait
-            // change; the HEAD-then-delete approach shrinks the race
-            // from minutes to milliseconds and is the trade-off the
-            // issue's "suggested fix" accepts.
-            let recheck = self.store.head(key).await;
-            let recheck_now = OffsetDateTime::now_utc();
-            match recheck {
-                Ok(meta) => {
-                    let still_stale = Duration::try_from(recheck_now - meta.last_modified)
-                        .is_ok_and(|elapsed| elapsed > ttl);
-                    if !still_stale {
-                        writeln!(
-                            out,
-                            "Skipping {key}: lock no longer stale, refusing to delete"
-                        )?;
-                        warn!(key, "lock no longer stale, skipping doctor delete");
-                        skipped += 1;
-                        continue;
-                    }
-                }
-                Err(ObjectStoreError::NotFound(_)) => {
-                    writeln!(out, "Skipping {key}: lock disappeared concurrently")?;
-                    warn!(key, "lock disappeared between listing and delete, skipping");
-                    skipped += 1;
-                    continue;
-                }
-                Err(e) => {
-                    // Best-effort sweep: a transient HEAD failure
-                    // must not abort the run or delete on a stale
-                    // assumption.
-                    writeln!(out, "Failed to re-check {key}: {e}")?;
-                    warn!(key, error = %e, "head re-check failed; skipping delete");
-                    skipped += 1;
-                    continue;
-                }
-            }
-            match self.store.delete(key).await {
-                Ok(()) => {
-                    writeln!(out, "Deleted {key}")?;
-                    info!(key, "deleted stale lock");
-                    deleted += 1;
-                }
-                Err(e) => {
-                    // Best-effort: report each failure but keep going.
-                    writeln!(out, "Failed to delete {key}: {e}")?;
-                }
+            match delete_stale_lock_if_still_stale(self.store.as_ref(), key, ttl, out).await? {
+                DeleteOutcome::Deleted => deleted += 1,
+                DeleteOutcome::SkippedNotStale
+                | DeleteOutcome::SkippedDisappeared
+                | DeleteOutcome::SkippedHeadError => skipped += 1,
+                DeleteOutcome::DeleteFailed => {}
             }
         }
         if skipped > 0 {
@@ -629,6 +568,103 @@ impl<'a> Doctor<'a> {
             )?;
         }
         Ok(())
+    }
+}
+
+/// Stale-lock scan result: each entry pairs the original listing's key
+/// with the elapsed age (relative to the scan's `now`) that exceeded
+/// the TTL. The age is preserved for the operator-visible report;
+/// `delete_stale_lock_if_still_stale` re-derives staleness from a
+/// fresh HEAD before any destructive action.
+fn scan_stale_locks(objects: &[ObjectMeta], ttl: Duration) -> Vec<(&str, Duration)> {
+    let now = OffsetDateTime::now_utc();
+    objects
+        .iter()
+        .filter(|o| super::is_lock_key(&o.key))
+        .filter_map(|o| {
+            let elapsed = Duration::try_from(now - o.last_modified).ok()?;
+            (elapsed > ttl).then_some((o.key.as_str(), elapsed))
+        })
+        .collect()
+}
+
+/// Outcome of a single re-check + delete attempt against one stale-listed
+/// lock key. Each variant maps 1:1 to a branch in the original
+/// `list_and_handle_stale_locks` loop so the orchestrator can aggregate
+/// counts without re-inspecting the store or the writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteOutcome {
+    /// The fresh HEAD confirmed staleness and `delete` succeeded.
+    Deleted,
+    /// The fresh HEAD reported a `last_modified` within the TTL; the
+    /// lock is now active and must not be deleted (issue #132).
+    SkippedNotStale,
+    /// The fresh HEAD returned `NotFound` — another client's
+    /// stale-lock recovery already cleaned up the key.
+    SkippedDisappeared,
+    /// The fresh HEAD failed with a non-`NotFound` error (transient
+    /// network / 5xx). Treated as inconclusive: skip the delete
+    /// rather than acting on the stale-listing assumption.
+    SkippedHeadError,
+    /// HEAD confirmed staleness but `delete` itself failed. Logged,
+    /// counted as neither deleted nor skipped, so the caller can
+    /// continue with the next key (best-effort sweep contract).
+    DeleteFailed,
+}
+
+/// Re-HEAD `key` and, if it is still stale relative to `ttl`, delete
+/// it. Writes the operator-visible status line for whichever branch
+/// fires so the orchestrator stays a pure aggregator.
+///
+/// The re-HEAD shrinks the TOCTOU window between the original
+/// `list` (potentially minutes old, after interactive prompts) and
+/// the destructive `delete` from minutes to milliseconds. A
+/// conditional-delete primitive on `ObjectStore` would eliminate the
+/// residual window, but that is a trait-wide change tracked separately
+/// (issue #132's "suggested fix" accepts this trade-off).
+async fn delete_stale_lock_if_still_stale<W: Write>(
+    store: &dyn ObjectStore,
+    key: &str,
+    ttl: Duration,
+    out: &mut W,
+) -> Result<DeleteOutcome, ManageError> {
+    match store.head(key).await {
+        Ok(meta) => {
+            let still_stale = Duration::try_from(OffsetDateTime::now_utc() - meta.last_modified)
+                .is_ok_and(|elapsed| elapsed > ttl);
+            if !still_stale {
+                writeln!(
+                    out,
+                    "Skipping {key}: lock no longer stale, refusing to delete"
+                )?;
+                warn!(key, "lock no longer stale, skipping doctor delete");
+                return Ok(DeleteOutcome::SkippedNotStale);
+            }
+        }
+        Err(ObjectStoreError::NotFound(_)) => {
+            writeln!(out, "Skipping {key}: lock disappeared concurrently")?;
+            warn!(key, "lock disappeared between listing and delete, skipping");
+            return Ok(DeleteOutcome::SkippedDisappeared);
+        }
+        Err(e) => {
+            // Best-effort sweep: a transient HEAD failure must not
+            // abort the run or delete on a stale assumption.
+            writeln!(out, "Failed to re-check {key}: {e}")?;
+            warn!(key, error = %e, "head re-check failed; skipping delete");
+            return Ok(DeleteOutcome::SkippedHeadError);
+        }
+    }
+    match store.delete(key).await {
+        Ok(()) => {
+            writeln!(out, "Deleted {key}")?;
+            info!(key, "deleted stale lock");
+            Ok(DeleteOutcome::Deleted)
+        }
+        Err(e) => {
+            // Best-effort: report each failure but keep going.
+            writeln!(out, "Failed to delete {key}: {e}")?;
+            Ok(DeleteOutcome::DeleteFailed)
+        }
     }
 }
 
@@ -1851,6 +1887,146 @@ mod tests {
         assert!(
             captured.contains(&format!("Deleted {dev_key}")),
             "operator output missing delete confirmation for {dev_key}: {captured:?}",
+        );
+    }
+
+    // --- `delete_stale_lock_if_still_stale` per-branch unit coverage -----
+    //
+    // The five `DeleteOutcome` variants each correspond to one of the
+    // failure / success paths the orchestrator counts against. Driving
+    // the helper directly (instead of through `list_and_handle_stale_locks`)
+    // pins each branch in isolation: a regression that conflates two
+    // outcomes — e.g. counts `DeleteFailed` as `Deleted` — fails the
+    // outcome-equality assertion even when the operator-visible writer
+    // text still looks plausible.
+
+    const DELETE_TTL: Duration = Duration::from_mins(1);
+    const LOCK_KEY: &str = "myrepo/refs/heads/main/LOCK#.lock";
+
+    /// Fresh HEAD confirms staleness; `delete` succeeds → `Deleted`.
+    #[tokio::test]
+    async fn helper_returns_deleted_when_head_confirms_stale() {
+        let mock = MockStore::new();
+        let stale_ts = OffsetDateTime::now_utc() - time::Duration::seconds(120);
+        mock.insert_with(LOCK_KEY, Bytes::new(), stale_ts, PutOpts::default());
+
+        let mut out = Vec::new();
+        let outcome =
+            super::delete_stale_lock_if_still_stale(&mock, LOCK_KEY, DELETE_TTL, &mut out)
+                .await
+                .expect("helper must not error on the happy path");
+
+        assert_eq!(outcome, DeleteOutcome::Deleted);
+        assert!(!mock.contains(LOCK_KEY), "lock body must be removed");
+        let captured = String::from_utf8(out).expect("utf-8 output");
+        assert!(
+            captured.contains(&format!("Deleted {LOCK_KEY}")),
+            "delete confirmation missing: {captured:?}",
+        );
+    }
+
+    /// Fresh HEAD shows a `last_modified` inside the TTL → `SkippedNotStale`.
+    /// Pins the issue-#132 race-window guard.
+    #[tokio::test]
+    async fn helper_returns_skipped_not_stale_when_head_shows_fresh() {
+        let mock = MockStore::new();
+        // Insert with `now` — HEAD will read this as fresh.
+        mock.insert(LOCK_KEY, Bytes::new());
+
+        let mut out = Vec::new();
+        let outcome =
+            super::delete_stale_lock_if_still_stale(&mock, LOCK_KEY, DELETE_TTL, &mut out)
+                .await
+                .expect("helper must not error when refusing to delete");
+
+        assert_eq!(outcome, DeleteOutcome::SkippedNotStale);
+        assert!(
+            mock.contains(LOCK_KEY),
+            "fresh lock must survive a stale-listing call",
+        );
+        let captured = String::from_utf8(out).expect("utf-8 output");
+        assert!(
+            captured.contains("no longer stale"),
+            "skip-reason text missing: {captured:?}",
+        );
+    }
+
+    /// HEAD returns `NotFound` → `SkippedDisappeared`.
+    #[tokio::test]
+    async fn helper_returns_skipped_disappeared_on_not_found() {
+        // No insert — HEAD will return NotFound.
+        let mock = MockStore::new();
+        let mut out = Vec::new();
+        let outcome =
+            super::delete_stale_lock_if_still_stale(&mock, LOCK_KEY, DELETE_TTL, &mut out)
+                .await
+                .expect("vanished key must not surface as an error");
+
+        assert_eq!(outcome, DeleteOutcome::SkippedDisappeared);
+        let captured = String::from_utf8(out).expect("utf-8 output");
+        assert!(
+            captured.contains("disappeared concurrently"),
+            "disappeared-skip line missing: {captured:?}",
+        );
+    }
+
+    /// HEAD fails with a transient (non-`NotFound`) error →
+    /// `SkippedHeadError`. The lock must NOT be deleted on the
+    /// inconclusive HEAD (best-effort sweep contract).
+    #[tokio::test]
+    async fn helper_returns_skipped_head_error_on_transient_failure() {
+        let mock = MockStore::new();
+        let stale_ts = OffsetDateTime::now_utc() - time::Duration::seconds(120);
+        mock.insert_with(LOCK_KEY, Bytes::new(), stale_ts, PutOpts::default());
+        mock.arm(Fault::NetworkOnHead {
+            key: LOCK_KEY.to_owned(),
+        });
+
+        let mut out = Vec::new();
+        let outcome =
+            super::delete_stale_lock_if_still_stale(&mock, LOCK_KEY, DELETE_TTL, &mut out)
+                .await
+                .expect("transient HEAD failure must not abort the sweep");
+
+        assert_eq!(outcome, DeleteOutcome::SkippedHeadError);
+        assert!(
+            mock.contains(LOCK_KEY),
+            "lock must survive an inconclusive HEAD",
+        );
+        let captured = String::from_utf8(out).expect("utf-8 output");
+        assert!(
+            captured.contains("Failed to re-check"),
+            "re-check failure line missing: {captured:?}",
+        );
+    }
+
+    /// HEAD confirms staleness but `delete` itself fails →
+    /// `DeleteFailed`. The helper must return Ok so the orchestrator
+    /// can proceed to the next key.
+    #[tokio::test]
+    async fn helper_returns_delete_failed_when_delete_errors() {
+        let mock = MockStore::new();
+        let stale_ts = OffsetDateTime::now_utc() - time::Duration::seconds(120);
+        mock.insert_with(LOCK_KEY, Bytes::new(), stale_ts, PutOpts::default());
+        mock.arm(Fault::NetworkOnDelete {
+            key: LOCK_KEY.to_owned(),
+        });
+
+        let mut out = Vec::new();
+        let outcome =
+            super::delete_stale_lock_if_still_stale(&mock, LOCK_KEY, DELETE_TTL, &mut out)
+                .await
+                .expect("delete failure must surface as Ok(DeleteFailed), not Err");
+
+        assert_eq!(outcome, DeleteOutcome::DeleteFailed);
+        assert!(
+            mock.contains(LOCK_KEY),
+            "failed delete must not have removed the lock",
+        );
+        let captured = String::from_utf8(out).expect("utf-8 output");
+        assert!(
+            captured.contains(&format!("Failed to delete {LOCK_KEY}")),
+            "delete-failure line missing: {captured:?}",
         );
     }
 
