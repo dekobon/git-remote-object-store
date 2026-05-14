@@ -67,7 +67,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Time
-time = { version = "0.3", features = ["parsing", "formatting"] }
+time = { version = "0.3", features = ["parsing", "formatting", "macros"] }
 
 # JSON (LFS)
 serde = { version = "1", features = ["derive"] }

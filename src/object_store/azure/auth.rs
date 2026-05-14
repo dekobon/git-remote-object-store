@@ -42,12 +42,27 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use time::OffsetDateTime;
-use time::format_description::well_known::Rfc2822;
+use time::format_description::BorrowedFormatItem;
+use time::macros::format_description;
 use url::Url;
 
 use crate::object_store::ObjectStoreError;
 use crate::object_store::error::other_boxed;
 use crate::url::RemoteFlags;
+
+/// RFC 1123 date format Azure requires for `x-ms-date` — the
+/// `Sun, 06 Nov 1994 08:49:37 GMT` shape documented at
+/// <https://learn.microsoft.com/en-us/rest/api/storageservices/representation-of-date-time-values-in-headers>.
+///
+/// Pinning the format here keeps Azure-auth correctness independent of
+/// the exact byte emission of any well-known formatter in the `time`
+/// crate; previously we formatted via `Rfc2822` and string-replaced
+/// `+0000` → `GMT`, which would silently produce malformed headers if
+/// `time` ever changed its RFC 2822 layout (e.g., `+00:00`).
+const X_MS_DATE_FORMAT: &[BorrowedFormatItem<'_>] = format_description!(
+    "[weekday repr:short], [day padding:zero] [month repr:short] [year] \
+     [hour padding:zero]:[minute padding:zero]:[second padding:zero] GMT"
+);
 
 /// Outcome of [`resolve`]: at most one of (`token_credential`,
 /// `per_try_policy`) is populated. `sas_signing_key` is populated
@@ -277,14 +292,12 @@ impl Policy for SharedKeySigningPolicy {
         // `Date` header instead; `x-ms-date` takes precedence per
         // the Azure spec.
         let now = OffsetDateTime::now_utc();
-        let date = now.format(&Rfc2822).map_err(|e| {
+        let date = now.format(&X_MS_DATE_FORMAT).map_err(|e| {
             azure_core::Error::with_message(
                 azure_core::error::ErrorKind::Other,
                 format!("failed to format x-ms-date: {e}"),
             )
         })?;
-        // RFC 2822 emits `+0000`; Azure expects `GMT` per RFC 1123.
-        let date = date.replace("+0000", "GMT");
         request.insert_header(HeaderName::from_static("x-ms-date"), date);
 
         let method = request.method();
@@ -706,6 +719,28 @@ mod tests {
         let sig = auth.strip_prefix("SharedKey devstoreaccount1:").unwrap();
         // HMAC-SHA256 → 32 bytes → 44 chars base64.
         assert_eq!(sig.len(), 44, "unexpected sig length: `{sig}`");
+    }
+
+    // --- X_MS_DATE_FORMAT --------------------------------------------
+
+    #[test]
+    fn x_ms_date_format_matches_rfc1123_literal() {
+        // Canonical RFC 1123 / Azure example, also used as the IMF-fixdate
+        // sample in RFC 7231: `Sun, 06 Nov 1994 08:49:37 GMT`.
+        // Unix timestamp 784111777 is 1994-11-06T08:49:37Z.
+        let when = OffsetDateTime::from_unix_timestamp(784_111_777).expect("valid timestamp");
+        let formatted = when.format(&X_MS_DATE_FORMAT).expect("formats");
+        assert_eq!(formatted, "Sun, 06 Nov 1994 08:49:37 GMT");
+    }
+
+    #[test]
+    fn x_ms_date_format_zero_pads_single_digit_fields() {
+        // Guards against a future regression that drops zero-padding on
+        // day, hour, minute, or second — Azure rejects unpadded values.
+        // 2025-01-02T03:04:05Z → all single-digit components.
+        let when = OffsetDateTime::from_unix_timestamp(1_735_787_045).expect("valid timestamp");
+        let formatted = when.format(&X_MS_DATE_FORMAT).expect("formats");
+        assert_eq!(formatted, "Thu, 02 Jan 2025 03:04:05 GMT");
     }
 
     // --- SasSigningPolicy --------------------------------------------
