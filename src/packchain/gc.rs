@@ -2181,78 +2181,22 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
-    impl ObjectStore for PostDeleteHookStore {
-        async fn list(
-            &self,
-            prefix: &str,
-        ) -> Result<Vec<crate::object_store::ObjectMeta>, ObjectStoreError> {
-            self.inner.list(prefix).await
-        }
+    crate::delegate_to_inner_impl! {
+        impl ObjectStore for PostDeleteHookStore {
+            forward: list, get_to_file, get_bytes, get_bytes_range,
+                     put_bytes, put_path, put_if_absent,
+                     head, copy;
 
-        async fn get_to_file(
-            &self,
-            key: &str,
-            dest: &std::path::Path,
-            opts: crate::object_store::GetOpts,
-        ) -> Result<(), ObjectStoreError> {
-            self.inner.get_to_file(key, dest, opts).await
-        }
-
-        async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
-            self.inner.get_bytes(key).await
-        }
-
-        async fn get_bytes_range(
-            &self,
-            key: &str,
-            range: std::ops::Range<u64>,
-        ) -> Result<Bytes, ObjectStoreError> {
-            self.inner.get_bytes_range(key, range).await
-        }
-
-        async fn put_bytes(
-            &self,
-            key: &str,
-            body: Bytes,
-            opts: PutOpts,
-        ) -> Result<(), ObjectStoreError> {
-            self.inner.put_bytes(key, body, opts).await
-        }
-
-        async fn put_path(
-            &self,
-            key: &str,
-            src: &std::path::Path,
-            opts: PutOpts,
-        ) -> Result<(), ObjectStoreError> {
-            self.inner.put_path(key, src, opts).await
-        }
-
-        async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
-            self.inner.put_if_absent(key, body).await
-        }
-
-        async fn head(
-            &self,
-            key: &str,
-        ) -> Result<crate::object_store::ObjectMeta, ObjectStoreError> {
-            self.inner.head(key).await
-        }
-
-        async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
-            self.inner.copy(src, dst).await
-        }
-
-        async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
-            let result = self.inner.delete(key).await;
-            if result.is_ok()
-                && key.starts_with(&self.trigger_prefix)
-                && let Some(hook) = self.hook.lock().unwrap().take()
-            {
-                hook(&self.inner);
+            async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
+                let result = self.inner.delete(key).await;
+                if result.is_ok()
+                    && key.starts_with(&self.trigger_prefix)
+                    && let Some(hook) = self.hook.lock().unwrap().take()
+                {
+                    hook(&self.inner);
+                }
+                result
             }
-            result
         }
     }
 
@@ -2632,78 +2576,25 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
-    impl ObjectStore for PostListHookStore {
-        async fn list(
-            &self,
-            prefix: &str,
-        ) -> Result<Vec<crate::object_store::ObjectMeta>, ObjectStoreError> {
-            let result = self.inner.list(prefix).await;
-            if result.is_ok() {
-                let hook = self.hook.lock().unwrap().take();
-                if let Some(hook) = hook {
-                    hook(&self.inner);
+    crate::delegate_to_inner_impl! {
+        impl ObjectStore for PostListHookStore {
+            forward: get_to_file, get_bytes, get_bytes_range,
+                     put_bytes, put_path, put_if_absent,
+                     head, copy, delete;
+
+            async fn list(
+                &self,
+                prefix: &str,
+            ) -> Result<Vec<crate::object_store::ObjectMeta>, ObjectStoreError> {
+                let result = self.inner.list(prefix).await;
+                if result.is_ok() {
+                    let hook = self.hook.lock().unwrap().take();
+                    if let Some(hook) = hook {
+                        hook(&self.inner);
+                    }
                 }
+                result
             }
-            result
-        }
-
-        async fn get_to_file(
-            &self,
-            key: &str,
-            dest: &std::path::Path,
-            opts: crate::object_store::GetOpts,
-        ) -> Result<(), ObjectStoreError> {
-            self.inner.get_to_file(key, dest, opts).await
-        }
-
-        async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
-            self.inner.get_bytes(key).await
-        }
-
-        async fn get_bytes_range(
-            &self,
-            key: &str,
-            range: std::ops::Range<u64>,
-        ) -> Result<Bytes, ObjectStoreError> {
-            self.inner.get_bytes_range(key, range).await
-        }
-
-        async fn put_bytes(
-            &self,
-            key: &str,
-            body: Bytes,
-            opts: PutOpts,
-        ) -> Result<(), ObjectStoreError> {
-            self.inner.put_bytes(key, body, opts).await
-        }
-
-        async fn put_path(
-            &self,
-            key: &str,
-            src: &std::path::Path,
-            opts: PutOpts,
-        ) -> Result<(), ObjectStoreError> {
-            self.inner.put_path(key, src, opts).await
-        }
-
-        async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
-            self.inner.put_if_absent(key, body).await
-        }
-
-        async fn head(
-            &self,
-            key: &str,
-        ) -> Result<crate::object_store::ObjectMeta, ObjectStoreError> {
-            self.inner.head(key).await
-        }
-
-        async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
-            self.inner.copy(src, dst).await
-        }
-
-        async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
-            self.inner.delete(key).await
         }
     }
 
@@ -2807,78 +2698,22 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
-    impl ObjectStore for PostGetHookStore {
-        async fn list(
-            &self,
-            prefix: &str,
-        ) -> Result<Vec<crate::object_store::ObjectMeta>, ObjectStoreError> {
-            self.inner.list(prefix).await
-        }
+    crate::delegate_to_inner_impl! {
+        impl ObjectStore for PostGetHookStore {
+            forward: list, get_to_file, get_bytes_range,
+                     put_bytes, put_path, put_if_absent,
+                     head, copy, delete;
 
-        async fn get_to_file(
-            &self,
-            key: &str,
-            dest: &std::path::Path,
-            opts: crate::object_store::GetOpts,
-        ) -> Result<(), ObjectStoreError> {
-            self.inner.get_to_file(key, dest, opts).await
-        }
-
-        async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
-            let result = self.inner.get_bytes(key).await;
-            if result.is_ok()
-                && key == self.trigger_key
-                && let Some(hook) = self.hook.lock().unwrap().take()
-            {
-                hook(&self.inner);
+            async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+                let result = self.inner.get_bytes(key).await;
+                if result.is_ok()
+                    && key == self.trigger_key
+                    && let Some(hook) = self.hook.lock().unwrap().take()
+                {
+                    hook(&self.inner);
+                }
+                result
             }
-            result
-        }
-
-        async fn get_bytes_range(
-            &self,
-            key: &str,
-            range: std::ops::Range<u64>,
-        ) -> Result<Bytes, ObjectStoreError> {
-            self.inner.get_bytes_range(key, range).await
-        }
-
-        async fn put_bytes(
-            &self,
-            key: &str,
-            body: Bytes,
-            opts: PutOpts,
-        ) -> Result<(), ObjectStoreError> {
-            self.inner.put_bytes(key, body, opts).await
-        }
-
-        async fn put_path(
-            &self,
-            key: &str,
-            src: &std::path::Path,
-            opts: PutOpts,
-        ) -> Result<(), ObjectStoreError> {
-            self.inner.put_path(key, src, opts).await
-        }
-
-        async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
-            self.inner.put_if_absent(key, body).await
-        }
-
-        async fn head(
-            &self,
-            key: &str,
-        ) -> Result<crate::object_store::ObjectMeta, ObjectStoreError> {
-            self.inner.head(key).await
-        }
-
-        async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
-            self.inner.copy(src, dst).await
-        }
-
-        async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
-            self.inner.delete(key).await
         }
     }
 

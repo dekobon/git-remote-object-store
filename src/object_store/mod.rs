@@ -19,6 +19,9 @@ pub mod s3;
 #[cfg(any(test, feature = "test-util"))]
 pub mod mock;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 use std::path::Path;
 use std::sync::Arc;
 

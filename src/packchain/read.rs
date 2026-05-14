@@ -2173,62 +2173,28 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
-    impl ObjectStore for EvolvingChainStore {
-        async fn list(
-            &self,
-            prefix: &str,
-        ) -> Result<Vec<crate::object_store::ObjectMeta>, ObjectStoreError> {
-            self.inner.list(prefix).await
-        }
-        async fn get_to_file(
-            &self,
-            key: &str,
-            dest: &std::path::Path,
-            opts: crate::object_store::GetOpts,
-        ) -> Result<(), ObjectStoreError> {
-            self.inner.get_to_file(key, dest, opts).await
-        }
-        async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
-            if key == self.chain_key {
-                let idx = self.calls.fetch_add(1, Ordering::SeqCst);
-                let pick = idx.min(self.bodies.len() - 1);
-                return Ok(self.bodies[pick].clone());
+    // Note: `put_path` is intentionally omitted from the forward list
+    // to preserve the original behavior (trait default → `Self::put_bytes`
+    // → `inner.put_bytes`), which bypasses `MockStore::put_path`. The
+    // test never invokes `put_path` on this decorator, so the bypass is
+    // a no-op in practice but kept for byte-for-byte parity.
+    crate::delegate_to_inner_impl! {
+        impl ObjectStore for EvolvingChainStore {
+            forward: list, get_to_file, get_bytes_range,
+                     put_bytes, put_if_absent,
+                     head, copy, delete;
+
+            async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+                if key == self.chain_key {
+                    let idx = self.calls.fetch_add(1, Ordering::SeqCst);
+                    let pick = idx.min(self.bodies.len() - 1);
+                    return Ok(self.bodies[pick].clone());
+                }
+                if key.ends_with("/path-index.json") {
+                    self.path_index_calls.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.get_bytes(key).await
             }
-            if key.ends_with("/path-index.json") {
-                self.path_index_calls.fetch_add(1, Ordering::SeqCst);
-            }
-            self.inner.get_bytes(key).await
-        }
-        async fn get_bytes_range(
-            &self,
-            key: &str,
-            range: std::ops::Range<u64>,
-        ) -> Result<Bytes, ObjectStoreError> {
-            self.inner.get_bytes_range(key, range).await
-        }
-        async fn put_bytes(
-            &self,
-            key: &str,
-            body: Bytes,
-            opts: crate::object_store::PutOpts,
-        ) -> Result<(), ObjectStoreError> {
-            self.inner.put_bytes(key, body, opts).await
-        }
-        async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
-            self.inner.put_if_absent(key, body).await
-        }
-        async fn head(
-            &self,
-            key: &str,
-        ) -> Result<crate::object_store::ObjectMeta, ObjectStoreError> {
-            self.inner.head(key).await
-        }
-        async fn copy(&self, src: &str, dst: &str) -> Result<(), ObjectStoreError> {
-            self.inner.copy(src, dst).await
-        }
-        async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
-            self.inner.delete(key).await
         }
     }
 
