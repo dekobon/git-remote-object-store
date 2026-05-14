@@ -193,8 +193,8 @@ Describe "S3 helper: concurrent push and stale-lock recovery"
 
 			# Issue #157: SHA1's bundle survives the fast-forward push
 			# as a tombstoned predecessor — pass the getter to filter.
-			assert_bundle_count rustfs_list "$BUCKET" "$PREFIX" \
-				refs/heads/main 1 rustfs_get_object
+			# `assert_bundle_sha_for_ref` enforces count == 1 with the
+			# named SHA, so a separate count assertion is redundant.
 			assert_bundle_sha_for_ref rustfs_list "$BUCKET" "$PREFIX" \
 				refs/heads/main "$SHA2" rustfs_get_object
 		End

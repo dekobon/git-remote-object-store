@@ -1,5 +1,6 @@
 # shellcheck shell=bash
-# shellcheck disable=SC2154
+# shellcheck disable=SC2154 # variables defined by shellspec hooks
+# shellcheck disable=SC2016 # BeforeEach strings are evaluated by shellspec in the test scope; deferred-expansion via single quotes is intentional
 
 Describe "Azure helper (live Azure Blob): force-push and protected refs"
 	Include spec/support/live_common.sh
@@ -91,8 +92,10 @@ Describe "Azure helper (live Azure Blob): force-push and protected refs"
 			# bundle-format check below would skip.
 			assert_ls_remote_sha "$URL" refs/heads/main "$SHA_A"
 			if live_engine_is_bundle; then
-				assert_bundle_count live_az_list "$CONTAINER" "$PREFIX" \
-					refs/heads/main 1
+				# `assert_bundle_sha_for_ref` enforces count == 1 with
+				# the named SHA, so a separate count assertion is
+				# redundant. No tombstone exists on the refusal path
+				# (no push succeeded), so no getter is needed.
 				assert_bundle_sha_for_ref live_az_list "$CONTAINER" "$PREFIX" \
 					refs/heads/main "$SHA_A"
 			fi

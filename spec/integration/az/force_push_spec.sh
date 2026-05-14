@@ -1,5 +1,6 @@
 # shellcheck shell=bash
-# shellcheck disable=SC2154
+# shellcheck disable=SC2154 # variables defined by shellspec hooks
+# shellcheck disable=SC2016 # BeforeEach strings are evaluated by shellspec in the test scope; deferred-expansion via single quotes is intentional
 
 Describe "Azure helper: force-push and protected refs"
 	Include spec/support/images.sh
@@ -80,8 +81,10 @@ Describe "Azure helper: force-push and protected refs"
 			# unrelated push failures (network, permission, ...).
 			The variable LAST_GIT_OUTPUT should include "not ancestor"
 
-			assert_bundle_count azurite_list "$CONTAINER" "$PREFIX" \
-				refs/heads/main 1
+			# `assert_bundle_sha_for_ref` enforces count == 1 with the
+			# named SHA, so a separate count assertion is redundant.
+			# No tombstone exists on the refusal path (no push
+			# succeeded), so no getter is needed.
 			assert_bundle_sha_for_ref azurite_list "$CONTAINER" "$PREFIX" \
 				refs/heads/main "$SHA_A"
 		End

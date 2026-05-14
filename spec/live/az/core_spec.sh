@@ -28,8 +28,9 @@ Describe "Azure helper (live Azure Blob): core git operations"
 			The status should equal 0
 
 			if live_engine_is_bundle; then
-				assert_bundle_count live_az_list "$CONTAINER" "$PREFIX" \
-					refs/heads/main 1
+				# `assert_bundle_sha_for_ref` already enforces exactly
+				# one bundle with the named SHA, subsuming a separate
+				# `assert_bundle_count == 1` check.
 				assert_bundle_sha_for_ref live_az_list "$CONTAINER" "$PREFIX" \
 					refs/heads/main "$SHA"
 				assert_head_pointer live_az_get_object "$CONTAINER" "$PREFIX" \
@@ -132,12 +133,11 @@ Describe "Azure helper (live Azure Blob): core git operations"
 					| grep -Fq "$SHA_TAG"
 				return $?
 			fi
-			assert_bundle_count live_az_list "$CONTAINER" "$PREFIX" \
-				refs/heads/feature 1 \
-				&& assert_bundle_sha_for_ref live_az_list "$CONTAINER" "$PREFIX" \
+			# `assert_bundle_sha_for_ref` enforces count == 1 with the
+			# named SHA, so paired `assert_bundle_count == 1` calls are
+			# redundant.
+			assert_bundle_sha_for_ref live_az_list "$CONTAINER" "$PREFIX" \
 				refs/heads/feature "$SHA_FEATURE" \
-				&& assert_bundle_count live_az_list "$CONTAINER" "$PREFIX" \
-				refs/tags/v1 1 \
 				&& assert_bundle_sha_for_ref live_az_list "$CONTAINER" "$PREFIX" \
 				refs/tags/v1 "$SHA_TAG"
 		}

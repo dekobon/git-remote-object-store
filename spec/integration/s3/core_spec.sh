@@ -32,8 +32,9 @@ Describe "S3 helper: core git operations against rustfs"
 			When call push_branch "$WORK" origin refs/heads/main:refs/heads/main
 			The status should equal 0
 
-			assert_bundle_count rustfs_list "$BUCKET" "$PREFIX" \
-				refs/heads/main 1
+			# `assert_bundle_sha_for_ref` already enforces exactly one
+			# bundle with the named SHA, subsuming a separate
+			# `assert_bundle_count == 1` check.
 			assert_bundle_sha_for_ref rustfs_list "$BUCKET" "$PREFIX" \
 				refs/heads/main "$SHA"
 			assert_head_pointer rustfs_get_object "$BUCKET" "$PREFIX" \
@@ -132,12 +133,11 @@ Describe "S3 helper: core git operations against rustfs"
 		BeforeEach 'setup'
 
 		verify_branch_and_tag() {
-			assert_bundle_count rustfs_list "$BUCKET" "$PREFIX" \
-				refs/heads/feature 1 \
-				&& assert_bundle_sha_for_ref rustfs_list "$BUCKET" "$PREFIX" \
+			# `assert_bundle_sha_for_ref` enforces count == 1 with the
+			# named SHA, so paired `assert_bundle_count == 1` calls are
+			# redundant.
+			assert_bundle_sha_for_ref rustfs_list "$BUCKET" "$PREFIX" \
 				refs/heads/feature "$SHA_FEATURE" \
-				&& assert_bundle_count rustfs_list "$BUCKET" "$PREFIX" \
-				refs/tags/v1 1 \
 				&& assert_bundle_sha_for_ref rustfs_list "$BUCKET" "$PREFIX" \
 				refs/tags/v1 "$SHA_TAG"
 		}
