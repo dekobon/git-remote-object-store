@@ -100,10 +100,16 @@ Describe "S3 helper: concurrent push and stale-lock recovery"
 			rm -rf "$result_dir"
 
 			# Identify the winner from the surviving bundle.
+			# Issue #157: every successful force-push tombstones the
+			# prior baseline, so the raw listing contains the
+			# base-commit bundle (tombstoned) AND the winner's bundle.
+			# Pass `rustfs_get_object` so the assertion filters out the
+			# tombstoned predecessor.
 			assert_bundle_count rustfs_list "$bucket" "$prefix" \
-				refs/heads/main 1 || return 1
+				refs/heads/main 1 rustfs_get_object || return 1
 			local keys winner=""
-			keys=$(rustfs_list "$bucket" "$prefix")
+			keys=$(bundle_keys rustfs_list "$bucket" "$prefix" \
+				refs/heads/main rustfs_get_object)
 			if [[ "$keys" == *"/${sha_a}.bundle"* ]]; then
 				winner="A"
 			elif [[ "$keys" == *"/${sha_b}.bundle"* ]]; then
@@ -177,10 +183,12 @@ Describe "S3 helper: concurrent push and stale-lock recovery"
 			When call quiet_push
 			The status should equal 0
 
+			# Issue #157: SHA1's bundle survives the fast-forward push
+			# as a tombstoned predecessor — pass the getter to filter.
 			assert_bundle_count rustfs_list "$BUCKET" "$PREFIX" \
-				refs/heads/main 1
+				refs/heads/main 1 rustfs_get_object
 			assert_bundle_sha_for_ref rustfs_list "$BUCKET" "$PREFIX" \
-				refs/heads/main "$SHA2"
+				refs/heads/main "$SHA2" rustfs_get_object
 		End
 	End
 End

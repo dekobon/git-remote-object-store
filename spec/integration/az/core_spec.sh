@@ -95,9 +95,12 @@ Describe "Azure helper: core git operations against Azurite"
 			When call push_branch "$SRC" origin refs/heads/main:refs/heads/main
 			The status should equal 0
 
-			# Post-condition: SHA1 replaced by SHA2.
+			# Post-condition: SHA1 replaced by SHA2 logically. Issue
+			# #157 defers SHA1's deletion via a baseline tombstone —
+			# pass the getter so the assertion filters tombstoned
+			# predecessors and checks the live state.
 			assert_bundle_sha_for_ref azurite_list "$CONTAINER" "$PREFIX" \
-				refs/heads/main "$SHA2"
+				refs/heads/main "$SHA2" azurite_get_object
 
 			fetch_remote "$DST" origin
 			assert_git_sha_equals "$DST" refs/remotes/origin/main "$SHA2"

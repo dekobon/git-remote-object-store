@@ -5,31 +5,119 @@
 # and Azurite. The lister is invoked as `<lister> <bucket> <prefix>`
 # and prints one key per line.
 
-# bundle_keys <lister> <bucket> <prefix> <ref>
+# tombstoned_bundle_keys <lister> <getter> <bucket> <prefix>
+# Print the set of bundle keys (full path) that have a matching baseline
+# tombstone under <prefix>/gc/. Mirrors `tombstoned_bundle_keys` in
+# `src/packchain/gc.rs`: the bundle engine defers prior-bundle deletion
+# (issue #157) so the on-bucket listing temporarily contains both the
+# live bundle and any tombstoned predecessors during the gc grace
+# window. White-box assertions on "logical" bucket state need to
+# subtract the tombstoned set to recover the pre-#157 semantics.
+#
+# Requires `jq` on PATH (already a hard prereq of the live + integration
+# suites). Each tombstone body is JSON with `.ref_name` and `.sha`
+# fields (see `BaselineTombstone` in `src/packchain/gc.rs`); the bundle
+# key is reconstructed via `<prefix>/<ref_name>/<sha>.bundle` to match
+# the canonical `keys::bundle_key` shape.
+tombstoned_bundle_keys() {
+	local lister="$1"
+	local getter="$2"
+	local bucket="$3"
+	local prefix="$4"
+	local tomb_prefix="${prefix}/gc/baseline-tomb-"
+	local tomb_keys
+	tomb_keys=$("$lister" "$bucket" "$prefix" \
+		| awk -v t="$tomb_prefix" 'index($0, t) == 1 && /\.json$/')
+	if [[ -z "$tomb_keys" ]]; then
+		return 0
+	fi
+	local tmp key body ref sha
+	tmp=$(mktemp -t baseline-tomb.XXXXXX) || {
+		echo "tombstoned_bundle_keys: mktemp failed" >&2
+		return 1
+	}
+	# `IFS=` + `-r` preserves the literal key, then we trim by hand.
+	while IFS= read -r key; do
+		[[ -z "$key" ]] && continue
+		if ! "$getter" "$bucket" "$key" "$tmp" >/dev/null 2>&1; then
+			rm -f "$tmp"
+			echo "tombstoned_bundle_keys: failed to download $key" >&2
+			return 1
+		fi
+		body=$(<"$tmp")
+		ref=$(jq -r '.ref_name // empty' <<<"$body")
+		sha=$(jq -r '.sha // empty' <<<"$body")
+		if [[ -z "$ref" || -z "$sha" ]]; then
+			rm -f "$tmp"
+			echo "tombstoned_bundle_keys: malformed tombstone at $key" >&2
+			return 1
+		fi
+		printf '%s/%s/%s.bundle\n' "$prefix" "$ref" "$sha"
+	done <<<"$tomb_keys"
+	rm -f "$tmp"
+}
+
+# bundle_keys <lister> <bucket> <prefix> <ref> [getter]
 # Print the bundle keys (full path) under <prefix>/<ref>/.
 # `index($0, target) == 1` is a literal-substring match (no regex), so
 # `$prefix` / `$ref` containing `.`, `+`, `*`, `[` cannot turn into
 # wildcards. Only the trailing `<sha>.bundle` shape is matched as a
 # regex.
+#
+# When the optional 5th arg <getter> is provided, the result is filtered
+# to exclude bundle keys that have a matching baseline tombstone (see
+# `tombstoned_bundle_keys`). Tests that exercise A→B transitions on the
+# bundle engine must pass a getter so the assertion reflects logical
+# (live) state, not the raw on-bucket listing that includes
+# soon-to-be-reclaimed predecessors.
 bundle_keys() {
 	local lister="$1"
 	local bucket="$2"
 	local prefix="$3"
 	local ref="$4"
+	local getter="${5:-}"
 	local target="${prefix}/${ref}/"
-	"$lister" "$bucket" "$prefix" \
-		| awk -v t="$target" 'index($0, t) == 1 && /\/[0-9a-f]+\.bundle$/'
+	local all_keys
+	all_keys=$("$lister" "$bucket" "$prefix" \
+		| awk -v t="$target" 'index($0, t) == 1 && /\/[0-9a-f]+\.bundle$/')
+	local tombstoned=""
+	if [[ -n "$getter" ]]; then
+		tombstoned=$(tombstoned_bundle_keys "$lister" "$getter" "$bucket" "$prefix") || return 1
+	fi
+	if [[ -z "$tombstoned" ]]; then
+		# An empty `all_keys` is a valid result (zero bundles under
+		# the ref — e.g. immediately after a delete) so the helper
+		# must return 0; an explicit `return 0` avoids inheriting the
+		# `[[ -n ]] &&` short-circuit's exit-1 status.
+		if [[ -n "$all_keys" ]]; then
+			echo "$all_keys"
+		fi
+		return 0
+	fi
+	# `grep -Fxvf <tombstoned> <all_keys>` returns 1 when every input
+	# line is filtered out (an empty result). That is a valid outcome
+	# here — every observed bundle was tombstoned — so the `|| true`
+	# pin keeps the helper from failing.
+	grep -Fxvf <(echo "$tombstoned") <(echo "$all_keys") || true
 }
 
-# assert_bundle_count <lister> <bucket> <prefix> <ref> <expected>
+# assert_bundle_count <lister> <bucket> <prefix> <ref> <expected> [getter]
+# Pass <getter> to filter tombstoned bundles from the count; required on
+# bundle-engine tests that exercise A→B transitions (see `bundle_keys`).
 assert_bundle_count() {
 	local lister="$1"
 	local bucket="$2"
 	local prefix="$3"
 	local ref="$4"
 	local expected="$5"
-	local actual
-	actual=$(bundle_keys "$lister" "$bucket" "$prefix" "$ref" | wc -l | tr -d ' ')
+	local getter="${6:-}"
+	# Split the pipe so `bundle_keys`'s non-zero exit (e.g. a
+	# `tombstoned_bundle_keys` failure on getter / mktemp / malformed
+	# JSON) propagates up instead of being masked by `grep -c`'s
+	# zero-input "count == 0" result.
+	local keys actual
+	keys=$(bundle_keys "$lister" "$bucket" "$prefix" "$ref" "$getter") || return 1
+	actual=$(echo "$keys" | grep -c . || true)
 	if [[ "$actual" != "$expected" ]]; then
 		echo "assert_bundle_count: $prefix/$ref/ has $actual bundle(s), expected $expected" >&2
 		"$lister" "$bucket" "$prefix" >&2 || true
@@ -37,17 +125,22 @@ assert_bundle_count() {
 	fi
 }
 
-# assert_bundle_sha_for_ref <lister> <bucket> <prefix> <ref> <sha>
+# assert_bundle_sha_for_ref <lister> <bucket> <prefix> <ref> <sha> [getter]
 # Fail unless exactly one bundle exists under <prefix>/<ref>/ and its
-# basename is <sha>.bundle.
+# basename is <sha>.bundle. Pass <getter> to filter tombstoned bundles
+# (see `bundle_keys`).
 assert_bundle_sha_for_ref() {
 	local lister="$1"
 	local bucket="$2"
 	local prefix="$3"
 	local ref="$4"
 	local sha="$5"
+	local getter="${6:-}"
 	local keys
-	keys=$(bundle_keys "$lister" "$bucket" "$prefix" "$ref")
+	# Propagate `bundle_keys` errors directly rather than letting them
+	# surface as "found 0 bundles" with the original cause hidden on
+	# stderr — see `assert_bundle_count` for the same fix.
+	keys=$(bundle_keys "$lister" "$bucket" "$prefix" "$ref" "$getter") || return 1
 	local count
 	count=$(echo "$keys" | grep -c . || true)
 	if [[ "$count" != "1" ]]; then

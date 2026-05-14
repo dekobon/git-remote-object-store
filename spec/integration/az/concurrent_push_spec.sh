@@ -90,10 +90,16 @@ Describe "Azure helper: concurrent push and stale-lock recovery"
 			fi
 			rm -rf "$result_dir"
 
+			# Issue #157: every successful force-push tombstones the
+			# prior baseline, so the raw listing contains the
+			# base-commit bundle (tombstoned) AND the winner's bundle.
+			# Pass `azurite_get_object` to filter the tombstoned
+			# predecessor.
 			assert_bundle_count azurite_list "$container" "$prefix" \
-				refs/heads/main 1 || return 1
+				refs/heads/main 1 azurite_get_object || return 1
 			local keys winner=""
-			keys=$(azurite_list "$container" "$prefix")
+			keys=$(bundle_keys azurite_list "$container" "$prefix" \
+				refs/heads/main azurite_get_object)
 			if [[ "$keys" == *"/${sha_a}.bundle"* ]]; then
 				winner="A"
 			elif [[ "$keys" == *"/${sha_b}.bundle"* ]]; then
@@ -163,10 +169,12 @@ Describe "Azure helper: concurrent push and stale-lock recovery"
 			When call quiet_push
 			The status should equal 0
 
+			# Issue #157: SHA1's bundle survives the fast-forward push
+			# as a tombstoned predecessor — pass the getter to filter.
 			assert_bundle_count azurite_list "$CONTAINER" "$PREFIX" \
-				refs/heads/main 1
+				refs/heads/main 1 azurite_get_object
 			assert_bundle_sha_for_ref azurite_list "$CONTAINER" "$PREFIX" \
-				refs/heads/main "$SHA2"
+				refs/heads/main "$SHA2" azurite_get_object
 		End
 	End
 End

@@ -101,12 +101,19 @@ Describe "S3 helper (live AWS): concurrent push contention"
 
 			# Identify the winner: bundle path under bundle-engine,
 			# `ls-remote` tip otherwise (engine-agnostic).
+			# Issue #157: every successful force-push tombstones the
+			# prior baseline, so the raw listing under the bundle engine
+			# contains the base-commit bundle (tombstoned) AND the
+			# winner's bundle. Pass the getter to `assert_bundle_count`
+			# so the predecessor is filtered out and the logical "one
+			# bundle for the ref" invariant still holds.
 			local winner=""
 			if live_engine_is_bundle; then
 				assert_bundle_count live_s3_list "$bucket" "$prefix" \
-					refs/heads/main 1 || return 1
+					refs/heads/main 1 live_s3_get_object || return 1
 				local keys
-				keys=$(live_s3_list "$bucket" "$prefix")
+				keys=$(bundle_keys live_s3_list "$bucket" "$prefix" \
+					refs/heads/main live_s3_get_object)
 				if [[ "$keys" == *"/${sha_a}.bundle"* ]]; then
 					winner="A"
 				elif [[ "$keys" == *"/${sha_b}.bundle"* ]]; then

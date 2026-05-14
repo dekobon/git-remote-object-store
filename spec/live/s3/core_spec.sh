@@ -91,9 +91,15 @@ Describe "S3 helper (live AWS): core git operations"
 			When call push_branch "$SRC" origin refs/heads/main:refs/heads/main
 			The status should equal 0
 
+			# Issue #157: the bundle engine defers prior-bundle deletion
+			# via a baseline tombstone, so SHA1's bundle survives the
+			# fast-forward push during the gc grace window. Pass the
+			# getter so the assertion subtracts the tombstoned key set
+			# and verifies the LOGICAL state (one live bundle named
+			# SHA2) rather than the raw listing.
 			if live_engine_is_bundle; then
 				assert_bundle_sha_for_ref live_s3_list "$BUCKET" "$PREFIX" \
-					refs/heads/main "$SHA2"
+					refs/heads/main "$SHA2" live_s3_get_object
 			fi
 
 			fetch_remote "$DST" origin

@@ -95,11 +95,15 @@ Describe "S3 helper: core git operations against rustfs"
 			When call push_branch "$SRC" origin refs/heads/main:refs/heads/main
 			The status should equal 0
 
-			# Post-condition: SHA1 replaced by SHA2 (the helper:
-			# `assert_bundle_sha_for_ref` enforces "exactly one bundle
-			# and it equals SHA2", so SHA1 must be gone).
+			# Post-condition: SHA1 replaced by SHA2 logically. Under
+			# issue #157 the bundle engine defers prior-bundle deletion
+			# via a baseline tombstone, so SHA1's bundle survives on
+			# the bucket during the gc grace window. Pass the getter so
+			# the assertion subtracts the tombstoned key set and the
+			# "exactly one bundle, named SHA2" invariant still holds
+			# against the logical (live) state.
 			assert_bundle_sha_for_ref rustfs_list "$BUCKET" "$PREFIX" \
-				refs/heads/main "$SHA2"
+				refs/heads/main "$SHA2" rustfs_get_object
 
 			fetch_remote "$DST" origin
 			assert_git_sha_equals "$DST" refs/remotes/origin/main "$SHA2"

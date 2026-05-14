@@ -96,9 +96,16 @@ Describe "Azure helper (live Azure Blob): concurrent push contention"
 			SHA_B=$(git -C "$SRC_B" rev-parse HEAD)
 
 			if live_engine_is_bundle; then
+				# Issue #157: every successful force-push tombstones
+				# the prior baseline, so the raw listing contains the
+				# base-commit bundle (tombstoned) AND the winner's
+				# bundle. Pass the getter so the assertion filters out
+				# the tombstoned predecessor and verifies the LOGICAL
+				# state (one live bundle for the ref).
 				assert_bundle_count live_az_list "$CONTAINER" "$PREFIX" \
-					refs/heads/main 1
-				keys=$(live_az_list "$CONTAINER" "$PREFIX")
+					refs/heads/main 1 live_az_get_object
+				keys=$(bundle_keys live_az_list "$CONTAINER" "$PREFIX" \
+					refs/heads/main live_az_get_object)
 				[[ "$keys" == *"/${SHA_A}.bundle"* || "$keys" == *"/${SHA_B}.bundle"* ]]
 			else
 				# Engine-agnostic black-box check: ls-remote tip must

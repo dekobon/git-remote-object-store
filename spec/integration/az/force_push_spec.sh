@@ -49,8 +49,10 @@ Describe "Azure helper: force-push and protected refs"
 			When call push_branch "$SRC" origin "+refs/heads/main:refs/heads/main"
 			The status should equal 0
 
+			# Issue #157: SHA_A's bundle survives the force-push as a
+			# tombstoned predecessor — pass the getter to filter.
 			assert_bundle_sha_for_ref azurite_list "$CONTAINER" "$PREFIX" \
-				refs/heads/main "$SHA_B"
+				refs/heads/main "$SHA_B" azurite_get_object
 		End
 	End
 

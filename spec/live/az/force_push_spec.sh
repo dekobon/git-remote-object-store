@@ -57,9 +57,11 @@ Describe "Azure helper (live Azure Blob): force-push and protected refs"
 			The status should equal 0
 
 			assert_ls_remote_sha "$URL" refs/heads/main "$SHA_B"
+			# Issue #157: SHA_A's bundle survives the force-push as a
+			# tombstoned predecessor — pass the getter to filter.
 			if live_engine_is_bundle; then
 				assert_bundle_sha_for_ref live_az_list "$CONTAINER" "$PREFIX" \
-					refs/heads/main "$SHA_B"
+					refs/heads/main "$SHA_B" live_az_get_object
 			fi
 		End
 	End

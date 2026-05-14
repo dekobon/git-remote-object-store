@@ -56,8 +56,11 @@ Describe "S3 helper: force-push and protected refs"
 			When call push_branch "$SRC" origin "+refs/heads/main:refs/heads/main"
 			The status should equal 0
 
+			# Issue #157: SHA_A's bundle survives the force-push as a
+			# tombstoned predecessor — pass the getter so the assertion
+			# filters it out and checks the logical (live) state.
 			assert_bundle_sha_for_ref rustfs_list "$BUCKET" "$PREFIX" \
-				refs/heads/main "$SHA_B"
+				refs/heads/main "$SHA_B" rustfs_get_object
 		End
 	End
 

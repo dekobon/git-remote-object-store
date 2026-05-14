@@ -91,9 +91,11 @@ Describe "Azure helper (live Azure Blob): core git operations"
 			When call push_branch "$SRC" origin refs/heads/main:refs/heads/main
 			The status should equal 0
 
+			# Issue #157: SHA1's bundle survives the fast-forward push
+			# as a tombstoned predecessor — pass the getter to filter.
 			if live_engine_is_bundle; then
 				assert_bundle_sha_for_ref live_az_list "$CONTAINER" "$PREFIX" \
-					refs/heads/main "$SHA2"
+					refs/heads/main "$SHA2" live_az_get_object
 			fi
 
 			fetch_remote "$DST" origin
