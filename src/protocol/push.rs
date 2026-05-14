@@ -3781,7 +3781,7 @@ mod tests {
             sanitize_metadata_value("hello\r\nX-Injected: yes"),
             "hello  X-Injected: yes",
         );
-        assert_eq!(sanitize_metadata_value("nul\0byte"), "nul byte",);
+        assert_eq!(sanitize_metadata_value("nul\0byte"), "nul byte");
         assert_eq!(sanitize_metadata_value("plain text"), "plain text");
         assert_eq!(
             sanitize_metadata_value("café — short summary"),
