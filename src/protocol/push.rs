@@ -29,20 +29,13 @@ use crate::packchain::gc::{tombstoned_bundle_keys, write_baseline_tombstone_best
 use crate::packchain::schema::Sha40;
 use crate::url::{BackendKind, StorageEngine};
 
-/// Default per-ref lock TTL, in seconds.
-/// Default lock TTL (seconds) when [`ENV_LOCK_TTL_SECONDS`] is unset
-/// or unparseable.
-///
-/// Widened to `pub` under `cfg(any(test, feature = "test-util"))` so
-/// integration tests can pin the wire-format error message without
-/// re-deriving the magic number from a parallel literal that could
-/// drift from this constant unnoticed.
-#[cfg(not(any(test, feature = "test-util")))]
-pub(crate) const DEFAULT_LOCK_TTL_SECONDS: u64 = 60;
-
-/// Default lock TTL (seconds) when [`ENV_LOCK_TTL_SECONDS`] is unset
-/// or unparseable. Exposed for integration-test wire-format pinning.
-#[cfg(any(test, feature = "test-util"))]
+/// Default per-ref lock TTL (seconds) when [`ENV_LOCK_TTL_SECONDS`] is
+/// unset or unparseable. Single source of truth for the lock TTL —
+/// `manage::doctor`'s stale-lock predicate, the CLI's
+/// `--lock-ttl-seconds` default, and integration-test wire-format
+/// pinning all consume this constant (the management surface
+/// re-exports it from [`crate::manage::DEFAULT_LOCK_TTL_SECONDS`]) so
+/// the views of "stale" cannot drift silently.
 pub const DEFAULT_LOCK_TTL_SECONDS: u64 = 60;
 
 /// Push configuration that is constant across an entire batch.
@@ -392,12 +385,22 @@ pub(crate) async fn verify_no_orphan_protected_after_delete(
 /// the arm, the guard remains in place so a future caller that bypasses
 /// the filter cannot silently treat a malformed key as a bundle.
 fn parse_remote_sha_from_key(key: &str) -> Option<Sha> {
+    let stem = parse_remote_sha_stem_from_key(key)?;
+    Sha::from_hex(stem).ok()
+}
+
+/// Extract the validated 40-lowercase-hex stem from a `<…>/<sha>.bundle`
+/// key without the `&str → Sha → String` round-trip
+/// [`parse_remote_sha_from_key`] incurs. Callers that need the schema
+/// [`Sha40`] (e.g. the tombstone writers) save one hex-encode + one
+/// re-validation by going through the borrowed stem directly.
+fn parse_remote_sha_stem_from_key(key: &str) -> Option<&str> {
     let last = key.rsplit('/').next()?;
     let stem = last.strip_suffix(".bundle")?;
     if !keys::is_valid_bundle_stem(stem) {
         return None;
     }
-    Sha::from_hex(stem).ok()
+    Some(stem)
 }
 
 /// Read the lock TTL from `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`,
@@ -789,7 +792,7 @@ async fn defer_prior_bundle_via_tombstone(
     prior_key: &str,
     local_sha: Sha,
 ) {
-    let Some(prior_sha) = parse_remote_sha_from_key(prior_key) else {
+    let Some(prior_stem) = parse_remote_sha_stem_from_key(prior_key) else {
         warn!(
             ref_path = %remote_ref.as_str(),
             key = %prior_key,
@@ -798,14 +801,15 @@ async fn defer_prior_bundle_via_tombstone(
         delete_prior_bundle_best_effort(store, remote_ref, prior_key).await;
         return;
     };
-    // `parse_remote_sha_from_key` validated the stem against
-    // `is_valid_bundle_stem` (40 lowercase hex), so `Sha::to_string`
-    // emits exactly what `Sha40::try_new` expects. The conversion is
-    // therefore infallible in practice; surface a failure as the
-    // synchronous-delete fallback rather than panicking — a future
-    // tightening of `Sha40` validation must not crash the push.
+    // `parse_remote_sha_stem_from_key` already validated the stem
+    // against `is_valid_bundle_stem` (40 lowercase hex), so
+    // `Sha40::try_new(prior_stem)` is infallible in practice; surface
+    // a failure as the synchronous-delete fallback rather than
+    // panicking — a future tightening of `Sha40` validation must not
+    // crash the push. `local_sha` still routes through `to_string`
+    // because `Sha` (gix `ObjectId`) only exposes a binary form.
     let (Ok(prior_sha40), Ok(local_sha40)) = (
-        Sha40::try_new(prior_sha.to_string()),
+        Sha40::try_new(prior_stem),
         Sha40::try_new(local_sha.to_string()),
     ) else {
         warn!(

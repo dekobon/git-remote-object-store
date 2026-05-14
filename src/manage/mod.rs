@@ -47,8 +47,10 @@ fn fmt_partial_delete(
     )
 }
 
-/// Default lock TTL in seconds.
-pub const DEFAULT_LOCK_TTL_SECONDS: u64 = 60;
+/// Default lock TTL in seconds. Re-exported from
+/// [`crate::protocol::push::DEFAULT_LOCK_TTL_SECONDS`] so the doctor's
+/// stale-lock predicate and `acquire_lock`'s TTL cannot silently drift.
+pub use crate::protocol::push::DEFAULT_LOCK_TTL_SECONDS;
 
 /// `true` iff `key` is a lock-file key. The `.lock` suffix is a
 /// wire-format token on a case-sensitive S3/Azure key, not a filesystem

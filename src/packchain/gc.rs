@@ -1758,6 +1758,26 @@ mod tests {
         assert!(keys.is_empty(), "empty bucket yields no tombstoned keys");
     }
 
+    /// Root-prefix repos (no `<prefix>/` segment, keys collapse to
+    /// `gc/baseline-tomb-*.json` and `refs/heads/<ref>/<sha>.bundle`)
+    /// must produce the same tombstone → bundle-key mapping. All other
+    /// tests cover `Some("repo")`; this is the negative-control for
+    /// the `prefix.unwrap_or("")` path in `tombstoned_bundle_keys`.
+    #[tokio::test]
+    async fn tombstoned_bundle_keys_handles_root_prefix() {
+        let store = MockStore::new();
+        write_baseline_tombstone_for_orphan(&store, None, &ref_main(), &sha40(SHA_FULL))
+            .await
+            .unwrap();
+
+        let keys = tombstoned_bundle_keys(&store, None).await.unwrap();
+        assert_eq!(keys.len(), 1, "got {keys:?}");
+        assert!(
+            keys.contains(&format!("refs/heads/main/{SHA_FULL}.bundle")),
+            "root-prefix bundle key (no leading repo/) must be produced; got {keys:?}",
+        );
+    }
+
     /// An unparseable tombstone must not block the rest. Mirrors
     /// `sweep_one_baseline_tombstone`'s tolerance for bad records:
     /// the sweep loop logs a warn and continues.

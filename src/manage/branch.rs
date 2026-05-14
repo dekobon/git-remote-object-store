@@ -210,41 +210,12 @@ impl<'a> ManageBranch<'a> {
         // key, so a concurrent `git push` or `compact` racing this
         // delete is mutually excluded.
         let ref_name = self.validated_ref_name()?;
-        let prefix_opt = self.prefix_opt();
-        let lock = lock_key(prefix_opt, &ref_name);
-        let ttl = lock_ttl_from_env();
-        let now = OffsetDateTime::now_utc();
-        let Some(guard) = acquire_lock(Arc::clone(&self.store), &lock, ttl, now).await? else {
-            warn!(
-                branch = %self.branch,
-                key = %lock,
-                "delete-branch: per-ref lock is held by another writer; refusing to race",
-            );
-            return Err(ManageError::LockContended {
-                branch: self.branch.clone(),
-                lock,
-                ttl_seconds: ttl.whole_seconds(),
-            });
-        };
-
-        // Everything from here to the matching `release_lock` must
-        // route exits through `release_lock_or_warn` so the lock is
-        // freed regardless of outcome. A leaked guard is recovered by
-        // the next acquirer's stale-lock branch after `ttl` elapses,
-        // but explicit release is the well-behaved path and matches
-        // the helper-protocol delete release tail.
+        let (lock_key, guard) = self.acquire_ref_lock("delete-branch").await?;
         let work = self
-            .delete_under_lock(out, &listing_prefix, &lock, &initial)
+            .delete_under_lock(out, &listing_prefix, &lock_key, &initial, &ref_name)
             .await;
-        let release_result = release_lock(guard).await;
-        if let Err(e) = release_result {
-            warn!(
-                branch = %self.branch,
-                key = %lock,
-                error = %e,
-                "delete-branch: failed to release per-ref lock; will age out by TTL",
-            );
-        }
+        self.release_or_warn(guard, &lock_key, "delete-branch")
+            .await;
         work
     }
 
@@ -259,6 +230,7 @@ impl<'a> ManageBranch<'a> {
         listing_prefix: &str,
         lock: &str,
         initial: &[ObjectMeta],
+        ref_name: &RefName,
     ) -> Result<(), ManageError> {
         // Re-list under the lock so concurrent pushes that landed
         // during the prompt window — before the lock window opened —
@@ -385,8 +357,7 @@ impl<'a> ManageBranch<'a> {
         // misbehaving sibling tool). The helper logs at `error!` and
         // does NOT change the delete's success outcome — the branch's
         // bundle artefacts are gone, so the operator's intent stands.
-        let ref_name = self.validated_ref_name()?;
-        verify_no_orphan_protected_after_delete(self.store.as_ref(), self.prefix_opt(), &ref_name)
+        verify_no_orphan_protected_after_delete(self.store.as_ref(), self.prefix_opt(), ref_name)
             .await;
         writeln!(out, "Branch {} has been deleted", self.branch)?;
         info!(branch = %self.branch, count = attempted, "branch deleted");
@@ -534,9 +505,9 @@ impl<'a> ManageBranch<'a> {
     /// Same as [`Self::protect`], plus [`ManageError::Io`] if a write
     /// to `out` fails.
     pub(crate) async fn protect_into<W: Write>(&self, out: &mut W) -> Result<(), ManageError> {
-        let (lock, guard) = self.acquire_ref_lock("protect").await?;
+        let (lock_key, guard) = self.acquire_ref_lock("protect").await?;
         let work = self.protect_under_lock(out).await;
-        self.release_or_warn(guard, &lock, "protect").await;
+        self.release_or_warn(guard, &lock_key, "protect").await;
         work
     }
 
@@ -593,9 +564,9 @@ impl<'a> ManageBranch<'a> {
     /// Same as [`Self::unprotect`], plus [`ManageError::Io`] if a
     /// write to `out` fails.
     pub(crate) async fn unprotect_into<W: Write>(&self, out: &mut W) -> Result<(), ManageError> {
-        let (lock, guard) = self.acquire_ref_lock("unprotect").await?;
+        let (lock_key, guard) = self.acquire_ref_lock("unprotect").await?;
         let work = self.unprotect_under_lock(out).await;
-        self.release_or_warn(guard, &lock, "unprotect").await;
+        self.release_or_warn(guard, &lock_key, "unprotect").await;
         work
     }
 
@@ -615,10 +586,11 @@ impl<'a> ManageBranch<'a> {
         }
     }
 
-    /// Acquire the per-ref lock for `op` (`protect`, `unprotect`, or
-    /// any future protection-state caller). Returns the resolved lock
-    /// key alongside the guard so the matching `release_or_warn` tail
-    /// can name the key in its log line without re-deriving it.
+    /// Acquire the per-ref lock for `op` (`delete-branch`, `protect`,
+    /// `unprotect`, or any future ref-mutating caller). Returns the
+    /// resolved lock object-store key alongside the guard so the
+    /// matching `release_or_warn` tail can name the key in its log
+    /// line without re-deriving it.
     ///
     /// Contention surfaces as [`ManageError::LockContended`] with the
     /// branch name, lock key, and current TTL — matching the wording
@@ -627,23 +599,23 @@ impl<'a> ManageBranch<'a> {
     async fn acquire_ref_lock(&self, op: &'static str) -> Result<(String, LockGuard), ManageError> {
         let ref_name = self.validated_ref_name()?;
         let prefix_opt = self.prefix_opt();
-        let lock = lock_key(prefix_opt, &ref_name);
+        let lock_key = lock_key(prefix_opt, &ref_name);
         let ttl = lock_ttl_from_env();
         let now = OffsetDateTime::now_utc();
-        let Some(guard) = acquire_lock(Arc::clone(&self.store), &lock, ttl, now).await? else {
+        let Some(guard) = acquire_lock(Arc::clone(&self.store), &lock_key, ttl, now).await? else {
             warn!(
                 branch = %self.branch,
                 op = op,
-                key = %lock,
+                key = %lock_key,
                 "{op}: per-ref lock is held by another writer; refusing to race",
             );
             return Err(ManageError::LockContended {
                 branch: self.branch.clone(),
-                lock,
+                lock: lock_key,
                 ttl_seconds: ttl.whole_seconds(),
             });
         };
-        Ok((lock, guard))
+        Ok((lock_key, guard))
     }
 
     /// Release a previously acquired lock, downgrading release failures
@@ -651,12 +623,12 @@ impl<'a> ManageBranch<'a> {
     /// surfaces. The lock's TTL recovers a leaked key on the next
     /// acquirer (#150), so the worst case is a delayed retry rather
     /// than a permanently stuck ref.
-    async fn release_or_warn(&self, guard: LockGuard, lock: &str, op: &'static str) {
+    async fn release_or_warn(&self, guard: LockGuard, lock_key: &str, op: &'static str) {
         if let Err(e) = release_lock(guard).await {
             warn!(
                 branch = %self.branch,
                 op = op,
-                key = %lock,
+                key = %lock_key,
                 error = %e,
                 "{op}: failed to release per-ref lock; will age out by TTL",
             );
