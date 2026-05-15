@@ -23,24 +23,49 @@ Path\-style form against custom endpoints (Azurite, sovereign clouds).
 .PP
 \fIprefix\fR is an optional repository subpath under the container.
 .SH ENVIRONMENT
+The Azure backend uses its own env\-var scheme keyed by a credential
+alias selected with the URL flag \fB?credential=<NAME>\fR. The alias
+is uppercased; the helper then looks for
+\fBAZSTORE_<UPPER>_KEY\fR, then
+\fBAZSTORE_<UPPER>_CONNECTION_STRING\fR, then
+\fBAZSTORE_<UPPER>_SAS\fR. First match wins.
+.PP
+If \fB?credential=\fR is omitted, the helper falls back to the Azure
+SDK's \fBDeveloperToolsCredential\fR (Entra ID), which walks its own
+env vars, workload identity, managed identity, and the Azure CLI.
+.PP
+The Azure CLI / azure\-sdk \fBAZURE_STORAGE_*\fR variables are
+\fBnot\fR consulted on the \fB?credential=\fR path \(em that scheme
+is process\-global and would shadow other shells. See
+\fIdocs/environment-variables.md\fR for the complete reference,
+including the project\-specific
+\fBGIT_REMOTE_OBJECT_STORE_*\fR variables shared with the S3 helper.
 .TP
-\fBAZURE_STORAGE_ACCOUNT\fR, \fBAZURE_STORAGE_KEY\fR
-Static shared\-key credentials. With both set, the helper uses
-shared\-key auth.
+\fBAZSTORE_<ALIAS>_KEY\fR
+Base64\-encoded storage account key. Signed via Azure Storage
+shared\-key v2. Required for presigning \fBbundle_uri\fR URLs against
+private containers.
 .TP
-\fBAZURE_STORAGE_SAS_TOKEN\fR
-SAS\-token auth. Takes precedence over shared\-key credentials.
+\fBAZSTORE_<ALIAS>_CONNECTION_STRING\fR
+Full \fBDefaultEndpointsProtocol=...;AccountName=...;AccountKey=...\fR
+form. The \fBAccountKey=\fR field is parsed out and used for
+shared\-key signing.
 .TP
-\fBAZURE_TENANT_ID\fR, \fBAZURE_CLIENT_ID\fR, \fBAZURE_CLIENT_SECRET\fR
-Service\-principal auth (workload identity / OIDC). The helper falls
-back to the default Azure credential chain (managed identity, Azure
-CLI, environment) when no static credential set is configured.
+\fBAZSTORE_<ALIAS>_SAS\fR
+Pre\-issued SAS token, appended verbatim to every outgoing request.
+Cannot presign \fBbundle_uri\fR URLs (no key material).
+.TP
+\fBGIT_REMOTE_OBJECT_STORE_ALLOW_HTTP\fR
+Set to \fB1\fR to allow \fBaz+http://\fR against non\-loopback hosts.
+Loopback (\fBlocalhost\fR, \fB127.0.0.1\fR, \fB::1\fR) is always allowed.
+.TP
+\fBGIT_REMOTE_OBJECT_STORE_VERBOSE\fR
+Numeric. \fB>= 2\fR raises the startup tracing level from \fBerror\fR
+to \fBinfo\fR. The protocol \fBoption verbosity 2+\fR directive can
+raise the level at runtime; it cannot lower a level set here.
 .TP
 \fBGIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS\fR
-Per\-ref lock TTL. Default 60.
-.TP
-\fBRUST_LOG\fR
-Verbosity for the helper's stderr log. Defaults to \fBwarn\fR.
+Per\-ref lock TTL, in seconds. Default 60.
 .SH NOTES
 Standard output is reserved for the remote\-helper wire protocol. Every
 diagnostic goes to standard error.

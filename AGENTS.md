@@ -27,6 +27,7 @@ Coding conventions for the project live in `.claude/rules/`:
 | `.claude/rules/worktree-safety.md` | Worktree deletion / branch-escape bans |
 | `.claude/rules/changelog.md` | CHANGELOG format |
 | `.claude/rules/documentation.md` | No stale counts in docs |
+| `.claude/rules/environment-variables.md` | Adding/removing env vars (single index in `docs/environment-variables.md`) |
 | `.claude/rules/lessons-learned.md` | Where hard-won lessons live and the quality bar |
 | `.claude/rules/protocol-stdout.md` | stdout/stderr discipline for the helper-protocol binaries |
 

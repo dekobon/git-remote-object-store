@@ -19,6 +19,8 @@ that skip cloud accounts entirely.
 - [9. Garbage collection](#9-garbage-collection)
 - [10. Bundle URI — faster `git clone` for large repos](#10-bundle-uri--faster-git-clone-for-large-repos)
 - [11. Troubleshooting](#11-troubleshooting)
+- See also: [environment-variables.md](environment-variables.md) —
+  every env var the helper binaries, CLI, and test suites read.
 
 ## 1. Install
 
@@ -399,8 +401,10 @@ git-remote-object-store unprotect origin main
 `doctor` flags worth knowing:
 
 - `--lock-ttl <SECS>` — seconds after which a `*.lock` file is
-  considered stale (default `60`). Also configurable via the
-  `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` env var.
+  considered stale (default `60`). Unlike `compact --lock-ttl`,
+  `doctor --lock-ttl` does **not** read
+  `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`; pass the flag
+  explicitly if you need a non-default TTL.
 - `--delete-stale-locks` — actually remove stale locks (otherwise
   doctor only reports them).
 - `--delete-bundle` — delete losing bundles outright instead of

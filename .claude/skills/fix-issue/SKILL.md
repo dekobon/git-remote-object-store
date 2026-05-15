@@ -106,6 +106,12 @@ description: Complete workflow for fixing GitHub issues including investigation,
       Changed, Fixed) per `.claude/rules/changelog.md`.
     - `README.md` — if user-facing behavior, install steps, or supported
       backends changed.
+    - `docs/environment-variables.md` — if the fix added, renamed, or
+      removed **any** env var read by the helpers, CLI, or test suites. Per
+      `.claude/rules/environment-variables.md`, this page is the single
+      index and must stay in sync with the constants in code. Also update
+      the matching `man/git-remote-*.1` page when the variable is
+      helper-runtime visible.
     - Crate-level or module-level doc comments (`//!`) — if module intent or
       architecture changed.
     - Avoid hardcoding stale counts in any doc per

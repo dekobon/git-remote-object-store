@@ -316,6 +316,10 @@ will apply, so the vocabulary must match end-to-end. Mapping rules:
 16. Are inline comments factually correct and not stale (old architectures, wrong line numbers, removed features)?
 17. Do doc-test examples compile and run correctly?
 18. Are there TODO/FIXME/HACK comments indicating known tech debt?
+19. Is every env var read by the code (`std::env::var`, `env::var_os`,
+    `pub const ENV_*`) listed in `docs/environment-variables.md`? Per
+    `.claude/rules/environment-variables.md` that page is the single index;
+    any undocumented variable is a `documentation` finding.
 
 ### Code Smells and Unnecessary Complexity
 

@@ -98,6 +98,8 @@ API.
   troubleshooting.
 - [Storage engines](docs/storage-engines.md) — `bundle` vs
   `packchain`, trade-offs, on-bucket layout, when to choose which.
+- [Environment variables](docs/environment-variables.md) — every
+  variable the helpers, CLI, and test suites read.
 - [Library usage](docs/library-usage.md) — using the crate as a Rust
   library.
 - [Verifying releases](docs/verifying-releases.md) — signature,

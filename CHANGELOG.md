@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Environment-variables reference.** New
+  `docs/environment-variables.md` page consolidating every env var read
+  by the helper binaries, LFS agent, management CLI, and test suites
+  (`GIT_REMOTE_OBJECT_STORE_*`, `AZSTORE_<ALIAS>_*`, the AWS SDK
+  provider-chain vars, `RUN_LARGE_BODY_TESTS`, the `LIVE_*` shellspec
+  gates, and `GIT_DIR`). Linked from README, getting-started, and
+  storage-engines. Also documents env vars that look applicable but are
+  not honored (`RUST_LOG`, `AZURE_STORAGE_*`). A new
+  `.claude/rules/environment-variables.md` rule plus checklist updates
+  in `fix-issue` and `audit` keep this index in sync as env vars are
+  added or removed. `tests/env_var_doc_sync.rs` enforces the sync
+  mechanically: it scans every `pub` / `pub(crate)` `const ENV_*`
+  declaration under `src/` and fails if the literal value is missing
+  from the doc, so a forgotten row trips `cargo test` rather than
+  shipping stale.
+
+### Changed
+
+- **Corrected the `ENVIRONMENT` sections of the helper man pages.**
+  `man/git-remote-s3+https.1` and `man/git-remote-az+https.1` previously
+  listed variables the helpers do not actually honor — `RUST_LOG`, the
+  Azure CLI `AZURE_STORAGE_*` / `AZURE_TENANT_ID` / `AZURE_CLIENT_*`
+  family. Replaced them with what the code actually reads: the project
+  `GIT_REMOTE_OBJECT_STORE_ALLOW_HTTP` / `_VERBOSE` /
+  `_LOCK_TTL_SECONDS` variables, the Azure `AZSTORE_<ALIAS>_*` scheme,
+  and the most common AWS provider-chain variables. Each page now
+  points at `docs/environment-variables.md` for the complete
+  reference.
+
+- **Corrected `doctor --lock-ttl` env-var claim in
+  `docs/getting-started.md`.** The doctor flag is wired to
+  `default_value_t = DEFAULT_LOCK_TTL_SECONDS` (`cli/src/management.rs`),
+  not `lock_ttl_from_env`, so it does not read
+  `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` the way `compact --lock-ttl`
+  and `delete-branch` do. The page previously claimed otherwise.
+
+- **`tracing_init` doc comments now state the reload is one-way.**
+  `option verbosity 2+` can raise the subscriber to `info` but the
+  protocol provides no inverse to lower it. The module and `raise_to_info`
+  doc comments described the reload as a generic "flip", which implied
+  bidirectional control.
+
 ### Fixed
 
 - **Pinned Azure `x-ms-date` format (#174).** Replaced

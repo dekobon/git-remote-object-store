@@ -4,8 +4,9 @@
 //! see `.claude/rules/protocol-stdout.md` — so every log line MUST go to
 //! stderr. The subscriber returned here is wired with [`std::io::stderr`]
 //! as its writer; the `EnvFilter` is wrapped in a [`reload::Layer`] so
-//! the protocol REPL can flip the level at runtime in response to
-//! `option verbosity <n>`.
+//! the protocol REPL can raise the level to `info` at runtime in
+//! response to `option verbosity 2+`. The reload is one-way — there is
+//! no path that lowers the level once raised.
 //!
 //! Startup level is `error`, with one env-var override honoured:
 //!
@@ -58,7 +59,8 @@ pub fn init() -> Result<ReloadHandle, InitError> {
     Ok(handle)
 }
 
-/// Flip the subscriber to `info` level. Used by `option verbosity 2+`.
+/// Raise the subscriber to `info` level. One-way: there is no inverse
+/// that lowers the level. Called by `option verbosity 2+`.
 ///
 /// # Errors
 ///

@@ -26,22 +26,40 @@ S3\-compatible endpoint (MinIO, RustFS, Cloudflare R2, …).
 \fIprefix\fR is an optional repository subpath under the bucket; multiple
 repositories can share a bucket by giving each its own prefix.
 .SH ENVIRONMENT
+The S3 backend hands credential resolution to the AWS SDK's default
+provider chain (\fBaws_config::defaults\fR), which honors the standard
+\fBAWS_*\fR variables; the most common are listed below. See
+\fIdocs/environment-variables.md\fR for the complete reference,
+including the project\-specific
+\fBGIT_REMOTE_OBJECT_STORE_*\fR variables shared with the Azure helper.
 .TP
 \fBAWS_ACCESS_KEY_ID\fR, \fBAWS_SECRET_ACCESS_KEY\fR, \fBAWS_SESSION_TOKEN\fR
-Static credentials. The helper otherwise uses the default AWS provider
-chain (instance metadata, IAM Identity Center, web\-identity, profile).
+Static credentials. Without them the SDK walks the rest of the
+provider chain (shared credentials file, IAM Identity Center / SSO,
+web\-identity / workload identity, instance metadata).
 .TP
-\fBAWS_REGION\fR
-Override the region parsed from the URL.
+\fBAWS_REGION\fR (or \fBAWS_DEFAULT_REGION\fR)
+Region for SigV4 signing. The URL\(aqs \fB?region=\fR flag overrides this.
 .TP
-\fBAWS_PROFILE\fR
-Select a non\-default profile from \fI~/.aws/credentials\fR.
+\fBAWS_PROFILE\fR (or \fBAWS_DEFAULT_PROFILE\fR)
+Named profile in \fI~/.aws/credentials\fR. The URL\(aqs \fB?profile=\fR
+flag overrides this.
+.TP
+\fBAWS_ENDPOINT_URL\fR
+Override the inferred endpoint (MinIO, RustFS, on\-prem S3). The URL
+host normally supplies this; the env var is a last\-resort override.
+.TP
+\fBGIT_REMOTE_OBJECT_STORE_ALLOW_HTTP\fR
+Set to \fB1\fR to allow \fBs3+http://\fR against non\-loopback hosts.
+Loopback (\fBlocalhost\fR, \fB127.0.0.1\fR, \fB::1\fR) is always allowed.
+.TP
+\fBGIT_REMOTE_OBJECT_STORE_VERBOSE\fR
+Numeric. \fB>= 2\fR raises the startup tracing level from \fBerror\fR
+to \fBinfo\fR. The protocol \fBoption verbosity 2+\fR directive can
+raise the level at runtime; it cannot lower a level set here.
 .TP
 \fBGIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS\fR
-Per\-ref lock TTL. Default 60.
-.TP
-\fBRUST_LOG\fR
-Verbosity for the helper's stderr log. Defaults to \fBwarn\fR.
+Per\-ref lock TTL, in seconds. Default 60.
 .SH NOTES
 Standard output is reserved for the remote\-helper wire protocol. Every
 diagnostic, including credential errors and lock contention messages,

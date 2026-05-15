@@ -115,9 +115,10 @@ Force-pushes, branch deletions, and compactions detach packs from the
 chain. `git-remote-object-store gc` removes them through a two-phase
 mark-and-sweep with a grace window (default 24 hours; override with
 `--grace-hours` or the `GIT_REMOTE_OBJECT_STORE_GC_GRACE_HOURS` env
-var). The grace window protects in-flight readers — a clone that
-started before the mark phase is allowed to finish even if `gc`
-decided the pack was orphan.
+var — see [environment-variables.md](environment-variables.md)). The
+grace window protects in-flight readers — a clone that started before
+the mark phase is allowed to finish even if `gc` decided the pack was
+orphan.
 
 A single weekly invocation is the standard schedule: each run sweeps
 the previous run's tombstones and writes new ones. See
