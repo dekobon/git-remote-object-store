@@ -150,11 +150,11 @@ pub fn git_capture(args: &[&str], cwd: &Path) -> String {
 /// Initialise a fresh repo with `n` linear commits on `refs/heads/main`
 /// and return the dir + Vec<sha> in commit order (oldest first).
 ///
-/// `salt` differentiates blob contents so two repos seeded in the same
+/// `label` differentiates blob contents so two repos seeded in the same
 /// wall-clock second still produce distinct commit SHAs (commit time
-/// resolution is one second; without per-call salt, two seeded repos
+/// resolution is one second; without a per-call label, two seeded repos
 /// can hash-collide and break tests that compare their tip SHAs).
-pub fn make_seed_repo(n: usize, salt: &str) -> (tempfile::TempDir, Vec<String>) {
+pub fn make_seed_repo(n: usize, label: &str) -> (tempfile::TempDir, Vec<String>) {
     let dir = tempfile::tempdir().expect("tempdir");
     git(&["init", "--quiet", "--initial-branch=main"], dir.path());
     git(&["config", "user.email", "test@example.com"], dir.path());
@@ -163,7 +163,7 @@ pub fn make_seed_repo(n: usize, salt: &str) -> (tempfile::TempDir, Vec<String>) 
 
     let mut shas = Vec::with_capacity(n);
     for i in 0..n {
-        let body = format!("{salt}-{i}\n");
+        let body = format!("{label}-{i}\n");
         std::fs::write(dir.path().join(format!("f{i}.txt")), body.as_bytes()).unwrap();
         git(&["add", "."], dir.path());
         git(
@@ -183,10 +183,10 @@ pub fn make_seed_repo(n: usize, salt: &str) -> (tempfile::TempDir, Vec<String>) 
 /// The annotated tag creates a tag-object (not a lightweight tag), so
 /// `tag_sha != commit_sha`.
 pub fn make_seed_repo_with_annotated_tag(
-    salt: &str,
+    label: &str,
     tag_name: &str,
 ) -> (tempfile::TempDir, String, String) {
-    let (dir, shas) = make_seed_repo(1, salt);
+    let (dir, shas) = make_seed_repo(1, label);
     git(
         &[
             "tag",
@@ -213,11 +213,11 @@ pub fn make_seed_repo_with_annotated_tag(
 /// `<outer_name>` (annotated) → `<inner_name>` (annotated) → commit.
 /// Returns `(dir, commit_sha, inner_tag_sha, outer_tag_sha)`.
 pub fn make_seed_repo_with_tag_of_tag(
-    salt: &str,
+    label: &str,
     inner_name: &str,
     outer_name: &str,
 ) -> (tempfile::TempDir, String, String, String) {
-    let (dir, shas) = make_seed_repo(1, salt);
+    let (dir, shas) = make_seed_repo(1, label);
     git(
         &[
             "tag",

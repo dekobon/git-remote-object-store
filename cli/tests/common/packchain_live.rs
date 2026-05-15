@@ -86,14 +86,14 @@ pub fn git_capture(args: &[&str], cwd: &Path) -> String {
 /// Initialise a fresh repo with `n` linear commits on `refs/heads/main`
 /// and return the dir + Vec<sha> in commit order (oldest first).
 ///
-/// `salt` differentiates blob contents *across distinct scenarios* so
+/// `label` differentiates blob contents *across distinct scenarios* so
 /// two scenarios in the same test binary do not produce identical
 /// commit SHAs (which would otherwise share a content-SHA pack on the
-/// shared bucket). Within a single scenario, salt-equality is fine
+/// shared bucket). Within a single scenario, label-equality is fine
 /// because each scenario uses its own bucket / tempdir — bucket
-/// isolation, not salt, is what guarantees no on-bucket collisions
+/// isolation, not the label, is what guarantees no on-bucket collisions
 /// across parameterised invocations of the same scenario.
-pub fn make_seed_repo(n: usize, salt: &str) -> (tempfile::TempDir, Vec<String>) {
+pub fn make_seed_repo(n: usize, label: &str) -> (tempfile::TempDir, Vec<String>) {
     let dir = tempfile::tempdir().expect("tempdir");
     git(&["init", "--quiet", "--initial-branch=main"], dir.path());
     git(&["config", "user.email", "test@example.com"], dir.path());
@@ -102,7 +102,7 @@ pub fn make_seed_repo(n: usize, salt: &str) -> (tempfile::TempDir, Vec<String>) 
 
     let mut shas = Vec::with_capacity(n);
     for i in 0..n {
-        let body = format!("{salt}-{i}\n");
+        let body = format!("{label}-{i}\n");
         std::fs::write(dir.path().join(format!("f{i}.txt")), body.as_bytes()).unwrap();
         git(&["add", "."], dir.path());
         git(

@@ -57,9 +57,9 @@ fn make_empty_dst() -> tempfile::TempDir {
 async fn push_n_commits_into(
     store: &Arc<MockStore>,
     n: usize,
-    salt: &str,
+    label: &str,
 ) -> (tempfile::TempDir, Vec<String>) {
-    let (seed, shas) = make_seed_repo(n, salt);
+    let (seed, shas) = make_seed_repo(n, label);
     // make_seed_repo creates n commits in one repo, but they're
     // committed sequentially. To put each commit into its own
     // chain.json segment, push after each commit. Simpler approach:
