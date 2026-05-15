@@ -21,6 +21,8 @@ Cargo.lock
 
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+.claude/ralph-loop.local.md
+.ralph/
 spec/live/.env
 
 # CycloneDX SBOMs are generated at release time by `cargo cyclonedx`
