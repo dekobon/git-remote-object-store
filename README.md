@@ -1,5 +1,9 @@
 # git-remote-object-store
 
+[![CI](https://github.com/dekobon/git-remote-object-store/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/dekobon/git-remote-object-store/actions/workflows/ci.yml?query=branch%3Amain+event%3Apush)
+[![CodeQL](https://github.com/dekobon/git-remote-object-store/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/dekobon/git-remote-object-store/actions/workflows/codeql.yml?query=branch%3Amain)
+[![crates.io](https://img.shields.io/crates/v/git-remote-object-store.svg)](https://crates.io/crates/git-remote-object-store)
+
 **Push, fetch, and clone Git repositories straight against a S3 compatible store or
 Azure Blob Storage. No intermediary servers. One static binary, one object store.**
 
