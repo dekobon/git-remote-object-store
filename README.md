@@ -1,8 +1,7 @@
 # git-remote-object-store
 
-**Push, fetch, and clone Git repositories straight against AWS S3 or
-Azure Blob Storage. No server. No SaaS. No managed runner. One
-static binary, two clouds.**
+**Push, fetch, and clone Git repositories straight against a S3 compatible store or
+Azure Blob Storage. No intermediary servers. One static binary, one object store.**
 
 ```bash
 git remote add origin 's3+https://my-bucket.s3.us-west-2.amazonaws.com/my-repo'
