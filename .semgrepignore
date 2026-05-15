@@ -1,0 +1,6 @@
+# cargo-about template that renders THIRD-PARTY-LICENSES.md (a Markdown
+# file, not HTML). Triple-brace unescape is required so license texts
+# containing Markdown-significant characters render correctly. The
+# `javascript.express.security.audit.xss.mustache.explicit-unescape`
+# rule targets Express.js web apps and does not apply here.
+/about.hbs

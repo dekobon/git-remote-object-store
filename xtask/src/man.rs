@@ -141,7 +141,13 @@ fn compare_trees(checked_in: &Path, fresh: &Path) -> Result<()> {
             errors.push(format!("missing from man/: {name}"));
             continue;
         }
+        // `want` / `have` are joined from caller-supplied directories and
+        // the `.1` filenames the same xtask just rendered. xtask is a
+        // developer-only build tool; no untrusted input. The actix-web
+        // path-traversal rule does not apply.
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         let want_bytes = fs::read(&want).with_context(|| format!("read {}", want.display()))?;
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         let have_bytes = fs::read(&have).with_context(|| format!("read {}", have.display()))?;
         if want_bytes != have_bytes {
             errors.push(format!("drift: man/{name}"));
@@ -168,6 +174,10 @@ fn compare_trees(checked_in: &Path, fresh: &Path) -> Result<()> {
 
 fn list_files(dir: &Path) -> Result<Vec<String>> {
     let mut out = Vec::new();
+    // `dir` is a caller-supplied man-page directory inside the project;
+    // xtask is a developer-only build tool with no untrusted input. The
+    // actix-web path-traversal rule does not apply.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let read = fs::read_dir(dir).with_context(|| format!("read directory {}", dir.display()))?;
     for entry in read {
         let entry = entry.with_context(|| format!("read entry under {}", dir.display()))?;

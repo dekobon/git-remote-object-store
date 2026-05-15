@@ -178,6 +178,11 @@ pub(crate) fn refresh_symlink(
             .with_context(|| format!("remove existing symlink {}", link.display()))?;
     }
 
+    // xtask is a developer-only build tool. `cargo_name` / `plus_name` are
+    // fixed helper names passed by `cargo xtask install`; `bin_dir` is the
+    // developer's chosen install prefix. No untrusted input — the
+    // actix-web path-traversal rule does not apply.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     std::os::unix::fs::symlink(cargo_name, &link)
         .with_context(|| format!("create symlink {} -> {}", link.display(), cargo_name))?;
 
