@@ -86,6 +86,16 @@ pub(crate) fn build_blob_sas_url(
     signing: &SasSigningKey,
     ttl: Duration,
 ) -> Result<String, ObjectStoreError> {
+    // Reject control characters that would shift fields in the
+    // string-to-sign (a literal `\n` in `container` or `blob_path`
+    // would inject a new line into the canonical resource and let
+    // an attacker control the signed protocol or expiry). The
+    // upstream `RemoteUrl` parser and `Sha40` constraint already
+    // limit these to ASCII path-segment characters, so this guard
+    // is defence-in-depth at the function boundary.
+    reject_control_chars("container", container)?;
+    reject_control_chars("blob_path", blob_path)?;
+
     let expiry = OffsetDateTime::now_utc()
         .checked_add(time::Duration::seconds_f64(ttl.as_secs_f64()))
         .ok_or_else(|| {
@@ -174,10 +184,27 @@ fn format_iso8601_utc(t: OffsetDateTime) -> String {
         .expect("ISO-8601 second-precision format is infallible for OffsetDateTime + String")
 }
 
+/// Reject ASCII control characters (`\n`, `\r`, and the rest of
+/// `0x00..=0x1F` plus `0x7F`) in inputs that participate in the
+/// SAS string-to-sign. The upstream `RemoteUrl` parser and the
+/// `Sha40` constraint already limit `container` / `blob_path` to
+/// ASCII path-segment characters; this guard is defence-in-depth
+/// at the function boundary so a future refactor of either source
+/// cannot silently allow control characters to corrupt the signed
+/// string.
+fn reject_control_chars(field: &'static str, value: &str) -> Result<(), ObjectStoreError> {
+    if let Some(byte) = value.bytes().find(u8::is_ascii_control) {
+        return Err(ObjectStoreError::Other(
+            format!("SAS {field} contains forbidden control byte 0x{byte:02x}").into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use azure_core::credentials::Secret;
+    use crate::object_store::azure::auth::HmacKey;
 
     /// The published Azurite well-known account key — base64-valid
     /// and safe to embed.
@@ -187,7 +214,7 @@ mod tests {
     fn azurite_signing() -> SasSigningKey {
         SasSigningKey {
             account: "devstoreaccount1".to_owned(),
-            key: Secret::new(AZURITE_KEY.to_owned()),
+            key: HmacKey::from_base64(AZURITE_KEY).expect("valid base64"),
         }
     }
 
@@ -374,5 +401,67 @@ mod tests {
             .find(|(k, _)| k == "sig")
             .map(|(_, v)| v.into_owned())
             .expect("sig present")
+    }
+
+    /// F-001: reject control characters in `container` so a literal
+    /// `\n` cannot shift fields in the string-to-sign.
+    #[test]
+    fn build_blob_sas_url_rejects_newline_in_container() {
+        let base = Url::parse(
+            "https://devstoreaccount1.blob.core.windows.net/repo/refs/heads/main/aa.bundle",
+        )
+        .expect("base parses");
+        let err = build_blob_sas_url(
+            &base,
+            "repo\nspoofed",
+            "refs/heads/main/aa.bundle",
+            &azurite_signing(),
+            Duration::from_hours(1),
+        )
+        .expect_err("newline in container must be rejected");
+        assert!(
+            err.to_string().contains("container"),
+            "error message must name the rejecting field: {err}"
+        );
+    }
+
+    /// F-001: same rejection for carriage return.
+    #[test]
+    fn build_blob_sas_url_rejects_cr_in_blob_path() {
+        let base = Url::parse(
+            "https://devstoreaccount1.blob.core.windows.net/repo/refs/heads/main/aa.bundle",
+        )
+        .expect("base parses");
+        let err = build_blob_sas_url(
+            &base,
+            "repo",
+            "refs/heads/main/aa\rbundle",
+            &azurite_signing(),
+            Duration::from_hours(1),
+        )
+        .expect_err("\\r in blob_path must be rejected");
+        assert!(
+            err.to_string().contains("blob_path"),
+            "error message must name the rejecting field: {err}"
+        );
+    }
+
+    /// F-001: valid path-segment characters still pass through.
+    /// Regression guard so the control-character rejector does not
+    /// accidentally over-reject (e.g., by treating `/` as control).
+    #[test]
+    fn build_blob_sas_url_accepts_normal_ascii_paths() {
+        let base = Url::parse(
+            "https://devstoreaccount1.blob.core.windows.net/repo/refs/heads/main/aa.bundle",
+        )
+        .expect("base parses");
+        build_blob_sas_url(
+            &base,
+            "repo",
+            "refs/heads/main/aa.bundle",
+            &azurite_signing(),
+            Duration::from_hours(1),
+        )
+        .expect("plain ASCII path must build");
     }
 }

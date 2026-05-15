@@ -33,10 +33,11 @@ use crate::packchain::gc;
 /// Tunables for [`Gc::run`]. Field semantics mirror the CLI flags.
 #[derive(Debug, Clone, Copy)]
 pub struct GcOpts {
-    /// Run mark only — no sweep.
-    pub mark_only: bool,
-    /// Run sweep only — no mark.
-    pub sweep_only: bool,
+    /// Operating mode. The two-boolean `mark_only`/`sweep_only`
+    /// shape was prone to silently no-oping the conflicting
+    /// combination; the enum makes the three valid states the only
+    /// representable states.
+    pub mode: GcMode,
     /// `force` mode for sweep: bypass grace window and the orphan
     /// re-check. Operator-asserted safe.
     pub force: bool,
@@ -46,11 +47,29 @@ pub struct GcOpts {
     pub grace_hours: u64,
 }
 
+/// Which phases of the mark-and-sweep flow [`Gc::run`] executes.
+///
+/// The `--mark-only` / `--sweep-only` CLI flags translate into the
+/// matching variant at the parser boundary; passing both flags is
+/// rejected there (rather than silently degenerating to a no-op,
+/// which the previous two-boolean representation would have done).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GcMode {
+    /// Mark then sweep. Cron-friendly: previous runs' tombstones
+    /// age out while the current run's tombstones wait the grace
+    /// window.
+    #[default]
+    Default,
+    /// Mark only — produce a tombstone, do not delete.
+    MarkOnly,
+    /// Sweep only — process pre-existing tombstones, do not mark.
+    SweepOnly,
+}
+
 impl Default for GcOpts {
     fn default() -> Self {
         Self {
-            mark_only: false,
-            sweep_only: false,
+            mode: GcMode::Default,
             force: false,
             grace_hours: gc::DEFAULT_GRACE_HOURS,
         }
@@ -98,7 +117,7 @@ impl Gc {
     async fn run_with_writer<W: Write>(&self, out: &mut W) -> Result<(), ManageError> {
         let store_ref = self.store.as_ref();
 
-        if !self.opts.sweep_only {
+        if self.opts.mode != GcMode::SweepOnly {
             let mark_outcome = gc::mark(store_ref, &self.prefix, gc::MarkOpts::default()).await?;
             format_mark_outcome(out, &mark_outcome)?;
             if mark_outcome.orphan_count != 0 {
@@ -110,7 +129,7 @@ impl Gc {
             }
         }
 
-        if !self.opts.mark_only {
+        if self.opts.mode != GcMode::MarkOnly {
             let sweep_outcome = gc::sweep(
                 store_ref,
                 &self.prefix,
@@ -180,7 +199,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn ObjectStore>,
             "repo",
             GcOpts {
-                mark_only: true,
+                mode: GcMode::MarkOnly,
                 ..GcOpts::default()
             },
         );
@@ -207,7 +226,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn ObjectStore>,
             "repo",
             GcOpts {
-                sweep_only: true,
+                mode: GcMode::SweepOnly,
                 force: true,
                 ..GcOpts::default()
             },

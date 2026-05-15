@@ -20,7 +20,7 @@ use git_remote_object_store::manage::{
     branch::ManageBranch,
     compact::{Compact, CompactOpts},
     doctor::{Doctor, DoctorOpts},
-    gc::{Gc, GcOpts},
+    gc::{Gc, GcMode, GcOpts},
 };
 use git_remote_object_store::object_store::ObjectStore;
 use git_remote_object_store::packchain::gc as packchain_gc;
@@ -212,10 +212,10 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             force,
             grace_hours,
         } => {
+            let mode = gc_mode_from_flags(mark_only, sweep_only)?;
             let (store, prefix) = open_target(&target).await?;
             let opts = GcOpts {
-                mark_only,
-                sweep_only,
+                mode,
                 force,
                 grace_hours: grace_hours.unwrap_or_else(packchain_gc::grace_hours_from_env),
             };
@@ -240,6 +240,24 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let prompter = DialoguerPrompter;
             Ok(Compact::new(store, prefix, opts, &prompter).run().await?)
         }
+    }
+}
+
+/// Translate the `--mark-only` / `--sweep-only` CLI flags into a
+/// [`GcMode`]. clap's `conflicts_with` already rejects both flags
+/// together (so the `(true, true)` arm is unreachable in practice),
+/// but the explicit error keeps the parser contract local to this
+/// helper rather than scattered across attribute metadata —
+/// matching the "reject the conflicting combination with a clear
+/// error message" criterion from finding F-008.
+fn gc_mode_from_flags(mark_only: bool, sweep_only: bool) -> Result<GcMode> {
+    match (mark_only, sweep_only) {
+        (false, false) => Ok(GcMode::Default),
+        (true, false) => Ok(GcMode::MarkOnly),
+        (false, true) => Ok(GcMode::SweepOnly),
+        (true, true) => Err(anyhow!(
+            "--mark-only and --sweep-only are mutually exclusive"
+        )),
     }
 }
 
@@ -308,4 +326,71 @@ fn remote_url_from_named_remote(cwd: &Path, name: &str) -> Result<String> {
     git_helpers::remote_url(&repo, name)
         .map_err(|err| anyhow!(err))
         .with_context(|| format!("failed to read remote `{name}` URL"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// F-008: the helper round-trips `--mark-only` and `--sweep-only`
+    /// flags into the matching [`GcMode`] variant. The defaults flow
+    /// to `GcMode::Default`.
+    #[test]
+    fn gc_mode_from_flags_round_trips() {
+        assert_eq!(
+            gc_mode_from_flags(false, false).expect("default"),
+            GcMode::Default
+        );
+        assert_eq!(
+            gc_mode_from_flags(true, false).expect("mark only"),
+            GcMode::MarkOnly
+        );
+        assert_eq!(
+            gc_mode_from_flags(false, true).expect("sweep only"),
+            GcMode::SweepOnly
+        );
+    }
+
+    /// F-008: passing both flags is a hard error at the boundary,
+    /// not a silent no-op. The clap-level `conflicts_with` already
+    /// rejects this combination at parse time; the helper enforces
+    /// the same contract for programmatic callers and gives the
+    /// error a clearer wording than clap's default message.
+    #[test]
+    fn gc_mode_from_flags_rejects_conflicting_combination() {
+        let err = gc_mode_from_flags(true, true).expect_err("conflict");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--mark-only") && msg.contains("--sweep-only"),
+            "error must name both flags: {msg}"
+        );
+    }
+
+    /// F-008: clap also rejects the conflicting CLI invocation at
+    /// parse time, so the helper never sees `(true, true)` in
+    /// production. Pin the parse-time rejection so a future attribute
+    /// edit cannot silently drop the `conflicts_with` guard.
+    #[test]
+    fn cli_rejects_mark_only_and_sweep_only_together() {
+        let result = Cli::command().try_get_matches_from([
+            "git-remote-object-store",
+            "gc",
+            "--mark-only",
+            "--sweep-only",
+            "s3+https://example.com/bucket",
+        ]);
+        let err = result.expect_err("clap must reject conflicting flags");
+        // Pin the rejection mechanism, not just the wording: a future
+        // refactor that turns the failure into `MissingRequiredArgument`
+        // or any other parser error (instead of an explicit conflict)
+        // would silently weaken the guard but still produce a message
+        // mentioning "mark" or "sweep".
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("--mark-only") && rendered.contains("--sweep-only"),
+            "clap error must name both conflicting flags: {rendered}"
+        );
+    }
 }

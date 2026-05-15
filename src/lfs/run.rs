@@ -8,14 +8,16 @@
 //! stderr or a debug log file by the bin entrypoint).
 
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite};
 use tracing::{debug, error, warn};
 
-use crate::lfs::agent::{self, Agent, AgentError};
-use crate::lfs::protocol::{ErrorPayload, Event, InitEvent, InitResponse};
+use crate::lfs::agent::{self, Agent, AgentError, ERR_CODE_GENERIC};
+use crate::lfs::oid::LfsOid;
+use crate::lfs::protocol::{CompleteEvent, ErrorPayload, Event, InitEvent, InitResponse};
 use crate::object_store::ObjectStore;
 use crate::protocol::backend;
 use crate::url;
@@ -196,12 +198,16 @@ where
                 warn!("received second init; ignoring");
             }
             Event::Upload(u) => {
-                agent
-                    .upload(&u.oid, u.size, Path::new(&u.path), &mut writer)
-                    .await?;
+                if let Some(oid) = validate_oid(&u.oid, &mut writer, "upload").await? {
+                    agent
+                        .upload(&oid, u.size, Path::new(&u.path), &mut writer)
+                        .await?;
+                }
             }
             Event::Download(d) => {
-                agent.download(&d.oid, d.size, &mut writer).await?;
+                if let Some(oid) = validate_oid(&d.oid, &mut writer, "download").await? {
+                    agent.download(&oid, d.size, &mut writer).await?;
+                }
             }
             Event::Terminate => {
                 debug!("received terminate; exiting");
@@ -239,6 +245,37 @@ where
                 source,
             })?;
     Ok(Agent::new(store, prefix, tmp_dir))
+}
+
+/// Validate `oid_raw` at the run-loop boundary. Returns `Some(oid)`
+/// on success (the caller dispatches into the agent), or `None`
+/// after emitting a `complete` event with an empty `oid` field and
+/// the raw rejected value folded into the `error.message`. The
+/// `op` label flows into the warn-log so an operator can correlate
+/// the rejection with the source event line.
+async fn validate_oid<W: AsyncWrite + Unpin>(
+    oid_raw: &str,
+    writer: &mut W,
+    op: &'static str,
+) -> Result<Option<LfsOid>, RunError> {
+    match LfsOid::from_str(oid_raw) {
+        Ok(oid) => Ok(Some(oid)),
+        Err(err) => {
+            warn!(oid = %oid_raw, error = %err, op, "rejecting malformed oid");
+            let message = format!("invalid oid `{oid_raw}`: {err}");
+            let evt = CompleteEvent {
+                event: "complete",
+                oid: "",
+                path: None,
+                error: Some(ErrorPayload {
+                    code: ERR_CODE_GENERIC,
+                    message: &message,
+                }),
+            };
+            agent::write_event(writer, &evt).await?;
+            Ok(None)
+        }
+    }
 }
 
 async fn write_init_ack<W: AsyncWrite + Unpin>(
@@ -484,5 +521,127 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (_, res) = drive(&[], &resolver, tmp.path()).await;
         assert!(matches!(res, Err(RunError::StdinClosed)));
+    }
+
+    /// F-009: oid validation moved to the run-loop boundary. A
+    /// malformed oid on an `upload` event must surface as a
+    /// `complete` event with an empty `oid` field and the raw
+    /// rejected value folded into the `error.message` so the
+    /// operator can correlate the failure with the source event
+    /// line.
+    #[tokio::test]
+    async fn upload_with_invalid_oid_emits_complete_with_empty_oid() {
+        let store = MockStore::new();
+        let resolver = StubResolver {
+            store,
+            prefix: Some("repo".to_owned()),
+        };
+        let tmp = TempDir::new().unwrap();
+        let bad_oid = "not-a-real-oid";
+        let src = tmp.path().join("body");
+        tokio::fs::write(&src, b"x").await.unwrap();
+        let events = vec![
+            r#"{"event":"init","operation":"upload","remote":"origin"}"#.to_owned(),
+            format!(
+                r#"{{"event":"upload","oid":"{bad_oid}","size":1,"path":"{path}"}}"#,
+                path = src.to_str().unwrap(),
+            ),
+            r#"{"event":"terminate"}"#.to_owned(),
+        ];
+        let (lines, res) = drive(&events, &resolver, tmp.path()).await;
+        res.expect("run completes despite bad oid");
+        // init ack + complete (error) for the upload.
+        assert!(
+            lines.len() >= 2,
+            "expected init ack and complete: {lines:?}"
+        );
+        let complete_line = lines
+            .iter()
+            .find(|l| l.contains("\"event\":\"complete\""))
+            .expect("complete event present");
+        // Byte-exact assertion on the wire format. Per the LFS
+        // spec we surface an empty oid field (we never had a
+        // validated id) and place the raw rejected string in the
+        // error message.
+        assert_eq!(
+            complete_line.as_str(),
+            r#"{"event":"complete","oid":"","error":{"code":2,"message":"invalid oid `not-a-real-oid`: LFS oid must be 64 chars, got 14"}}"#,
+        );
+    }
+
+    /// F-009: the same shape for `download`. Validation lives in the
+    /// run loop, the agent is never reached, and the wire-format
+    /// failure event matches the upload case.
+    #[tokio::test]
+    async fn download_with_invalid_oid_emits_complete_with_empty_oid() {
+        let store = MockStore::new();
+        let resolver = StubResolver {
+            store,
+            prefix: Some("repo".to_owned()),
+        };
+        let tmp = TempDir::new().unwrap();
+        let bad_oid = "DEADBEEF";
+        let events = vec![
+            r#"{"event":"init","operation":"download","remote":"origin"}"#.to_owned(),
+            format!(r#"{{"event":"download","oid":"{bad_oid}","size":1}}"#),
+            r#"{"event":"terminate"}"#.to_owned(),
+        ];
+        let (lines, res) = drive(&events, &resolver, tmp.path()).await;
+        res.expect("run completes despite bad oid");
+        let complete_line = lines
+            .iter()
+            .find(|l| l.contains("\"event\":\"complete\""))
+            .expect("complete event present");
+        assert!(
+            complete_line.contains(r#""oid":"""#),
+            "wire-format oid field must be empty for validation failure: {complete_line}"
+        );
+        assert!(
+            complete_line.contains(&format!("invalid oid `{bad_oid}`")),
+            "raw rejected oid must appear in the error message: {complete_line}"
+        );
+        assert!(
+            complete_line.contains(r#""code":2"#),
+            "error code must be the generic value 2: {complete_line}"
+        );
+    }
+
+    /// F-009 sanity check: a valid oid passes the boundary check
+    /// and the agent is reached. This is covered by the existing
+    /// `full_round_trip_init_upload_download_terminate` test; this
+    /// shorter sibling pins the contract more directly.
+    #[tokio::test]
+    async fn upload_with_valid_oid_reaches_agent() {
+        let store = MockStore::new();
+        let resolver = StubResolver {
+            store: store.clone(),
+            prefix: Some("repo".to_owned()),
+        };
+        let tmp = TempDir::new().unwrap();
+        let oid = good_oid();
+        let src = tmp.path().join("body");
+        let body = b"payload";
+        tokio::fs::write(&src, body).await.unwrap();
+        let events = vec![
+            r#"{"event":"init","operation":"upload","remote":"origin"}"#.to_owned(),
+            format!(
+                r#"{{"event":"upload","oid":"{oid}","size":{size},"path":"{path}"}}"#,
+                size = body.len(),
+                path = src.to_str().unwrap(),
+            ),
+            r#"{"event":"terminate"}"#.to_owned(),
+        ];
+        let (lines, res) = drive(&events, &resolver, tmp.path()).await;
+        res.expect("run completes");
+        // The bucket actually received the body — proof the agent
+        // was reached after boundary validation.
+        assert!(store.contains(&format!("repo/lfs/{oid}")));
+        // Wire-side complete has the validated oid (not empty).
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(&format!(r#""oid":"{oid}""#))
+                    && l.contains("\"event\":\"complete\""))
+        );
     }
 }

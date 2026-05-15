@@ -226,7 +226,6 @@ impl PathIndex {
     /// # Errors
     ///
     /// See [`ChainManifest::from_json_bytes`].
-    #[allow(dead_code)]
     pub(crate) fn from_json_bytes(bytes: &[u8]) -> Result<Self, PackchainError> {
         #[derive(Deserialize)]
         struct VersionPeek {

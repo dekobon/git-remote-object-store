@@ -116,10 +116,11 @@ async fn create_container(port: u16, container: &str) {
     headers.insert(HeaderName::from_static("x-ms-date"), date.clone());
     headers.insert(HeaderName::from_static("content-length"), "0");
 
-    let secret = azure_core::credentials::Secret::new(TEST_KEY.to_owned());
+    let key = git_remote_object_store::object_store::azure::auth::HmacKey::from_base64(TEST_KEY)
+        .expect("valid base64 key");
     let auth = git_remote_object_store::object_store::azure::auth::compute_authorization(
         TEST_ACCOUNT,
-        &secret,
+        &key,
         Method::Put,
         &url,
         &headers,

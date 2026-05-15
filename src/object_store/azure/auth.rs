@@ -31,7 +31,7 @@ use std::env;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use azure_core::credentials::{Secret, TokenCredential};
+use azure_core::credentials::TokenCredential;
 use azure_core::http::Method;
 use azure_core::http::headers::{HeaderName, Headers};
 use azure_core::http::policies::{Policy, PolicyResult};
@@ -87,19 +87,61 @@ pub(crate) struct ResolvedCredentials {
 }
 
 /// Material required to sign a service-blob SAS token (issue #76).
-/// Carries the storage key as an [`azure_core::credentials::Secret`]
-/// so accidental `Debug` / log emission redacts the key.
-#[derive(Clone)]
+/// Carries the storage key as pre-decoded [`HmacKey`] bytes — the
+/// base64 decode happens once at credential-resolution time rather
+/// than per SAS-URL build.
+///
+/// `Debug` is derived: the inner [`HmacKey`] redacts its own bytes,
+/// so the default field-walking impl already produces safe output.
+#[derive(Clone, Debug)]
 pub(crate) struct SasSigningKey {
     pub account: String,
-    pub key: Secret,
+    pub key: HmacKey,
 }
 
-impl std::fmt::Debug for SasSigningKey {
+/// Pre-decoded HMAC-SHA256 key bytes for Azure shared-key /
+/// service-SAS signing. The base64 decode happens once at
+/// construction (in [`SharedKeySigningPolicy::new`] and the
+/// `parse_connection_string` paths) instead of per request.
+///
+/// The bytes themselves are an Azure storage account key — leaking
+/// them via `Debug` or log output would give full storage-account
+/// access — so the manual `Debug` impl redacts. The underlying
+/// `Vec<u8>` is not zeroized on drop; the existing `Secret`-based
+/// design did not zeroize either, so this is a parity choice
+/// rather than a regression (adding `zeroize` would mean a new
+/// dependency).
+#[derive(Clone)]
+pub struct HmacKey {
+    bytes: Vec<u8>,
+}
+
+impl HmacKey {
+    /// Decode `key_b64` and return an [`HmacKey`]. Surfaces the
+    /// decoding failure inline so the malformed-key error fires at
+    /// credential-resolution time rather than at first request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObjectStoreError::Other`] if `key_b64` is not valid
+    /// base64.
+    pub fn from_base64(key_b64: &str) -> Result<Self, ObjectStoreError> {
+        let bytes = BASE64.decode(key_b64.as_bytes()).map_err(|e| {
+            ObjectStoreError::Other(format!("AccountKey is not valid base64: {e}").into())
+        })?;
+        Ok(Self { bytes })
+    }
+
+    /// Raw HMAC key bytes. Use only inside the signing primitives.
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl std::fmt::Debug for HmacKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SasSigningKey")
-            .field("account", &self.account)
-            .field("key", &"<redacted>")
+        f.debug_struct("HmacKey")
+            .field("bytes", &"<redacted>")
             .finish()
     }
 }
@@ -137,22 +179,24 @@ fn resolve_alias(account: &str, alias: &str) -> Result<ResolvedCredentials, Obje
 
     if let Ok(key_b64) = env::var(&key_var) {
         let policy = SharedKeySigningPolicy::new(account, &key_b64)?;
+        let key = HmacKey::from_base64(&key_b64)?;
         return Ok(resolved(
             Arc::new(policy),
             Some(SasSigningKey {
                 account: account.to_owned(),
-                key: Secret::new(key_b64),
+                key,
             }),
         ));
     }
     if let Ok(conn) = env::var(&conn_var) {
         let parsed = parse_connection_string(&conn)?;
         let policy = SharedKeySigningPolicy::new(&parsed.account, &parsed.key_b64)?;
+        let key = HmacKey::from_base64(&parsed.key_b64)?;
         return Ok(resolved(
             Arc::new(policy),
             Some(SasSigningKey {
                 account: parsed.account,
-                key: Secret::new(parsed.key_b64),
+                key,
             }),
         ));
     }
@@ -251,30 +295,22 @@ pub(crate) fn parse_connection_string(
 
 /// Per-try policy that signs every outgoing request with the Azure
 /// Storage shared-key v2 scheme.
+#[derive(Debug)]
 pub(crate) struct SharedKeySigningPolicy {
     account: String,
-    key: Secret,
-}
-
-impl std::fmt::Debug for SharedKeySigningPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SharedKeySigningPolicy")
-            .field("account", &self.account)
-            .field("key", &"<redacted>")
-            .finish()
-    }
+    key: HmacKey,
 }
 
 impl SharedKeySigningPolicy {
     pub(crate) fn new(account: &str, key_b64: &str) -> Result<Self, ObjectStoreError> {
         // Validate base64-decodability up front so a malformed key
-        // surfaces at construction, not on the first request.
-        BASE64.decode(key_b64.as_bytes()).map_err(|e| {
-            ObjectStoreError::Other(format!("AccountKey is not valid base64: {e}").into())
-        })?;
+        // surfaces at construction, not on the first request. The
+        // decoded bytes are cached so subsequent signs avoid the
+        // per-request decode cost.
+        let key = HmacKey::from_base64(key_b64)?;
         Ok(Self {
             account: account.to_owned(),
-            key: Secret::new(key_b64.to_owned()),
+            key,
         })
     }
 }
@@ -367,13 +403,16 @@ fn request_content_length(request: &Request) -> Option<u64> {
 /// pure, and stable enough that re-using it in tests is preferable
 /// to duplicating the spec-exact canonicalisation logic.
 ///
+/// The `key` argument is a pre-decoded [`HmacKey`]; callers that
+/// have only a base64 string call [`HmacKey::from_base64`] once and
+/// reuse the resulting [`HmacKey`] across signs.
+///
 /// # Errors
 ///
-/// Returns `Err(String)` if the HMAC key cannot be decoded from
-/// base64 (the error string describes the decoding failure).
+/// Returns `Err(String)` if HMAC initialisation fails.
 pub fn compute_authorization(
     account: &str,
-    key: &Secret,
+    key: &HmacKey,
     method: Method,
     url: &Url,
     headers: &Headers,
@@ -392,10 +431,25 @@ pub fn compute_authorization(
     Ok(format!("SharedKey {account}:{sig}"))
 }
 
-fn header_str<'a>(headers: &'a Headers, name: &'static str) -> &'a str {
-    headers
+/// Look up a header value for inclusion in the string-to-sign,
+/// applying the same trim + unfold-newlines transform that
+/// [`canonicalized_headers`] applies to `x-ms-*` headers. Both
+/// sites participate in the same string-to-sign and must use the
+/// same sanitisation — a literal `\n` in any of these header
+/// values would shift fields downstream and let a malformed
+/// request masquerade as a different signed request. In practice
+/// the HTTP stack rejects header values containing newlines, so
+/// this is theoretical; the consistency is the point.
+fn header_str<'a>(headers: &'a Headers, name: &'static str) -> Cow<'a, str> {
+    let raw = headers
         .get_optional_str(&HeaderName::from_static(name))
-        .unwrap_or("")
+        .unwrap_or("");
+    let trimmed = raw.trim();
+    if trimmed.contains('\n') {
+        Cow::Owned(trimmed.replace('\n', " "))
+    } else {
+        Cow::Borrowed(trimmed)
+    }
 }
 
 /// Build the Azure shared-key v2 string-to-sign.
@@ -492,17 +546,16 @@ fn canonicalized_resource(account: &str, url: &Url) -> String {
     out
 }
 
-/// HMAC-SHA256 a base64-encoded `key` over `data` and return a
-/// base64-encoded MAC. Used by both the shared-key signing policy
+/// HMAC-SHA256 over `data` with a pre-decoded [`HmacKey`], returning
+/// a base64-encoded MAC. Used by both the shared-key signing policy
 /// (`Authorization: SharedKey …` header) and the service-blob SAS
 /// builder ([`super::sas`]) — same primitive, same byte sequence,
-/// same error wording.
-pub(super) fn hmac_sha256_base64(data: &str, key: &Secret) -> Result<String, String> {
-    let key_bytes = BASE64
-        .decode(key.secret().as_bytes())
-        .map_err(|e| format!("AccountKey base64 decode: {e}"))?;
-    let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(&key_bytes).map_err(|e| format!("HMAC init: {e}"))?;
+/// same error wording. The base64 decode of the storage key happens
+/// once at [`HmacKey::from_base64`] time; this function does no
+/// decoding.
+pub(super) fn hmac_sha256_base64(data: &str, key: &HmacKey) -> Result<String, String> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key.as_bytes())
+        .map_err(|e| format!("HMAC init: {e}"))?;
     mac.update(data.as_bytes());
     Ok(BASE64.encode(mac.finalize().into_bytes()))
 }
@@ -701,7 +754,7 @@ mod tests {
         // canonicalisation into place so future refactors don't
         // silently change wire output.
         let key_b64 = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
-        let key = Secret::new(key_b64.to_owned());
+        let key = HmacKey::from_base64(key_b64).expect("valid base64");
         let url =
             Url::parse("http://127.0.0.1:10000/devstoreaccount1/c?restype=container&comp=list")
                 .unwrap();
@@ -722,6 +775,90 @@ mod tests {
     }
 
     // --- X_MS_DATE_FORMAT --------------------------------------------
+
+    /// F-003: signing through a pre-decoded [`HmacKey`] must produce
+    /// the canonical Azure shared-key v2 signature for the fixed
+    /// inputs below. The pinned wire-format byte sequence is the
+    /// real assertion — a future refactor that silently swaps the
+    /// decoder, transforms the key bytes, or alters the
+    /// string-to-sign layout will flip the signature and trip the
+    /// equality check.
+    #[test]
+    fn hmac_key_signs_canonical_shared_key_v2_signature() {
+        let key_b64 = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+        let url =
+            Url::parse("http://127.0.0.1:10000/devstoreaccount1/c?restype=container&comp=list")
+                .unwrap();
+        let mut headers = Headers::new();
+        headers.insert(
+            HeaderName::from_static("x-ms-date"),
+            "Wed, 01 Jan 2025 00:00:00 GMT",
+        );
+        headers.insert(HeaderName::from_static("x-ms-version"), "2025-11-05");
+
+        let key = HmacKey::from_base64(key_b64).expect("valid base64");
+        let auth = compute_authorization(
+            "devstoreaccount1",
+            &key,
+            Method::Get,
+            &url,
+            &headers,
+            None,
+        )
+        .expect("signs");
+        // Pinned wire-format vector — computed once from the inputs
+        // above against the Azure shared-key v2 string-to-sign
+        // layout. (Round-tripping two independently-constructed
+        // `HmacKey`s would only verify that base64 decode is
+        // deterministic — already guaranteed by the standard.)
+        assert_eq!(
+            auth, "SharedKey devstoreaccount1:VgcoAvg+vqaLJ76WpTkj7NrIj4dwCiYGPiMhJ7Q/2zI=",
+            "signature must match the pinned wire-format vector",
+        );
+    }
+
+    /// F-003: the derived `Debug` on [`SasSigningKey`] must inherit
+    /// [`HmacKey`]'s redaction — switching from a manual impl to
+    /// `derive(Debug)` relies on the inner field's `Debug` doing the
+    /// right thing, so pin it here.
+    #[test]
+    fn sas_signing_key_debug_does_not_leak_inner_bytes() {
+        let key_b64 = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+        let signing = SasSigningKey {
+            account: "devstoreaccount1".to_owned(),
+            key: HmacKey::from_base64(key_b64).expect("valid base64"),
+        };
+        let rendered = format!("{signing:?}");
+        assert!(
+            rendered.contains("redacted"),
+            "Debug must redact via inner HmacKey: {rendered}"
+        );
+        assert!(
+            !rendered.contains("bytes: ["),
+            "Debug must not leak raw key bytes: {rendered}"
+        );
+    }
+
+    /// F-003: `Debug` on [`HmacKey`] must not leak the underlying
+    /// key bytes — any rendering that includes the raw `Vec<u8>`
+    /// would surface the key in tracing output.
+    #[test]
+    fn hmac_key_debug_does_not_leak_bytes() {
+        let key_b64 = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+        let key = HmacKey::from_base64(key_b64).expect("valid base64");
+        let rendered = format!("{key:?}");
+        assert!(
+            rendered.contains("redacted"),
+            "Debug must redact: {rendered}"
+        );
+        // A leaky derive would render the raw `Vec<u8>` as
+        // `[0x12, 0x34, ...]`. Reject any byte-array delimiters
+        // appearing alongside the bytes field name.
+        assert!(
+            !rendered.contains("bytes: ["),
+            "Debug output must not include raw key bytes: {rendered}"
+        );
+    }
 
     #[test]
     fn x_ms_date_format_matches_rfc1123_literal() {

@@ -10,7 +10,6 @@
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -23,8 +22,10 @@ use crate::lfs::oid::LfsOid;
 use crate::lfs::protocol::{CompleteEvent, ErrorPayload, ProgressEvent};
 use crate::object_store::{GetOpts, ObjectStore, ObjectStoreError, ProgressSink, PutOpts};
 
-/// Generic error code surfaced in `complete` event payloads.
-const ERR_CODE_GENERIC: u32 = 2;
+/// Generic error code surfaced in `complete` event payloads. Shared
+/// with [`crate::lfs::run`] so the oid-validation failure path and
+/// the per-event failure path emit the same numeric code.
+pub(crate) const ERR_CODE_GENERIC: u32 = 2;
 
 /// Driver for a single LFS session against one remote.
 pub(crate) struct Agent {
@@ -80,71 +81,71 @@ impl Agent {
     /// a final complete event. Progress events flow live as the body
     /// crosses chunk boundaries instead of as one trailing event with
     /// the full size.
+    ///
+    /// `oid` is already validated at the [`crate::lfs::run`] boundary
+    /// per the `LfsOid` doc — passing a typed value here keeps the
+    /// invariant local to the type rather than re-validating per call.
     pub(crate) async fn upload<W: AsyncWrite + Unpin>(
         &self,
-        oid_raw: &str,
+        oid: &LfsOid,
         _size: u64,
         path: &Path,
         writer: &mut W,
     ) -> Result<(), AgentError> {
-        let oid_for_progress = oid_raw.to_owned();
+        let oid_for_progress = oid.as_str().to_owned();
         let result = with_progress_stream(writer, oid_for_progress, |sink| async move {
-            self.try_upload(oid_raw, path, sink).await
+            self.try_upload(oid, path, sink).await
         })
         .await?;
         match result {
-            Ok(UploadOutcome::AlreadyPresent) => write_complete(writer, oid_raw, None, None).await,
-            Ok(UploadOutcome::Uploaded { oid }) => {
-                write_complete(writer, oid.as_str(), None, None).await
-            }
-            Err(OpError { oid, message }) => {
-                write_complete(writer, &oid, None, Some(&message)).await
+            Ok(()) => write_complete(writer, oid.as_str(), None, None).await,
+            Err(OpError { message }) => {
+                write_complete(writer, oid.as_str(), None, Some(&message)).await
             }
         }
     }
 
     /// Handle a `download` event: stream the body to
     /// `<tmp_dir>/<oid>` and emit per-chunk progress + complete-with-path.
+    ///
+    /// `oid` is already validated at the [`crate::lfs::run`] boundary.
     pub(crate) async fn download<W: AsyncWrite + Unpin>(
         &self,
-        oid_raw: &str,
+        oid: &LfsOid,
         _size: u64,
         writer: &mut W,
     ) -> Result<(), AgentError> {
-        let oid_for_progress = oid_raw.to_owned();
+        let oid_for_progress = oid.as_str().to_owned();
         let result = with_progress_stream(writer, oid_for_progress, |sink| async move {
-            self.try_download(oid_raw, sink).await
+            self.try_download(oid, sink).await
         })
         .await?;
         match result {
-            Ok(DownloadOutcome { oid, dest_str }) => {
-                write_complete(writer, oid.as_str(), Some(&dest_str), None).await
-            }
-            Err(OpError { oid, message }) => {
-                write_complete(writer, &oid, None, Some(&message)).await
+            Ok(dest_str) => write_complete(writer, oid.as_str(), Some(&dest_str), None).await,
+            Err(OpError { message }) => {
+                write_complete(writer, oid.as_str(), None, Some(&message)).await
             }
         }
     }
 
     async fn try_upload(
         &self,
-        oid_raw: &str,
+        oid: &LfsOid,
         path: &Path,
         progress: ProgressSink,
-    ) -> Result<UploadOutcome, OpError> {
-        let oid = parse_oid(oid_raw)?;
-        let key = self.key(&oid);
+    ) -> Result<(), OpError> {
+        let key = self.key(oid);
         debug!(oid = %oid, key = %key, "lfs upload");
 
         match self.store.head(&key).await {
             Ok(_) => {
                 debug!(oid = %oid, "object already present; skipping upload");
-                return Ok(UploadOutcome::AlreadyPresent);
+                return Ok(());
             }
             Err(ObjectStoreError::NotFound(_)) => {}
             Err(e) => {
                 warn!(oid = %oid, error = %e, "head failed during upload");
-                return Err(OpError::with_cause(oid.as_str(), &e));
+                return Err(OpError::with_cause(&e));
             }
         }
 
@@ -154,26 +155,21 @@ impl Agent {
         };
         self.store.put_path(&key, path, opts).await.map_err(|e| {
             warn!(oid = %oid, error = %e, "upload failed");
-            OpError::with_cause(oid.as_str(), &e)
+            OpError::with_cause(&e)
         })?;
 
-        Ok(UploadOutcome::Uploaded { oid })
+        Ok(())
     }
 
-    async fn try_download(
-        &self,
-        oid_raw: &str,
-        progress: ProgressSink,
-    ) -> Result<DownloadOutcome, OpError> {
-        let oid = parse_oid(oid_raw)?;
-        let key = self.key(&oid);
+    async fn try_download(&self, oid: &LfsOid, progress: ProgressSink) -> Result<String, OpError> {
+        let key = self.key(oid);
         let dest = self.tmp_dir.join(oid.as_str());
         debug!(oid = %oid, key = %key, dest = %dest.display(), "lfs download");
 
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 warn!(oid = %oid, error = %e, "create_dir_all failed");
-                OpError::with_cause(oid.as_str(), &e)
+                OpError::with_cause(&e)
             })?;
         }
 
@@ -185,14 +181,15 @@ impl Agent {
             .await
             .map_err(|e| {
                 warn!(oid = %oid, error = %e, "download failed");
-                OpError::with_cause(oid.as_str(), &e)
+                OpError::with_cause(&e)
             })?;
 
-        let dest_str = dest.to_str().map(str::to_owned).ok_or_else(|| {
-            OpError::with_cause(oid.as_str(), &"download destination is not valid UTF-8")
-        })?;
+        let dest_str = dest
+            .to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| OpError::with_cause(&"download destination is not valid UTF-8"))?;
 
-        Ok(DownloadOutcome { oid, dest_str })
+        Ok(dest_str)
     }
 }
 
@@ -263,38 +260,21 @@ where
     Ok(result)
 }
 
-enum UploadOutcome {
-    AlreadyPresent,
-    Uploaded { oid: LfsOid },
-}
-
-struct DownloadOutcome {
-    oid: LfsOid,
-    dest_str: String,
-}
-
-/// Recoverable per-event error. `oid` is owned because we may have
-/// failed before parsing succeeded (in which case the wire-side oid
-/// string from the event is the only handle we have).
+/// Recoverable per-event error. The validated [`LfsOid`] is held by
+/// the caller (validation happens at the run-loop boundary) so this
+/// struct only carries the failure message.
 struct OpError {
-    oid: String,
     message: String,
 }
 
 impl OpError {
     /// Build from any `Display`-able cause. Used uniformly for
     /// object-store errors, `std::io::Error`s, and string literals.
-    fn with_cause(oid: &str, cause: &dyn fmt::Display) -> Self {
+    fn with_cause(cause: &dyn fmt::Display) -> Self {
         Self {
-            oid: oid.to_owned(),
             message: cause.to_string(),
         }
     }
-}
-
-fn parse_oid(oid_raw: &str) -> Result<LfsOid, OpError> {
-    LfsOid::from_str(oid_raw)
-        .map_err(|e| OpError::with_cause(oid_raw, &format_args!("invalid oid: {e}")))
 }
 
 /// Serialize `evt` and write it as one newline-terminated line.
@@ -359,10 +339,12 @@ mod tests {
     use super::*;
     use crate::object_store::mock::MockStore;
     use bytes::Bytes;
+    use std::str::FromStr;
     use tempfile::TempDir;
 
-    fn good_oid() -> String {
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned()
+    fn good_oid() -> LfsOid {
+        LfsOid::from_str("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .expect("hard-coded oid is valid")
     }
 
     fn agent(store: MockStore, prefix: Option<&str>, tmp: &TempDir) -> Agent {
@@ -423,25 +405,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_rejects_invalid_oid() {
-        let store = MockStore::new();
-        let tmp = TempDir::new().unwrap();
-        let a = agent(store, Some("repo"), &tmp);
-
-        let src = tmp.path().join("body");
-        tokio::fs::write(&src, b"x").await.unwrap();
-
-        let mut out = Vec::new();
-        a.upload("not-a-real-oid", 1, &src, &mut out)
-            .await
-            .expect("dispatch ok");
-        let got = String::from_utf8(out).unwrap();
-        assert!(got.contains("\"error\""));
-        assert!(got.contains("invalid oid"));
-        assert_eq!(got.lines().count(), 1);
-    }
-
-    #[tokio::test]
     async fn download_writes_file_and_emits_progress_then_complete() {
         let store = MockStore::new();
         let oid = good_oid();
@@ -458,7 +421,7 @@ mod tests {
         let lines: Vec<&str> = got.lines().collect();
         assert_eq!(lines.len(), 2, "expected progress + complete: {got}");
         assert!(lines[0].contains("\"event\":\"progress\""));
-        let dest = tmp.path().join(&oid);
+        let dest = tmp.path().join(oid.as_str());
         let dest_str = dest.to_str().unwrap();
         assert!(
             lines[1].contains(&format!("\"path\":\"{dest_str}\"")),

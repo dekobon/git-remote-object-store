@@ -7,11 +7,9 @@
 //! the protocol REPL can flip the level at runtime in response to
 //! `option verbosity <n>`.
 //!
-//! Startup level is `error`, with two env-var overrides honoured:
+//! Startup level is `error`, with one env-var override honoured:
 //!
 //! - `GIT_REMOTE_OBJECT_STORE_VERBOSE` — canonical name for this crate.
-//! - `GIT_REMOTE_S3_VERBOSE` — accepted as an alias. The canonical name
-//!   wins when both are set.
 //!
 //! A numeric value `>= 2` bumps the start level to `info`, matching the
 //! `option verbosity 2` threshold from the helper protocol.
