@@ -7,7 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Pinned Azure `x-ms-date` format (#174).** Replaced
+  `time::format_description::well_known::Rfc2822` plus
+  `str::replace("+0000", "GMT")` with an explicit
+  `format_description!` matching the RFC 1123 shape Azure documents.
+  The previous approach coupled Azure-auth correctness to the exact
+  byte emission of the `time` crate's RFC 2822 formatter — a future
+  minor-version change (e.g., `+0000` → `+00:00`) would silently
+  turn the replace into a no-op and break every signed request.
+  Added a byte-exact unit test pinning the wire format to
+  `"Sun, 06 Nov 1994 08:49:37 GMT"` so a regression on the
+  format description trips a focused test rather than only a
+  network-level Azurite test downstream.
+
+- **Cross-platform pread for multipart uploads (#176).** Replaced
+  `src/object_store/multipart.rs`'s unguarded
+  `use std::os::unix::fs::FileExt;` and `read_exact_at` call with
+  a cross-platform `pread_exact` helper:
+  `#[cfg(unix)]` delegates to `FileExt::read_exact_at`;
+  `#[cfg(windows)]` uses `FileExt::seek_read` in a short-read loop
+  that returns `UnexpectedEof` on a premature zero-byte read so
+  the existing S3/Azure abort-on-truncation path still fires.
+  Restores reachability of the
+  `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` release
+  targets advertised in `.github/workflows/release.yml`. CI does
+  not yet exercise the Windows leg; a follow-up to add a Windows
+  runner to `ci.yml` is appropriate.
+
 ### Changed
+
+- **Deduped gc mark/sweep output (#175).** Extracted the operator-
+  facing "gc mark" and "gc sweep" output lines into a new
+  `pub(crate)` helper `manage::gc_output` taking
+  `&mut impl Write`. `Gc::run` and `Compact::run_gc` both delegate
+  to the helper, eliminating the four duplicated `println!` /
+  `writeln!` format strings that previously lived in both files.
+  Pluralisation now uses the `if n == 1 { "pack" } else { "packs" }`
+  pattern (matching `fmt_partial_delete`) instead of the inline
+  `"pack(s)"` / `"tombstone(s)"` / `"object(s)"` tokens. Byte-exact
+  unit tests pin the output for zero / singular / plural / deferred
+  / all-singular / all-plural / mixed-counter cases. The
+  `gc.rs::Gc::run` writer is now plain `&mut std::io::stdout()` so
+  the lock is not held across the `mark`/`sweep` await points.
+
+- **Bundled review-loop cleanups F-001/F-003/F-006/F-008/F-009/F-010 (#177).**
+  Six independent code-quality findings from the iterative
+  review-loop pass landed in a single commit:
+  - F-010: dropped stale `#[allow(dead_code)]` on
+    `PathIndex::from_json_bytes` (reached via
+    `manifest::load_path_index`).
+  - F-006: removed the `GIT_REMOTE_S3_VERBOSE` alias claim from
+    the `protocol::tracing_init` module doc; only the canonical
+    env var is honoured (per `AGENTS.md`: no compatibility
+    aliases).
+  - F-003: introduced `HmacKey` (pre-decoded bytes with a
+    redacting `Debug`). `SharedKeySigningPolicy` and
+    `SasSigningKey` now store the decoded key; the per-request
+    base64 decode in `hmac_sha256_base64` is gone.
+    `compute_authorization` takes `&HmacKey`. (Follow-up in the
+    same batch: replaced the manual `SasSigningKey::Debug` with
+    `derive(Debug)` since the inner `HmacKey` already redacts.)
+  - F-001: `build_blob_sas_url` rejects `\n`/`\r` (and other ASCII
+    control bytes) in `container` / `blob_path` so a literal
+    newline cannot shift fields in the SAS string-to-sign.
+    `auth::header_str` now applies the same
+    trim-and-unfold-newline transform `canonicalized_headers`
+    already uses, so both string-to-sign feeds sanitise
+    consistently.
+  - F-008: `GcOpts.mark_only` / `sweep_only` booleans replaced
+    with `enum GcMode { Default, MarkOnly, SweepOnly }`. The CLI
+    parser keeps the two flags; the new `gc_mode_from_flags`
+    translates them at the boundary and rejects the conflicting
+    combination with a clear error (instead of the previous
+    silent no-op).
+  - F-009: LFS oid validation moved to the `run.rs` REPL
+    boundary. `Agent::upload` / `download` now take `&LfsOid`.
+    On validation failure the run loop emits a `complete` wire
+    event with an empty `oid` field and the raw rejected value
+    folded into `error.message`. `parse_oid` and `OpError::oid`
+    are gone from `agent.rs`.
 
 - **Split `Doctor::list_and_handle_stale_locks` (#167).** Extracted
   the per-key HEAD-recheck + delete loop into a free
