@@ -797,15 +797,9 @@ mod tests {
         headers.insert(HeaderName::from_static("x-ms-version"), "2025-11-05");
 
         let key = HmacKey::from_base64(key_b64).expect("valid base64");
-        let auth = compute_authorization(
-            "devstoreaccount1",
-            &key,
-            Method::Get,
-            &url,
-            &headers,
-            None,
-        )
-        .expect("signs");
+        let auth =
+            compute_authorization("devstoreaccount1", &key, Method::Get, &url, &headers, None)
+                .expect("signs");
         // Pinned wire-format vector — computed once from the inputs
         // above against the Azure shared-key v2 string-to-sign
         // layout. (Round-tripping two independently-constructed
