@@ -55,22 +55,9 @@ Use cases that fit naturally:
   active repos). Pick per-remote with `?engine=`; default is
   `bundle`. See [docs/storage-engines.md](docs/storage-engines.md)
   for the comparison and when to choose which.
-- **RFC 3986 HTTPS-native URL grammar.** `s3+https://<host>/<bucket>/<prefix>`
-  and `az+https://<account>.blob.<endpoint>/<container>/<prefix>`.
-  Cleartext `*+http://` is loopback-only by default for MinIO /
-  Azurite work.
 - **Streaming uploads end-to-end.** No in-memory buffering of bundles,
   no 5 GiB single-PUT ceiling — multipart upload is wired into both
   backends.
-- **Hand-rolled parallel ranged GETs**, `If-Match`-guarded against
-  concurrent overwrites.
-- **Per-ref push-batch error handling.** A single failed ref reports
-  a reason without aborting the rest of the batch.
-- **Up-front bucket-name validation.** AWS-reserved prefixes/suffixes,
-  IPv4 dotted-quads, and the rest of the rule set are checked before
-  the SDK can return a cryptic error.
-- **Modern TLS stack.** `rustls 0.23`, with deliberate opt-out of the
-  AWS SDK's legacy `rustls 0.21` chain.
 - **Locking parity across backends.** `If-None-Match: *` on S3,
   mirrored on Azure; same TTL semantics; tested across both.
 
