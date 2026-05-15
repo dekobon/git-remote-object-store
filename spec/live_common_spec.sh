@@ -66,6 +66,62 @@ Describe "live_common.sh: live_assert_safe_prefix"
 	End
 End
 
+Describe "live_common.sh: live_require_guard"
+	Include spec/support/live_common.sh
+
+	# This guard is the single source of truth for the cost-acknowledgement
+	# check; both the Makefile recipes (`shellspec-live-*`) and the bash
+	# entry points (`live_s3.sh`, `live_az.sh`, `utils/live-sweep.sh`) call
+	# it. The test pins the wording and exit semantics that both layers
+	# depend on.
+	It "fails when LIVE_TESTS_I_UNDERSTAND_THIS_COSTS_MONEY is unset"
+		unset LIVE_TESTS_I_UNDERSTAND_THIS_COSTS_MONEY
+		When call live_require_guard
+		The status should not equal 0
+		The stderr should include "LIVE_TESTS_I_UNDERSTAND_THIS_COSTS_MONEY is not set to 1"
+		The stderr should include "export LIVE_TESTS_I_UNDERSTAND_THIS_COSTS_MONEY=1"
+	End
+
+	It "fails when the variable is set to any value other than 1"
+		LIVE_TESTS_I_UNDERSTAND_THIS_COSTS_MONEY="yes"
+		When call live_require_guard
+		The status should not equal 0
+		The stderr should include "is not set to 1"
+	End
+
+	It "fails when the variable is set to 0"
+		LIVE_TESTS_I_UNDERSTAND_THIS_COSTS_MONEY="0"
+		When call live_require_guard
+		The status should not equal 0
+		The stderr should include "is not set to 1"
+	End
+
+	It "succeeds when the variable is set to exactly 1"
+		LIVE_TESTS_I_UNDERSTAND_THIS_COSTS_MONEY="1"
+		When call live_require_guard
+		The status should equal 0
+	End
+End
+
+Describe "Makefile: shellspec-live-* guard wiring"
+	# Regression cover for the recipe-level guard. `make -n` prints the
+	# expanded recipe without executing it, so the test never invokes
+	# shellspec or contacts a cloud backend. If a future edit drops the
+	# `$(check_live_guard)` line from a recipe, these tests fail before
+	# the misconfigured target ever hits CI or a developer's terminal.
+	It "shellspec-live-s3 delegates to live_require_guard"
+		When run command make -n shellspec-live-s3
+		The status should equal 0
+		The output should include "live_require_guard"
+	End
+
+	It "shellspec-live-azure delegates to live_require_guard"
+		When run command make -n shellspec-live-azure
+		The status should equal 0
+		The output should include "live_require_guard"
+	End
+End
+
 Describe "live_common.sh: live_run_id"
 	Include spec/support/live_common.sh
 

@@ -233,15 +233,25 @@ shellspec-integration: shellspec-integration-s3 shellspec-integration-azure
 # Azure Blob. Never invoked by `make ci`, `make pre-commit`, `make test`,
 # `make shellspec-integration`, or `make all`. Requires the explicit
 # acknowledgement variable `LIVE_TESTS_I_UNDERSTAND_THIS_COSTS_MONEY=1`
-# to be exported in the operator's environment; without it every spec
-# aborts at `BeforeAll` with a loud message. See `spec/live/README.md`
-# for setup, env vars, costs, and cleanup details. `ENGINES` defaults
-# to every implemented storage engine, so the live suite exercises each
-# one in turn against the same backend. Override with `ENGINES=bundle`
-# (or `ENGINES=packchain`) to scope a run to a single engine.
+# to be exported in the operator's environment; without it the recipe
+# refuses to invoke shellspec (the same `live_require_guard` check that
+# direct shellspec / `live-sweep.sh` invocations rely on). See
+# `spec/live/README.md` for setup, env vars, costs, and cleanup details.
+# `ENGINES` defaults to every implemented storage engine, so the live
+# suite exercises each one in turn against the same backend. Override
+# with `ENGINES=bundle` (or `ENGINES=packchain`) to scope a run to a
+# single engine.
 ENGINES ?= bundle packchain
 
+# Delegate the cost-acknowledgement check to the canonical bash helper
+# so the message and exact semantics live in one place. Without this
+# guard at the recipe level, shellspec's per-spec BeforeAll hook still
+# aborts — but only after printing one "FAILED" line per test plus a
+# buried Examples: block, which scrolls off short terminals.
+check_live_guard = bash -c 'source "$(BASE_DIR)spec/support/live_common.sh" && live_require_guard'
+
 shellspec-live-s3: build
+	@$(check_live_guard)
 	@[ -n "$(strip $(ENGINES))" ] || { echo "ENGINES is empty (set ENGINES=bundle, =packchain, or unset to use the default)" >&2; exit 1; }
 	@for engine in $(ENGINES); do \
 	  echo "Running shellspec live AWS S3 suite ($$engine)..."; \
@@ -250,6 +260,7 @@ shellspec-live-s3: build
 	done
 
 shellspec-live-azure: build
+	@$(check_live_guard)
 	@[ -n "$(strip $(ENGINES))" ] || { echo "ENGINES is empty (set ENGINES=bundle, =packchain, or unset to use the default)" >&2; exit 1; }
 	@for engine in $(ENGINES); do \
 	  echo "Running shellspec live Azure Blob suite ($$engine)..."; \
