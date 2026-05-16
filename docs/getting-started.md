@@ -778,11 +778,14 @@ advances `full_at`, invalidating any cached bundle.
 | Private S3 / private Azure container | `?bundle_uri=1&bundle_uri_presign_ttl=<seconds>` | Helper emits a per-ref presigned URL (S3 SigV4 / Azure service-blob SAS) that expires after `<seconds>`. |
 
 `bundle_uri_presign_ttl` is parsed as a positive integer of
-seconds (`Option<NonZeroU64>` internally — `=0` is rejected at
-the URL boundary). Choose it to balance accelerated-clone
-window vs URL-leakage risk: longer TTLs let one clone reuse the
-URL across retries, but the URL grants time-limited GET access
-to the bundle key to anyone who reads it.
+seconds in the range `1..=604_800` (1 second to 7 days).
+`=0` and values above 7 days are rejected at the URL boundary;
+the 7-day cap matches AWS's hard ceiling on presigned URLs and
+keeps both backends consistent. Choose the TTL to balance
+accelerated-clone window vs URL-leakage risk: longer TTLs let
+one clone reuse the URL across retries, but the URL grants
+time-limited GET access to the bundle key to anyone who reads
+it.
 
 ```bash
 # Private S3 bucket, 1-hour TTL.
@@ -811,10 +814,13 @@ AZSTORE_PROD_KEY=<base64-key> \
   warn-and-skipped, and the client falls back to the helper
   protocol fetch path. User-delegation SAS (Entra-ID-backed) is
   filed as a future enhancement.
-- **AWS TTL ceiling**: AWS enforces a 7-day maximum on
-  presigned URLs. Asking for `bundle_uri_presign_ttl=604801`
-  surfaces an SDK error at emission time, the entry is warn-and-
-  skipped, and again the client falls back gracefully.
+- **7-day TTL ceiling**: AWS enforces a 7-day maximum on
+  presigned URLs as part of the `SigV4` spec; this project
+  applies the same cap to Azure for consistency. Asking for
+  `bundle_uri_presign_ttl=604801` is rejected at URL-parse time
+  with a clear error (`bundle_uri_presign_ttl` too large), so
+  the helper never starts and `git clone` reports the bad flag
+  immediately.
 
 ## 11. Troubleshooting
 

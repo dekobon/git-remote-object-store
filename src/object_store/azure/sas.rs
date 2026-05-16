@@ -96,8 +96,20 @@ pub(crate) fn build_blob_sas_url(
     reject_control_chars("container", container)?;
     reject_control_chars("blob_path", blob_path)?;
 
+    // Convert `ttl` to `time::Duration` without going through
+    // `seconds_f64`: that helper panics on overflow (issue #219 — a
+    // pathological caller-supplied TTL like `u64::MAX` reaches us via
+    // `?bundle_uri_presign_ttl=<huge>`, although the URL parser now
+    // caps the flag at `MAX_BUNDLE_URI_PRESIGN_TTL_SECONDS` to keep
+    // that path unreachable as defence-in-depth). Integer-second
+    // precision is sufficient — the wire format only emits seconds.
+    let ttl_secs = i64::try_from(ttl.as_secs()).map_err(|_| {
+        ObjectStoreError::Other(
+            format!("SAS ttl too large: {}s exceeds i64::MAX", ttl.as_secs()).into(),
+        )
+    })?;
     let expiry = OffsetDateTime::now_utc()
-        .checked_add(time::Duration::seconds_f64(ttl.as_secs_f64()))
+        .checked_add(time::Duration::seconds(ttl_secs))
         .ok_or_else(|| {
             ObjectStoreError::Other(format!("SAS expiry overflow: ttl={}s", ttl.as_secs()).into())
         })?;
@@ -443,6 +455,35 @@ mod tests {
         assert!(
             err.to_string().contains("blob_path"),
             "error message must name the rejecting field: {err}"
+        );
+    }
+
+    /// Issue #219: a `u64::MAX`-class TTL previously panicked here
+    /// via `time::Duration::seconds_f64`. Defence-in-depth at the SAS
+    /// layer is still required even though the URL parser caps
+    /// `?bundle_uri_presign_ttl` at 7 days, because library callers
+    /// can reach `build_blob_sas_url` with any `std::time::Duration`.
+    /// The fix must return a clean `ObjectStoreError`, never panic.
+    #[test]
+    fn build_blob_sas_url_huge_ttl_returns_error_not_panic() {
+        let base = Url::parse(
+            "https://devstoreaccount1.blob.core.windows.net/repo/refs/heads/main/aa.bundle",
+        )
+        .expect("base parses");
+        let err = build_blob_sas_url(
+            &base,
+            "repo",
+            "refs/heads/main/aa.bundle",
+            &azurite_signing(),
+            // `Duration::MAX` carries `u64::MAX` seconds, which
+            // overflows both `time::Duration::seconds_f64` (the
+            // original panic site) and any `i64` second count.
+            Duration::MAX,
+        )
+        .expect_err("u64::MAX-class TTL must surface as an error, not panic");
+        assert!(
+            matches!(err, ObjectStoreError::Other(_)),
+            "expected ObjectStoreError::Other, got {err:?}",
         );
     }
 

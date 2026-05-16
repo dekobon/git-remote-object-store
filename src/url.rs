@@ -19,6 +19,22 @@ use url::Url;
 /// non-loopback hosts. Accepted only when set to `1`.
 pub const ENV_ALLOW_HTTP: &str = "GIT_REMOTE_OBJECT_STORE_ALLOW_HTTP";
 
+/// Maximum accepted value for `?bundle_uri_presign_ttl=<seconds>`: 7
+/// days, in seconds. Pinned at the URL boundary so the value cannot
+/// reach the backend SDKs as a degenerate input.
+///
+/// AWS enforces a 7-day ceiling on presigned URLs as part of the
+/// `SigV4` specification; passing anything larger to
+/// `aws_sdk_s3::presigning::PresigningConfig::expires_in` fails with
+/// `expires_in must be less than or equal to 604800 seconds`. Azure
+/// service-SAS does not have a comparable spec-mandated cap, but a
+/// pathological caller-supplied TTL (e.g. `u64::MAX`) caused a panic
+/// in [`crate::object_store::azure::sas::build_blob_sas_url`] via
+/// `time::Duration::seconds_f64` overflow. Applying the same 7-day
+/// cap to both backends gives consistent behaviour and a clean error
+/// at URL-parse time rather than mid-protocol (issue #219).
+pub const MAX_BUNDLE_URI_PRESIGN_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+
 /// A parsed remote URL.
 ///
 /// The `endpoint` field holds the canonical `https://` or `http://`
@@ -303,6 +319,22 @@ pub enum ParseError {
         /// The offending hostname.
         host: String,
     },
+    /// `?bundle_uri_presign_ttl=<seconds>` exceeded
+    /// [`MAX_BUNDLE_URI_PRESIGN_TTL_SECONDS`] (7 days). Rejecting at
+    /// the URL boundary prevents a degenerate value from reaching the
+    /// AWS SDK (which rejects > 7 days anyway) or the Azure SAS
+    /// builder (which previously panicked on `u64::MAX`). Issue #219.
+    #[error(
+        "bundle_uri_presign_ttl=`{value}` exceeds the 7-day maximum \
+         ({max} seconds); presigned URLs cannot be valid for longer"
+    )]
+    BundleUriPresignTtlTooLarge {
+        /// The offending value.
+        value: u64,
+        /// The maximum accepted value
+        /// ([`MAX_BUNDLE_URI_PRESIGN_TTL_SECONDS`]).
+        max: u64,
+    },
 }
 
 /// Parse a remote URL.
@@ -466,10 +498,7 @@ fn extract_flags(u: &Url) -> Result<(RemoteFlags, Option<AddressingOverride>), P
             }
             "bundle_uri" => flags.bundle_uri = parse_bool_flag("bundle_uri", value.as_ref())?,
             "bundle_uri_presign_ttl" => {
-                flags.bundle_uri_presign_ttl = Some(parse_nonzero_u64_flag(
-                    "bundle_uri_presign_ttl",
-                    value.as_ref(),
-                )?);
+                flags.bundle_uri_presign_ttl = Some(parse_bundle_uri_presign_ttl(value.as_ref())?);
             }
             other => return Err(ParseError::UnknownFlag(other.to_owned())),
         }
@@ -500,6 +529,21 @@ fn parse_nonzero_u64_flag(name: &str, value: &str) -> Result<NonZeroU64, ParseEr
         name: name.to_owned(),
         value: value.to_owned(),
     })
+}
+
+/// Parse `?bundle_uri_presign_ttl=<seconds>`: positive integer in
+/// `1..=MAX_BUNDLE_URI_PRESIGN_TTL_SECONDS`. The upper cap matches
+/// AWS's hard 7-day ceiling on presigned URLs and protects the Azure
+/// SAS builder from `u64`-overflow inputs (issue #219).
+fn parse_bundle_uri_presign_ttl(value: &str) -> Result<NonZeroU64, ParseError> {
+    let ttl = parse_nonzero_u64_flag("bundle_uri_presign_ttl", value)?;
+    if ttl.get() > MAX_BUNDLE_URI_PRESIGN_TTL_SECONDS {
+        return Err(ParseError::BundleUriPresignTtlTooLarge {
+            value: ttl.get(),
+            max: MAX_BUNDLE_URI_PRESIGN_TTL_SECONDS,
+        });
+    }
+    Ok(ttl)
 }
 
 /// Non-empty path segments. Segments are returned verbatim; bucket /
@@ -1293,6 +1337,65 @@ mod tests {
         assert!(
             matches!(err, ParseError::InvalidFlagValue { ref name, .. } if name == "bundle_uri_presign_ttl"),
             "expected InvalidFlagValue, got {err:?}",
+        );
+    }
+
+    /// Issue #219: huge values panic the Azure SAS builder via
+    /// `time::Duration::seconds_f64`. The URL boundary caps the flag
+    /// at [`MAX_BUNDLE_URI_PRESIGN_TTL_SECONDS`] (7 days) so the bad
+    /// value never reaches the helper, matching the AWS SDK's hard
+    /// ceiling.
+    #[test]
+    fn bundle_uri_presign_ttl_above_seven_days_rejected() {
+        let err = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo\
+             ?engine=packchain&bundle_uri=1&bundle_uri_presign_ttl=604801",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::BundleUriPresignTtlTooLarge { value, max }
+                    if value == 604_801 && max == MAX_BUNDLE_URI_PRESIGN_TTL_SECONDS
+            ),
+            "expected BundleUriPresignTtlTooLarge {{ value: 604801, max: {MAX_BUNDLE_URI_PRESIGN_TTL_SECONDS} }}, got {err:?}",
+        );
+    }
+
+    /// Issue #219: the pathological `u64::MAX`-class value reported
+    /// in the bug must be rejected at the URL boundary with a clean
+    /// error rather than panicking the helper.
+    #[test]
+    fn bundle_uri_presign_ttl_huge_value_rejected_not_panic() {
+        let err = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo\
+             ?engine=packchain&bundle_uri=1&bundle_uri_presign_ttl=999999999999999999",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::BundleUriPresignTtlTooLarge { value, .. }
+                    if value == 999_999_999_999_999_999
+            ),
+            "expected BundleUriPresignTtlTooLarge for huge value, got {err:?}",
+        );
+    }
+
+    /// Issue #219: the 7-day boundary value itself is accepted so
+    /// operators can express AWS's spec-mandated maximum.
+    #[test]
+    fn bundle_uri_presign_ttl_exactly_seven_days_accepted() {
+        let url = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo\
+             ?engine=packchain&bundle_uri=1&bundle_uri_presign_ttl=604800",
+        )
+        .unwrap();
+        assert_eq!(
+            url.flags().bundle_uri_presign_ttl,
+            Some(
+                NonZeroU64::new(MAX_BUNDLE_URI_PRESIGN_TTL_SECONDS).expect("7-day cap is non-zero")
+            ),
         );
     }
 
