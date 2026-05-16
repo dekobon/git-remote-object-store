@@ -152,13 +152,28 @@ fn resolve_repo_dir() -> anyhow::Result<PathBuf> {
         .map_or_else(|| repo.git_dir().to_path_buf(), Path::to_path_buf))
 }
 
+/// Install a SIGPIPE handler so a write to a closed stdout returns
+/// `ErrorKind::BrokenPipe` instead of killing the process.
+///
+/// Shared by every binary that speaks a line-based protocol on stdout:
+/// the four `git-remote-{s3,az}-{http,https}` helpers (via [`run_main`])
+/// and the `git-lfs-object-store` agent. Without it, git closing its
+/// read end of our stdout delivers SIGPIPE before our `BrokenPipe`
+/// classification (`is_broken_pipe()`) gets a chance to run, so the
+/// helper exits with a signal-death status instead of `EXIT_SUCCESS`.
+///
+/// `pub` because the LFS bin lives outside this module and needs to
+/// install the same mask. Effectively `pub(crate)`-scoped — the binary
+/// shims are the only consumers — but Rust has no inter-crate
+/// equivalent of `pub(crate)`.
 #[cfg(unix)]
-fn install_sigpipe_mask() {
+pub fn install_sigpipe_mask() {
     // tokio's signal handler installs SIG_IGN-equivalent semantics:
     // SIGPIPE no longer kills the process; instead, the failing write
-    // returns EPIPE → ErrorKind::BrokenPipe, which run_main catches
-    // above and turns into a clean exit. The returned Signal stream is
-    // dropped immediately — we just need the side effect of the installation.
+    // returns EPIPE → ErrorKind::BrokenPipe, which the bin's
+    // `is_broken_pipe()` arm catches and turns into a clean exit. The
+    // returned Signal stream is dropped immediately — we just need the
+    // side effect of the installation.
     let _ = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::pipe());
 }
 
@@ -199,5 +214,29 @@ mod tests {
             msg.contains("failed to parse remote URL"),
             "error should preserve context: {msg}"
         );
+    }
+
+    /// Regression guard for #216.
+    ///
+    /// `install_sigpipe_mask` was previously a private fn in this
+    /// module, called only from `run_main`. The LFS bin
+    /// (`cli/src/bin/git-lfs-object-store.rs`) lives in a separate
+    /// translation unit and could not reach it, so SIGPIPE killed the
+    /// agent before the `is_broken_pipe()` arm in its REPL ran. The
+    /// fix exposes the helper as `pub` so every binary that speaks a
+    /// line-based protocol on stdout can install the same mask.
+    ///
+    /// This test runs the install path inside a tokio runtime — the
+    /// underlying `tokio::signal::unix::signal` call requires one.
+    /// A successful call is the contract: it must not panic, and the
+    /// returned signal stream is intentionally dropped (we only want
+    /// the SIG_IGN-equivalent side effect on SIGPIPE).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn install_sigpipe_mask_is_publicly_reachable() {
+        // Resolve through the crate-root path the LFS bin uses. If a
+        // future change downgrades visibility, this test fails to
+        // compile — which is exactly the regression we want to catch.
+        crate::install_sigpipe_mask();
     }
 }

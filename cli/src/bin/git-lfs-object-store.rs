@@ -24,11 +24,22 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use git_remote_object_store::lfs::{self, GitRemoteResolver, disable_debug, enable_debug, install};
 use git_remote_object_store::protocol::tracing_init;
+#[cfg(unix)]
+use git_remote_object_store_cli::install_sigpipe_mask;
 
 const DEBUG_LOG_FILENAME: &str = "git-lfs-object-store.log";
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Install the SIGPIPE mask before any stdout write so a closed
+    // pipe surfaces as `ErrorKind::BrokenPipe` (caught by the
+    // `is_broken_pipe()` arm in `repl`) instead of killing the
+    // process with SIGPIPE. The helper-protocol binaries do the same
+    // in `cli::run_main`; the LFS agent needs it too — git-lfs may
+    // close its read end of our stdout at any point in the REPL.
+    #[cfg(unix)]
+    install_sigpipe_mask();
+
     // git invokes the agent with at most one positional argument
     // (the optional `debug` slot, set by `enable-debug`), so peeking
     // `argv[1]` is sufficient — no need to collect a `Vec`.
