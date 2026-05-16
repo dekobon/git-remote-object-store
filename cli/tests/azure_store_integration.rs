@@ -405,6 +405,61 @@ async fn list_with_empty_prefix_returns_everything() {
 }
 
 #[tokio::test]
+async fn list_paginates_past_default_page() {
+    // Azurite caps a single `List Blobs` response at `maxresults=5000`
+    // by default, so > 5000 blobs under the same prefix forces the
+    // page-walk loop in `AzureStore::list` (`while let Some(page) =
+    // pages.next().await { ... }`) to consume at least two pages. A
+    // regression to `if let Some(page) = pages.next().await { ... }`,
+    // an early `break`, or a missed continuation token would surface
+    // here as a length mismatch.
+    //
+    // Mirrors S3's `list_paginates_past_default_page` (which seeds
+    // 1500 blobs to force ≥ 2 pages against RustFS's 1000-per-page
+    // default). Azurite's default is higher (5000), so we pay the
+    // proportional seeding cost — accepted because the trait does not
+    // expose a `maxresults` knob, and adding one purely for a test
+    // would be a public-API expansion for a non-production property.
+    //
+    // Seeding is parallelised at fixed concurrency to keep the test
+    // wall-clock bounded on CI. Sequential `put_bytes` for 5500
+    // blobs against localhost Azurite takes ~minutes; with 32-way
+    // concurrency the test finishes in seconds.
+    let store = Arc::new(fresh_container().await);
+    // Azurite default maxresults is 5000; 5500 forces ≥ 2 pages.
+    let count: usize = 5500;
+    // Bounded concurrency: high enough to hide per-PUT latency,
+    // low enough to avoid exhausting Azurite's connection pool.
+    let concurrency: usize = 32;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut handles = Vec::with_capacity(count);
+    for i in 0..count {
+        let store = Arc::clone(&store);
+        let sem = Arc::clone(&semaphore);
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await.expect("acquire permit");
+            store
+                .put_bytes(
+                    &format!("p/{i:05}"),
+                    Bytes::from_static(b"x"),
+                    PutOpts::default(),
+                )
+                .await
+                .expect("put");
+        }));
+    }
+    for h in handles {
+        h.await.expect("seed join");
+    }
+    let listed = store.list("p/").await.expect("list");
+    assert_eq!(
+        listed.len(),
+        count,
+        "list must walk every page (Azurite default maxresults=5000)",
+    );
+}
+
+#[tokio::test]
 async fn list_with_prefix_filters() {
     let store = fresh_container().await;
     for k in ["a/1", "a/2", "b/1"] {
@@ -621,11 +676,22 @@ async fn get_to_file_failure_does_not_corrupt_dest() {
 async fn get_to_file_round_trips_streaming() {
     let store = fresh_container().await;
 
-    // 4 MiB body: large enough that the SDK's internal range
-    // download will be exercised but small enough to keep the test
-    // fast on CI. The byte sequence is deterministic so a sha256
-    // mismatch would be obvious.
-    let size: usize = 4 * 1024 * 1024;
+    // 32 MiB body: well past the Azure SDK's 4 MiB default partition
+    // size so the streaming-download body loop in
+    // `download_streaming` (`while let Some(chunk) = result.body.next()
+    // .await`) processes many TCP-level chunks. A regression to a
+    // single-shot read-then-write would still pass at the 4 MiB
+    // boundary the SDK's default partition sits on, so the body must
+    // be larger than that boundary by a clear margin. 32 MiB matches
+    // the existing `put_path_streams_file_and_round_trips` body and
+    // keeps the cost bounded on CI. The S3 sibling test is `large_object_multipart_download`
+    // at 50 MiB; Azure has no separate multi-GET download path
+    // (the SDK does one GET and streams the body), so the property
+    // under test is "streaming download write loop is correct across
+    // a many-chunk body", not "many ranged GETs are coalesced".
+    // The byte sequence is deterministic so a sha256 mismatch would
+    // be obvious.
+    let size: usize = 32 * 1024 * 1024;
     let mut body = vec![0u8; size];
     for (i, b) in body.iter_mut().enumerate() {
         *b = u8::try_from(i.wrapping_mul(2_654_435_761) & 0xff).unwrap_or(0);
