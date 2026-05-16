@@ -28,7 +28,7 @@ use crate::packchain::compact::{
     self, CompactAction, CompactOpts as PackchainCompactOpts, CompactOutcome,
 };
 use crate::packchain::gc;
-use crate::protocol::push::lock_ttl_from_env;
+use crate::protocol::push::resolve_lock_ttl_seconds;
 
 /// Tunables for [`Compact::run`]. Field semantics mirror the CLI flags.
 #[derive(Debug, Clone, Default)]
@@ -41,9 +41,11 @@ pub struct CompactOpts {
     /// Run [`crate::packchain::gc`] mark+sweep against the same
     /// bucket after a successful compact.
     pub with_gc: bool,
-    /// Lock TTL for compact's per-ref lock. When `None`, falls back
-    /// to [`crate::protocol::push::lock_ttl_from_env`] which honours
-    /// `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`.
+    /// Lock TTL for compact's per-ref lock. When `None` *or* `Some(0)`,
+    /// falls back to [`crate::protocol::push::lock_ttl_from_env`] which
+    /// honours `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`. A zero TTL
+    /// would defeat per-ref locking (issue #208), so the resolver
+    /// clamps it through [`crate::protocol::push::resolve_lock_ttl_seconds`].
     pub lock_ttl_seconds: Option<u64>,
     /// Grace hours forwarded to `gc::sweep` when `with_gc` is set.
     /// `None` falls back to [`crate::packchain::gc::grace_hours_from_env`]
@@ -105,12 +107,12 @@ impl<'a> Compact<'a> {
     /// Same as [`run`](Self::run), plus [`ManageError::Io`] if a write
     /// to `out` fails.
     pub(crate) async fn run_into<W: Write>(&self, out: &mut W) -> Result<(), ManageError> {
-        let lock_ttl = self
-            .opts
-            .lock_ttl_seconds
-            .map_or_else(lock_ttl_from_env, |s| {
-                Duration::seconds(i64::try_from(s).unwrap_or(i64::MAX))
-            });
+        // Route Option<u64> through the shared resolver so `Some(0)`
+        // cannot defeat per-ref locking (issue #208). `i64::try_from`
+        // saturates at `i64::MAX`, which `time::Duration::seconds`
+        // accepts as a sentinel ~292-billion-year ceiling.
+        let ttl_secs = resolve_lock_ttl_seconds(self.opts.lock_ttl_seconds);
+        let lock_ttl = Duration::seconds(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
         let compact_opts = PackchainCompactOpts {
             force: self.opts.force,
             lock_ttl,

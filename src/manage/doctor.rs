@@ -28,11 +28,17 @@ use uuid::Uuid;
 use super::snapshot::{
     BundleEntry, MalformedBundleKey, RefSnapshot, RepoSnapshot, analyze_objects,
 };
-use super::{DEFAULT_LOCK_TTL_SECONDS, ManageError, Prompter, StaleReason};
+use super::{ManageError, Prompter, StaleReason};
+// `DEFAULT_LOCK_TTL_SECONDS` is only referenced from the tests below
+// and from doc-comments; tests bring it in via the `use super::*;`
+// inside `mod tests`. Doc-comments resolve through the absolute
+// path so they do not need a `use` either.
+#[cfg(test)]
+use super::DEFAULT_LOCK_TTL_SECONDS;
 use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
 use crate::packchain::audit::{self, AuditReport, BranchRow};
-use crate::protocol::push::lock_ttl_from_env;
+use crate::protocol::push::resolve_lock_ttl_seconds;
 use crate::url::StorageEngine;
 
 /// Tunables for [`Doctor::run`].
@@ -42,10 +48,13 @@ pub struct DoctorOpts {
     /// outright. When `false` (default), they are quarantined to a
     /// fresh `<ref>_<uuid8>` ref so a human can recover them later.
     pub delete_bundle: bool,
-    /// Locks older than this TTL are considered stale. `None` falls
-    /// back to [`crate::protocol::push::lock_ttl_from_env`] which
-    /// honours `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` (defaulting
-    /// to [`DEFAULT_LOCK_TTL_SECONDS`] when unset).
+    /// Locks older than this TTL are considered stale. `None` *or*
+    /// `Some(0)` falls back to [`crate::protocol::push::lock_ttl_from_env`]
+    /// which honours `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`
+    /// (defaulting to [`DEFAULT_LOCK_TTL_SECONDS`] when unset). The zero
+    /// case is clamped because a zero TTL would make every live lock
+    /// appear stale, letting `doctor --delete-stale-locks` evict a
+    /// concurrent pusher's lock (issue #208).
     pub lock_ttl_seconds: Option<u64>,
     /// When `true`, scanned stale locks are deleted; otherwise, the
     /// doctor only reports them and recommends re-running with the
@@ -97,18 +106,18 @@ impl<'a> Doctor<'a> {
     }
 
     /// Resolve the stale-lock TTL in seconds. Mirrors
-    /// [`crate::manage::compact::Compact`]: an explicit
-    /// [`DoctorOpts::lock_ttl_seconds`] wins, otherwise we fall back to
-    /// [`lock_ttl_from_env`] so the management CLI honours
-    /// `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` even when the operator
-    /// instantiated `DoctorOpts` via `Default`. The env helper returns a
-    /// `time::Duration`; clamp to `u64` because `scan_stale_locks` uses
-    /// `std::time::Duration` (the rest of the doctor surface speaks
-    /// `std::time`).
+    /// [`crate::manage::compact::Compact`]: routes the operator's
+    /// `Option<u64>` through
+    /// [`crate::protocol::push::resolve_lock_ttl_seconds`] so a `None`
+    /// *or* explicit `Some(0)` falls back to
+    /// `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` (or
+    /// [`DEFAULT_LOCK_TTL_SECONDS`] when the env var is unset).
+    /// Centralising the resolution keeps the doctor's view of "stale"
+    /// in lockstep with the push-time lock-acquire TTL and protects
+    /// against the issue #208 footgun where `--lock-ttl-seconds 0`
+    /// would treat every live lock as instantly stale.
     fn resolved_lock_ttl_seconds(&self) -> u64 {
-        self.opts.lock_ttl_seconds.unwrap_or_else(|| {
-            u64::try_from(lock_ttl_from_env().whole_seconds()).unwrap_or(DEFAULT_LOCK_TTL_SECONDS)
-        })
+        resolve_lock_ttl_seconds(self.opts.lock_ttl_seconds)
     }
 
     /// Analyze, report, and fix — writing human-readable output to
@@ -3116,10 +3125,15 @@ mod tests {
     }
 
     #[test]
-    fn resolved_lock_ttl_honors_env_when_opts_unset() {
+    fn resolved_lock_ttl_honors_env_explicit_and_zero_clamp() {
         // The env var is process-global; serialise the read/write/clear
-        // dance inside one test to avoid racing parallel test threads.
-        use crate::protocol::push::ENV_LOCK_TTL_SECONDS;
+        // dance inside one test to avoid racing parallel test threads
+        // inside this module — and acquire the cross-module mutex so we
+        // do not race the env-touching test in `protocol::push::tests`.
+        use crate::protocol::push::{ENV_LOCK_TTL_SECONDS, ENV_LOCK_TTL_TEST_MUTEX};
+        let _guard = ENV_LOCK_TTL_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mock = MockStore::new();
         let prompter = ScriptedPrompter::new([]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
@@ -3158,5 +3172,37 @@ mod tests {
             std::env::remove_var(ENV_LOCK_TTL_SECONDS);
         }
         assert_eq!(got_explicit, 7, "explicit opts.lock_ttl_seconds must win");
+
+        // `Some(0)` (issue #208) used to bypass the #112 zero-clamp
+        // because it skipped the `lock_ttl_from_env` fallback entirely.
+        // The fix routes resolution through `resolve_lock_ttl_seconds`,
+        // which collapses `Some(0)` onto the env-or-default path.
+        // Without the clamp, `scan_stale_locks` would treat every live
+        // lock as instantly stale and `--delete-stale-locks` would
+        // evict a concurrent pusher's lock. Keep these assertions in
+        // the same test fn as the env-honouring assertions above so
+        // the process-global `ENV_LOCK_TTL_SECONDS` writes do not race
+        // parallel test threads.
+        let zero_opts = DoctorOpts {
+            lock_ttl_seconds: Some(0),
+            ..DoctorOpts::default()
+        };
+        let doctor_zero = Doctor::new(store_arc(&mock), "myrepo", zero_opts, &prompter);
+        // Env is already removed by the cleanup above. With env unset,
+        // `Some(0)` must clamp to the project default.
+        assert_eq!(
+            doctor_zero.resolved_lock_ttl_seconds(),
+            DEFAULT_LOCK_TTL_SECONDS,
+            "Some(0) must not survive into the engine — would mark every live lock stale",
+        );
+        // With env set, `Some(0)` must honour the operator's override.
+        unsafe {
+            std::env::set_var(ENV_LOCK_TTL_SECONDS, "240");
+        }
+        let got_zero = doctor_zero.resolved_lock_ttl_seconds();
+        unsafe {
+            std::env::remove_var(ENV_LOCK_TTL_SECONDS);
+        }
+        assert_eq!(got_zero, 240, "Some(0) must defer to the env override");
     }
 }

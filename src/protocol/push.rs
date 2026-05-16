@@ -64,6 +64,16 @@ struct PushConfig {
 /// Environment override for the lock TTL, in seconds.
 pub(crate) const ENV_LOCK_TTL_SECONDS: &str = "GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS";
 
+/// Process-wide mutex for tests that mutate [`ENV_LOCK_TTL_SECONDS`].
+/// Both `protocol::push::tests` and `manage::doctor::tests` poke this
+/// env var, and Cargo's default test runner schedules them on parallel
+/// threads — without this mutex one test's `remove_var` interleaves
+/// with the other's `set_var` and the asserts see the wrong value.
+/// `Mutex` rather than `OnceLock<Mutex<()>>` because the lock itself
+/// is stateless; we only need exclusive access to "the env var".
+#[cfg(test)]
+pub(crate) static ENV_LOCK_TTL_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Stable substring embedded in the rejection message returned when the
 /// remote ref is not an ancestor of the pushed local ref. Treated as a
 /// user-facing contract: shellspec suites assert on this token to
@@ -441,6 +451,40 @@ pub(crate) fn lock_ttl_from_env() -> Duration {
     // i64 cast: 60-ish seconds will never overflow; even MAX would just
     // saturate to ~292 billion years which is fine for a TTL ceiling.
     Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
+}
+
+/// Resolve a caller-supplied `Option<u64>` lock TTL to a concrete
+/// seconds value, applying the same zero-clamp as [`lock_ttl_from_env`].
+///
+/// Without this helper, library consumers (`Compact::run_into`,
+/// `Doctor::list_and_handle_stale_locks`) accept a raw `Option<u64>`
+/// and feed `Some(0)` straight into the engine, bypassing the #112
+/// clamp that protects against `acquire_lock` treating every held
+/// lock as instantly stale. A zero TTL defeats per-ref locking,
+/// corrupting concurrent pushes and letting `doctor` delete live
+/// locks (issue #208).
+///
+/// Resolution rules:
+///
+/// * `None` — defer to [`lock_ttl_from_env`] (env override or default).
+/// * `Some(0)` — defer to [`lock_ttl_from_env`] as well, so that an
+///   accidental zero from a CLI flag or default-constructed opts
+///   still picks up the operator's env override. This matches the
+///   shape of the existing env-side clamp.
+/// * `Some(n)` for `n > 0` — return `n` unchanged.
+///
+/// No upper bound is enforced: the existing env path accepts any
+/// `u64` and downstream `time::Duration::seconds` saturates at
+/// `i64::MAX` (~292 billion years), which is fine for a TTL ceiling.
+pub(crate) fn resolve_lock_ttl_seconds(opt: Option<u64>) -> u64 {
+    match opt {
+        Some(n) if n > 0 => n,
+        // None *and* Some(0) collapse to the env-or-default path. We
+        // intentionally consult the env even on Some(0) so an operator
+        // who has set `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` still
+        // gets that value when a CLI consumer passes the wrong default.
+        _ => u64::try_from(lock_ttl_from_env().whole_seconds()).unwrap_or(DEFAULT_LOCK_TTL_SECONDS),
+    }
 }
 
 /// Handle to an acquired per-ref lock with a live heartbeat task.
@@ -3002,13 +3046,30 @@ mod tests {
     fn lock_ttl_env_override_falls_back_for_unset_invalid_or_zero() {
         // Group all env-var cases in one test fn so they run sequentially
         // — the var is process-global and mutating it from multiple
-        // parallel tests would race.
+        // parallel tests would race. `resolve_lock_ttl_seconds`'s
+        // env-touching cases live here too for the same reason.
+        // The cross-module guard against parallel `manage::doctor` tests
+        // that also poke `ENV_LOCK_TTL_SECONDS`.
+        let _guard = ENV_LOCK_TTL_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let default_ttl = Duration::seconds(i64::try_from(DEFAULT_LOCK_TTL_SECONDS).unwrap());
         // Unset returns default.
         unsafe {
             env::remove_var(ENV_LOCK_TTL_SECONDS);
         }
         assert_eq!(lock_ttl_from_env(), default_ttl);
+        // `None` and `Some(0)` (issue #208) defer to env-or-default.
+        assert_eq!(
+            resolve_lock_ttl_seconds(None),
+            DEFAULT_LOCK_TTL_SECONDS,
+            "None must defer to env-or-default",
+        );
+        assert_eq!(
+            resolve_lock_ttl_seconds(Some(0)),
+            DEFAULT_LOCK_TTL_SECONDS,
+            "Some(0) must not defeat per-ref locking (issue #208)",
+        );
         // Non-numeric falls back.
         unsafe {
             env::set_var(ENV_LOCK_TTL_SECONDS, "not-a-number");
@@ -3024,9 +3085,44 @@ mod tests {
             env::set_var(ENV_LOCK_TTL_SECONDS, "120");
         }
         assert_eq!(lock_ttl_from_env(), Duration::seconds(120));
+        // With env set, `None` and `Some(0)` honour the env override —
+        // an operator's env var must still take effect when a CLI
+        // consumer accidentally passes the wrong default.
+        assert_eq!(
+            resolve_lock_ttl_seconds(None),
+            120,
+            "None must honour env override",
+        );
+        assert_eq!(
+            resolve_lock_ttl_seconds(Some(0)),
+            120,
+            "Some(0) must honour env override",
+        );
         unsafe {
             env::remove_var(ENV_LOCK_TTL_SECONDS);
         }
+    }
+
+    // --- resolve_lock_ttl_seconds (issue #208) ------------------------
+    //
+    // The library boundary (`Compact::run_into`,
+    // `Doctor::resolved_lock_ttl_seconds`) used to accept `Some(0)` and
+    // feed it straight into the engine, bypassing the `lock_ttl_from_env`
+    // zero-clamp from #112 and defeating per-ref locking. The shared
+    // resolver collapses both `None` and `Some(0)` onto the env-or-default
+    // path so neither call site can re-introduce the footgun.
+
+    #[test]
+    fn resolve_lock_ttl_some_positive_returns_unchanged() {
+        // Positive values bypass the env entirely and so are safe to
+        // assert in parallel with the env-touching test below. Cover
+        // the smallest valid value, a normal value, and the u64 ceiling
+        // — the ceiling documents the deliberate decision to not impose
+        // an upper bound: downstream `time::Duration::seconds` saturates
+        // safely at `i64::MAX`.
+        assert_eq!(resolve_lock_ttl_seconds(Some(1)), 1);
+        assert_eq!(resolve_lock_ttl_seconds(Some(120)), 120);
+        assert_eq!(resolve_lock_ttl_seconds(Some(u64::MAX)), u64::MAX);
     }
 
     // --- FORMAT key write via perform_push_under_lock --------------------
