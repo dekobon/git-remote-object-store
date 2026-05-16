@@ -178,8 +178,8 @@ pub(crate) async fn push_batch(
             Ok(o) => o,
             // Operational failures (transport, local git, local I/O,
             // packchain engine errors) become per-ref `error` lines so
-            // the batch can continue. Mirrors bundle's policy at
-            // src/protocol/push.rs:365-377.
+            // the batch can continue. Mirrors the per-ref classification
+            // in `protocol::push::push_batch`.
             Err(e)
                 if matches!(
                     e,
@@ -214,9 +214,9 @@ fn full_error_chain(err: &PushError) -> String {
 }
 
 /// Execute one push: prepare, lock, upload, release. Lock release is
-/// unconditional; the post-result `match` mirrors bundle's policy at
-/// `src/protocol/push.rs:656-676` (lock-release failure overrides a
-/// successful push but never masks a push error).
+/// unconditional; the post-result `match` mirrors the policy in
+/// `protocol::push::push_one` — lock-release failure overrides a
+/// successful push but never masks a push error.
 async fn push_one(
     store: Arc<dyn ObjectStore>,
     prefix: Option<&str>,

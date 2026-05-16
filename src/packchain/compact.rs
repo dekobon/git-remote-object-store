@@ -208,11 +208,12 @@ pub(crate) async fn compact(
     let result = compact_under_lock(store.as_ref(), prefix, ref_name).await;
     let release_result = release_lock(guard).await;
 
-    // Match push.rs:667-687: a genuine work error takes priority,
-    // but a release failure on the (Err, Err) path is logged at
-    // `warn` so an operator investigating a compact failure also
-    // sees the dangling-lock signal. Without this, the (Err, Err)
-    // case silently drops the release error.
+    // Match `protocol::push::push_one`'s release/work outcome match:
+    // a genuine work error takes priority, but a release failure on
+    // the (Err, Err) path is logged at `warn` so an operator
+    // investigating a compact failure also sees the dangling-lock
+    // signal. Without this, the (Err, Err) case silently drops the
+    // release error.
     match (&result, release_result) {
         (Ok(_), Err(e)) => {
             // Work succeeded but release failed; surface the

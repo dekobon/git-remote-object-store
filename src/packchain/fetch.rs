@@ -735,7 +735,7 @@ pub(crate) fn install_pack(repo_dir: &Path, pack_path: &Path) -> Result<(), Fetc
     // pack before refs land. The remote helper exits before git
     // updates refs, and `git gc --auto` is a synchronous post-fetch
     // step (not a daemon), so we can drop the `.keep` immediately
-    // (mirroring src/bundle.rs:332-337).
+    // (mirroring the `.keep` removal in `bundle::unbundle`).
     if let Some(keep_path) = outcome.keep_path
         && let Err(e) = fs::remove_file(&keep_path)
         && e.kind() != std::io::ErrorKind::NotFound

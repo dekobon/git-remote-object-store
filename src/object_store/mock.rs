@@ -692,7 +692,8 @@ mod tests {
         // Both a fault is armed AND the key is already present. The
         // implementation must consult the fault queue before the
         // contains_key short-circuit, so callers see Err(PreconditionFailed)
-        // rather than Ok(false). Locks in the ordering at mock.rs:248-270.
+        // rather than Ok(false). Locks in the ordering enforced by
+        // `MockStore::put_if_absent`.
         let store = MockStore::new();
         store.insert("k", body(b"existing"));
         store.arm(Fault::PreconditionFailedOnPutIfAbsent { key: "k".into() });

@@ -10,9 +10,8 @@
 //!
 //! `S3Store` does **not** auto-prepend the [`RemoteUrl`] `prefix`. Trait
 //! keys are byte-prefix per the contract on
-//! [`ObjectStore::list`]
-//! (`mod.rs:65-67`); the URL `prefix` is a repository concern and is
-//! composed by callers that build keys like
+//! [`ObjectStore::list`][super::ObjectStore::list]; the URL `prefix` is
+//! a repository concern and is composed by callers that build keys like
 //! `<prefix>/refs/.../<sha>.bundle`.
 //!
 //! ## Conditional writes
@@ -860,10 +859,9 @@ impl ObjectStore for S3Store {
         // `CopyObject` rejects bodies > 5 GiB; above the multipart
         // threshold we HEAD `src` and use `UploadPartCopy` per part
         // (issue #53). The HEAD adds one round trip for small copies,
-        // but the only production caller (`Doctor::evict_losing_bundle`
-        // at `manage/doctor.rs:263`) is a quarantine path on bundles
-        // that can be multi-GiB — paying one HEAD to learn whether to
-        // multipart is worth it.
+        // but the only production caller (`Doctor::evict_losing_bundle`)
+        // is a quarantine path on bundles that can be multi-GiB —
+        // paying one HEAD to learn whether to multipart is worth it.
         //
         // The HEAD also yields the source `ETag`, which we pass as
         // `x-amz-copy-source-if-match` on every subsequent

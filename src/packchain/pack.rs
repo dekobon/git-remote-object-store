@@ -206,7 +206,7 @@ fn build_pack(
     out_dir: &Path,
 ) -> Result<BuiltPack, PackchainError> {
     // Strip the Proxy wrapper to expose the gix_pack::Find impl needed
-    // by the output pipeline (parity with src/bundle.rs:186-189).
+    // by the output pipeline (parity with `bundle::count_objects_as_is`).
     let mut odb = repo.objects.clone().into_inner();
     odb.prevent_pack_unload();
 
@@ -355,7 +355,8 @@ fn derive_idx(
     // gix writes a .keep alongside the unbundled pack so post-bundle
     // git-gc can't reap it before refs are updated. We're not bundling
     // for unbundle here — the pack lives on the bucket — so the .keep
-    // is unnecessary; remove if present (mirror src/bundle.rs:332).
+    // is unnecessary; remove if present (mirror the `.keep` removal in
+    // `bundle::unbundle`).
     if let Some(keep_path) = outcome.keep_path {
         let _ = fs::remove_file(keep_path);
     }

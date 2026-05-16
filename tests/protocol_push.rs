@@ -835,14 +835,15 @@ async fn lock_release_failure_overrides_successful_push() {
 
 #[tokio::test]
 async fn pre_lock_multi_bundle_rejection_surfaces_unchanged() {
-    // When the pre-lock `bundles_for_ref` check (push.rs:480-487) finds
-    // multiple bundles for the same ref, the push is rejected BEFORE
-    // lock acquisition. The multi-bundle error must surface on the wire.
+    // When the pre-lock `bundles_for_ref` check finds multiple bundles
+    // for the same ref, the push is rejected BEFORE lock acquisition.
+    // The multi-bundle error must surface on the wire.
     //
-    // Note: the `_ => result` match arm in push_one (push.rs:577) that
-    // preserves a push error over a release failure cannot be exercised
-    // via this integration test: MockStore's state is static between
-    // the pre-lock and under-lock listings, so a multi-bundle condition
+    // Note: the `_ => result` fall-through arm in `push_one`'s
+    // (work-result, release-result) match — which preserves a push
+    // error over a release failure — cannot be exercised via this
+    // integration test: MockStore's state is static between the
+    // pre-lock and under-lock listings, so a multi-bundle condition
     // always fires at the pre-lock check before lock acquisition. The
     // under-lock path is covered structurally (only the `Ok(Ok{..})`
     // arm overrides the result; all others fall through unchanged) and
