@@ -28,6 +28,26 @@ const BUNDLE_V2_MAGIC: &str = "# v2 git bundle";
 /// First line of a git bundle v3 file (not supported).
 const BUNDLE_V3_MAGIC: &str = "# v3 git bundle";
 
+/// Maximum bytes accepted on a single bundle-header line, including the
+/// terminating `\n`.
+///
+/// A legitimate header line is one of: the v2/v3 magic (~16 bytes), a
+/// prerequisite (`-<sha40>` plus an optional trailing comment), or a ref
+/// line (`<sha40> <refname>`). Git ref names are spec-limited to well
+/// under 1 KiB in practice, so 16 KiB is a generous ceiling that still
+/// caps a malicious bundle whose header line is missing its `\n` (which
+/// would otherwise cause `read_line` to allocate without bound).
+const MAX_HEADER_LINE_BYTES: u64 = 16 * 1_024;
+
+/// Maximum bytes accepted across the entire text header (sum of all
+/// lines including newlines), before the PACK payload begins.
+///
+/// 64 MiB is far above any realistic ref count — even a million ref
+/// lines (~60 bytes each) fits comfortably — but cheap enough that an
+/// adversarial bundle padded with a forest of header lines is rejected
+/// long before exhausting memory.
+const MAX_HEADER_TOTAL_BYTES: u64 = 64 * 1_024 * 1_024;
+
 /// Parsed bundle header as it appears before the PACK payload.
 // `version` and `refs` are part of the format and available for callers; not
 // all fields are consumed internally.
@@ -45,11 +65,18 @@ pub struct BundleHeader {
 
 impl BundleHeader {
     /// Read and parse the text header from the bundle file at `path`.
+    ///
+    /// Both the per-line and the cumulative header size are capped (see
+    /// [`MAX_HEADER_LINE_BYTES`] and [`MAX_HEADER_TOTAL_BYTES`]). A
+    /// bundle whose header line is missing a terminating `\n`, or whose
+    /// header section is padded with a forest of lines, is rejected with
+    /// [`BundleError::InvalidHeader`] before it can exhaust memory.
     pub fn read(path: &Path) -> Result<Self, BundleError> {
         let mut file = BufReader::new(fs::File::open(path)?);
         let mut line = String::new();
+        let mut total_bytes: u64 = 0;
 
-        file.read_line(&mut line)?;
+        read_header_line(&mut file, &mut line, &mut total_bytes)?;
         let magic = line.trim_end_matches(['\n', '\r']);
         if magic == BUNDLE_V3_MAGIC {
             return Err(BundleError::UnsupportedVersion(3));
@@ -64,13 +91,7 @@ impl BundleHeader {
         let mut refs = Vec::new();
 
         loop {
-            line.clear();
-            let n = file.read_line(&mut line)?;
-            if n == 0 {
-                return Err(BundleError::InvalidHeader(
-                    "unexpected end of bundle header".to_owned(),
-                ));
-            }
+            read_header_line(&mut file, &mut line, &mut total_bytes)?;
             match parse_header_entry(&line)? {
                 HeaderEntry::End => break,
                 HeaderEntry::Prerequisite(oid) => prerequisites.push(oid),
@@ -91,6 +112,80 @@ impl BundleHeader {
             pack_offset,
         })
     }
+}
+
+/// Read a single header line into `line` (overwriting any prior contents),
+/// enforcing both [`MAX_HEADER_LINE_BYTES`] and a running cap of
+/// [`MAX_HEADER_TOTAL_BYTES`] across all lines read so far.
+///
+/// Uses `BufRead::take(...).read_until(b'\n', ...)` so an adversarial
+/// bundle missing its newline cannot trigger an unbounded allocation:
+/// `take` short-circuits the inner read at the cap. A line that hits the
+/// cap without a terminating `\n` is rejected, as is any line whose read
+/// would push the cumulative byte count past the total cap. EOF at the
+/// top of a read is reported as a truncated header.
+fn read_header_line<R: BufRead>(
+    reader: &mut R,
+    line: &mut String,
+    total_bytes: &mut u64,
+) -> Result<(), BundleError> {
+    line.clear();
+
+    // The total cap is the budget remaining for this line — never more
+    // than the per-line cap. Saturating below the per-line cap means a
+    // bundle that pads the header with many small lines is rejected with
+    // the total-cap error rather than silently reading past the total.
+    let remaining_total = MAX_HEADER_TOTAL_BYTES.saturating_sub(*total_bytes);
+    let budget = MAX_HEADER_LINE_BYTES.min(remaining_total);
+    if budget == 0 {
+        return Err(BundleError::InvalidHeader(format!(
+            "bundle header exceeds {MAX_HEADER_TOTAL_BYTES}-byte cap",
+        )));
+    }
+
+    // `read_until` returns the bytes consumed including the delimiter
+    // (if found). Reading via `take(budget)` guarantees we stop at the
+    // per-call budget even if the input never produces a newline.
+    let mut buf = Vec::new();
+    let n = reader.by_ref().take(budget).read_until(b'\n', &mut buf)?;
+    if n == 0 {
+        return Err(BundleError::InvalidHeader(
+            "unexpected end of bundle header".to_owned(),
+        ));
+    }
+
+    // `n` came from a `take(budget: u64)`-capped read, so `n <= budget`
+    // and the conversion is fallible only on a hypothetical platform
+    // where usize cannot represent u64 values we've already accepted —
+    // surface a clear error instead of panic in that case.
+    let n_u64 = u64::try_from(n)
+        .map_err(|_| BundleError::InvalidHeader("header line length overflow".to_owned()))?;
+
+    // If we read exactly the budget and the last byte is not `\n`, the
+    // line was truncated by `take` — either the line is over the
+    // per-line cap, or this line straddles the total cap. Distinguish
+    // by comparing the budget against the per-line cap so the error
+    // wording points at the actual violation.
+    if n_u64 == budget && buf.last() != Some(&b'\n') {
+        return Err(BundleError::InvalidHeader(
+            if budget < MAX_HEADER_LINE_BYTES {
+                format!("bundle header exceeds {MAX_HEADER_TOTAL_BYTES}-byte cap")
+            } else {
+                format!("bundle header line exceeds {MAX_HEADER_LINE_BYTES}-byte cap")
+            },
+        ));
+    }
+
+    *total_bytes = total_bytes.saturating_add(n_u64);
+
+    // Header lines must be valid UTF-8: the magic, OID hex, and ref
+    // names are all ASCII / UTF-8 per the bundle v2 spec. Reject any
+    // non-UTF-8 byte sequence with InvalidHeader instead of panicking.
+    let decoded = String::from_utf8(buf).map_err(|_| {
+        BundleError::InvalidHeader("bundle header line is not valid UTF-8".to_owned())
+    })?;
+    line.push_str(&decoded);
+    Ok(())
 }
 
 /// A single entry from the bundle v2 text header.
@@ -696,6 +791,150 @@ mod tests {
             }
             other => panic!("expected InvalidHeader for truncation, got {other:?}"),
         }
+    }
+
+    // --- BundleHeader::read bounded-input enforcement -----------------
+
+    /// Write `bytes` to a file under `dir` and return the path.
+    fn write_bundle_bytes(dir: &Path, bytes: &[u8]) -> PathBuf {
+        let path = dir.join("bundle");
+        fs::write(&path, bytes).expect("write fixture bundle");
+        path
+    }
+
+    #[test]
+    fn bundle_header_read_rejects_overlong_line() {
+        // A header line longer than MAX_HEADER_LINE_BYTES with no `\n`
+        // must NOT be allocated in full — the bounded reader caps the
+        // allocation at the per-line budget and rejects.
+        let dir = tempfile::tempdir().unwrap();
+        let overlong =
+            vec![b'#'; usize::try_from(MAX_HEADER_LINE_BYTES + 1).expect("cap fits usize")];
+        let path = write_bundle_bytes(dir.path(), &overlong);
+        let err = BundleHeader::read(&path)
+            .err()
+            .expect("expected InvalidHeader");
+        let BundleError::InvalidHeader(msg) = err else {
+            panic!("expected InvalidHeader, got {err:?}");
+        };
+        assert!(
+            msg.contains("line exceeds"),
+            "expected per-line cap wording, got {msg:?}",
+        );
+    }
+
+    #[test]
+    fn bundle_header_read_rejects_line_exactly_one_over_cap() {
+        // Boundary case: the per-line cap is INCLUSIVE of the
+        // terminating `\n`. A line of `cap` non-newline bytes followed
+        // by `\n` is one byte over and must be rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let mut overlong =
+            vec![b'#'; usize::try_from(MAX_HEADER_LINE_BYTES).expect("cap fits usize")];
+        overlong.push(b'\n');
+        let path = write_bundle_bytes(dir.path(), &overlong);
+        let err = BundleHeader::read(&path)
+            .err()
+            .expect("expected InvalidHeader");
+        let BundleError::InvalidHeader(msg) = err else {
+            panic!("expected InvalidHeader, got {err:?}");
+        };
+        assert!(
+            msg.contains("line exceeds"),
+            "expected per-line cap wording, got {msg:?}",
+        );
+    }
+
+    #[test]
+    fn bundle_header_read_rejects_total_header_over_cap() {
+        // Pad the header with many well-formed prerequisite lines whose
+        // cumulative size exceeds MAX_HEADER_TOTAL_BYTES. The lines
+        // parse successfully (so the running total has to be what
+        // trips), and each line stays well under the per-line cap (so
+        // the per-line guard does NOT fire first).
+        //
+        // Prerequisite syntax permits a trailing comment after the SHA,
+        // so `-<sha40> <padding>\n` is valid. With 8 KiB lines, ~8192
+        // lines cross the 64 MiB total cap.
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(BUNDLE_V2_MAGIC.as_bytes());
+        bytes.push(b'\n');
+
+        // Build one 8 KiB prerequisite line: `-<sha40> <pad>\n`.
+        let chunk_size: usize = 8 * 1_024;
+        // 1 (`-`) + 40 (sha hex) + 1 (space) + pad + 1 (`\n`) = chunk_size
+        let pad_len = chunk_size - 1 - 40 - 1 - 1;
+        let mut chunk = Vec::with_capacity(chunk_size);
+        chunk.push(b'-');
+        chunk.extend_from_slice(SHA.as_bytes());
+        chunk.push(b' ');
+        chunk.extend(std::iter::repeat_n(b'x', pad_len));
+        chunk.push(b'\n');
+        assert_eq!(chunk.len(), chunk_size);
+
+        // Enough lines to push the cumulative byte count past the cap;
+        // the read_header_line that crosses the boundary is the one
+        // that must report `header exceeds`.
+        let line_count = (MAX_HEADER_TOTAL_BYTES / chunk_size as u64) + 1;
+        for _ in 0..line_count {
+            bytes.extend_from_slice(&chunk);
+        }
+        let path = write_bundle_bytes(dir.path(), &bytes);
+        let err = BundleHeader::read(&path)
+            .err()
+            .expect("expected InvalidHeader");
+        let BundleError::InvalidHeader(msg) = err else {
+            panic!("expected InvalidHeader for total cap, got {err:?}");
+        };
+        assert!(
+            msg.contains("header exceeds"),
+            "expected total-cap wording, got {msg:?}",
+        );
+    }
+
+    #[test]
+    fn bundle_header_read_accepts_legitimate_header() {
+        // A minimal, well-formed v2 header followed by the PACK magic
+        // must still parse with the bounded reader in place. This pins
+        // the bounded-read change does not regress the happy path.
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(BUNDLE_V2_MAGIC.as_bytes());
+        bytes.push(b'\n');
+        bytes.extend_from_slice(format!("{SHA} refs/heads/main\n").as_bytes());
+        bytes.extend_from_slice(format!("-{OTHER_SHA}\n").as_bytes());
+        bytes.push(b'\n'); // header terminator
+        bytes.extend_from_slice(b"PACK");
+        let path = write_bundle_bytes(dir.path(), &bytes);
+        let header = BundleHeader::read(&path).expect("legitimate header parses");
+        assert_eq!(header.version, 2);
+        assert_eq!(header.refs.len(), 1);
+        assert_eq!(header.refs[0].1, b"refs/heads/main");
+        assert_eq!(header.prerequisites.len(), 1);
+        assert_eq!(header.prerequisites[0].to_hex().to_string(), OTHER_SHA);
+    }
+
+    #[test]
+    fn bundle_header_read_rejects_missing_trailing_newline() {
+        // A bundle whose magic line is not newline-terminated must NOT
+        // be silently accepted — `read_line` would have produced a
+        // string here, but the bounded reader treats it as a truncated
+        // header so the caller sees a clear error instead of a partial
+        // parse.
+        let dir = tempfile::tempdir().unwrap();
+        // Magic without trailing newline, then EOF.
+        let path = write_bundle_bytes(dir.path(), BUNDLE_V2_MAGIC.as_bytes());
+        // The magic line parses (read_until returns at EOF without a
+        // newline, n > 0, n < budget) and then the follow-up read hits
+        // EOF → "unexpected end".
+        let err = BundleHeader::read(&path)
+            .err()
+            .expect("expected InvalidHeader");
+        assert!(
+            matches!(err, BundleError::InvalidHeader(_)),
+            "expected InvalidHeader, got {err:?}",
+        );
     }
 
     // --- create / unbundle round-trips with tag chains ----------------
