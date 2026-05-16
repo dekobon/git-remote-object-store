@@ -26,7 +26,10 @@ use tracing::{debug, info, warn};
 use crate::git::{self, GitError, RefName, RefNameError, Sha, ShaError, is_valid_ref_name};
 use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, ProgressSink, PutOpts};
-use crate::packchain::gc::{tombstoned_bundle_keys, write_baseline_tombstone_best_effort};
+use crate::packchain::gc::{
+    tombstoned_bundle_keys, write_baseline_tombstone_best_effort,
+    write_baseline_tombstone_for_orphan,
+};
 use crate::packchain::schema::Sha40;
 use crate::url::{BackendKind, StorageEngine};
 
@@ -1682,6 +1685,67 @@ const DELETE_EXPECTED_NO_ZIP: usize = 1;
 /// Expected key count for a zip ref: one bundle + one archive object.
 const DELETE_EXPECTED_WITH_ZIP: usize = 2;
 
+/// Attempt to tombstone the baseline `<sha>.bundle` for a helper-protocol
+/// delete so the synchronous sweep loop can skip it (issue #205).
+///
+/// Returns the bundle key that was deferred, or `None` if no deferral is
+/// possible (no `<sha>.bundle` in the listing, an unparseable stem, or a
+/// tombstone PUT failure). The `None` fall-through is the correct
+/// behaviour for every "deferral is not actionable" case: with no
+/// tombstone, `gc sweep` has nothing to reclaim, so the sweep loop must
+/// remove the bundle synchronously instead. A logged warning surfaces
+/// PUT failures for operator review without blocking the delete.
+///
+/// Mirrors:
+/// - [`defer_prior_bundle_via_tombstone`] (issue #157, bundle-engine
+///   force-push) for the parse-and-tombstone shape.
+/// - `manage::branch::ManageBranch::try_tombstone_baseline` (issue #143)
+///   and `packchain::push::try_tombstone_baseline_for_delete` (issue
+///   #203) for the "delete the ref, but defer the baseline bundle"
+///   pattern.
+///
+/// Runs UNDER the per-ref lock: a concurrent push cannot land between
+/// the tombstone write and the synchronous sweep that removes the rest
+/// of the ref's entries, so the tombstoned SHA cannot drift out of date
+/// before the bundle is detached from any chain reference.
+async fn try_tombstone_baseline_for_protocol_delete(
+    store: &dyn ObjectStore,
+    prefix: Option<&str>,
+    remote_ref: &RefName,
+    entries: &[&ObjectMeta],
+) -> Option<String> {
+    // Find the bundle entry — there must be exactly one in the well-formed
+    // count-matches-expected branch, but scan rather than index so the
+    // helper does not couple to the caller's count guard.
+    let (bundle_key, bundle_stem) = entries.iter().find_map(|entry| {
+        parse_remote_sha_stem_from_key(&entry.key).map(|stem| (entry.key.clone(), stem))
+    })?;
+    // Stem already validated as 40 lowercase hex by
+    // `parse_remote_sha_stem_from_key`; surface a future tightening of
+    // `Sha40` validation as the "no deferral" fall-back rather than a
+    // panic.
+    let Ok(orphan_sha) = Sha40::try_new(bundle_stem) else {
+        warn!(
+            ref_path = %remote_ref.as_str(),
+            key = %bundle_key,
+            "bundle stem failed Sha40 validation; falling back to synchronous bundle delete",
+        );
+        return None;
+    };
+    match write_baseline_tombstone_for_orphan(store, prefix, remote_ref, &orphan_sha).await {
+        Ok(()) => Some(bundle_key),
+        Err(err) => {
+            warn!(
+                ref_path = %remote_ref.as_str(),
+                key = %bundle_key,
+                error = %err,
+                "helper-protocol delete: baseline tombstone write failed; falling back to synchronous bundle delete",
+            );
+            None
+        }
+    }
+}
+
 /// Handle a delete refspec (`:<remote_ref>`) UNDER the per-ref lock
 /// acquired by [`push_one`]: list `<prefix>/<ref>/`, expect 1 (or 2
 /// with zip) keys after filtering out the lock we hold, delete them
@@ -1764,7 +1828,43 @@ async fn delete_remote_ref_under_lock(
         });
     }
     if entries.len() == expected {
+        // Issue #205: defer the baseline `<sha>.bundle` delete by writing
+        // a tombstone BEFORE the synchronous sweep, then exclude that
+        // bundle key from the delete loop. A concurrent fetcher that
+        // already advertised `refs/heads/main -> <sha>` from a stale
+        // listing can still range-GET the bundle within the grace window
+        // — without this, the bundle is gone the moment the sweep
+        // completes and the fetch fails with `NotFound`. Mirrors:
+        //
+        // - `defer_prior_bundle_via_tombstone` (issue #157, force-push).
+        // - `manage::branch::ManageBranch::try_tombstone_baseline`
+        //   (issue #143, management `delete-branch`).
+        // - `packchain::push::try_tombstone_baseline_for_delete`
+        //   (issue #203, packchain helper-protocol delete).
+        //
+        // The tombstone write runs UNDER the lock: a concurrent push
+        // cannot land between the tombstone PUT and the sweep, so the
+        // tombstoned SHA stays consistent with bucket state. An
+        // unparseable stem, a missing bundle, or a tombstone PUT failure
+        // falls through to immediate bundle deletion so the operator's
+        // "ref is gone" intent is still satisfied even when deferral is
+        // not actionable.
+        let deferred_bundle_key =
+            try_tombstone_baseline_for_protocol_delete(store, prefix, remote_ref, &entries).await;
+        if let Some(ref key) = deferred_bundle_key {
+            debug!(
+                ref_path = %remote_ref.as_str(),
+                key = %key,
+                "helper-protocol delete: deferred baseline bundle delete via tombstone",
+            );
+        }
         for entry in &entries {
+            // Bundle is left for `gc sweep` (see tombstone block above);
+            // other keys (e.g. `repo.zip` in zip mode) are deleted
+            // synchronously.
+            if deferred_bundle_key.as_deref() == Some(entry.key.as_str()) {
+                continue;
+            }
             delete_idempotent(store, &entry.key).await?;
         }
         // Issue #151 defence-in-depth: confirm no `PROTECTED#` marker
@@ -2724,13 +2824,16 @@ mod tests {
     // --- delete_remote_ref_under_lock ---------------------------------
 
     #[tokio::test]
-    async fn delete_remote_ref_removes_single_bundle() {
+    async fn delete_remote_ref_defers_single_bundle_via_tombstone() {
+        // Issue #205: the baseline `<sha>.bundle` must survive the
+        // synchronous sweep so a concurrent fetcher that already
+        // advertised the SHA can still read it within the grace window.
+        // `gc sweep` reclaims the bundle after grace via the tombstone
+        // this delete wrote.
         let store = MockStore::new();
         let r = rn("refs/heads/main");
-        store.insert(
-            format!("repo/refs/heads/main/{SHA}.bundle"),
-            Bytes::from_static(b"b"),
-        );
+        let bundle = format!("repo/refs/heads/main/{SHA}.bundle");
+        store.insert(&bundle, Bytes::from_static(b"b"));
         let outcome = delete_remote_ref_under_lock(
             &store,
             Some("repo"),
@@ -2746,7 +2849,23 @@ mod tests {
                 remote_ref: "refs/heads/main".into()
             }
         );
-        assert!(!store.contains(&format!("repo/refs/heads/main/{SHA}.bundle")));
+        // Bundle deferred — must remain readable within the grace window.
+        assert!(
+            store.contains(&bundle),
+            "baseline bundle must survive the synchronous delete (deferred via tombstone)",
+        );
+        // Exactly one baseline tombstone under
+        // `<prefix>/gc/baseline-tomb-*.json`.
+        let tomb_keys: Vec<String> = store
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .collect();
+        assert_eq!(
+            tomb_keys.len(),
+            1,
+            "exactly one baseline tombstone must exist: {tomb_keys:?}",
+        );
     }
 
     #[tokio::test]
@@ -2978,11 +3097,160 @@ mod tests {
                 remote_ref: "refs/heads/main".into()
             }
         );
-        // Verify both keys were actually deleted — without these, a
-        // regression that returned Ok without invoking the delete loop
-        // would still pass.
-        assert!(!store.contains(&bundle));
-        assert!(!store.contains(zip));
+        // Zip is swept synchronously; bundle is deferred via tombstone
+        // (issue #205) and reclaimed by `gc sweep` after grace.
+        assert!(
+            store.contains(&bundle),
+            "baseline bundle must survive synchronous delete (deferred via tombstone)",
+        );
+        assert!(
+            !store.contains(zip),
+            "zip artifact must be swept synchronously"
+        );
+    }
+
+    /// Issue #205: round-trip the tombstone contract. A helper-protocol
+    /// delete writes the baseline tombstone, then `gc sweep --force`
+    /// (skipping the grace window) finds the bundle whose ref no longer
+    /// exists and reclaims it. A regression in the tombstone shape would
+    /// surface as a deferred sweep step rather than a reclaim — mirrors
+    /// `packchain::push::tests::delete_tombstone_is_reaped_by_gc_sweep`.
+    #[tokio::test]
+    async fn delete_baseline_tombstone_is_reaped_by_gc_sweep() {
+        use crate::packchain::gc;
+
+        let store = MockStore::new();
+        let r = rn("refs/heads/main");
+        let bundle = format!("repo/refs/heads/main/{SHA}.bundle");
+        store.insert(&bundle, Bytes::from_static(b"BUNDLE"));
+
+        let outcome = delete_remote_ref_under_lock(
+            &store,
+            Some("repo"),
+            &r,
+            false,
+            "repo/refs/heads/main/LOCK#.lock",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, PushOutcome::Ok { .. }));
+        // Pre-condition for the sweep: bundle deferred, tombstone present.
+        assert!(
+            store.contains(&bundle),
+            "baseline bundle must survive synchronous delete (deferred)",
+        );
+
+        let sweep = gc::sweep(
+            &store,
+            "repo",
+            gc::SweepOpts {
+                grace_hours: 0,
+                force: true,
+            },
+        )
+        .await
+        .expect("sweep");
+        assert_eq!(
+            sweep.swept_tombstones, 1,
+            "sweep must reclaim exactly the tombstone helper-protocol delete wrote",
+        );
+        assert!(
+            !store.contains(&bundle),
+            "baseline bundle must be deleted by sweep past grace: surviving keys = {:?}",
+            store.keys(),
+        );
+        let surviving_tombs: Vec<String> = store
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .collect();
+        assert!(
+            surviving_tombs.is_empty(),
+            "tombstone must be deleted by sweep: {surviving_tombs:?}",
+        );
+    }
+
+    /// Issue #205: a concurrent fetcher that already advertised the
+    /// baseline SHA can still range-GET the bundle immediately after a
+    /// helper-protocol delete returns. This is the race the tombstone
+    /// defers — without it, the bundle is gone the moment the sweep
+    /// completes and the fetch fails with `NotFound`. Mirrors
+    /// `packchain::push::tests::delete_leaves_baseline_bundle_for_concurrent_fetch`.
+    #[tokio::test]
+    async fn delete_leaves_baseline_bundle_for_concurrent_fetch() {
+        let store = MockStore::new();
+        let r = rn("refs/heads/main");
+        let bundle = format!("repo/refs/heads/main/{SHA}.bundle");
+        store.insert(&bundle, Bytes::from_static(b"BUNDLE"));
+
+        let outcome = delete_remote_ref_under_lock(
+            &store,
+            Some("repo"),
+            &r,
+            false,
+            "repo/refs/heads/main/LOCK#.lock",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, PushOutcome::Ok { .. }));
+
+        // A concurrent fetcher that already advertised this SHA performs
+        // a `get_bytes` against the still-live bundle key. It must
+        // succeed within the grace window.
+        let bytes = store
+            .get_bytes(&bundle)
+            .await
+            .expect("concurrent fetcher must still read the bundle within the grace window");
+        assert_eq!(bytes.as_ref(), b"BUNDLE");
+    }
+
+    /// Issue #205 fall-back path: when the baseline tombstone PUT fails,
+    /// the bundle must be reclaimed by the synchronous sweep loop —
+    /// without the fall-back a tombstone PUT failure would orphan the
+    /// bundle indefinitely (no tombstone means `gc sweep` has nothing
+    /// to act on). Mirrors `defer_prior_bundle_via_tombstone`'s
+    /// synchronous-delete fallback in
+    /// `perform_push_under_lock_falls_back_to_sync_delete_on_tombstone_put_failure`.
+    #[tokio::test]
+    async fn delete_falls_back_to_sync_delete_on_tombstone_put_failure() {
+        use crate::object_store::mock::Fault;
+        let store = MockStore::new();
+        let r = rn("refs/heads/main");
+        let bundle = format!("repo/refs/heads/main/{SHA}.bundle");
+        store.insert(&bundle, Bytes::from_static(b"BUNDLE"));
+        // Fail the tombstone PUT (any key under `repo/gc/baseline-tomb-`).
+        store.arm(Fault::NetworkOnPutBytesPrefix {
+            prefix: "repo/gc/baseline-tomb-".to_owned(),
+        });
+
+        let outcome = delete_remote_ref_under_lock(
+            &store,
+            Some("repo"),
+            &r,
+            false,
+            "repo/refs/heads/main/LOCK#.lock",
+        )
+        .await
+        .expect("delete must succeed even when tombstone PUT fails");
+        assert!(
+            matches!(&outcome, PushOutcome::Ok { remote_ref } if remote_ref == "refs/heads/main"),
+            "expected Ok(refs/heads/main), got {outcome:?}",
+        );
+        // The tombstone fault fired; no tombstone remains.
+        assert_eq!(store.pending_faults(), 0);
+        let metas = store.list("repo/gc/").await.unwrap();
+        assert!(
+            !metas
+                .iter()
+                .any(|m| m.key.starts_with("repo/gc/baseline-tomb-")),
+            "tombstone PUT failed, so no baseline-tomb key may exist",
+        );
+        // Fall-back synchronous delete reclaimed the bundle — without
+        // this the bundle would orphan indefinitely.
+        assert!(
+            !store.contains(&bundle),
+            "fall-back synchronous delete must reclaim the bundle on tombstone PUT failure",
+        );
     }
 
     // --- PushOutcome rendering ----------------------------------------
@@ -3777,8 +4045,13 @@ mod tests {
     /// the close of the race window the issue describes: the listing
     /// is now under the lock, so the deletion target is whatever the
     /// concurrent writer left behind, not a stale pre-lock snapshot.
+    ///
+    /// Issue #205: the bundle itself is deferred via a baseline tombstone
+    /// rather than swept synchronously. A regression that swept the
+    /// bundle inline would let a concurrent fetcher's range-GET fail
+    /// with `NotFound` immediately after the delete returns.
     #[tokio::test]
-    async fn delete_remote_ref_under_lock_deletes_concurrently_landed_bundle() {
+    async fn delete_remote_ref_under_lock_defers_concurrently_landed_bundle() {
         let store = MockStore::new();
         let r = rn("refs/heads/main");
         let lock_key = "repo/refs/heads/main/LOCK#.lock";
@@ -3797,9 +4070,22 @@ mod tests {
                 remote_ref: "refs/heads/main".into()
             }
         );
+        // Bundle deferred — must remain readable for concurrent fetchers
+        // until `gc sweep` reclaims it past the grace window.
         assert!(
-            !store.contains(&bundle),
-            "concurrently-landed bundle must be swept"
+            store.contains(&bundle),
+            "concurrently-landed bundle must survive synchronous delete (deferred via tombstone)",
+        );
+        // Exactly one tombstone was written naming the deferred bundle.
+        let tomb_keys: Vec<String> = store
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .collect();
+        assert_eq!(
+            tomb_keys.len(),
+            1,
+            "exactly one baseline tombstone must exist: {tomb_keys:?}",
         );
         assert!(
             store.contains(lock_key),
@@ -4220,10 +4506,11 @@ mod tests {
     #[tokio::test]
     async fn issue_151_clean_delete_passes_post_sweep_verification() {
         // Happy path with the lock contract honoured: bundle present,
-        // no marker, lock held. The sweep removes the bundle and the
-        // post-sweep `head(PROTECTED#)` returns NotFound — silently —
-        // and the delete reports `ok`. A regression that promoted the
-        // post-sweep probe into a hard error would surface here.
+        // no marker, lock held. The sweep tombstones the bundle (issue
+        // #205) and the post-sweep `head(PROTECTED#)` returns NotFound —
+        // silently — and the delete reports `ok`. A regression that
+        // promoted the post-sweep probe into a hard error would surface
+        // here.
         let store = MockStore::new();
         let r = rn("refs/heads/main");
         let bundle = format!("repo/refs/heads/main/{SHA}.bundle");
@@ -4241,7 +4528,11 @@ mod tests {
             },
             "clean delete must report ok after the post-sweep probe",
         );
-        assert!(!store.contains(&bundle), "bundle must be swept");
+        // Issue #205: bundle is deferred via tombstone, not swept inline.
+        assert!(
+            store.contains(&bundle),
+            "bundle survives synchronous delete (deferred via tombstone)",
+        );
         assert!(
             store.contains(lock_key),
             "lock survives the sweep (release removes it)",
