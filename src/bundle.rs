@@ -449,7 +449,7 @@ fn write_bundle_header<W: Write>(
 /// Objects become immediately available via gix's dynamic store. No ref is
 /// created — that is the remote-helper protocol's responsibility (confirmed by
 /// the contract documented in [`crate::git::unbundle_at`]).
-pub fn unbundle(cwd: &Path, folder: &Path, sha: Sha) -> Result<(), BundleError> {
+pub(crate) fn unbundle(cwd: &Path, folder: &Path, sha: Sha) -> Result<(), BundleError> {
     let folder = folder.canonicalize()?;
     let bundle_path = folder.join(format!("{sha}.bundle"));
 
@@ -931,9 +931,18 @@ mod tests {
         let err = BundleHeader::read(&path)
             .err()
             .expect("expected InvalidHeader");
+        // Pin the specific reason: the magic line parses (read_until
+        // returns at EOF without a newline, n > 0, n < budget) and then
+        // the follow-up read hits EOF and surfaces as "unexpected end".
+        // Asserting only `matches!(InvalidHeader(_))` admitted a future
+        // regression that fired the same variant from any other branch.
+        let message = match &err {
+            BundleError::InvalidHeader(m) => m.clone(),
+            other => panic!("expected InvalidHeader, got {other:?}"),
+        };
         assert!(
-            matches!(err, BundleError::InvalidHeader(_)),
-            "expected InvalidHeader, got {err:?}",
+            message.contains("unexpected end"),
+            "expected 'unexpected end' in message, got {message:?}",
         );
     }
 

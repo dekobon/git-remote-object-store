@@ -37,7 +37,7 @@ pub const ENV_ALLOW_HTTP: &str = "GIT_REMOTE_OBJECT_STORE_ALLOW_HTTP";
 /// `time::Duration::seconds_f64` overflow. Applying the same 7-day
 /// cap to both backends gives consistent behaviour and a clean error
 /// at URL-parse time rather than mid-protocol (issue #219).
-pub const MAX_BUNDLE_URI_PRESIGN_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+pub(crate) const MAX_BUNDLE_URI_PRESIGN_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 /// A parsed remote URL.
 ///

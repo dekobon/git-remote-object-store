@@ -174,31 +174,11 @@ fn init_tracing(tmp_dir: &Path, debug_logging: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Regression guard for #180.
-    ///
-    /// Before the fix, the LFS agent's non-debug path installed its own
-    /// `EnvFilter` pinned to `error`, ignoring
-    /// `GIT_REMOTE_OBJECT_STORE_VERBOSE`. The fix routes that path
-    /// through [`tracing_init::init`] so the LFS agent shares the same
-    /// single-knob verbosity policy as the helper-protocol binaries and
-    /// the management CLI.
-    ///
-    /// The compile-time `use tracing_init` in the bin's preamble and
-    /// the `tracing_init::init()` call in the non-debug branch are the
-    /// structural delegation. The test below is a value-level pin so a
-    /// future rename of `ENV_VERBOSE` doesn't silently break the
-    /// contract documented in `docs/environment-variables.md`.
-    #[test]
-    fn lfs_non_debug_path_honors_verbose_env_var() {
-        assert_eq!(
-            tracing_init::ENV_VERBOSE,
-            "GIT_REMOTE_OBJECT_STORE_VERBOSE",
-            "LFS bin's non-debug path delegates to tracing_init::init, \
-             which keys verbosity off this exact env var",
-        );
-    }
-}
+// Regression guard for #180 lives in `src/protocol/tracing_init.rs`
+// (the shared `read_verbose_env_ignores_rust_log` test) — that test
+// pins the value of `ENV_VERBOSE` and the single-knob policy that the
+// LFS bin's non-debug REPL path now delegates to via
+// `tracing_init::init()`. A previous tautological const-equality test
+// here was removed: it only asserted `ENV_VERBOSE` equalled its own
+// literal and would still pass if `init_tracing` reverted to its
+// per-bin `EnvFilter` (issue tracked in the env-mutation-leak follow-up).

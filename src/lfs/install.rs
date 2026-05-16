@@ -22,17 +22,31 @@ pub const AGENT_NAME: &str = "git-lfs-object-store";
 
 const KEY_STANDALONE: &str = "lfs.standalonetransferagent";
 
-/// `lfs.customtransfer.<AGENT_NAME>.path` — built from [`AGENT_NAME`]
-/// rather than duplicated as a literal so renaming the agent cannot
-/// silently break LFS routing (issue #190).
-fn key_path() -> String {
-    format!("lfs.customtransfer.{AGENT_NAME}.path")
-}
+/// `lfs.customtransfer.<AGENT_NAME>.path` — composed from [`AGENT_NAME`]
+/// at compile time via `concat!` so renaming the agent cannot silently
+/// break LFS routing (issue #190) and no per-call allocation occurs.
+const KEY_PATH: &str = concat!("lfs.customtransfer.", "git-lfs-object-store", ".path");
 
-/// `lfs.customtransfer.<AGENT_NAME>.args` — see [`key_path`].
-fn key_args() -> String {
-    format!("lfs.customtransfer.{AGENT_NAME}.args")
-}
+/// `lfs.customtransfer.<AGENT_NAME>.args` — see [`KEY_PATH`].
+const KEY_ARGS: &str = concat!("lfs.customtransfer.", "git-lfs-object-store", ".args");
+
+#[cfg(test)]
+const _: () = {
+    // Compile-time guard: if `AGENT_NAME` ever drifts from the literal
+    // substring baked into the keys above, this assertion stops the
+    // build. `concat!` only accepts string literals so we cannot inline
+    // `AGENT_NAME` directly — the runtime test below catches drift in
+    // CI, and this const_assert catches it during type-check on every
+    // build that touches this module.
+    let agent = AGENT_NAME.as_bytes();
+    let needle = b"git-lfs-object-store";
+    assert!(agent.len() == needle.len());
+    let mut i = 0;
+    while i < needle.len() {
+        assert!(agent[i] == needle[i]);
+        i += 1;
+    }
+};
 
 /// Errors surfaced by the install / debug-toggle subcommands.
 #[derive(Debug, Error)]
@@ -57,13 +71,7 @@ pub enum InstallError {
 ///
 /// Returns [`InstallError::Git`] if writing the config entries fails.
 pub fn install(cwd: &Path) -> Result<(), InstallError> {
-    git::config_set_many(
-        cwd,
-        &[
-            (key_path().as_str(), AGENT_NAME),
-            (KEY_STANDALONE, AGENT_NAME),
-        ],
-    )?;
+    git::config_set_many(cwd, &[(KEY_PATH, AGENT_NAME), (KEY_STANDALONE, AGENT_NAME)])?;
     Ok(())
 }
 
@@ -78,7 +86,7 @@ pub fn install(cwd: &Path) -> Result<(), InstallError> {
 ///
 /// Returns [`InstallError::Git`] if writing the config entry fails.
 pub fn enable_debug(cwd: &Path) -> Result<(), InstallError> {
-    git::config_set(cwd, &key_args(), "debug")?;
+    git::config_set(cwd, KEY_ARGS, "debug")?;
     Ok(())
 }
 
@@ -93,44 +101,41 @@ pub fn enable_debug(cwd: &Path) -> Result<(), InstallError> {
 /// [`crate::git::config_unset_if_present`] other than `ConfigKeyNotSet`
 /// (which this helper treats as success).
 pub fn disable_debug(cwd: &Path) -> Result<(), InstallError> {
-    git::config_unset_if_present(cwd, &key_args())?;
+    git::config_unset_if_present(cwd, KEY_ARGS)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AGENT_NAME, key_args, key_path};
+    use super::{AGENT_NAME, KEY_ARGS, KEY_PATH};
 
     // Drift between `AGENT_NAME` and the config keys is what issue #190
     // is about — `git lfs` looks up the agent by exact string match on
     // the subsection, so a mismatch silently sends LFS traffic to the
-    // HTTPS transfer queue instead of the helper. `format!` already
-    // makes drift impossible at compile time; these tests pin the
+    // HTTPS transfer queue instead of the helper. The `concat!`-built
+    // constants plus the `const _: () = { ... }` compile-time check
+    // make drift impossible at build time; these tests pin the
     // resulting shape so a future refactor cannot quietly change it.
     #[test]
     fn key_path_embeds_agent_name() {
         assert!(
-            key_path().contains(AGENT_NAME),
-            "key_path() = {:?} must contain AGENT_NAME = {:?}",
-            key_path(),
-            AGENT_NAME,
+            KEY_PATH.contains(AGENT_NAME),
+            "KEY_PATH = {KEY_PATH:?} must contain AGENT_NAME = {AGENT_NAME:?}",
         );
     }
 
     #[test]
     fn key_args_embeds_agent_name() {
         assert!(
-            key_args().contains(AGENT_NAME),
-            "key_args() = {:?} must contain AGENT_NAME = {:?}",
-            key_args(),
-            AGENT_NAME,
+            KEY_ARGS.contains(AGENT_NAME),
+            "KEY_ARGS = {KEY_ARGS:?} must contain AGENT_NAME = {AGENT_NAME:?}",
         );
     }
 
     #[test]
     fn key_shapes_match_lfs_customtransfer_namespace() {
-        assert_eq!(key_path(), format!("lfs.customtransfer.{AGENT_NAME}.path"));
-        assert_eq!(key_args(), format!("lfs.customtransfer.{AGENT_NAME}.args"));
+        assert_eq!(KEY_PATH, format!("lfs.customtransfer.{AGENT_NAME}.path"));
+        assert_eq!(KEY_ARGS, format!("lfs.customtransfer.{AGENT_NAME}.args"));
     }
 
     // --- idempotency contract (#198, #210) ----------------------------
@@ -180,10 +185,7 @@ mod tests {
         install(&cwd).expect("second install");
         install(&cwd).expect("third install");
         // Both keys the install writes must end up with exactly one value.
-        assert_eq!(
-            config_values(&cwd, &key_path()),
-            vec![AGENT_NAME.to_owned()],
-        );
+        assert_eq!(config_values(&cwd, KEY_PATH), vec![AGENT_NAME.to_owned()],);
         assert_eq!(
             config_values(&cwd, KEY_STANDALONE),
             vec![AGENT_NAME.to_owned()],
@@ -196,15 +198,26 @@ mod tests {
         // binary twice had two entries per key. After upgrading, a single
         // `install` call must clean that up rather than adding a third.
         let (_dir, cwd) = empty_repo();
-        git::config_add(&cwd, &key_path(), AGENT_NAME).expect("seed 1");
-        git::config_add(&cwd, &key_path(), AGENT_NAME).expect("seed 2");
+        git::config_add(&cwd, KEY_PATH, AGENT_NAME).expect("seed 1");
+        git::config_add(&cwd, KEY_PATH, AGENT_NAME).expect("seed 2");
         git::config_add(&cwd, KEY_STANDALONE, AGENT_NAME).expect("seed 1");
         git::config_add(&cwd, KEY_STANDALONE, AGENT_NAME).expect("seed 2");
-        install(&cwd).expect("install");
+        // Pre-state guard: confirm the seed step actually produced legacy
+        // multi-valued entries. Without this, a regression that turned
+        // `config_add` into idempotent-set would make the seeds a no-op
+        // and the post-install assertion would still pass — testing only
+        // that `install` produces one entry, not that it collapses two.
         assert_eq!(
-            config_values(&cwd, &key_path()),
-            vec![AGENT_NAME.to_owned()],
+            config_values(&cwd, KEY_PATH),
+            vec![AGENT_NAME.to_owned(), AGENT_NAME.to_owned()],
+            "seed step must produce two values for the collapse test to be meaningful",
         );
+        assert_eq!(
+            config_values(&cwd, KEY_STANDALONE),
+            vec![AGENT_NAME.to_owned(), AGENT_NAME.to_owned()],
+        );
+        install(&cwd).expect("install");
+        assert_eq!(config_values(&cwd, KEY_PATH), vec![AGENT_NAME.to_owned()],);
         assert_eq!(
             config_values(&cwd, KEY_STANDALONE),
             vec![AGENT_NAME.to_owned()],
@@ -216,7 +229,7 @@ mod tests {
         let (_dir, cwd) = empty_repo();
         enable_debug(&cwd).expect("first");
         enable_debug(&cwd).expect("second");
-        assert_eq!(config_values(&cwd, &key_args()), vec!["debug".to_owned()]);
+        assert_eq!(config_values(&cwd, KEY_ARGS), vec!["debug".to_owned()]);
     }
 
     #[test]
@@ -225,7 +238,7 @@ mod tests {
         // debug must succeed cleanly.
         let (_dir, cwd) = empty_repo();
         disable_debug(&cwd).expect("disable on empty repo");
-        assert!(config_values(&cwd, &key_args()).is_empty());
+        assert!(config_values(&cwd, KEY_ARGS).is_empty());
     }
 
     #[test]
@@ -236,6 +249,6 @@ mod tests {
         enable_debug(&cwd).expect("enable");
         disable_debug(&cwd).expect("first disable");
         disable_debug(&cwd).expect("second disable");
-        assert!(config_values(&cwd, &key_args()).is_empty());
+        assert!(config_values(&cwd, KEY_ARGS).is_empty());
     }
 }

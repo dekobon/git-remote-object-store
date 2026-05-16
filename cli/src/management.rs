@@ -181,6 +181,14 @@ pub struct Target {
 /// Returns `Ok(())` on success and propagates any backend / domain
 /// error otherwise. The binary `main()` is responsible for installing
 /// a tokio runtime, initialising tracing, and rendering errors.
+///
+/// # Errors
+///
+/// Returns any error produced by the dispatched subcommand:
+/// URL parsing (`url::ParseError`), backend / object-store errors
+/// (`BackendError`, `ObjectStoreError`), management-layer errors
+/// (`ManageError`, doctor / gc / compact / branch failures), or
+/// IO errors propagated through `anyhow`.
 pub async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Doctor {

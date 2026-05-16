@@ -486,7 +486,13 @@ pub(crate) fn resolve_lock_ttl_seconds(opt: Option<u64>) -> u64 {
         // intentionally consult the env even on Some(0) so an operator
         // who has set `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` still
         // gets that value when a CLI consumer passes the wrong default.
-        _ => u64::try_from(lock_ttl_from_env().whole_seconds()).unwrap_or(DEFAULT_LOCK_TTL_SECONDS),
+        // `lock_ttl_from_env` already clamps to a positive `time::Duration`
+        // built from a `u64` literal, so `.whole_seconds()` is always a
+        // non-negative `i64` that fits in `u64`. `expect` makes the
+        // unreachable branch surface instead of silently masking a
+        // future regression that loosens that invariant.
+        _ => u64::try_from(lock_ttl_from_env().whole_seconds())
+            .expect("lock_ttl_from_env returns a non-negative seconds count"),
     }
 }
 
