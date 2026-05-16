@@ -16,7 +16,11 @@ use thiserror::Error;
 use url::Url;
 
 /// Environment override that allows cleartext `*+http://` URLs against
-/// non-loopback hosts. Accepted only when set to `1`.
+/// non-loopback hosts. Accepted when set to any of the truthy values
+/// recognised by [`parse_bool_value`] (`1`, `true`, `yes`, `on`,
+/// case-insensitive). Any other value — including the empty string,
+/// `0`, `false`, `no`, `off`, or any unrecognised token — is treated
+/// as "not set" and the cleartext-HTTP gate stays closed.
 pub const ENV_ALLOW_HTTP: &str = "GIT_REMOTE_OBJECT_STORE_ALLOW_HTTP";
 
 /// Maximum accepted value for `?bundle_uri_presign_ttl=<seconds>`: 7
@@ -469,7 +473,15 @@ fn is_loopback(u: &Url) -> bool {
 }
 
 fn http_allowed_by_env() -> bool {
-    matches!(env::var(ENV_ALLOW_HTTP).as_deref(), Ok("1"))
+    // Reuse the same vocabulary the URL boolean flags accept so
+    // `ALLOW_HTTP=true` and `ALLOW_HTTP=1` behave identically. Anything
+    // we cannot parse as a boolean (unset, empty, junk) leaves the
+    // gate closed — fail-safe is "no cleartext".
+    env::var(ENV_ALLOW_HTTP)
+        .ok()
+        .as_deref()
+        .and_then(parse_bool_value)
+        .unwrap_or(false)
 }
 
 /// Pull known flags out of the query string. Unknown keys are an error
@@ -507,13 +519,40 @@ fn extract_flags(u: &Url) -> Result<(RemoteFlags, Option<AddressingOverride>), P
 }
 
 fn parse_bool_flag(name: &str, value: &str) -> Result<bool, ParseError> {
-    match value {
-        "1" | "true" => Ok(true),
-        "0" | "false" => Ok(false),
-        other => Err(ParseError::InvalidFlagValue {
-            name: name.to_owned(),
-            value: other.to_owned(),
-        }),
+    parse_bool_value(value).ok_or_else(|| ParseError::InvalidFlagValue {
+        name: name.to_owned(),
+        value: value.to_owned(),
+    })
+}
+
+/// Single source of truth for boolean-string parsing across the URL
+/// query-flag parser and the helper-runtime env-var reads.
+///
+/// Accepts the conventional "truthy / falsy" vocabulary used by most
+/// shells and config files (`1|true|yes|on` for true; `0|false|no|off`
+/// for false), all case-insensitively. Returns `None` for any token
+/// outside the accepted set so callers can map the failure mode they
+/// need (URL flags surface [`ParseError::InvalidFlagValue`]; env-var
+/// reads fall back to "unset/false").
+///
+/// Centralising the vocabulary here (rather than open-coding `matches!`
+/// at each read site) prevents the divergence reported in issue #187,
+/// where `?zip=true` worked in the URL but `ALLOW_HTTP=true` did not.
+fn parse_bool_value(value: &str) -> Option<bool> {
+    if value.eq_ignore_ascii_case("1")
+        || value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("yes")
+        || value.eq_ignore_ascii_case("on")
+    {
+        Some(true)
+    } else if value.eq_ignore_ascii_case("0")
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("no")
+        || value.eq_ignore_ascii_case("off")
+    {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -1502,5 +1541,114 @@ mod tests {
         parse("s3+https://play.min.io/my-bucket/repo").unwrap();
         parse("s3+https://acc.r2.cloudflarestorage.com/my-bucket/repo").unwrap();
         parse("s3+https://localhost/my-bucket/repo?zip=0").unwrap();
+    }
+
+    // --- Boolean-value vocabulary (issue #187) ----------------------------
+    //
+    // The same `parse_bool_value` helper governs both URL query flags
+    // (`?zip=`, `?bundle_uri=`) and env-var booleans (`ALLOW_HTTP`).
+    // The matrix below pins the accepted set so the two surfaces stay
+    // in sync.
+
+    #[test]
+    fn parse_bool_value_accepts_truthy_tokens() {
+        for v in ["1", "true", "yes", "on"] {
+            assert_eq!(parse_bool_value(v), Some(true), "expected true for `{v}`");
+        }
+    }
+
+    #[test]
+    fn parse_bool_value_accepts_falsy_tokens() {
+        for v in ["0", "false", "no", "off"] {
+            assert_eq!(parse_bool_value(v), Some(false), "expected false for `{v}`");
+        }
+    }
+
+    #[test]
+    fn parse_bool_value_is_case_insensitive() {
+        // Per-value matrix covering common mixed-case spellings users
+        // type ad-hoc. The helper must accept every casing for every
+        // accepted token; this loop checks the full cross product.
+        for (input, expected) in [
+            ("TRUE", true),
+            ("True", true),
+            ("tRuE", true),
+            ("YES", true),
+            ("Yes", true),
+            ("ON", true),
+            ("On", true),
+            ("FALSE", false),
+            ("False", false),
+            ("NO", false),
+            ("No", false),
+            ("OFF", false),
+            ("Off", false),
+        ] {
+            assert_eq!(
+                parse_bool_value(input),
+                Some(expected),
+                "expected {expected} for `{input}`",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bool_value_rejects_unknown_tokens() {
+        // Empty string, near-misses, common typos, and arbitrary
+        // junk must all fall through to `None` so the URL-flag path
+        // can surface `InvalidFlagValue` and the env-var path can
+        // fall back to "unset". Picking "y"/"n" as rejected pins the
+        // policy: short forms are NOT accepted (issue #187 left this
+        // explicit to avoid surprising aliases).
+        for v in [
+            "", " ", "yep", "nope", "2", "-1", "truee", "y", "n", "enabled",
+        ] {
+            assert_eq!(parse_bool_value(v), None, "expected None for `{v}`");
+        }
+    }
+
+    #[test]
+    fn parse_bool_flag_propagates_invalid_flag_value_error() {
+        // Names propagated into the error must match the flag the
+        // user typed so the diagnostic stays useful.
+        let err = parse_bool_flag("zip", "maybe").unwrap_err();
+        assert!(
+            matches!(&err, ParseError::InvalidFlagValue { name, value }
+                if name == "zip" && value == "maybe"),
+            "expected InvalidFlagValue(zip, maybe), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn url_bool_flags_accept_mixed_case_and_extended_vocabulary() {
+        // Per-value coverage at the URL surface: `?zip=` and
+        // `?bundle_uri=` must accept every truthy / falsy token the
+        // helper recognises. Loopback host keeps this independent of
+        // the AWS-endpoint validator.
+        for v in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "ON"] {
+            let url = parse(&format!("s3+https://localhost/my-bucket/repo?zip={v}")).unwrap();
+            assert!(url.flags().zip, "expected zip=true for `{v}`");
+        }
+        for v in ["0", "false", "False", "FALSE", "no", "No", "off", "OFF"] {
+            let url = parse(&format!("s3+https://localhost/my-bucket/repo?zip={v}")).unwrap();
+            assert!(!url.flags().zip, "expected zip=false for `{v}`");
+        }
+    }
+
+    #[test]
+    fn url_bool_flags_reject_unknown_value_with_flag_name() {
+        let err = parse("s3+https://localhost/my-bucket/repo?zip=maybe").unwrap_err();
+        assert!(
+            matches!(&err, ParseError::InvalidFlagValue { name, value }
+                if name == "zip" && value == "maybe"),
+            "expected InvalidFlagValue(zip, maybe), got {err:?}",
+        );
+
+        let err = parse("s3+https://localhost/my-bucket/repo?bundle_uri=2").unwrap_err();
+        assert!(
+            matches!(&err, ParseError::InvalidFlagValue { name, value }
+                if name == "bundle_uri" && value == "2"),
+            "expected InvalidFlagValue(bundle_uri, 2), got {err:?}",
+        );
     }
 }

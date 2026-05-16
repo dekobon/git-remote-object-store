@@ -461,12 +461,48 @@ fn allows_cleartext_http_to_non_loopback_with_env() {
     });
 }
 
+/// Per-value matrix for the boolean vocabulary on `ENV_ALLOW_HTTP`.
+/// Issue #187: the env-var read shares its parser with `parse_bool_flag`
+/// so `ALLOW_HTTP=true`, `ALLOW_HTTP=yes`, `ALLOW_HTTP=ON`, … all open
+/// the gate just like `?zip=true` accepts the same vocabulary on the
+/// URL surface.
 #[test]
-fn env_value_other_than_one_does_not_unlock() {
-    with_allow_http_env(Some("yes"), || {
-        let err = parse("s3+http://example.com/my-bucket/my-repo").unwrap_err();
-        assert!(matches!(err, ParseError::CleartextHttpForbidden { .. }));
-    });
+fn env_allow_http_accepts_every_truthy_token() {
+    for value in [
+        "1", "true", "TRUE", "True", "yes", "Yes", "YES", "on", "On", "ON",
+    ] {
+        with_allow_http_env(Some(value), || {
+            let url = parse("s3+http://example.com/my-bucket/my-repo")
+                .unwrap_or_else(|err| panic!("expected `{value}` to open the gate, got {err:?}"));
+            let RemoteUrl::S3 { bucket, .. } = url else {
+                panic!("expected S3");
+            };
+            assert_eq!(bucket, "my-bucket");
+        });
+    }
+}
+
+/// Per-value matrix for falsy / unrecognised env-var values. These
+/// must leave the gate closed — fail-safe is "no cleartext".
+#[test]
+fn env_allow_http_rejects_falsy_and_unknown_tokens() {
+    // Falsy tokens recognised by the helper, plus arbitrary junk
+    // (`maybe`, ` `, `2`) and the empty string. Every case must
+    // continue to refuse cleartext against a non-loopback host.
+    for value in [
+        "0", "false", "FALSE", "False", "no", "No", "NO", "off", "Off", "OFF", "", " ", "maybe",
+        "2", "-1",
+    ] {
+        with_allow_http_env(Some(value), || {
+            let err = parse("s3+http://example.com/my-bucket/my-repo")
+                .err()
+                .unwrap_or_else(|| panic!("expected `{value}` to keep the gate closed"));
+            assert!(
+                matches!(err, ParseError::CleartextHttpForbidden { .. }),
+                "expected CleartextHttpForbidden for `{value}`, got {err:?}",
+            );
+        });
+    }
 }
 
 #[test]
@@ -605,10 +641,14 @@ fn rejects_unknown_flag() {
 
 #[test]
 fn rejects_invalid_zip_value() {
-    let err = parse("s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?zip=yes").unwrap_err();
+    // `?zip=maybe` is outside the accepted boolean vocabulary
+    // (`1|true|yes|on` / `0|false|no|off`, case-insensitive); the URL
+    // surface must surface `InvalidFlagValue` so typos are caught at
+    // parse time rather than silently treated as "off".
+    let err = parse("s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?zip=maybe").unwrap_err();
     assert!(matches!(
         err,
-        ParseError::InvalidFlagValue { name, value } if name == "zip" && value == "yes"
+        ParseError::InvalidFlagValue { name, value } if name == "zip" && value == "maybe"
     ));
 }
 

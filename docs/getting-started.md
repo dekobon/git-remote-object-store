@@ -314,6 +314,26 @@ The complete grammar lives in the URL parser (`src/url.rs`); the
 table above and the scheme outline earlier in this section cover
 everything an end-user typically needs.
 
+### Case-sensitivity policy
+
+The case rules below are intentional, not historical accidents.
+
+| Flag class                          | Case                 | Example                                                                                                                                                                                                  |
+| ----------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Boolean flags (`zip`, `bundle_uri`) | Case-**in**sensitive | `?zip=true`, `?zip=TRUE`, `?zip=Yes`, `?zip=on` all enable the flag; `0`, `false`, `no`, `off` (any casing) disable it.                                                                                  |
+| `engine=<name>`                     | Case-**sensitive**   | `?engine=bundle` and `?engine=packchain` are the only accepted spellings. `?engine=Bundle` is rejected.                                                                                                  |
+| `addressing=<style>`                | Case-**sensitive**   | `?addressing=path` and `?addressing=virtual` only — not `Path` or `VIRTUAL`.                                                                                                                             |
+| `credential=<NAME>`                 | Normalised           | The value is preserved at the URL surface but normalised to ASCII upper case when used to build the Azure credential env-var name (`AZSTORE_<NAME>_KEY`, …). `?credential=prod` and `?credential=PROD` both resolve to `AZSTORE_PROD_KEY`. |
+| `profile=<NAME>`, `region=<REGION>` | Verbatim             | Forwarded as-is to the AWS SDK; the SDK's own casing rules apply (profile names are case-sensitive; region names are conventionally lower case).                                                         |
+
+Boolean values share their vocabulary with the
+`GIT_REMOTE_OBJECT_STORE_ALLOW_HTTP` env-var gate
+([environment-variables.md](environment-variables.md)) — anything the
+URL flag accepts, the env var accepts, and vice versa. Engine and
+addressing values are deliberately case-sensitive: their accepted set
+is small and stable, and accepting variant spellings would just create
+ambiguity for anyone reading a URL out of a config file or CI log.
+
 ## 6. Submodules
 
 Git refuses unknown URL schemes inside submodule URLs by default.
