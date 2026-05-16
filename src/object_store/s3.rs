@@ -10,7 +10,7 @@
 //!
 //! `S3Store` does **not** auto-prepend the [`RemoteUrl`] `prefix`. Trait
 //! keys are byte-prefix per the contract on
-//! [`ObjectStore::list`][super::ObjectStore::list]; the URL `prefix` is
+//! [`ObjectStore::list`]; the URL `prefix` is
 //! a repository concern and is composed by callers that build keys like
 //! `<prefix>/refs/.../<sha>.bundle`.
 //!

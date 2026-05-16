@@ -30,9 +30,12 @@ use super::snapshot::{
 };
 use super::{ManageError, Prompter, StaleReason};
 // `DEFAULT_LOCK_TTL_SECONDS` is only referenced from the tests below
-// and from doc-comments; tests bring it in via the `use super::*;`
-// inside `mod tests`. Doc-comments resolve through the absolute
-// path so they do not need a `use` either.
+// and from doc-comments. Tests bring it in via the `use super::*;`
+// inside `mod tests`. The `#[cfg(test)]` gate makes this `use`
+// invisible to `cargo doc`, so doc-comments must reach the constant
+// through its fully-qualified path
+// (`crate::protocol::push::DEFAULT_LOCK_TTL_SECONDS`) rather than the
+// bare identifier.
 #[cfg(test)]
 use super::DEFAULT_LOCK_TTL_SECONDS;
 use crate::keys;
@@ -51,7 +54,8 @@ pub struct DoctorOpts {
     /// Locks older than this TTL are considered stale. `None` falls
     /// back to [`crate::protocol::push::lock_ttl_from_env`] which
     /// honours `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` (defaulting
-    /// to [`DEFAULT_LOCK_TTL_SECONDS`] when unset). An explicit
+    /// to [`crate::protocol::push::DEFAULT_LOCK_TTL_SECONDS`] when
+    /// unset). An explicit
     /// `Some(n)` — including `Some(0)` — passes through unchanged:
     /// `doctor` only compares lock ages, it never acquires a lock, so
     /// `--lock-ttl-seconds 0` is a deliberate "treat every lock as

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Rustdoc check wired into `make pre-commit` and `make ci`.** New
+  `make doc-check` target (and `_pc-doc-check` / `_ci-doc-check`
+  wrappers) so the same rustdoc gate the CI `docs` job enforces runs
+  locally before commit. The dedicated `docs` job in
+  `.github/workflows/ci.yml` now delegates to `make _ci-doc-check`,
+  making the Makefile target the single source of truth. Fixed three
+  pre-existing rustdoc lint failures: a broken intra-doc link in
+  `src/manage/doctor.rs` and a redundant explicit link target in
+  `src/object_store/s3.rs` (both visible to the existing CI command),
+  plus a broken intra-doc link in `src/object_store/mock.rs` that was
+  hidden until the consolidated `make doc-check` command added
+  `--all-features`, which activates the `test-util`-gated mock
+  `ObjectStore` so its doc comments are also checked.
+
 - **Environment-variables reference.** New
   `docs/environment-variables.md` page consolidating every env var read
   by the helper binaries, LFS agent, management CLI, and test suites

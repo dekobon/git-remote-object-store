@@ -6,10 +6,10 @@
 //! tests pick it up via `cfg(test)`; integration tests in `tests/` opt in
 //! by enabling the `test-util` Cargo feature.
 //!
-//! The backing store is a `BTreeMap<String, MockObject>` so [`list`]'s
-//! iteration is deterministic (lexicographic). Prefix matching mirrors S3
-//! `Prefix=` byte-prefix semantics — `list("a")` returns `a`, `a/1`, and
-//! `aaa`.
+//! The backing store is a `BTreeMap<String, MockObject>` so
+//! [`ObjectStore::list`]'s iteration is deterministic (lexicographic).
+//! Prefix matching mirrors S3 `Prefix=` byte-prefix semantics —
+//! `list("a")` returns `a`, `a/1`, and `aaa`.
 //!
 //! Fault injection is FIFO: tests call [`MockStore::arm`] to queue a
 //! [`Fault`]; the next matching operation consumes it and returns the

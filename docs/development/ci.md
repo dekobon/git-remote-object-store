@@ -117,6 +117,22 @@ the "Fail on test failures" safety-net step.
 
 - Debug build: `cargo build --workspace --all-targets`
 
+### Rustdoc Validation
+
+Broken intra-doc links, redundant explicit link targets, and any other
+rustdoc lint failures fail the build. Runs as the dedicated `rustdoc`
+job in CI (`make _ci-doc-check`) and as part of `make pre-commit` /
+`make ci` locally — both routes call `make doc-check`, which expands
+to:
+
+```bash
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace \
+  --all-features --locked
+```
+
+`--all-features` is what activates the `test-util`-gated mock
+`ObjectStore` so its doc comments are also checked.
+
 ## Tool Installation
 
 The CI workflow installs tools using a hybrid caching strategy.

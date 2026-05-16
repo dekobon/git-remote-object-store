@@ -336,13 +336,18 @@ jobs:
 
   # -------------------------------------------------------------------
   # Job 5: rustdoc — fails on broken doclinks and missing-docs warnings.
+  #
+  # Delegates to `make _ci-doc-check` so the exact command (`-D warnings`
+  # plus `--all-features --locked --no-deps --workspace`) lives in the
+  # Makefile alongside the local `make pre-commit` hook. `--all-features`
+  # is what activates the `test-util`-gated mock store so its doc
+  # comments are also checked — the previous in-line `cargo doc` did not
+  # set it and silently skipped those modules.
   # -------------------------------------------------------------------
   docs:
     name: rustdoc
     needs: derive-toolchain
     runs-on: ubuntu-latest
-    env:
-      RUSTDOCFLAGS: "-D warnings"
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -354,7 +359,7 @@ jobs:
           cache-key: docs
 
       - name: Build rustdoc
-        run: cargo doc --no-deps --workspace --locked
+        run: make _ci-doc-check
 
   # -------------------------------------------------------------------
   # Job 6: MSRV — build-only on the declared minimum Rust version.

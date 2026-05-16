@@ -31,7 +31,7 @@ FIND_EXCLUDE   := $(foreach dir,$(EXCLUDE_DIRS),! -path "./$(dir)/*")
 # --warn-undefined-variables warnings, e.g. $(call find-by-ext,md,,).
 find-by-ext = $(if $(FD),$(FD) --extension $(1) $(FD_EXCLUDE) $(2),find . -name "*.$(1)" -type f $(FIND_EXCLUDE) $(3))
 
-.PHONY: help check-tools build build-release test test-all test-integration-s3 test-integration-azure fmt fmt-check markdown-fmt markdown-check markdown-lint shellcheck sh-fmt sh-fmt-check toml-fmt toml-fmt-check toml-lint makefile-check lint check deny shellspec shellspec-integration shellspec-integration-s3 shellspec-integration-azure shellspec-live shellspec-live-s3 shellspec-live-azure shellspec-live-sweep image-pin-check clean install install-man man man-check doc doc-open bench all pre-commit ci _pc-fmt _pc-clippy _pc-test _pc-build _pc-shellspec _pc-shellcheck _pc-markdown-lint _pc-toml-lint _pc-makefile-check _pc-deny _pc-man-check _ci-fmt-check _ci-clippy _ci-test _ci-build _ci-shellspec _ci-shellcheck _ci-markdown-check _ci-toml-lint _ci-makefile-check _ci-deny _ci-man-check _ci-cargo-pipeline
+.PHONY: help check-tools build build-release test test-all test-integration-s3 test-integration-azure fmt fmt-check markdown-fmt markdown-check markdown-lint shellcheck sh-fmt sh-fmt-check toml-fmt toml-fmt-check toml-lint makefile-check lint check deny shellspec shellspec-integration shellspec-integration-s3 shellspec-integration-azure shellspec-live shellspec-live-s3 shellspec-live-azure shellspec-live-sweep image-pin-check clean install install-man man man-check doc doc-open doc-check bench all pre-commit ci _pc-fmt _pc-clippy _pc-test _pc-build _pc-shellspec _pc-shellcheck _pc-markdown-lint _pc-toml-lint _pc-makefile-check _pc-deny _pc-man-check _pc-doc-check _ci-fmt-check _ci-clippy _ci-test _ci-build _ci-shellspec _ci-shellcheck _ci-markdown-check _ci-toml-lint _ci-makefile-check _ci-deny _ci-man-check _ci-doc-check _ci-cargo-pipeline
 
 # Default target
 help:
@@ -84,6 +84,7 @@ help:
 	@echo "Documentation:"
 	@echo "  doc                                  Generate documentation"
 	@echo "  doc-open                             Generate and open documentation"
+	@echo "  doc-check                            Generate docs with -D warnings (broken intra-doc links fail)"
 	@echo ""
 	@echo "Performance:"
 	@echo "  bench                                Run Rust micro-benchmarks"
@@ -354,6 +355,16 @@ doc:
 doc-open:
 	cargo doc --no-deps --workspace --open
 
+# Build docs with all warnings promoted to errors so broken intra-doc
+# links, missing-docs, and redundant explicit links fail the build.
+# `--all-features` activates `test-util`-gated items (e.g. the mock
+# `ObjectStore`) so their doc comments are also checked. `--locked`
+# matches the dedicated `docs` job in CI. This target is the single
+# source of truth invoked from `make pre-commit`, `make ci`, and the
+# `docs` job in `.github/workflows/ci.yml`.
+doc-check:
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --all-features --locked
+
 # ---------------------------------------------------------------------------
 # Performance
 # ---------------------------------------------------------------------------
@@ -369,7 +380,7 @@ pre-commit:
 	$(MAKE) -j --output-sync=target \
 	  _pc-test _pc-shellspec \
 	  _pc-shellcheck _pc-markdown-lint _pc-toml-lint _pc-makefile-check _pc-deny \
-	  _pc-man-check
+	  _pc-man-check _pc-doc-check
 	@echo "Pre-commit checks passed"
 
 ci:
@@ -387,15 +398,17 @@ ci:
 # independent stages concurrently. The `pre-commit` target invokes them
 # with `-j --output-sync=target`.
 #
-# Cargo targets (_pc-clippy → _pc-test → _pc-build) are serialized because
-# concurrent cargo commands block on the package cache lock. Non-cargo
-# checks run in parallel with the cargo pipeline, gated only on _pc-fmt.
+# Cargo targets (_pc-clippy → _pc-test → _pc-build → _pc-doc-check) are
+# serialized because concurrent cargo commands block on the package cache
+# lock. Non-cargo checks run in parallel with the cargo pipeline, gated
+# only on _pc-fmt.
 #
 # Dependency graph:
 #
 #   _pc-fmt
 #    ├── _pc-clippy → _pc-test → _pc-build
-#    │                              └── _pc-shellspec
+#    │                              ├── _pc-shellspec
+#    │                              └── _pc-doc-check
 #    ├── _pc-shellcheck
 #    ├── _pc-markdown-lint
 #    ├── _pc-toml-lint
@@ -439,6 +452,9 @@ _pc-deny: _pc-fmt
 _pc-man-check: _pc-fmt
 	$(MAKE) man-check
 
+_pc-doc-check: _pc-build
+	$(MAKE) doc-check
+
 # ---------------------------------------------------------------------------
 # CI validation targets (no auto-formatting)
 #
@@ -449,9 +465,14 @@ _pc-man-check: _pc-fmt
 # Execution order (enforced by `ci` target + _ci-cargo-pipeline):
 #   1. _ci-fmt-check (sequential, must pass before anything else)
 #   2. parallel:
-#      _ci-cargo-pipeline: clippy → test → build → shellspec
+#      _ci-cargo-pipeline: clippy → test → build → doc-check → shellspec
 #      _ci-shellcheck, _ci-markdown-check, _ci-toml-lint,
 #      _ci-makefile-check, _ci-deny
+#
+# `_ci-doc-check` lives inside the cargo pipeline (not the parallel
+# siblings) so it serializes against the other `cargo *` invocations on
+# the package cache lock — see the matching rationale in the
+# `_pc-doc-check` DAG comment above.
 # ---------------------------------------------------------------------------
 _ci-fmt-check:
 	$(MAKE) fmt-check
@@ -490,9 +511,17 @@ _ci-deny:
 _ci-man-check:
 	$(MAKE) man-check
 
-# Sequential cargo pipeline for local `make ci`
+_ci-doc-check:
+	$(MAKE) doc-check
+
+# Sequential cargo pipeline for local `make ci`. `_ci-doc-check` is
+# part of the chain (not a parallel sibling) so its `cargo doc` does
+# not race the other cargo invocations on the package cache lock; the
+# GitHub workflow runs `_ci-doc-check` in its own job and so does not
+# enter this serial path.
 _ci-cargo-pipeline:
 	$(MAKE) _ci-clippy
 	$(MAKE) _ci-test
 	$(MAKE) _ci-build
+	$(MAKE) _ci-doc-check
 	$(MAKE) _ci-shellspec
