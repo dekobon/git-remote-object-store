@@ -1074,6 +1074,123 @@ pub fn config_unset(cwd: &Path, key: &str) -> Result<(), GitError> {
     write_atomic(&config_path, &serialized)
 }
 
+/// Idempotent variant of [`config_unset`]: succeeds even when the key is
+/// already absent.
+///
+/// `disable-debug` style operations want "ensure this key is gone" semantics
+/// — re-running on a repo that never had the key set should not fail. This
+/// helper swallows [`GitError::ConfigKeyNotSet`] and propagates every other
+/// error.
+///
+/// # Errors
+///
+/// Returns the same errors as [`config_unset`] except
+/// [`GitError::ConfigKeyNotSet`], which is treated as success.
+pub fn config_unset_if_present(cwd: &Path, key: &str) -> Result<(), GitError> {
+    match config_unset(cwd, key) {
+        Ok(()) | Err(GitError::ConfigKeyNotSet(_)) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Set a single-value entry in the repository's local config, replacing any
+/// existing values for the key.
+///
+/// In-process equivalent of `git config <key> <value>` (without `--add`).
+/// Used by the LFS agent's `install` / `enable-debug` subcommands to provide
+/// idempotent re-installs: re-running with the same `(key, value)` is a
+/// no-op, and re-running after the value changes replaces the old entry
+/// instead of accumulating duplicates.
+///
+/// # Errors
+///
+/// Returns the same errors as [`config_set_many`].
+pub fn config_set(cwd: &Path, key: &str, value: &str) -> Result<(), GitError> {
+    config_set_many(cwd, &[(key, value)])
+}
+
+/// Batched variant of [`config_set`]: applies every `(key, value)` entry to
+/// the local config in a single read / parse / lock / write cycle.
+///
+/// For each entry the helper enforces single-value semantics:
+///
+/// - If the key has exactly one existing value and it already equals
+///   `value`, no change is made for that entry.
+/// - Otherwise, every existing value for the key is removed and a single
+///   `value` is pushed. This cleans up legacy multi-valued state left
+///   behind by older versions that used `--add` semantics here (see #198).
+///
+/// If none of the entries require a change the file is not rewritten, so
+/// re-running install on an already-installed repo touches no bytes.
+///
+/// # Errors
+///
+/// Returns [`GitError::ConfigKeyParse`] for a malformed dotted key,
+/// [`GitError::ConfigInvalidValueName`] if a value name is rejected by
+/// `gix-config`, [`GitError::ConfigInvalidSectionName`] if a section name is
+/// rejected, [`GitError::Discover`] if the repository cannot be located,
+/// [`GitError::ConfigParse`] if the existing config cannot be parsed,
+/// [`GitError::ConfigLock`] if the lock cannot be acquired, or
+/// [`GitError::Io`] for other file I/O failures.
+pub fn config_set_many(cwd: &Path, entries: &[(&str, &str)]) -> Result<(), GitError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let parsed: Vec<(DottedKey<'_>, ValueName<'_>, &str)> = entries
+        .iter()
+        .map(|(key, value)| {
+            let parts = parse_dotted_key(key)?;
+            let value_name = ValueName::try_from(parts.name).map_err(|source| {
+                GitError::ConfigInvalidValueName {
+                    name: parts.name.to_owned(),
+                    source,
+                }
+            })?;
+            Ok::<_, GitError>((parts, value_name, *value))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let config_path = config_path_for_cwd(cwd)?;
+    let bytes = read_or_empty(&config_path)?;
+    let mut file = gix::config::File::from_bytes_no_includes(
+        &bytes,
+        GixConfigMetadata::api(),
+        gix_config_init::Options::default(),
+    )?;
+
+    let mut changed = false;
+    for (parts, value_name, value) in parsed {
+        let subsection = parts.subsection.map(BStr::new);
+        let mut section = file
+            .section_mut_or_create_new(parts.section, subsection)
+            .map_err(|source| GitError::ConfigInvalidSectionName {
+                name: parts.section.to_owned(),
+                source,
+            })?;
+        let existing = section.values(parts.name);
+        // Idempotent path: a single existing entry equal to `value` is the
+        // desired final state — no write needed.
+        if existing.len() == 1 && existing[0].as_ref() == value.as_bytes() {
+            continue;
+        }
+        // Strip legacy duplicates (or a stale single value) and re-push a
+        // single canonical entry. `SectionMut::remove` removes the latest
+        // matching value per call, so loop until exhausted.
+        while section.remove(parts.name).is_some() {}
+        section.push(value_name, Some(BStr::new(value)));
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(());
+    }
+
+    let extra: usize = entries.iter().map(|(k, v)| k.len() + v.len() + 16).sum();
+    let mut serialized = Vec::with_capacity(bytes.len() + extra);
+    file.write_to(&mut serialized).map_err(GitError::Io)?;
+    write_atomic(&config_path, &serialized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1938,6 +2055,197 @@ mod tests {
         );
         let stdout = String::from_utf8(output.stdout).expect("utf8");
         assert_eq!(stdout.trim(), "git-lfs-object-store");
+    }
+
+    // --- config_set / config_set_many / config_unset_if_present ------
+    //
+    // These exercise the idempotency contract used by `lfs::install` and
+    // friends (issues #198, #210): re-running set-style writes must not
+    // accumulate duplicates, and unset-if-present must not error when the
+    // key is already gone.
+
+    #[test]
+    fn config_set_writes_value_when_key_absent() {
+        let (repo, _dir) = empty_repo();
+        let cwd = repo.workdir().expect("workdir");
+        config_set(cwd, "lfs.standalonetransferagent", "git-lfs-object-store").expect("config_set");
+        assert_eq!(
+            config_values(&repo, "lfs.standalonetransferagent"),
+            vec!["git-lfs-object-store".to_owned()],
+        );
+    }
+
+    #[test]
+    fn config_set_is_idempotent_on_matching_value() {
+        // Two back-to-back sets with the same value must leave exactly one
+        // entry — this is the primary regression test for issue #198.
+        let (repo, _dir) = empty_repo();
+        let cwd = repo.workdir().expect("workdir");
+        config_set(cwd, "lfs.standalonetransferagent", "git-lfs-object-store").expect("first");
+        config_set(cwd, "lfs.standalonetransferagent", "git-lfs-object-store").expect("second");
+        assert_eq!(
+            config_values(&repo, "lfs.standalonetransferagent"),
+            vec!["git-lfs-object-store".to_owned()],
+        );
+    }
+
+    #[test]
+    fn config_set_replaces_differing_value() {
+        let (repo, _dir) = empty_repo();
+        let cwd = repo.workdir().expect("workdir");
+        config_set(cwd, "lfs.standalonetransferagent", "old-name").expect("first");
+        config_set(cwd, "lfs.standalonetransferagent", "new-name").expect("second");
+        assert_eq!(
+            config_values(&repo, "lfs.standalonetransferagent"),
+            vec!["new-name".to_owned()],
+        );
+    }
+
+    #[test]
+    fn config_set_collapses_legacy_duplicates() {
+        // Simulate the on-disk state produced by older binaries that used
+        // `--add` semantics for install/enable_debug: two entries for the
+        // same key. `config_set` must collapse them to one canonical value.
+        let (repo, _dir) = empty_repo();
+        let cwd = repo.workdir().expect("workdir");
+        config_add(cwd, "lfs.standalonetransferagent", "git-lfs-object-store").expect("seed 1");
+        config_add(cwd, "lfs.standalonetransferagent", "git-lfs-object-store").expect("seed 2");
+        assert_eq!(
+            config_values(&repo, "lfs.standalonetransferagent").len(),
+            2,
+            "pre-condition: two duplicate entries",
+        );
+        config_set(cwd, "lfs.standalonetransferagent", "git-lfs-object-store").expect("set");
+        assert_eq!(
+            config_values(&repo, "lfs.standalonetransferagent"),
+            vec!["git-lfs-object-store".to_owned()],
+        );
+    }
+
+    #[test]
+    fn config_set_idempotent_call_does_not_rewrite_file() {
+        // Beyond byte-equality of values, the no-op fast path should leave
+        // the file's bytes (and mtime) untouched. Asserting byte-equality
+        // pins the optimization that `config_set_many` returns early when
+        // nothing changed.
+        let (repo, _dir) = empty_repo();
+        let cwd = repo.workdir().expect("workdir");
+        config_set(cwd, "lfs.standalonetransferagent", "git-lfs-object-store").expect("first");
+        let after_first = read_local_config(&repo);
+        config_set(cwd, "lfs.standalonetransferagent", "git-lfs-object-store").expect("second");
+        assert_eq!(read_local_config(&repo), after_first);
+    }
+
+    #[test]
+    fn config_set_many_writes_both_entries() {
+        let (repo, _dir) = empty_repo();
+        let entries: &[(&str, &str)] = &[
+            (
+                "lfs.customtransfer.git-lfs-object-store.path",
+                "git-lfs-object-store",
+            ),
+            ("lfs.standalonetransferagent", "git-lfs-object-store"),
+        ];
+        config_set_many(repo.workdir().expect("workdir"), entries).expect("config_set_many");
+        for (key, value) in entries {
+            assert_eq!(config_values(&repo, key), vec![(*value).to_owned()]);
+        }
+    }
+
+    #[test]
+    fn config_set_many_is_idempotent_across_all_entries() {
+        // Direct simulation of `lfs::install::install` re-runs: the two
+        // keys it writes must both have exactly one entry after two calls.
+        let (repo, _dir) = empty_repo();
+        let cwd = repo.workdir().expect("workdir");
+        let entries: &[(&str, &str)] = &[
+            (
+                "lfs.customtransfer.git-lfs-object-store.path",
+                "git-lfs-object-store",
+            ),
+            ("lfs.standalonetransferagent", "git-lfs-object-store"),
+        ];
+        config_set_many(cwd, entries).expect("first");
+        config_set_many(cwd, entries).expect("second");
+        for (key, value) in entries {
+            assert_eq!(
+                config_values(&repo, key),
+                vec![(*value).to_owned()],
+                "key {key:?} should have a single entry after two set_many calls",
+            );
+        }
+    }
+
+    #[test]
+    fn config_set_many_validates_all_entries_before_writing() {
+        // Same guarantee as `config_add_many`: a malformed key anywhere in
+        // the batch must abort before touching the file, so partial state
+        // never lands on disk.
+        let (repo, _dir) = empty_repo();
+        let cwd = repo.workdir().expect("workdir");
+        let before = read_local_config(&repo);
+        let err = config_set_many(
+            cwd,
+            &[
+                ("lfs.standalonetransferagent", "git-lfs-object-store"),
+                ("nodot", "v"),
+            ],
+        )
+        .expect_err("expected parse failure on second entry");
+        assert!(matches!(err, GitError::ConfigKeyParse(_)), "got {err:?}");
+        assert_eq!(read_local_config(&repo), before);
+        assert!(
+            config_values(&repo, "lfs.standalonetransferagent").is_empty(),
+            "first entry should not have been written",
+        );
+    }
+
+    #[test]
+    fn config_set_many_empty_input_is_noop() {
+        let (repo, _dir) = empty_repo();
+        let cwd = repo.workdir().expect("workdir");
+        let before = read_local_config(&repo);
+        config_set_many(cwd, &[]).expect("noop");
+        assert_eq!(read_local_config(&repo), before);
+    }
+
+    #[test]
+    fn config_unset_if_present_removes_existing_value() {
+        let (repo, _dir) = empty_repo();
+        let cwd = repo.workdir().expect("workdir");
+        config_add(cwd, "lfs.customtransfer.git-lfs-object-store.args", "debug").expect("seed");
+        config_unset_if_present(cwd, "lfs.customtransfer.git-lfs-object-store.args")
+            .expect("unset");
+        assert!(config_values(&repo, "lfs.customtransfer.git-lfs-object-store.args").is_empty(),);
+    }
+
+    #[test]
+    fn config_unset_if_present_succeeds_when_key_absent() {
+        // Issue #210: `disable-debug` re-runs must not error. The helper
+        // swallows ConfigKeyNotSet for both the "section missing" and
+        // "value missing within existing section" cases.
+        let (repo, _dir) = empty_repo();
+        let cwd = repo.workdir().expect("workdir");
+        // Section missing entirely.
+        config_unset_if_present(cwd, "lfs.never.set").expect("missing section is ok");
+        // Section exists but the value doesn't.
+        config_add(cwd, "lfs.standalonetransferagent", "git-lfs-object-store").expect("seed");
+        config_unset_if_present(cwd, "lfs.othervalue").expect("missing value is ok");
+        // The seeded value is still present.
+        assert_eq!(
+            config_values(&repo, "lfs.standalonetransferagent"),
+            vec!["git-lfs-object-store".to_owned()],
+        );
+    }
+
+    #[test]
+    fn config_unset_if_present_propagates_non_keynotset_errors() {
+        // Malformed key must still surface as a parse error rather than
+        // being silently swallowed alongside ConfigKeyNotSet.
+        let (repo, _dir) = empty_repo();
+        let err = config_unset_if_present(repo.workdir().expect("workdir"), "")
+            .expect_err("expected parse error");
+        assert!(matches!(err, GitError::ConfigKeyParse(_)), "got {err:?}");
     }
 
     // --- shallow_boundaries / write_shallow_file ----------------------
