@@ -33,11 +33,14 @@ use gix_hash::ObjectId;
 use thiserror::Error;
 use tracing::debug;
 
-/// SHA-1 commit OID, displayed as 40 lowercase hex characters.
+/// SHA-1 object OID, displayed as 40 lowercase hex characters.
 ///
 /// Wraps [`gix_hash::ObjectId`] to make the wire-format invariant —
 /// lowercase-hex bundle filenames on the bucket — a type-system
-/// property.
+/// property. The wrapper is agnostic to object kind: instances may
+/// hold the OID of a commit, annotated tag, tree, or blob. Callers
+/// that require a commit specifically must peel via
+/// [`peel_tag_chain`] and match on [`PeeledTip`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Sha(ObjectId);
 

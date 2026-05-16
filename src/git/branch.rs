@@ -10,7 +10,12 @@ use gix::bstr::BStr;
 use super::{GitError, Sha};
 
 /// Resolve a rev-spec (a ref name, full or short SHA, `HEAD~n`, etc.)
-/// to the canonical 40-hex commit OID it points at.
+/// to the OID of whatever object it points at — commit, annotated tag,
+/// tree, or blob. The returned [`Sha`] is the object's own OID, not the
+/// commit reached after peeling tags. Callers that need to traverse an
+/// annotated-tag chain (the common case for refs that may point at
+/// `tag` objects) must invoke [`peel_tag_chain`][crate::git::peel_tag_chain]
+/// on the result.
 ///
 /// # Errors
 ///
