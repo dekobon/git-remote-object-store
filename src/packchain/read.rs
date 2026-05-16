@@ -1023,6 +1023,16 @@ fn apply_delta(base: &ResolvedObject, delta: &[u8]) -> Result<ResolvedObject, Pa
         } else {
             apply_delta_insert_op(op, delta, &mut cursor, &mut out)?;
         }
+        // Bound per-op growth so a malicious delta cannot grow `out`
+        // without limit between the dst_size header check and the
+        // post-loop equality check. Mirrors git's `patch-delta.c`
+        // `size -= cp_size` invariant (any op that would push past
+        // the announced destination size is rejected immediately).
+        if out.len() > dst_size_usize {
+            return Err(PackchainError::MalformedDelta {
+                reason: "produced object exceeds announced destination size",
+            });
+        }
     }
     if out.len() as u64 != dst_size {
         return Err(PackchainError::MalformedDelta {
@@ -1613,6 +1623,84 @@ mod tests {
             matches!(err, PackchainError::MalformedDelta { reason } if reason.contains("destination size")),
             "expected MalformedDelta undershoot error, got {err:?}",
         );
+    }
+
+    #[test]
+    fn apply_delta_rejects_overshoot() {
+        // Delta announces dst_size=4 but emits 8 bytes via a single
+        // copy op. Without the per-op bound, `out` would grow past
+        // the announced size and only get caught by the post-loop
+        // equality check — a malicious delta with a multi-TiB total
+        // could OOM the helper before reaching that point. The
+        // per-op bound must reject as soon as `out.len()` exceeds
+        // `dst_size_usize`.
+        let base = base_blob(b"abcdefgh");
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&varint(8)); // src_size
+        delta.extend_from_slice(&varint(4)); // dst_size — under-claim
+        // Copy 8 bytes from offset 0 (overshoots dst_size).
+        delta.push(0b1001_0001);
+        delta.push(0);
+        delta.push(8);
+        let err = apply_delta(&base, &delta).expect_err("overshoot must fail");
+        assert!(
+            matches!(
+                err,
+                PackchainError::MalformedDelta {
+                    reason: "produced object exceeds announced destination size"
+                }
+            ),
+            "expected MalformedDelta overshoot error, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn apply_delta_overshoot_check_fires_after_single_default_size_copy() {
+        // Aggressive variant: small base (1 byte, repeated 16 times so
+        // copy size 0x1_0000 stays in-bounds against the base), and a
+        // copy opcode with size operand bits cleared so it falls back
+        // to GIT_DELTA_DEFAULT_COPY_SIZE (0x1_0000 = 64 KiB). A single
+        // op therefore emits 64 KiB, which must trip the per-op bound
+        // when dst_size is set to 4. This proves the check fires
+        // after the FIRST op, not just at end-of-loop — a chain of
+        // such ops in a real attack would otherwise blow through
+        // memory before the post-loop check ever ran.
+        // Heap allocation avoids large_stack_arrays clippy lint (16 KiB cap).
+        let base_payload = vec![b'x'; 0x1_0000];
+        let base = base_blob(&base_payload);
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&varint(0x1_0000)); // src_size matches base
+        delta.extend_from_slice(&varint(4)); // dst_size — tiny
+        // Copy opcode: MSB=1, bit0 set (1 byte of offset follows),
+        // size bits (4..6) cleared so default 0x1_0000 substitutes.
+        delta.push(0b1000_0001);
+        delta.push(0); // offset = 0
+        let err = apply_delta(&base, &delta).expect_err("default-size overshoot must fail");
+        assert!(
+            matches!(
+                err,
+                PackchainError::MalformedDelta {
+                    reason: "produced object exceeds announced destination size"
+                }
+            ),
+            "expected MalformedDelta overshoot error after first op, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn apply_delta_exact_match_does_not_trip_overshoot_check() {
+        // Boundary: a delta that exactly fills dst_size must succeed.
+        // The per-op bound rejects only `>`, never `==`, so an exact
+        // match flows through to the post-loop equality check.
+        let base = base_blob(b"abcd");
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&varint(4));
+        delta.extend_from_slice(&varint(4));
+        delta.push(0b1001_0001);
+        delta.push(0);
+        delta.push(4);
+        let out = apply_delta(&base, &delta).expect("exact-match delta applies");
+        assert_eq!(out.payload, b"abcd");
     }
 
     // --- delta-depth guard (issue #83) -------------------------------------
