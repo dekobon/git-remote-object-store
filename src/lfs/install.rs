@@ -17,9 +17,19 @@ use crate::git::{self, GitError};
 /// the binary name (`git-lfs-object-store`).
 pub const AGENT_NAME: &str = "git-lfs-object-store";
 
-const KEY_PATH: &str = "lfs.customtransfer.git-lfs-object-store.path";
-const KEY_ARGS: &str = "lfs.customtransfer.git-lfs-object-store.args";
 const KEY_STANDALONE: &str = "lfs.standalonetransferagent";
+
+/// `lfs.customtransfer.<AGENT_NAME>.path` — built from [`AGENT_NAME`]
+/// rather than duplicated as a literal so renaming the agent cannot
+/// silently break LFS routing (issue #190).
+fn key_path() -> String {
+    format!("lfs.customtransfer.{AGENT_NAME}.path")
+}
+
+/// `lfs.customtransfer.<AGENT_NAME>.args` — see [`key_path`].
+fn key_args() -> String {
+    format!("lfs.customtransfer.{AGENT_NAME}.args")
+}
 
 /// Errors surfaced by the install / debug-toggle subcommands.
 #[derive(Debug, Error)]
@@ -32,15 +42,21 @@ pub enum InstallError {
 /// Register the agent with `git lfs` in the repository at `cwd`.
 ///
 /// Two writes, batched into a single read / parse / lock / write cycle:
-/// - `lfs.customtransfer.git-lfs-object-store.path` → the binary name.
-/// - `lfs.standalonetransferagent` → `git-lfs-object-store`, telling
-///   LFS to bypass the HTTP transfer queue and call us directly.
+/// - `lfs.customtransfer.<AGENT_NAME>.path` → the binary name.
+/// - `lfs.standalonetransferagent` → [`AGENT_NAME`], telling LFS to
+///   bypass the HTTP transfer queue and call us directly.
 ///
 /// # Errors
 ///
 /// Returns [`InstallError::Git`] if writing the config entries fails.
 pub fn install(cwd: &Path) -> Result<(), InstallError> {
-    git::config_add_many(cwd, &[(KEY_PATH, AGENT_NAME), (KEY_STANDALONE, AGENT_NAME)])?;
+    git::config_add_many(
+        cwd,
+        &[
+            (key_path().as_str(), AGENT_NAME),
+            (KEY_STANDALONE, AGENT_NAME),
+        ],
+    )?;
     Ok(())
 }
 
@@ -52,7 +68,7 @@ pub fn install(cwd: &Path) -> Result<(), InstallError> {
 ///
 /// Returns [`InstallError::Git`] if writing the config entry fails.
 pub fn enable_debug(cwd: &Path) -> Result<(), InstallError> {
-    git::config_add(cwd, KEY_ARGS, "debug")?;
+    git::config_add(cwd, &key_args(), "debug")?;
     Ok(())
 }
 
@@ -65,6 +81,43 @@ pub fn enable_debug(cwd: &Path) -> Result<(), InstallError> {
 /// [`crate::git::GitError::ConfigKeyNotSet`] when the args key is absent;
 /// callers that want idempotent behaviour should match on that inner variant.
 pub fn disable_debug(cwd: &Path) -> Result<(), InstallError> {
-    git::config_unset(cwd, KEY_ARGS)?;
+    git::config_unset(cwd, &key_args())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AGENT_NAME, key_args, key_path};
+
+    // Drift between `AGENT_NAME` and the config keys is what issue #190
+    // is about — `git lfs` looks up the agent by exact string match on
+    // the subsection, so a mismatch silently sends LFS traffic to the
+    // HTTPS transfer queue instead of the helper. `format!` already
+    // makes drift impossible at compile time; these tests pin the
+    // resulting shape so a future refactor cannot quietly change it.
+    #[test]
+    fn key_path_embeds_agent_name() {
+        assert!(
+            key_path().contains(AGENT_NAME),
+            "key_path() = {:?} must contain AGENT_NAME = {:?}",
+            key_path(),
+            AGENT_NAME,
+        );
+    }
+
+    #[test]
+    fn key_args_embeds_agent_name() {
+        assert!(
+            key_args().contains(AGENT_NAME),
+            "key_args() = {:?} must contain AGENT_NAME = {:?}",
+            key_args(),
+            AGENT_NAME,
+        );
+    }
+
+    #[test]
+    fn key_shapes_match_lfs_customtransfer_namespace() {
+        assert_eq!(key_path(), format!("lfs.customtransfer.{AGENT_NAME}.path"));
+        assert_eq!(key_args(), format!("lfs.customtransfer.{AGENT_NAME}.args"));
+    }
 }
