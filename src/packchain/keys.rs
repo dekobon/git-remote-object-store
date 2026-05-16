@@ -24,17 +24,17 @@ use std::fmt;
 use super::PackchainError;
 use super::schema::{ChainSegment, Sha40};
 
-/// Suffix bytes that mark a [`chain_key`] in a listing. Defined
-/// once so `gc::list_referenced_packs` and `list::list_refs` can't
-/// drift apart.
-pub(crate) const CHAIN_JSON_SUFFIX: &[u8] = b"/chain.json";
+/// Suffix that marks a [`chain_key`] in a listing. Defined once so
+/// `gc::list_referenced_packs`, `list::list_refs`, and
+/// [`ref_path_from_chain_key`] can't drift apart.
+pub(crate) const CHAIN_JSON_SUFFIX: &str = "/chain.json";
 
 /// Returns `true` when `key` ends with [`CHAIN_JSON_SUFFIX`] —
 /// i.e. it is a chain manifest key, not a sibling
 /// `path-index.json` / `<sha>.bundle` under the same ref directory.
 #[must_use]
 pub(crate) fn is_chain_json_key(key: &str) -> bool {
-    key.as_bytes().ends_with(CHAIN_JSON_SUFFIX)
+    key.ends_with(CHAIN_JSON_SUFFIX)
 }
 
 /// Compose the full bucket key for a chain segment's pack from the
@@ -57,7 +57,7 @@ pub(crate) fn pack_key_from_relative(prefix: Option<&str>, bucket_relative_pack:
 /// `audit::load_chains` can't drift apart.
 #[must_use]
 pub(crate) fn ref_path_from_chain_key(prefix: Option<&str>, key: &str) -> Option<String> {
-    let without_suffix = key.strip_suffix("/chain.json")?;
+    let without_suffix = key.strip_suffix(CHAIN_JSON_SUFFIX)?;
     match prefix {
         None | Some("") => Some(without_suffix.to_owned()),
         Some(p) => without_suffix

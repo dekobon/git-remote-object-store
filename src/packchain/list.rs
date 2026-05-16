@@ -686,7 +686,7 @@ mod tests {
         // chain.json sitting alongside `path-index.json` and
         // `<sha>.bundle` keys under the same `refs/heads/<branch>/`
         // directory (Phase 2 push writes all three). The
-        // `ends_with(b"/chain.json")` filter must skip the siblings.
+        // `ends_with("/chain.json")` filter must skip the siblings.
         // A regression that broadened the filter (e.g. to
         // `.json`) would parse `path-index.json` as `ChainManifest`
         // and warn-and-skip silently — still passing this test only
