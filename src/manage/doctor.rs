@@ -622,7 +622,19 @@ impl<'a> Doctor<'a> {
 /// `delete_stale_lock_if_still_stale` re-derives staleness from a
 /// fresh HEAD before any destructive action.
 fn scan_stale_locks(objects: &[ObjectMeta], ttl: Duration) -> Vec<(&str, Duration)> {
-    let now = OffsetDateTime::now_utc();
+    scan_stale_locks_at(OffsetDateTime::now_utc(), objects, ttl)
+}
+
+/// Same as [`scan_stale_locks`] but with `now` injected so tests can pin
+/// the `age > ttl` strict-inequality boundary deterministically. The
+/// wall-clock `OffsetDateTime::now_utc()` ticks between any two
+/// instructions, so a test that constructs `last_modified = now - ttl`
+/// cannot observe `age == ttl` without controlling `now`.
+fn scan_stale_locks_at(
+    now: OffsetDateTime,
+    objects: &[ObjectMeta],
+    ttl: Duration,
+) -> Vec<(&str, Duration)> {
     objects
         .iter()
         .filter(|o| super::is_lock_key(&o.key))
@@ -3242,6 +3254,93 @@ mod tests {
                 "myrepo/refs/heads/feature/LOCK#.lock",
             ],
             "TTL=0 must flag every lock with a positive age as stale",
+        );
+    }
+
+    /// Pin the strict-greater-than comparison `age > ttl` in
+    /// `scan_stale_locks` at the equality boundary. A regression that
+    /// loosened it to `age >= ttl` would silently flag locks whose age
+    /// exactly equals the operator's TTL — a stricter staleness
+    /// threshold than the documented "older than" semantics.
+    ///
+    /// Constructs the boundary case via `scan_stale_locks_at`: a lock
+    /// whose `last_modified` is exactly `ttl` before the injected
+    /// `now`, so `age == ttl`. Wall-clock `OffsetDateTime::now_utc()`
+    /// ticks between any two instructions, so reaching `age == ttl`
+    /// deterministically requires the `_at` helper — see its doc.
+    #[tokio::test]
+    async fn scan_stale_locks_treats_age_equal_to_ttl_as_fresh() {
+        let now = OffsetDateTime::now_utc();
+        let ttl = Duration::from_mins(1);
+        let listing = [ObjectMeta {
+            key: "myrepo/refs/heads/main/LOCK#.lock".to_owned(),
+            size: 0,
+            last_modified: now - time::Duration::minutes(1),
+            etag: None,
+        }];
+        let stale = scan_stale_locks_at(now, &listing, ttl);
+        assert!(
+            stale.is_empty(),
+            "lock with age == ttl must NOT be flagged (contract is `age > ttl`, \
+             not `>=`); a regression to `>=` would flag this lock: {stale:?}",
+        );
+    }
+
+    /// Full-pipeline pin for the `--lock-ttl-seconds 0 --delete-stale-locks`
+    /// operator contract: a freshly-PUT lock (RECENT `last_modified`)
+    /// MUST be deleted when `lock_ttl_seconds: Some(0)` is set.
+    ///
+    /// Wires the regression-prone path end-to-end inside `cargo test`:
+    /// `DoctorOpts { lock_ttl_seconds: Some(0), delete_stale_locks: true }`
+    /// → `Doctor::resolved_lock_ttl_seconds()` → `scan_stale_locks` →
+    /// per-key re-HEAD → `store.delete`. The previous regression
+    /// (#208 narrowed, 7dfa5dc) clamped `Some(0)` to env-or-default
+    /// at the resolver boundary, so the freshly-PUT lock looked
+    /// non-stale (age < 60s) and survived. The unit test
+    /// `resolved_lock_ttl_honors_env_explicit_and_zero` covers the
+    /// resolver in isolation; this test pins the same contract at the
+    /// orchestration boundary that lives shellspec exercises (lesson 15
+    /// — the in-tree analog of the live `doctor --delete-stale-locks`
+    /// test that originally caught the regression).
+    #[tokio::test]
+    async fn doctor_with_explicit_zero_lock_ttl_deletes_fresh_lock() {
+        let mock = MockStore::new();
+        let lock_key = "myrepo/refs/heads/main/LOCK#.lock";
+        // Fresh lock — `last_modified` defaults to `OffsetDateTime::now_utc()`
+        // inside the mock, so the lock's age is essentially zero. With
+        // the project default TTL (60s), this lock is NOT stale; with
+        // an operator-explicit `--lock-ttl-seconds 0`, it IS stale.
+        mock.insert(lock_key, Bytes::new());
+        let synthetic_listing = vec![ObjectMeta {
+            key: lock_key.to_owned(),
+            size: 0,
+            last_modified: OffsetDateTime::now_utc(),
+            etag: None,
+        }];
+
+        let opts = DoctorOpts {
+            lock_ttl_seconds: Some(0),
+            delete_stale_locks: true,
+            ..DoctorOpts::default()
+        };
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", opts, &prompter);
+        let mut out = Vec::new();
+        doctor
+            .list_and_handle_stale_locks(&mut out, &synthetic_listing)
+            .await
+            .expect("stale-lock handler");
+        let captured = String::from_utf8(out).expect("utf-8 output");
+
+        assert!(
+            !mock.contains(lock_key),
+            "explicit --lock-ttl-seconds 0 must evict the fresh lock; \
+             a regression that clamped Some(0) to env-or-default would \
+             leave the lock in place. Captured output: {captured:?}",
+        );
+        assert!(
+            captured.contains(&format!("Deleted {lock_key}")),
+            "per-key deletion line missing from operator output: {captured:?}",
         );
     }
 }

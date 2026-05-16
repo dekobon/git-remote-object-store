@@ -2751,7 +2751,31 @@ mod tests {
                 remote_ref: "refs/heads/main".into()
             }
         );
-        assert!(!store.contains(&format!("repo/refs/heads/main/{SHA}.bundle")));
+        // Prefix-empty oracle (lesson 15): no key survives under the ref
+        // prefix after a successful delete. Stronger than `!contains(bundle)`
+        // because a regression that wrote a tombstone or other residue
+        // (e.g. a re-introduction of c5468b4's bundle-engine tombstone)
+        // would also trip it.
+        let remaining: Vec<_> = store
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with("repo/refs/heads/main/"))
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "ref prefix must be empty after delete: {remaining:?}",
+        );
+        // Bundle-engine delete must not write a tombstone — tombstoning
+        // is a packchain-only deferral (#143, #203).
+        let gc_keys: Vec<_> = store
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with("repo/gc/"))
+            .collect();
+        assert!(
+            gc_keys.is_empty(),
+            "bundle-engine delete must not write a tombstone: {gc_keys:?}",
+        );
     }
 
     #[tokio::test]

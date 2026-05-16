@@ -20,6 +20,30 @@ use common::{
     s3_url_with_zip,
 };
 
+/// Assert that a bundle-engine delete left no residue: no keys under the
+/// ref prefix (bundle + lock both gone) and no baseline tombstone under
+/// `<prefix>/gc/` (tombstoning is a packchain-only deferral, #143/#203).
+/// Stronger than `!contains(<specific key>)` because a regression that
+/// left a tombstone or any other residue under the ref prefix (#205,
+/// c5468b4-shape) would slip past a key-specific check. See lesson 15
+/// in `docs/development/lessons_learned.md`.
+async fn assert_bundle_engine_delete_swept_clean(store: &MockStore, prefix: &str, ref_path: &str) {
+    let ref_prefix = format!("{prefix}/{ref_path}/");
+    let remaining = store.list(&ref_prefix).await.unwrap();
+    assert!(
+        remaining.is_empty(),
+        "ref prefix {ref_prefix:?} must be empty after delete: {:?}",
+        remaining.iter().map(|m| &m.key).collect::<Vec<_>>(),
+    );
+    let gc_prefix = format!("{prefix}/gc/");
+    let gc_keys = store.list(&gc_prefix).await.unwrap();
+    assert!(
+        gc_keys.is_empty(),
+        "bundle-engine delete must not write a tombstone under {gc_prefix:?}: {:?}",
+        gc_keys.iter().map(|m| &m.key).collect::<Vec<_>>(),
+    );
+}
+
 #[tokio::test]
 async fn push_to_empty_remote_uploads_bundle_and_seeds_head() {
     if !git_available() {
@@ -427,7 +451,7 @@ async fn delete_remote_ref_removes_single_bundle() {
     .await;
     result.expect("delete should succeed");
     assert_eq!(std::str::from_utf8(&out).unwrap(), "ok refs/heads/main\n\n");
-    assert!(!store.contains(&format!("repo/refs/heads/main/{}.bundle", &shas[0])));
+    assert_bundle_engine_delete_swept_clean(&store, "repo", "refs/heads/main").await;
 }
 
 #[tokio::test]
@@ -577,6 +601,14 @@ async fn delete_with_held_lock_returns_contention_error() {
 /// a concurrent writer) can't directly observe. Pairing this with
 /// `delete_with_held_lock_returns_contention_error` covers both
 /// halves of the contract.
+///
+/// The lock-release half of the contract is checked by the shared
+/// `assert_bundle_engine_delete_swept_clean` helper: any lingering
+/// `LOCK#.lock` under the ref prefix would trip its prefix-empty
+/// assertion. Keeping the helper call instead of an explicit lock-key
+/// check avoids the lockstep-with-code coupling lesson 15 warns
+/// against — the operator-visible contract is "nothing survives under
+/// the ref prefix", which doesn't move with internal refactors.
 #[tokio::test]
 async fn delete_acquires_and_releases_per_ref_lock() {
     if !git_available() {
@@ -600,14 +632,7 @@ async fn delete_acquires_and_releases_per_ref_lock() {
     result.expect("delete should succeed");
     let text = std::str::from_utf8(&out).unwrap();
     assert_eq!(text, "ok refs/heads/main\n\n");
-    assert!(
-        !store.contains(&format!("repo/refs/heads/main/{}.bundle", &shas[0])),
-        "bundle must be swept under the lock",
-    );
-    assert!(
-        !store.contains("repo/refs/heads/main/LOCK#.lock"),
-        "lock must be released after a successful delete",
-    );
+    assert_bundle_engine_delete_swept_clean(&store, "repo", "refs/heads/main").await;
 }
 
 #[tokio::test]
