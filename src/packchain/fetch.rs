@@ -473,9 +473,9 @@ async fn fetch_full(
     if let Some((sha, _bundle_path)) = drained.baseline {
         // _bundle_path is rooted in `temp_path`; tempdir cleanup drops
         // the file after this scope. `git::unbundle_at` clones cwd /
-        // folder / ref_name internally before its spawn_blocking, so
-        // there's no need to pre-own them here.
-        git::unbundle_at(repo_dir, temp_path, sha, ref_name).await?;
+        // folder internally before its spawn_blocking, so there's no
+        // need to pre-own them here.
+        git::unbundle_at(repo_dir, temp_path, sha).await?;
     }
     for segment in needed.iter().rev() {
         let pack_path = drained.segments.remove(&segment.sha).ok_or_else(|| {
@@ -648,7 +648,7 @@ async fn fetch_shallow(
         let key = keys::bundle_key(prefix, ref_name, baseline_sha);
         let dest = temp_path.join(format!("{baseline_sha}.bundle"));
         download_baseline(store, &key, &dest).await?;
-        git::unbundle_at(repo_dir, temp_path, baseline_sha, ref_name).await?;
+        git::unbundle_at(repo_dir, temp_path, baseline_sha).await?;
     }
     Ok(())
 }

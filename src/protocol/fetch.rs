@@ -294,7 +294,7 @@ async fn fetch_one(ctx: FetchOneCtx<'_>) -> Result<(), FetchError> {
         store
             .get_to_file(&key, &bundle_path, GetOpts::default())
             .await?;
-        git::unbundle_at(repo_dir, temp_dir.path(), sha, ref_name).await?;
+        git::unbundle_at(repo_dir, temp_dir.path(), sha).await?;
         fetched_refs.insert(sha);
     }
 

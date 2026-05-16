@@ -21,7 +21,7 @@ use gix_pack::data::output::{count, entry};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-use crate::git::{PeeledTip, RefName, Sha};
+use crate::git::{PeeledTip, Sha};
 
 /// First line of every git bundle v2 file.
 const BUNDLE_V2_MAGIC: &str = "# v2 git bundle";
@@ -354,12 +354,7 @@ fn write_bundle_header<W: Write>(
 /// Objects become immediately available via gix's dynamic store. No ref is
 /// created — that is the remote-helper protocol's responsibility (confirmed by
 /// the contract documented in [`crate::git::unbundle_at`]).
-pub fn unbundle(
-    cwd: &Path,
-    folder: &Path,
-    sha: Sha,
-    _ref_name: &RefName,
-) -> Result<(), BundleError> {
+pub fn unbundle(cwd: &Path, folder: &Path, sha: Sha) -> Result<(), BundleError> {
     let folder = folder.canonicalize()?;
     let bundle_path = folder.join(format!("{sha}.bundle"));
 
@@ -774,15 +769,11 @@ mod tests {
 
     /// Install a bundle into a fresh repo and return the destination
     /// repo handle (and its tempdir, which keeps the on-disk state alive).
-    fn install_bundle_into_fresh_repo(
-        bundle_path: &Path,
-        sha: Sha,
-        ref_name: &RefName,
-    ) -> (TempDir, gix::Repository) {
+    fn install_bundle_into_fresh_repo(bundle_path: &Path, sha: Sha) -> (TempDir, gix::Repository) {
         let dst = TempDir::new().unwrap();
         gix::init(dst.path()).unwrap();
         let folder = bundle_path.parent().unwrap().to_owned();
-        unbundle(dst.path(), &folder, sha, ref_name).unwrap();
+        unbundle(dst.path(), &folder, sha).unwrap();
         let dst_repo = gix::open(dst.path()).unwrap();
         (dst, dst_repo)
     }
@@ -803,8 +794,7 @@ mod tests {
         let bundle_path =
             create(repo_dir.path(), folder.path(), tag_sha, "refs/tags/v1").expect("create bundle");
 
-        let ref_name = RefName::new("refs/tags/v1").unwrap();
-        let (_dst_dir, dst_repo) = install_bundle_into_fresh_repo(&bundle_path, tag_sha, &ref_name);
+        let (_dst_dir, dst_repo) = install_bundle_into_fresh_repo(&bundle_path, tag_sha);
         let odb = dst_repo.objects.clone().into_inner();
         assert!(
             odb.contains(&tag_oid),
@@ -847,14 +837,7 @@ mod tests {
         // empty-tag-chain code path.
         let dst = TempDir::new().unwrap();
         gix::init(dst.path()).unwrap();
-        let ref_name = RefName::new("refs/heads/main").unwrap();
-        unbundle(
-            dst.path(),
-            folder.path(),
-            Sha::from_object_id(commit),
-            &ref_name,
-        )
-        .unwrap();
+        unbundle(dst.path(), folder.path(), Sha::from_object_id(commit)).unwrap();
         let dst_repo = gix::open(dst.path()).unwrap();
         // Find the installed pack and count its entries.
         let pack_dir = dst_repo.git_dir().join("objects/pack");
@@ -894,8 +877,7 @@ mod tests {
         )
         .expect("blob-tag bundle must build");
 
-        let ref_name = RefName::new("refs/tags/blob-tag").unwrap();
-        let (_dst_dir, dst_repo) = install_bundle_into_fresh_repo(&bundle_path, tag_sha, &ref_name);
+        let (_dst_dir, dst_repo) = install_bundle_into_fresh_repo(&bundle_path, tag_sha);
         let odb = dst_repo.objects.clone().into_inner();
         assert!(odb.contains(&tag_oid), "tag object must land in pack");
         assert!(odb.contains(&blob), "blob target must land in pack");
@@ -967,8 +949,7 @@ mod tests {
         )
         .expect("tree-tag bundle must build");
 
-        let ref_name = RefName::new("refs/tags/tree-tag").unwrap();
-        let (_dst_dir, dst_repo) = install_bundle_into_fresh_repo(&bundle_path, tag_sha, &ref_name);
+        let (_dst_dir, dst_repo) = install_bundle_into_fresh_repo(&bundle_path, tag_sha);
         let odb = dst_repo.objects.clone().into_inner();
         assert!(odb.contains(&tag_oid), "tag must land in pack");
         assert!(odb.contains(&tree_id), "leaf tree must land in pack");

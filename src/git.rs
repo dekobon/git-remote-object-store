@@ -398,13 +398,8 @@ pub async fn bundle_at(
 /// Returns [`GitError::Bundle`] if the bundle file is malformed,
 /// prerequisite objects are missing, or the pack cannot be installed.
 /// Returns [`GitError::Panic`] if the blocking task panics.
-pub async fn unbundle(
-    repo: &Repository,
-    folder: &Path,
-    sha: Sha,
-    ref_name: &RefName,
-) -> Result<(), GitError> {
-    unbundle_at(repo_cwd(repo), folder, sha, ref_name).await
+pub async fn unbundle(repo: &Repository, folder: &Path, sha: Sha) -> Result<(), GitError> {
+    unbundle_at(repo_cwd(repo), folder, sha).await
 }
 
 /// Path-only variant of [`unbundle`] for callers that cannot hold a
@@ -417,14 +412,9 @@ pub async fn unbundle(
 /// Returns [`GitError::Bundle`] if the bundle file is malformed,
 /// prerequisite objects are missing, or the pack cannot be installed.
 /// Returns [`GitError::Panic`] if the blocking task panics.
-pub async fn unbundle_at(
-    cwd: &Path,
-    folder: &Path,
-    sha: Sha,
-    ref_name: &RefName,
-) -> Result<(), GitError> {
-    let (cwd, folder, ref_name) = (cwd.to_owned(), folder.to_owned(), ref_name.clone());
-    tokio::task::spawn_blocking(move || crate::bundle::unbundle(&cwd, &folder, sha, &ref_name))
+pub async fn unbundle_at(cwd: &Path, folder: &Path, sha: Sha) -> Result<(), GitError> {
+    let (cwd, folder) = (cwd.to_owned(), folder.to_owned());
+    tokio::task::spawn_blocking(move || crate::bundle::unbundle(&cwd, &folder, sha))
         .await?
         .map_err(|e| GitError::Bundle(Box::new(e)))
 }
@@ -2204,7 +2194,7 @@ mod tests {
         assert_eq!(first_line, "# v2 git bundle", "bundle magic mismatch");
 
         let (dst_repo, _dst_dir) = empty_repo();
-        unbundle(&dst_repo, bundles.path(), sha, &ref_name)
+        unbundle(&dst_repo, bundles.path(), sha)
             .await
             .expect("unbundle");
         // `unbundle` copies pack objects into the destination ODB but does
@@ -2255,7 +2245,7 @@ mod tests {
             .expect("bundle");
 
         let (dst_repo, _dst_dir) = empty_repo();
-        unbundle(&dst_repo, bundles.path(), sha, &ref_name)
+        unbundle(&dst_repo, bundles.path(), sha)
             .await
             .expect("unbundle");
 
@@ -2305,13 +2295,13 @@ mod tests {
 
         let (dst_repo, _dst_dir) = empty_repo();
 
-        unbundle(&dst_repo, bundles.path(), sha, &ref_name)
+        unbundle(&dst_repo, bundles.path(), sha)
             .await
             .expect("first unbundle");
 
         // Second unbundle of the same SHA: pack already on disk, so
         // write_to_directory returns keep_path = None. Must still return Ok(()).
-        unbundle(&dst_repo, bundles.path(), sha, &ref_name)
+        unbundle(&dst_repo, bundles.path(), sha)
             .await
             .expect("second unbundle (duplicate install)");
 
@@ -2361,8 +2351,8 @@ mod tests {
         let bundles_path = bundles.path().to_owned();
 
         let (r1, r2) = tokio::join!(
-            unbundle_at(&dst_cwd, &bundles_path, sha, &ref_name),
-            unbundle_at(&dst_cwd, &bundles_path, sha, &ref_name),
+            unbundle_at(&dst_cwd, &bundles_path, sha),
+            unbundle_at(&dst_cwd, &bundles_path, sha),
         );
         assert!(r1.is_ok(), "first concurrent unbundle failed: {r1:?}");
         assert!(r2.is_ok(), "second concurrent unbundle failed: {r2:?}");
@@ -2399,7 +2389,6 @@ mod tests {
         let (src_repo, src_dir) = empty_repo();
         let oid = add_commit(&src_repo, "refs/heads/main", &[], "first");
         let sha = Sha::from_object_id(oid);
-        let ref_name = RefName::new("refs/heads/main").expect("RefName");
 
         let bundles = TempDir::new().expect("tempdir");
         let bundle_path = bundles.path().join(format!("{sha}.bundle"));
@@ -2418,7 +2407,7 @@ mod tests {
         );
 
         let (dst_repo, _dst_dir) = empty_repo();
-        unbundle(&dst_repo, bundles.path(), sha, &ref_name)
+        unbundle(&dst_repo, bundles.path(), sha)
             .await
             .expect("native unbundle of git-created bundle");
 

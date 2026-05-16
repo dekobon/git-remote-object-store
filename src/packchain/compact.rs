@@ -308,7 +308,7 @@ async fn compact_under_lock(
     // from oldest (last in newest-first list) to newest. Mirrors
     // `fetch::fetch_full`'s install order so deltas resolve against
     // already-installed bases.
-    install_chain_into_repo(&repo_dir, &download_dir, &chain, ref_name).await?;
+    install_chain_into_repo(&repo_dir, &download_dir, &chain).await?;
 
     // Build the fresh baseline pack at the current tip. After this
     // returns, `<output_dir>/<content_sha>.{pack,idx}` exist. `tip_sha`
@@ -514,14 +514,13 @@ async fn install_chain_into_repo(
     repo_dir: &Path,
     download_dir: &Path,
     chain: &ChainManifest,
-    ref_name: &RefName,
 ) -> Result<(), PackchainError> {
     // `chain.full_at` has the same Sha40-validated provenance as
     // `chain.tip`; see the matching comment in `compact_under_lock`.
     let baseline_sha =
         Sha::from_hex(chain.full_at.as_str()).expect("Sha40 always parses as a gix Sha");
     // `unbundle_at` resolves the bundle file via `<folder>/<sha>.bundle`.
-    git::unbundle_at(repo_dir, download_dir, baseline_sha, ref_name)
+    git::unbundle_at(repo_dir, download_dir, baseline_sha)
         .await
         .map_err(PackchainError::Git)?;
 
