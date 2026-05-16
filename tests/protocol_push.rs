@@ -406,19 +406,17 @@ async fn zip_variant_uploads_repo_zip_with_metadata() {
 }
 
 #[tokio::test]
-async fn delete_remote_ref_defers_single_bundle_via_tombstone() {
-    // Issue #205: the helper-protocol delete writes a baseline tombstone
-    // and leaves the `<sha>.bundle` in place so a concurrent fetcher
-    // already advertising the SHA can finish its range-GET within the
-    // grace window. `gc sweep` reclaims the bundle after grace expires.
+async fn delete_remote_ref_removes_single_bundle() {
     if !git_available() {
         eprintln!("skipping: git not on PATH");
         return;
     }
     let (seed, shas) = make_seed_repo(1, "primary");
     let store = Arc::new(MockStore::new());
-    let bundle_key = format!("repo/refs/heads/main/{}.bundle", &shas[0]);
-    store.insert(&bundle_key, Bytes::from_static(b"x"));
+    store.insert(
+        format!("repo/refs/heads/main/{}.bundle", &shas[0]),
+        Bytes::from_static(b"x"),
+    );
 
     let (out, result) = drive_in(
         s3_url_with_zip(Some("repo"), false),
@@ -429,22 +427,7 @@ async fn delete_remote_ref_defers_single_bundle_via_tombstone() {
     .await;
     result.expect("delete should succeed");
     assert_eq!(std::str::from_utf8(&out).unwrap(), "ok refs/heads/main\n\n");
-    // Bundle survives (deferred via tombstone).
-    assert!(
-        store.contains(&bundle_key),
-        "baseline bundle must survive synchronous delete (deferred via tombstone)",
-    );
-    // Exactly one tombstone written under `<prefix>/gc/baseline-tomb-*.json`.
-    let tomb_keys: Vec<String> = store
-        .keys()
-        .into_iter()
-        .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
-        .collect();
-    assert_eq!(
-        tomb_keys.len(),
-        1,
-        "exactly one baseline tombstone must exist: {tomb_keys:?}",
-    );
+    assert!(!store.contains(&format!("repo/refs/heads/main/{}.bundle", &shas[0])));
 }
 
 #[tokio::test]
@@ -594,10 +577,6 @@ async fn delete_with_held_lock_returns_contention_error() {
 /// a concurrent writer) can't directly observe. Pairing this with
 /// `delete_with_held_lock_returns_contention_error` covers both
 /// halves of the contract.
-///
-/// Issue #205: the baseline `<sha>.bundle` is deferred via a tombstone
-/// — the lock-release post-condition still holds, but the bundle key
-/// itself survives until `gc sweep` reclaims it after the grace window.
 #[tokio::test]
 async fn delete_acquires_and_releases_per_ref_lock() {
     if !git_available() {
@@ -606,8 +585,10 @@ async fn delete_acquires_and_releases_per_ref_lock() {
     }
     let (seed, shas) = make_seed_repo(1, "primary");
     let store = Arc::new(MockStore::new());
-    let bundle_key = format!("repo/refs/heads/main/{}.bundle", &shas[0]);
-    store.insert(&bundle_key, Bytes::from_static(b"x"));
+    store.insert(
+        format!("repo/refs/heads/main/{}.bundle", &shas[0]),
+        Bytes::from_static(b"x"),
+    );
 
     let (out, result) = drive_in(
         s3_url_with_zip(Some("repo"), false),
@@ -619,22 +600,9 @@ async fn delete_acquires_and_releases_per_ref_lock() {
     result.expect("delete should succeed");
     let text = std::str::from_utf8(&out).unwrap();
     assert_eq!(text, "ok refs/heads/main\n\n");
-    // Issue #205: bundle is deferred via tombstone, not swept inline.
-    // The lock-release contract is independent: the lock is gone, the
-    // bundle remains until grace expires.
     assert!(
-        store.contains(&bundle_key),
-        "baseline bundle must survive synchronous delete (deferred via tombstone)",
-    );
-    let tomb_keys: Vec<String> = store
-        .keys()
-        .into_iter()
-        .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
-        .collect();
-    assert_eq!(
-        tomb_keys.len(),
-        1,
-        "exactly one baseline tombstone must exist: {tomb_keys:?}",
+        !store.contains(&format!("repo/refs/heads/main/{}.bundle", &shas[0])),
+        "bundle must be swept under the lock",
     );
     assert!(
         !store.contains("repo/refs/heads/main/LOCK#.lock"),

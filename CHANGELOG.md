@@ -86,11 +86,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now `Option<u64>` (#185, #189).** `grace_hours`, `gc_grace_hours`,
   and `lock_ttl_seconds` on the public opts structs changed type
   from `u64` to `Option<u64>`. `None` defers to the matching
-  env-var helper (`grace_hours_from_env` / `lock_ttl_from_env`);
-  `Some(0)` is clamped to the env-or-default value at the library
-  boundary so it no longer silently disables locking (#208).
-  Breaking change for any out-of-tree library consumer that
-  constructed these structs by literal.
+  env-var helper (`grace_hours_from_env` / `lock_ttl_from_env`).
+  On `CompactOpts`, `Some(0)` is clamped to the env-or-default
+  value at the library boundary so it no longer silently disables
+  per-ref locking (#208). On `DoctorOpts` the clamp is deliberately
+  NOT applied — doctor only compares lock ages, it never acquires
+  a lock, so `--lock-ttl-seconds 0` is an operator-deliberate
+  "treat every lock as stale" request and is honoured. Breaking
+  change for any out-of-tree library consumer that constructed
+  these structs by literal.
 
 - **`bundle::unbundle` / `git::unbundle` / `git::unbundle_at`
   signature change (#195).** The unused `ref_name: &RefName`
@@ -190,16 +194,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is the only env var that affects startup level. Matches the
   documented policy in `docs/environment-variables.md`.
 
-- **Helper-protocol delete no longer races concurrent fetch
-  (#203, #205).** The bundle-engine and packchain-engine
-  helper-protocol delete paths (`git push :refs/heads/foo`) now
-  write a baseline tombstone via `write_baseline_tombstone_*`
-  before sweeping per-ref artefacts, deferring the bundle
-  delete to `gc sweep`. Mirrors the existing pattern from #134
-  (compact/force-push), #143 (delete-branch), and #157
-  (bundle force-push). A fetcher that resolves the bundle SHA
-  before the delete now still finds the bundle on the bucket
-  through the grace window.
+- **Packchain helper-protocol delete no longer races concurrent
+  fetch (#203).** The packchain-engine helper-protocol delete path
+  (`git push :refs/heads/foo` on a packchain remote) now writes a
+  baseline tombstone before sweeping per-ref artefacts, deferring
+  the `<full_at>.bundle` delete to `gc sweep`. Mirrors the existing
+  pattern from #134 (compact/force-push), #143 (delete-branch on
+  packchain refs), and #157 (bundle force-push). A fetcher that
+  resolved the bundle SHA from a stale `chain.json` before the
+  delete now still finds the bundle on the bucket through the
+  grace window. Bundle-engine deletes (helper-protocol or `git-remote-object-store
+  delete-branch`) remain synchronous: there is no chain reference
+  to orphan, and operators rely on `git push :ref` to remove the
+  bundle promptly.
 
 - **Surface non-UTF-8 Azure credential env vars (#218).**
   `resolve_alias` in `src/object_store/azure/auth.rs` now

@@ -38,7 +38,7 @@ use super::DEFAULT_LOCK_TTL_SECONDS;
 use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
 use crate::packchain::audit::{self, AuditReport, BranchRow};
-use crate::protocol::push::resolve_lock_ttl_seconds;
+use crate::protocol::push::lock_ttl_from_env_seconds;
 use crate::url::StorageEngine;
 
 /// Tunables for [`Doctor::run`].
@@ -48,13 +48,17 @@ pub struct DoctorOpts {
     /// outright. When `false` (default), they are quarantined to a
     /// fresh `<ref>_<uuid8>` ref so a human can recover them later.
     pub delete_bundle: bool,
-    /// Locks older than this TTL are considered stale. `None` *or*
-    /// `Some(0)` falls back to [`crate::protocol::push::lock_ttl_from_env`]
-    /// which honours `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`
-    /// (defaulting to [`DEFAULT_LOCK_TTL_SECONDS`] when unset). The zero
-    /// case is clamped because a zero TTL would make every live lock
-    /// appear stale, letting `doctor --delete-stale-locks` evict a
-    /// concurrent pusher's lock (issue #208).
+    /// Locks older than this TTL are considered stale. `None` falls
+    /// back to [`crate::protocol::push::lock_ttl_from_env`] which
+    /// honours `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` (defaulting
+    /// to [`DEFAULT_LOCK_TTL_SECONDS`] when unset). An explicit
+    /// `Some(n)` — including `Some(0)` — passes through unchanged:
+    /// `doctor` only compares lock ages, it never acquires a lock, so
+    /// `--lock-ttl-seconds 0` is a deliberate "treat every lock as
+    /// stale" request rather than a footgun. The push and compact
+    /// paths, which DO acquire locks, route through
+    /// [`crate::protocol::push::resolve_lock_ttl_seconds`] for the
+    /// zero-clamp that protects them.
     pub lock_ttl_seconds: Option<u64>,
     /// When `true`, scanned stale locks are deleted; otherwise, the
     /// doctor only reports them and recommends re-running with the
@@ -105,19 +109,21 @@ impl<'a> Doctor<'a> {
         }
     }
 
-    /// Resolve the stale-lock TTL in seconds. Mirrors
-    /// [`crate::manage::compact::Compact`]: routes the operator's
-    /// `Option<u64>` through
-    /// [`crate::protocol::push::resolve_lock_ttl_seconds`] so a `None`
-    /// *or* explicit `Some(0)` falls back to
+    /// Resolve the stale-lock TTL in seconds. `None` defers to
     /// `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` (or
-    /// [`DEFAULT_LOCK_TTL_SECONDS`] when the env var is unset).
-    /// Centralising the resolution keeps the doctor's view of "stale"
-    /// in lockstep with the push-time lock-acquire TTL and protects
-    /// against the issue #208 footgun where `--lock-ttl-seconds 0`
-    /// would treat every live lock as instantly stale.
+    /// [`DEFAULT_LOCK_TTL_SECONDS`] when the env var is unset) via
+    /// [`crate::protocol::push::lock_ttl_from_env`]. An explicit
+    /// `Some(n)` — including `Some(0)` — passes through unchanged:
+    /// `doctor` only compares lock ages, it never acquires a lock,
+    /// so `--lock-ttl-seconds 0` is a deliberate "treat every lock as
+    /// stale" request and is left to the operator's discretion. The
+    /// push/compact paths, which DO acquire locks, route through
+    /// `resolve_lock_ttl_seconds` for the zero-clamp that protects
+    /// them.
     fn resolved_lock_ttl_seconds(&self) -> u64 {
-        resolve_lock_ttl_seconds(self.opts.lock_ttl_seconds)
+        self.opts
+            .lock_ttl_seconds
+            .unwrap_or_else(lock_ttl_from_env_seconds)
     }
 
     /// Analyze, report, and fix — writing human-readable output to
@@ -3125,7 +3131,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_lock_ttl_honors_env_explicit_and_zero_clamp() {
+    fn resolved_lock_ttl_honors_env_explicit_and_zero() {
         // The env var is process-global; serialise the read/write/clear
         // dance inside one test to avoid racing parallel test threads
         // inside this module — and acquire the cross-module mutex so we
@@ -3150,8 +3156,7 @@ mod tests {
         }
         assert_eq!(got, 120, "env override must propagate to Doctor default");
 
-        // Unset env falls back to the project default — must not "stale-lock"
-        // every lock instantly nor diverge from push's lock-acquire TTL.
+        // Unset env falls back to the project default.
         assert_eq!(
             doctor.resolved_lock_ttl_seconds(),
             DEFAULT_LOCK_TTL_SECONDS,
@@ -3173,29 +3178,23 @@ mod tests {
         }
         assert_eq!(got_explicit, 7, "explicit opts.lock_ttl_seconds must win");
 
-        // `Some(0)` (issue #208) used to bypass the #112 zero-clamp
-        // because it skipped the `lock_ttl_from_env` fallback entirely.
-        // The fix routes resolution through `resolve_lock_ttl_seconds`,
-        // which collapses `Some(0)` onto the env-or-default path.
-        // Without the clamp, `scan_stale_locks` would treat every live
-        // lock as instantly stale and `--delete-stale-locks` would
-        // evict a concurrent pusher's lock. Keep these assertions in
-        // the same test fn as the env-honouring assertions above so
-        // the process-global `ENV_LOCK_TTL_SECONDS` writes do not race
-        // parallel test threads.
+        // Explicit `Some(0)` is an operator-deliberate "treat every
+        // lock as stale" request. `doctor` only compares ages — it
+        // never acquires a lock — so the zero passes through. The
+        // push/compact paths use `resolve_lock_ttl_seconds` which
+        // applies the zero-clamp; doctor must not.
         let zero_opts = DoctorOpts {
             lock_ttl_seconds: Some(0),
             ..DoctorOpts::default()
         };
         let doctor_zero = Doctor::new(store_arc(&mock), "myrepo", zero_opts, &prompter);
-        // Env is already removed by the cleanup above. With env unset,
-        // `Some(0)` must clamp to the project default.
         assert_eq!(
             doctor_zero.resolved_lock_ttl_seconds(),
-            DEFAULT_LOCK_TTL_SECONDS,
-            "Some(0) must not survive into the engine — would mark every live lock stale",
+            0,
+            "explicit Some(0) must pass through to scan_stale_locks",
         );
-        // With env set, `Some(0)` must honour the operator's override.
+        // Env value is irrelevant when the operator passed an explicit
+        // value — the explicit value wins, including 0.
         unsafe {
             std::env::set_var(ENV_LOCK_TTL_SECONDS, "240");
         }
@@ -3203,6 +3202,46 @@ mod tests {
         unsafe {
             std::env::remove_var(ENV_LOCK_TTL_SECONDS);
         }
-        assert_eq!(got_zero, 240, "Some(0) must defer to the env override");
+        assert_eq!(
+            got_zero, 0,
+            "explicit Some(0) must override the env var (operator opt-in)",
+        );
+    }
+
+    /// Pin the `--lock-ttl-seconds 0` operator contract end-of-pipeline:
+    /// once `resolved_lock_ttl_seconds()` returns `0`, the resulting
+    /// `Duration::ZERO` must flow through `scan_stale_locks` and flag
+    /// every lock as stale. Without this pin, a future regression that
+    /// changed the comparison to `age >= ttl` (or otherwise short-circuited
+    /// on `ttl.is_zero()`) would silently disable the zero-TTL contract
+    /// while `resolved_lock_ttl_honors_env_explicit_and_zero` continued
+    /// to pass on the resolver alone.
+    #[tokio::test]
+    async fn scan_stale_locks_with_zero_ttl_flags_every_lock() {
+        let now = OffsetDateTime::now_utc();
+        let listing = [
+            ObjectMeta {
+                key: "myrepo/refs/heads/main/LOCK#.lock".to_owned(),
+                size: 0,
+                last_modified: now - Duration::from_secs(1),
+                etag: None,
+            },
+            ObjectMeta {
+                key: "myrepo/refs/heads/feature/LOCK#.lock".to_owned(),
+                size: 0,
+                last_modified: now - Duration::from_hours(1),
+                etag: None,
+            },
+        ];
+        let stale = scan_stale_locks(&listing, Duration::ZERO);
+        let keys: Vec<&str> = stale.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "myrepo/refs/heads/main/LOCK#.lock",
+                "myrepo/refs/heads/feature/LOCK#.lock",
+            ],
+            "TTL=0 must flag every lock with a positive age as stale",
+        );
     }
 }
