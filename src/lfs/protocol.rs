@@ -105,8 +105,9 @@ pub(crate) struct CompleteEvent<'a> {
 /// `{code, message}` error object embedded in init / complete events.
 #[derive(Debug, Serialize)]
 pub(crate) struct ErrorPayload<'a> {
-    /// Numeric error code. Mirrors upstream's choice of `2` for
-    /// generic agent errors and `32` for malformed init.
+    /// Numeric error code. See [`crate::lfs::agent::ERR_CODE_GENERIC`]
+    /// (per-event failures) and [`crate::lfs::agent::ERR_CODE_INIT`]
+    /// (init-time failures) for the values used by this crate.
     pub(crate) code: u32,
     /// Human-readable description.
     pub(crate) message: &'a str,

@@ -27,6 +27,13 @@ use crate::object_store::{GetOpts, ObjectStore, ObjectStoreError, ProgressSink, 
 /// the per-event failure path emit the same numeric code.
 pub(crate) const ERR_CODE_GENERIC: u32 = 2;
 
+/// Error code surfaced in the `init` response payload when init
+/// itself fails (empty remote, resolve failure, etc.). Distinct from
+/// [`ERR_CODE_GENERIC`] so the LFS client can tell init-time failures
+/// (the agent never became usable) apart from per-event failures
+/// (the agent works, this object did not).
+pub(crate) const ERR_CODE_INIT: u32 = 32;
+
 /// Driver for a single LFS session against one remote.
 pub(crate) struct Agent {
     store: Arc<dyn ObjectStore>,

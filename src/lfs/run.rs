@@ -15,7 +15,7 @@ use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite};
 use tracing::{debug, error, warn};
 
-use crate::lfs::agent::{self, Agent, AgentError, ERR_CODE_GENERIC};
+use crate::lfs::agent::{self, Agent, AgentError, ERR_CODE_GENERIC, ERR_CODE_INIT};
 use crate::lfs::oid::LfsOid;
 use crate::lfs::protocol::{CompleteEvent, ErrorPayload, Event, InitEvent, InitResponse};
 use crate::object_store::ObjectStore;
@@ -284,7 +284,7 @@ async fn write_init_ack<W: AsyncWrite + Unpin>(
 ) -> Result<(), RunError> {
     let resp = InitResponse {
         error: error_msg.map(|m| ErrorPayload {
-            code: 32,
+            code: ERR_CODE_INIT,
             message: m,
         }),
     };
@@ -404,7 +404,7 @@ mod tests {
         res.expect("init failure is non-fatal");
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("\"error\""));
-        assert!(lines[0].contains("\"code\":32"));
+        assert!(lines[0].contains(&format!("\"code\":{ERR_CODE_INIT}")));
     }
 
     #[tokio::test]
@@ -459,7 +459,7 @@ mod tests {
         res.expect("empty-remote init failure is non-fatal");
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("\"error\""));
-        assert!(lines[0].contains("\"code\":32"));
+        assert!(lines[0].contains(&format!("\"code\":{ERR_CODE_INIT}")));
         assert!(
             lines[0].contains("init.remote is empty"),
             "ack should include the InitError::EmptyRemote message: {}",
