@@ -224,21 +224,23 @@ async fn collect_entries(
             continue;
         }
         // Belt-and-suspenders against bundle-uri wire-format
-        // injection. The line shape is
+        // *and* URL injection. The line shape is
         // `bundle.<id>.<key>=<value>\n`; git's parser splits each
         // line at the first `=`. `RefName::is_valid` (via
         // `gix_validate::reference::name`) already bans `\n`, `\r`,
-        // ` `, `:`, and the rest of `\0-\x1F`, but it permits `=`.
-        // A ref-path containing `=` cannot relocate the URL host —
-        // the `:` ban forecloses scheme injection — but it would
-        // produce a malformed entry that breaks a clone with
-        // `?bundle_uri=1` against a shared-prefix bucket where
-        // another tenant has write access. Reject defensively.
+        // ` `, `:`, and the rest of `\0-\x1F`, but it permits `=`
+        // as well as RFC 3986 reserved bytes that would corrupt
+        // the emitted URL (`#`, `%`, `&`, `;`, `,`, `?`). None of
+        // these can relocate the URL host — the `:` ban forecloses
+        // scheme injection — but each can either break wire framing
+        // or produce a URL the bucket no longer resolves. Reject
+        // defensively. See [`is_safe_for_bundle_uri_emission`] for
+        // the per-byte rationale.
         if !is_safe_for_bundle_uri_emission(&ref_path) {
             warn!(
                 key = %meta.key,
                 ref_path = %ref_path,
-                "bundle-uri: derived ref path contains framing-unsafe bytes; skipping",
+                "bundle-uri: derived ref path contains framing-unsafe or URL-unsafe bytes; skipping",
             );
             continue;
         }
@@ -348,14 +350,44 @@ fn canonical_bundle_url(remote: &RemoteUrl, ref_path: &str, full_at: &str) -> St
 }
 
 /// `true` if `ref_path` is safe to interpolate into the
-/// `bundle.<id>.<key>=<value>\n` wire shape after `RefName::is_valid`
-/// has already accepted it. Specifically, reject `=`: gix-validate
-/// permits it in ref names, but git's `bundle-uri` parser splits at
-/// the first `=` so its presence in the id position breaks framing.
+/// `bundle.<id>.<key>=<value>\n` wire shape, *and* into the URL that
+/// follows the `=`, after `RefName::is_valid` has already accepted it.
+///
+/// Rejected bytes and their reasons:
+///
+/// - `=` — bundle-uri wire framing: git's parser splits each line at
+///   the first `=`, so a ref-name containing `=` corrupts the
+///   `id`/`value` boundary.
+/// - `#` — RFC 3986 fragment delimiter: a URL parser treats everything
+///   after `#` as the fragment and discards it from the path. A
+///   ref-name containing `#` would silently truncate the emitted URL.
+/// - `%` — RFC 3986 percent-encoding sentinel: a literal `%` in the
+///   path may be decoded as `%XX` by URL parsers or re-encoded by
+///   intermediaries (CDNs, proxies), producing a URL the bucket no
+///   longer recognises.
+/// - `&` — RFC 3986 query separator: when the emission path appends a
+///   query string (e.g. presigned URLs), a `&` mid-path is ambiguous
+///   with the query separator and may shift the parsed boundary.
+/// - `;` — RFC 3986 sub-delim historically used as a secondary query
+///   separator by some clients (matrix-URI / cookie / form-encoded).
+/// - `,` — RFC 3986 sub-delim used for matrix parameters; ambiguous
+///   in some URL processors.
+/// - `?` — RFC 3986 query delimiter: would truncate the path and
+///   inject the rest of the ref-name into the query string.
+///
 /// All other framing-relevant bytes (`\n`, `\r`, ` `, `:`,
 /// `\0`-`\x1F`, `\x7F`) are already rejected by gix-validate.
 fn is_safe_for_bundle_uri_emission(ref_path: &str) -> bool {
-    !ref_path.as_bytes().contains(&b'=')
+    // Defense-in-depth: a ref-name containing any of these bytes
+    // would corrupt either the bundle-uri wire framing (the `=`
+    // split) or the emitted URL (RFC 3986 reserved characters).
+    // Rather than percent-encode and risk a double-decode by an
+    // intermediary, follow the existing warn-and-skip pattern.
+    const FRAMING_AND_URL_UNSAFE: &[u8] = b"=#%&;,?";
+    !ref_path
+        .as_bytes()
+        .iter()
+        .any(|b| FRAMING_AND_URL_UNSAFE.contains(b))
 }
 
 /// Render `<scheme>://<host>[:port]` from a parsed [`url::Url`].
@@ -641,8 +673,8 @@ mod tests {
 
     #[test]
     fn is_safe_for_bundle_uri_emission_rejects_equals() {
-        // `=` is the only framing-relevant byte gix-validate
-        // permits. Reject it everywhere it appears in the ref-path.
+        // `=` is the framing-relevant byte gix-validate permits.
+        // Reject it everywhere it appears in the ref-path.
         for path in &[
             "refs/heads/x=y",
             "refs/heads/=",
@@ -653,6 +685,92 @@ mod tests {
             assert!(
                 !is_safe_for_bundle_uri_emission(path),
                 "expected `{path}` to be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn is_safe_for_bundle_uri_emission_rejects_url_reserved_bytes() {
+        // gix-validate permits each of these in ref names, but each
+        // breaks the emitted URL in a different way:
+        //
+        // - `#` → URL fragment delimiter; truncates the path.
+        // - `%` → percent-encoding sentinel; may be re-encoded by
+        //   intermediaries (CDN, proxy) into an unrecognised key.
+        // - `&` → query separator; ambiguous when a query string is
+        //   appended (presigned URLs).
+        // - `;` → historical secondary query separator.
+        // - `,` → matrix-parameter delimiter.
+        // - `?` → query-string delimiter; truncates the path.
+        //
+        // Each byte is covered at three positions (mid-component,
+        // leading, trailing) so a partial-fix that only checks one
+        // position would visibly fail.
+        for unsafe_byte in ['#', '%', '&', ';', ',', '?'] {
+            for path in &[
+                format!("refs/heads/x{unsafe_byte}y"),
+                format!("{unsafe_byte}refs/heads/main"),
+                format!("refs/heads/main{unsafe_byte}"),
+            ] {
+                assert!(
+                    !is_safe_for_bundle_uri_emission(path),
+                    "expected `{path}` to be rejected (byte = {unsafe_byte:?})",
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn skips_chain_json_with_url_reserved_bytes_in_ref_name() {
+        // Per-byte end-to-end check that the warn-and-skip path
+        // engages for each newly-rejected byte. gix-validate accepts
+        // each of `#`, `%`, `&`, `;`, `,` in ref names but the
+        // bundle-uri emission path must skip them so the resulting
+        // URL stays well-formed.
+        //
+        // `?` is in `FRAMING_AND_URL_UNSAFE` for defense-in-depth but
+        // gix-validate already rejects it (see `tag::name_inner`), so
+        // it can't reach this code path through `RefName::is_valid`
+        // and is therefore not exercisable end-to-end here. The
+        // per-byte unit test below covers the `?` rejection at the
+        // predicate level.
+        //
+        // Mutation-verified: shrinking `FRAMING_AND_URL_UNSAFE` back
+        // to `b"="` makes this test fail because each malicious ref
+        // reaches the wire output.
+        for unsafe_byte in ['#', '%', '&', ';', ','] {
+            let store = MockStore::new();
+            // The good ref must still emit; it shares the listing
+            // with the malicious entry so any over-broad rejection
+            // would also drop it.
+            write_test_chain(&store, Some("repo"), &ref_main(), SHA_TIP, SHA_FULL).await;
+            let bad_key = format!("repo/refs/heads/x{unsafe_byte}evil/chain.json");
+            store.insert(
+                &bad_key,
+                Bytes::from(
+                    format!(r#"{{"v":1,"tip":"{SHA_TIP}","full_at":"{SHA_TIP}","segments":[]}}"#)
+                        .into_bytes(),
+                ),
+            );
+            let remote = parse(
+                "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?engine=packchain&bundle_uri=1",
+            )
+            .unwrap();
+            let mut buf: Vec<u8> = Vec::new();
+            handle_bundle_uri(&store, &remote, BundleUriOpts::default(), true, &mut buf)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&buf).unwrap();
+            let needle = format!("x{unsafe_byte}evil");
+            assert!(
+                !text.contains(&needle),
+                "no entry containing `{needle}` may reach the wire output: {text}",
+            );
+            // The good ref is still present — the rejection is
+            // scoped to the offending entry.
+            assert!(
+                text.contains("bundle.refs/heads/main.uri="),
+                "good ref dropped for byte {unsafe_byte:?}: {text}",
             );
         }
     }
