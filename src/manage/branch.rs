@@ -61,10 +61,11 @@ impl<'a> ManageBranch<'a> {
         // are case-sensitive byte stores with no path semantics, so a
         // value like `foo/../bar` would be stored verbatim and produce
         // unrecoverable junk under `<prefix>/refs/heads/`. The strict
-        // `RefName::new` (delegating to `gix_validate::reference::name`)
+        // `RefName::is_valid` (delegating to `gix_validate::reference::name`)
         // rejects empties, `..`, control characters, and the rest of
-        // git's invalid-ref alphabet.
-        if RefName::new(format!("refs/heads/{branch}")).is_err() {
+        // git's invalid-ref alphabet. Use the borrow-only predicate
+        // here so we don't allocate a wrapped `RefName` we'd discard.
+        if !RefName::is_valid(&format!("refs/heads/{branch}")) {
             return Err(ManageError::InvalidBranch(branch));
         }
         let mb = Self {

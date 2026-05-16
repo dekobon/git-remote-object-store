@@ -212,9 +212,10 @@ async fn collect_entries(
         // the audit do: a maliciously-planted key such as
         // `<prefix>/refs/heads/../etc/passwd/chain.json` must not
         // emit a verbatim `bundle.refs/heads/../etc/passwd.uri=…`
-        // line. RefName::new rejects `..`, control chars, and other
-        // gix-validate-rejected shapes.
-        if crate::git::RefName::new(&ref_path).is_err() {
+        // line. `RefName::is_valid` rejects `..`, control chars, and
+        // other gix-validate-rejected shapes without allocating a
+        // wrapped `String` we'd immediately drop.
+        if !crate::git::RefName::is_valid(&ref_path) {
             warn!(
                 key = %meta.key,
                 ref_path = %ref_path,
@@ -225,7 +226,7 @@ async fn collect_entries(
         // Belt-and-suspenders against bundle-uri wire-format
         // injection. The line shape is
         // `bundle.<id>.<key>=<value>\n`; git's parser splits each
-        // line at the first `=`. `RefName::new` (via
+        // line at the first `=`. `RefName::is_valid` (via
         // `gix_validate::reference::name`) already bans `\n`, `\r`,
         // ` `, `:`, and the rest of `\0-\x1F`, but it permits `=`.
         // A ref-path containing `=` cannot relocate the URL host —
@@ -347,7 +348,7 @@ fn canonical_bundle_url(remote: &RemoteUrl, ref_path: &str, full_at: &str) -> St
 }
 
 /// `true` if `ref_path` is safe to interpolate into the
-/// `bundle.<id>.<key>=<value>\n` wire shape after `RefName::new`
+/// `bundle.<id>.<key>=<value>\n` wire shape after `RefName::is_valid`
 /// has already accepted it. Specifically, reject `=`: gix-validate
 /// permits it in ref names, but git's `bundle-uri` parser splits at
 /// the first `=` so its presence in the id position breaks framing.
