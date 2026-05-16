@@ -1,7 +1,12 @@
 //! Enforces that every `pub` / `pub(crate)` `const ENV_*` constant
-//! declared in `src/**/*.rs` has a row in `docs/environment-variables.md`,
-//! AND that the documented default values for the env vars match the live
-//! `DEFAULT_*` constants the code actually reads.
+//! declared in `src/**/*.rs` or `cli/src/**/*.rs` has a row in
+//! `docs/environment-variables.md`, AND that the documented default
+//! values for the env vars match the live `DEFAULT_*` constants the
+//! code actually reads.
+//!
+//! Both crate roots are scanned because the helper binaries' shared
+//! entrypoint lives in the `cli` crate (`cli/src/lib.rs`) and reads
+//! env vars too (e.g. `GIT_DIR`); a single-root scan would miss them.
 //!
 //! Per `.claude/rules/environment-variables.md`, that page is the single
 //! index for every env var the project reads; the audit and fix-issue
@@ -34,6 +39,30 @@ use std::path::{Path, PathBuf};
 /// Project root (the directory containing this test's `Cargo.toml`).
 fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Source-tree roots scanned for `ENV_*` and `DEFAULT_*` declarations.
+///
+/// Both the library crate (`src/`) and the CLI / helper-binaries crate
+/// (`cli/src/`) read env vars, so a single-root scan would silently miss
+/// the helper-binaries' reads (see issue #186 — `GIT_DIR` slipped past the
+/// scan because it lives in `cli/src/lib.rs`).
+const RUST_SCAN_ROOTS: &[&str] = &["src", "cli/src"];
+
+/// Collect every Rust source file under each configured scan root.
+fn collect_all_rust_sources(root: &Path) -> Vec<PathBuf> {
+    let mut sources = Vec::new();
+    for rel in RUST_SCAN_ROOTS {
+        let dir = root.join(rel);
+        assert!(
+            dir.is_dir(),
+            "expected scan root `{}` to exist; update RUST_SCAN_ROOTS \
+             if the workspace layout changed",
+            dir.display(),
+        );
+        collect_rust_files(&dir, &mut sources);
+    }
+    sources
 }
 
 /// Recursively collect every `.rs` file under `dir`.
@@ -87,14 +116,11 @@ fn extract_env_constants(source: &str) -> Vec<(String, String)> {
 #[test]
 fn every_env_constant_has_a_documentation_row() {
     let root = project_root();
-    let src = root.join("src");
 
-    let mut sources = Vec::new();
-    collect_rust_files(&src, &mut sources);
+    let sources = collect_all_rust_sources(&root);
     assert!(
         !sources.is_empty(),
-        "no Rust files found under {}",
-        src.display()
+        "no Rust files found under any of {RUST_SCAN_ROOTS:?}",
     );
 
     let mut declared = Vec::new();
@@ -107,9 +133,9 @@ fn every_env_constant_has_a_documentation_row() {
     }
     assert!(
         !declared.is_empty(),
-        "scan found zero ENV_ constants under {}; the regex shape probably drifted — \
-         update `extract_env_constants` to match the project's current declaration style",
-        src.display()
+        "scan found zero ENV_ constants under {RUST_SCAN_ROOTS:?}; the regex shape \
+         probably drifted — update `extract_env_constants` to match the project's \
+         current declaration style",
     );
 
     let doc_path = root.join("docs/environment-variables.md");
@@ -123,8 +149,8 @@ fn every_env_constant_has_a_documentation_row() {
 
     assert!(
         missing.is_empty(),
-        "the following env-var constants are declared in src/ but not mentioned \
-         in docs/environment-variables.md (the single index, per \
+        "the following env-var constants are declared in the workspace but not \
+         mentioned in docs/environment-variables.md (the single index, per \
          .claude/rules/environment-variables.md):\n{}",
         missing
             .iter()
@@ -475,10 +501,10 @@ fn parse_env_table_default(doc: &str, env_var_name: &str) -> Option<(usize, Stri
     None
 }
 
-/// Collect every `DEFAULT_*` constant declared under `src/`.
-fn collect_defaults(src: &Path) -> Vec<(String, u64, PathBuf)> {
-    let mut sources = Vec::new();
-    collect_rust_files(src, &mut sources);
+/// Collect every `DEFAULT_*` constant declared under the configured scan
+/// roots (see [`RUST_SCAN_ROOTS`]).
+fn collect_defaults(root: &Path) -> Vec<(String, u64, PathBuf)> {
+    let sources = collect_all_rust_sources(root);
 
     let mut defaults: Vec<(String, u64, PathBuf)> = Vec::new();
     for path in &sources {
@@ -577,10 +603,11 @@ fn check_env_table_row(
 #[test]
 fn documented_defaults_match_live_constants() {
     let root = project_root();
-    let defaults = collect_defaults(&root.join("src"));
+    let defaults = collect_defaults(&root);
     assert!(
         !defaults.is_empty(),
-        "scan found zero DEFAULT_ constants under src/; the matcher probably drifted",
+        "scan found zero DEFAULT_ constants under {RUST_SCAN_ROOTS:?}; \
+         the matcher probably drifted",
     );
 
     // Every entry in `DEFAULT_PATTERNS` and `ENV_TABLE_BINDINGS` must
@@ -591,15 +618,16 @@ fn documented_defaults_match_live_constants() {
             defaults
                 .iter()
                 .any(|(name, _, _)| name == patterns.constant),
-            "DEFAULT_PATTERNS names `{}` but no such constant exists in src/; \
-             remove the entry or fix the spelling",
-            patterns.constant
+            "DEFAULT_PATTERNS names `{}` but no such constant exists under \
+             {RUST_SCAN_ROOTS:?}; remove the entry or fix the spelling",
+            patterns.constant,
         );
     }
     for (constant, _) in ENV_TABLE_BINDINGS {
         assert!(
             defaults.iter().any(|(name, _, _)| name == constant),
-            "ENV_TABLE_BINDINGS names `{constant}` but no such constant exists in src/",
+            "ENV_TABLE_BINDINGS names `{constant}` but no such constant exists \
+             under {RUST_SCAN_ROOTS:?}",
         );
     }
 
@@ -631,6 +659,48 @@ fn documented_defaults_match_live_constants() {
          CLI doc-comments without mechanical sync). Update either the constant \
          or each documented mention below:\n{}",
         divergences.join("\n"),
+    );
+}
+
+/// Regression guard for issue #186: the env-var doc-sync scan must
+/// reach `cli/src/` so helper-binary env reads (such as `GIT_DIR`)
+/// can't quietly skip the docs-coverage check.
+///
+/// We assert two things:
+///   1. The scan visits at least one file under each configured root.
+///   2. The literal `"GIT_DIR"` is one of the values discovered.
+///
+/// Either failure means the scan no longer covers the CLI crate, which
+/// is exactly the regression the issue fixed.
+#[test]
+fn scan_covers_cli_src_root() {
+    let root = project_root();
+    let sources = collect_all_rust_sources(&root);
+
+    for rel in RUST_SCAN_ROOTS {
+        let expected_prefix = root.join(rel);
+        assert!(
+            sources.iter().any(|p| p.starts_with(&expected_prefix)),
+            "scan visited zero files under `{}`; RUST_SCAN_ROOTS or \
+             collect_rust_files drifted",
+            expected_prefix.display(),
+        );
+    }
+
+    let mut declared_values: Vec<String> = Vec::new();
+    for path in &sources {
+        let body =
+            fs::read_to_string(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        for (_, value) in extract_env_constants(&body) {
+            declared_values.push(value);
+        }
+    }
+
+    assert!(
+        declared_values.iter().any(|v| v == "GIT_DIR"),
+        "scan did not pick up `GIT_DIR` from cli/src/lib.rs; either the \
+         constant was renamed or the scan stopped covering cli/src/. \
+         Declared values found: {declared_values:?}",
     );
 }
 

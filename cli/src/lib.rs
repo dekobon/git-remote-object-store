@@ -21,6 +21,12 @@ pub mod management;
 /// without re-declaring the `CARGO_PKG_VERSION` constant.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Name of the standard `GIT_DIR` environment variable git itself
+/// exports before invoking a remote helper during `git clone`. Centralised
+/// here so the literal lives once (see `.claude/rules/environment-variables.md`)
+/// and the docs-sync test in `tests/env_var_doc_sync.rs` can scan for it.
+pub(crate) const ENV_GIT_DIR: &str = "GIT_DIR";
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -134,7 +140,7 @@ where
 ///    the worktree, no `GIT_DIR` set).
 fn resolve_repo_dir() -> anyhow::Result<PathBuf> {
     let cwd = std::env::current_dir().context("failed to read current working directory")?;
-    let candidate = match std::env::var_os("GIT_DIR") {
+    let candidate = match std::env::var_os(ENV_GIT_DIR) {
         Some(d) => {
             let p = PathBuf::from(d);
             if p.is_absolute() { p } else { cwd.join(p) }
