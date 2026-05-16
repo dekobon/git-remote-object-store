@@ -113,6 +113,41 @@ fn extract_env_constants(source: &str) -> Vec<(String, String)> {
     found
 }
 
+/// Return `true` if `doc` mentions the env-var literal `value` with
+/// word-boundary anchoring on both sides. A plain substring check would
+/// admit false negatives: a new constant such as
+/// `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS_FOR_DELETE` would silently
+/// "pass" by matching the shorter existing
+/// `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` row, even though the new
+/// name has no row of its own.
+///
+/// "Word boundary" here means the byte immediately before and after each
+/// occurrence is not an ASCII letter, digit, or underscore — the
+/// character class that makes up an env-var identifier. That allows the
+/// surrounding backticks (`` ` ``), table pipes (`|`), spaces, and
+/// punctuation the docs actually use, while rejecting a match that runs
+/// into an adjacent identifier character.
+fn doc_mentions_env_var(doc: &str, value: &str) -> bool {
+    let haystack = doc.as_bytes();
+    let needle = value.as_bytes();
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    let is_word_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    haystack
+        .windows(needle.len())
+        .enumerate()
+        .any(|(i, window)| {
+            if window != needle {
+                return false;
+            }
+            let before_ok = i == 0 || !is_word_byte(haystack[i - 1]);
+            let after_idx = i + needle.len();
+            let after_ok = after_idx == haystack.len() || !is_word_byte(haystack[after_idx]);
+            before_ok && after_ok
+        })
+}
+
 #[test]
 fn every_env_constant_has_a_documentation_row() {
     let root = project_root();
@@ -144,7 +179,7 @@ fn every_env_constant_has_a_documentation_row() {
 
     let missing: Vec<_> = declared
         .iter()
-        .filter(|(_, value, _)| !doc.contains(value))
+        .filter(|(_, value, _)| !doc_mentions_env_var(&doc, value))
         .collect();
 
     assert!(
@@ -838,5 +873,58 @@ mod unit {
     fn env_table_default_returns_none_for_missing_row() {
         let doc = "no rows here";
         assert!(parse_env_table_default(doc, "GIT_REMOTE_OBJECT_STORE_BAR").is_none());
+    }
+
+    #[test]
+    fn doc_mention_check_matches_backtick_wrapped_name() {
+        // The doc rows shape every env var as `` `<NAME>` `` — that must count.
+        let doc = "row: | `GIT_REMOTE_OBJECT_STORE_FOO` | unset | x | y |";
+        assert!(doc_mentions_env_var(doc, "GIT_REMOTE_OBJECT_STORE_FOO"));
+    }
+
+    #[test]
+    fn doc_mention_check_matches_at_start_or_end_of_input() {
+        // Boundary checks must treat start-of-input and end-of-input as
+        // valid word boundaries; otherwise a name flush against either
+        // edge would be silently rejected.
+        let at_start = "GIT_REMOTE_OBJECT_STORE_FOO appears first";
+        let at_end = "trailing GIT_REMOTE_OBJECT_STORE_FOO";
+        assert!(doc_mentions_env_var(
+            at_start,
+            "GIT_REMOTE_OBJECT_STORE_FOO"
+        ));
+        assert!(doc_mentions_env_var(at_end, "GIT_REMOTE_OBJECT_STORE_FOO"));
+    }
+
+    #[test]
+    fn doc_mention_check_rejects_substring_of_longer_name() {
+        // Issue #214: a plain substring search would let
+        // `ENV_FOO_BAR` "pass" against a doc that only mentions `FOO`,
+        // and vice versa let a new longer name silently match a
+        // shorter existing row.
+        let doc_with_short = "row: | `FOO` | unset | x | y |";
+        assert!(
+            !doc_mentions_env_var(doc_with_short, "FOO_BAR"),
+            "the new longer var `FOO_BAR` must not be considered \
+             documented merely because `FOO` appears in the doc"
+        );
+
+        let doc_with_long = "row: | `FOO_BAR` | unset | x | y |";
+        assert!(
+            !doc_mentions_env_var(doc_with_long, "FOO"),
+            "the bare `FOO` must not be considered documented \
+             merely because `FOO_BAR` appears in the doc"
+        );
+    }
+
+    #[test]
+    fn doc_mention_check_rejects_alphanumeric_or_underscore_neighbor() {
+        // Boundaries are not just about underscores — adjacent ASCII
+        // letters or digits must also block a match, because env-var
+        // identifiers can grow in either direction.
+        assert!(!doc_mentions_env_var("xFOO", "FOO"));
+        assert!(!doc_mentions_env_var("FOOx", "FOO"));
+        assert!(!doc_mentions_env_var("FOO9", "FOO"));
+        assert!(!doc_mentions_env_var("9FOO", "FOO"));
     }
 }
