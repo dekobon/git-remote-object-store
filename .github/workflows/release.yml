@@ -31,9 +31,10 @@ env:
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
   RUSTFLAGS: "-D warnings"
-  # Pinned toolchain for deterministic release builds. Matches the
-  # MSRV declared in Cargo.toml (rust-version = "1.94").
-  RUST_TOOLCHAIN: "1.94.0"
+  # MSRV is the single source of truth for the release toolchain; the
+  # `preflight` job reads it from `[workspace.package].rust-version` in
+  # Cargo.toml via `cargo metadata` and exposes it as the `toolchain`
+  # output that every downstream job consumes.
   CROSS_VERSION: "0.2.5"
   # cargo-deb 3.x and cargo-generate-rpm 0.20+ are the first releases
   # that parse Cargo.toml `resolver = "3"` (stabilised in Rust 1.84).
@@ -52,6 +53,7 @@ jobs:
       tag: ${{ steps.classify.outputs.tag }}
       prerelease: ${{ steps.classify.outputs.prerelease }}
       ref: ${{ steps.classify.outputs.ref }}
+      toolchain: ${{ steps.toolchain.outputs.toolchain }}
     steps:
       - name: Resolve tag
         id: tag
@@ -90,9 +92,26 @@ jobs:
           persist-credentials: false
           ref: ${{ steps.tag.outputs.tag }}
 
+      # Read MSRV from Cargo.toml so every downstream job pins to the
+      # same toolchain without a duplicated literal. The runner's
+      # pre-installed rustup default is sufficient — `cargo metadata
+      # --no-deps` only parses Cargo.toml.
+      - name: Derive toolchain from Cargo.toml
+        id: toolchain
+        run: |
+          set -eu
+          TOOLCHAIN=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "git-remote-object-store") | .rust_version')
+          if [[ -z "$TOOLCHAIN" || "$TOOLCHAIN" == "null" ]]; then
+            echo "::error::Could not read rust-version from Cargo.toml"
+            exit 1
+          fi
+          echo "toolchain=$TOOLCHAIN" >> "$GITHUB_OUTPUT"
+          echo "Derived toolchain: $TOOLCHAIN"
+
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable tip
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          toolchain: ${{ steps.toolchain.outputs.toolchain }}
 
       - name: Verify tag ↔ Cargo.toml version parity
         env:
@@ -238,7 +257,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable tip
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          toolchain: ${{ needs.preflight.outputs.toolchain }}
           targets: ${{ matrix.target }}
 
       - name: Install cross (Linux / FreeBSD cross-compile)
@@ -405,7 +424,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable tip
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          toolchain: ${{ needs.preflight.outputs.toolchain }}
           targets: ${{ matrix.target }}
 
       - uses: taiki-e/install-action@ec28e287910af896fd98e04056d31fa68607e7ad # v2.62.23
@@ -470,7 +489,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable tip
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          toolchain: ${{ needs.preflight.outputs.toolchain }}
           targets: ${{ matrix.target }}
 
       - uses: taiki-e/install-action@ec28e287910af896fd98e04056d31fa68607e7ad # v2.62.23
@@ -904,7 +923,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable tip
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          toolchain: ${{ needs.preflight.outputs.toolchain }}
       - uses: taiki-e/install-action@ec28e287910af896fd98e04056d31fa68607e7ad # v2.62.23
         with:
           tool: cargo-cyclonedx@${{ env.CARGO_CYCLONEDX_VERSION }}
@@ -1098,7 +1117,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable tip
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          toolchain: ${{ needs.preflight.outputs.toolchain }}
 
       # Trusted Publishing: exchange the runner's OIDC ID token for a
       # short-lived (30-minute) crates.io token authorizing every

@@ -2,7 +2,7 @@
 name = "git-remote-object-store-cli"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version.workspace = true
 license = "Apache-2.0"
 description = "Git remote helper binaries (git-remote-s3+https, git-remote-az+https, …) and LFS custom-transfer agent backed by cloud object stores"
 repository = "https://github.com/dekobon/git-remote-object-store"

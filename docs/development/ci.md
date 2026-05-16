@@ -132,7 +132,7 @@ The CI workflow installs tools using a hybrid caching strategy.
 | Tool | Version | Method | Cached |
 |---|---|---|---|
 | commitsar | 1.0.3 | Static binary download | Yes |
-| Rust toolchain | 1.94.0 | `actions-rust-lang/setup-rust-toolchain` | Yes |
+| Rust toolchain | derived from `Cargo.toml` `[workspace.package].rust-version` via `cargo metadata` in the `derive-toolchain` job | `actions-rust-lang/setup-rust-toolchain` | Yes |
 | cargo-deny | 0.18.4 | `cargo install --locked` | Yes (via Rust cache) |
 | shellspec | 0.28.1 | Install script (version-pinned) | Yes |
 | markdownlint-cli2 | 0.21.0 | `npm install -g` | Yes |
@@ -171,7 +171,6 @@ section of `.github/workflows/ci.yml`:
 
 ```yaml
 env:
-  RUST_TOOLCHAIN: "1.94.0"
   COMMITSAR_VERSION: "1.0.3"
   CARGO_DENY_VERSION: "0.18.4"
   SHELLSPEC_VERSION: "0.28.1"
@@ -181,12 +180,19 @@ env:
   CHECKMAKE_VERSION: "0.3.2"
 ```
 
-To update:
+The Rust toolchain version is **not** pinned in this list — the
+`derive-toolchain` job reads it from `[workspace.package].rust-version`
+in the root `Cargo.toml` via `cargo metadata` and exposes it as a job
+output that downstream jobs consume. Bumping MSRV is therefore a
+single-file edit.
+
+To update a tool version:
 
 1. Edit the version (and the matching `*_SHA256_*` checksum, where
    applicable — fetch the new checksum from the upstream release page).
-2. If updating `RUST_TOOLCHAIN`, also update `rust-version` in
-   `Cargo.toml` so `cargo` rejects builds that need a newer compiler.
+2. To bump the Rust toolchain, edit `rust-version` in the root
+   `[workspace.package]` table of `Cargo.toml`. The CI and release
+   workflows pick the new value up automatically.
 3. Commit and push. The cache invalidates automatically because the cache
    key includes the version strings.
 

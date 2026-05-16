@@ -6,11 +6,18 @@ members = [".", "cli", "xtask"]
 default-members = [".", "cli"]
 resolver = "2"
 
+# Single source of truth for the workspace MSRV. The CLI and xtask crates
+# inherit this via `rust-version.workspace = true`, and the CI / release
+# workflows read it from `cargo metadata` so a bump here propagates
+# everywhere without manual edits.
+[workspace.package]
+rust-version = "1.94"
+
 [package]
 name = "git-remote-object-store"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version.workspace = true
 license = "Apache-2.0"
 repository = "https://github.com/dekobon/git-remote-object-store"
 authors = ["Elijah Zupancic <elijah@zupancic.name>"]

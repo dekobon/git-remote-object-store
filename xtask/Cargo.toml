@@ -2,7 +2,7 @@
 name = "xtask"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version.workspace = true
 publish = false
 description = "Workspace automation tasks (install, …) for git-remote-object-store"
 
