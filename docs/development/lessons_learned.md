@@ -599,3 +599,60 @@ contractual write* — what must not fail-loud once the protocol
 contract is already met.
 
 ---
+
+## 15. A test flipped alongside production code is no longer an oracle
+
+When a single commit changes behavior AND modifies the corresponding
+test in lockstep (flipping an assertion `!contains` → `contains` or
+`is_empty` → `len > 0`, deleting an old test and writing a new one
+with inverted expectations, or adding a new test that pins the new
+behavior as the contract), the test stops oraculing the new code —
+it becomes a self-consistent mirror.
+`cargo test` and `make pre-commit` agree with themselves because the
+production change and the new assertion describe the same world. The
+contract the test was *supposed* to pin (operator expectation, wire
+behavior, on-bucket post-condition) is no longer asserted anywhere
+inside the suite. The check-in passes review for the same reason: a
+reviewer reading the diff sees production and test moving together and
+infers the change is intentional, when the question to ask is whether
+the operator-visible contract moved with them.
+
+**Bundle-engine helper-protocol delete left the bundle in place**
+(#205, c5468b4 reverted). c5468b4 added a tombstone-defer to
+`delete_remote_ref_under_lock` for in-flight-fetcher race safety.
+In the same commit, it renamed
+`delete_remote_ref_removes_single_bundle` to
+`..._defers_..._via_tombstone` and flipped the assertion from
+`!store.contains(<bundle>)` to `store.contains(<bundle>)` — plus
+matching flips on the integration test and the lock-release test. The
+unit suite went green. The live shellspec suite (gated behind
+`LIVE_TESTS_I_UNDERSTAND_THIS_COSTS_MONEY=1`, authored before c5468b4)
+asserted on raw `aws s3 ls` output and caught the regression because
+its oracle pre-dated the commit.
+
+**`doctor --lock-ttl-seconds 0` silently clamped to default** (#208,
+7dfa5dc → Doctor's call site rerouted to bypass the shared resolver).
+7dfa5dc added the test `resolved_lock_ttl_honors_env_explicit_and_zero_clamp`
+that pinned `Some(0)` → env-or-default as the contract. The test was
+new, not modified — but the operator-facing contract it asserted
+("explicit zero clamps") was the regression itself. The lib suite
+agreed. The shellspec test `doctor --delete-stale-locks` with
+`--lock-ttl-seconds 0` (authored a week earlier in 406c811) caught
+it because, again, its assertion ("the seeded lock is gone") predated
+7dfa5dc.
+
+**Lesson**: When reviewing a diff that flips a test assertion alongside
+a production change, ask explicitly: "would this test have failed
+before this commit?" If yes (red → green), healthy. If the test was
+added or rewritten in the same commit, it is not an oracle for that
+commit — find or add an *independent* assertion that pre-dated the
+change. Prefer post-condition assertions on observable contracts
+(prefix listings, full stdout, operator-visible bucket state) over
+assertions on specific implementation keys: the operator's expectation
+moves slowly; specific keys move with every refactor. Related to
+lessons #4 (exact bytes) and #5 (expected from spec): lesson #4 is
+about assertion form, lesson #5 is about where the expected value
+comes from, and this one is about whether the assertion's invariant
+pre-dated the production change it oracles.
+
+---
