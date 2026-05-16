@@ -907,23 +907,15 @@ mod tests {
         // runs do not race. `lookup_env` does no caching, so reading
         // a guaranteed-unset name is deterministic.
         let name = "AZSTORE_AUTH_TEST_DEFINITELY_UNSET_VAR";
-        unsafe {
-            env::remove_var(name);
-        }
+        let _env = crate::test_util::EnvGuard::unset(name);
         assert!(matches!(lookup_env(name), Ok(None)));
     }
 
     #[test]
     fn lookup_env_returns_value_when_valid_utf8() {
         let name = "AZSTORE_AUTH_TEST_VALID_UTF8";
-        unsafe {
-            env::set_var(name, "hello");
-        }
-        let got = lookup_env(name);
-        unsafe {
-            env::remove_var(name);
-        }
-        let value = got.expect("UTF-8 value must read");
+        let _env = crate::test_util::EnvGuard::set(name, "hello");
+        let value = lookup_env(name).expect("UTF-8 value must read");
         assert_eq!(value.as_deref(), Some("hello"));
     }
 
@@ -941,14 +933,8 @@ mod tests {
         // 0xFF is never valid in a UTF-8 byte stream, so this is
         // guaranteed to land in the `VarError::NotUnicode` branch.
         let bad = OsString::from_vec(vec![0xFF, 0xFE, 0xFD]);
-        unsafe {
-            env::set_var(name, &bad);
-        }
-        let got = lookup_env(name);
-        unsafe {
-            env::remove_var(name);
-        }
-        let err = got.expect_err("non-UTF-8 env value must error, not be ignored");
+        let _env = crate::test_util::EnvGuard::set(name, &bad);
+        let err = lookup_env(name).expect_err("non-UTF-8 env value must error, not be ignored");
         let msg = err.to_string();
         assert!(
             msg.contains(name),

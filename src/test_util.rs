@@ -21,10 +21,145 @@
 // stdout buffer that callers commonly drop after assertions.
 #![allow(clippy::missing_panics_doc, clippy::must_use_candidate)]
 
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use tokio::io::AsyncWriteExt;
+
+/// Per-key serialization registry for [`EnvGuard`]. Tests that touch the
+/// same env var across modules acquire the same `Mutex` so the
+/// `set_var` / `remove_var` calls do not race. The map itself is behind
+/// a `Mutex`; we `Box::leak` per-key mutexes so guards can hold a
+/// `'static` reference without a lifetime parameter.
+fn env_var_lock(key: &'static str) -> &'static Mutex<()> {
+    static REGISTRY: OnceLock<Mutex<HashMap<&'static str, &'static Mutex<()>>>> = OnceLock::new();
+    let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = registry.lock().unwrap_or_else(PoisonError::into_inner);
+    map.entry(key)
+        .or_insert_with(|| Box::leak(Box::new(Mutex::new(()))))
+}
+
+/// RAII guard that mutates a process-global env var and restores its
+/// prior value when dropped — including on panic.
+///
+/// Two correctness properties this gives every test that uses it:
+///
+/// 1. **Panic-safe cleanup**: the manual `set_var` / `remove_var` pair
+///    leaks the env var to subsequent tests when an assertion between
+///    the two panics. `Drop` runs on unwind, so the prior value is
+///    always restored.
+/// 2. **Per-key serialization**: two tests touching the same env var
+///    across modules would race, with `set_var` from one interleaving
+///    with `remove_var` from the other. The guard holds a per-key
+///    `Mutex` for its full lifetime, so only one guard for a given key
+///    exists at a time.
+///
+/// Recursive acquisition on the same thread would deadlock — hold one
+/// guard per env var at a time.
+///
+/// API shape: `set` / `unset` / `take` are the constructors (they
+/// acquire the per-key lock); `set_to` / `clear` are the mutation
+/// methods you call on an existing guard when a test toggles through
+/// multiple values without ever releasing the lock. Rust's inherent-
+/// method rules forbid reusing the same name for an associated
+/// function and a method, so the constructor/method pair uses
+/// `set` / `set_to` and `unset` / `clear` respectively.
+///
+/// # Example
+///
+/// ```ignore
+/// // Set a var, run assertions, restore prior on drop:
+/// let _env = EnvGuard::set("MY_VAR", "value");
+/// assert_eq!(std::env::var("MY_VAR").unwrap(), "value");
+/// // … drop restores the value `MY_VAR` had before the guard ran.
+///
+/// // For tests that toggle through several values, `take` acquires
+/// // the lock without mutating, and `set_to` / `clear` mutate within
+/// // the guarded scope:
+/// let env = EnvGuard::take("MY_VAR");
+/// env.set_to("first");
+/// env.set_to("second");
+/// env.clear();
+/// // … drop restores the original.
+/// ```
+pub struct EnvGuard {
+    key: &'static str,
+    prior: Option<OsString>,
+    /// Holds the per-key serialization lock for the guard's lifetime.
+    /// The manual `Drop for EnvGuard` runs before any field is
+    /// dropped, so `_lock` is still held while we restore the value
+    /// — no other guard for this key can interleave with the restore.
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl EnvGuard {
+    /// Acquire the per-key serialization lock and record the env var's
+    /// current value. Does not mutate. Pair with [`Self::set_to`] /
+    /// [`Self::clear`] for tests that toggle through multiple values.
+    pub fn take(key: &'static str) -> Self {
+        let lock = env_var_lock(key)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let prior = std::env::var_os(key);
+        Self {
+            key,
+            prior,
+            _lock: lock,
+        }
+    }
+
+    /// Acquire the lock, record the prior value, and set `key` to
+    /// `value` for the guard's lifetime.
+    pub fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+        let guard = Self::take(key);
+        guard.set_to(value);
+        guard
+    }
+
+    /// Acquire the lock, record the prior value, and unset `key` for
+    /// the guard's lifetime.
+    pub fn unset(key: &'static str) -> Self {
+        let guard = Self::take(key);
+        guard.clear();
+        guard
+    }
+
+    /// Set the env var to `value`. The caller already holds the
+    /// per-key lock via this guard.
+    pub fn set_to(&self, value: impl AsRef<OsStr>) {
+        // SAFETY: `set_var` is process-global; the per-key mutex held
+        // by `self._lock` is the only writer for `self.key` in the
+        // test binary, and the production code that reads the var
+        // does not race against test threads.
+        unsafe {
+            std::env::set_var(self.key, value);
+        }
+    }
+
+    /// Unset the env var. The caller already holds the per-key lock
+    /// via this guard.
+    pub fn clear(&self) {
+        // SAFETY: see [`Self::set_to`].
+        unsafe {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: we still hold the per-key lock via `_lock`; no
+        // other thread can be reading or writing this key concurrently.
+        unsafe {
+            match &self.prior {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
 
 use crate::object_store::ObjectStore;
 use crate::protocol::backend;
@@ -190,4 +325,112 @@ pub async fn drive_in(
     writer_task.await.unwrap();
     let output = reader_task.await.unwrap();
     (output, result)
+}
+
+#[cfg(test)]
+mod env_guard_tests {
+    use super::EnvGuard;
+
+    // Each test uses a unique key so the cases are independent even if
+    // run in parallel. `EnvGuard`'s registry serializes per-key, not
+    // globally, so unrelated keys never block each other.
+
+    #[test]
+    fn set_then_drop_restores_unset_prior() {
+        let key = "GROS_ENV_GUARD_TEST_SET_THEN_UNSET";
+        // SAFETY: this key is unique to this test; no other reader exists.
+        unsafe {
+            std::env::remove_var(key);
+        }
+        {
+            let _g = EnvGuard::set(key, "value");
+            assert_eq!(std::env::var(key).as_deref(), Ok("value"));
+        }
+        assert!(std::env::var_os(key).is_none());
+    }
+
+    #[test]
+    fn set_then_drop_restores_prior_set_value() {
+        let key = "GROS_ENV_GUARD_TEST_SET_THEN_RESET";
+        // SAFETY: this key is unique to this test; no other reader exists.
+        unsafe {
+            std::env::set_var(key, "original");
+        }
+        {
+            let _g = EnvGuard::set(key, "override");
+            assert_eq!(std::env::var(key).as_deref(), Ok("override"));
+        }
+        assert_eq!(std::env::var(key).as_deref(), Ok("original"));
+        // SAFETY: cleanup of fixture-set value.
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn unset_then_drop_restores_prior_value() {
+        let key = "GROS_ENV_GUARD_TEST_UNSET_THEN_RESET";
+        // SAFETY: this key is unique to this test; no other reader exists.
+        unsafe {
+            std::env::set_var(key, "original");
+        }
+        {
+            let _g = EnvGuard::unset(key);
+            assert!(std::env::var_os(key).is_none());
+        }
+        assert_eq!(std::env::var(key).as_deref(), Ok("original"));
+        // SAFETY: cleanup of fixture-set value.
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn take_then_multi_toggle_restores_original() {
+        let key = "GROS_ENV_GUARD_TEST_MULTI_TOGGLE";
+        // SAFETY: this key is unique to this test; no other reader exists.
+        unsafe {
+            std::env::set_var(key, "first");
+        }
+        {
+            let g = EnvGuard::take(key);
+            g.set_to("second");
+            assert_eq!(std::env::var(key).as_deref(), Ok("second"));
+            g.set_to("third");
+            assert_eq!(std::env::var(key).as_deref(), Ok("third"));
+            g.clear();
+            assert!(std::env::var_os(key).is_none());
+        }
+        // Drop restores the original "first", not any intermediate value.
+        assert_eq!(std::env::var(key).as_deref(), Ok("first"));
+        // SAFETY: cleanup of fixture-set value.
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+
+    /// Panic inside the guarded scope must still restore the prior
+    /// value — this is the core regression issue #220 closes.
+    #[test]
+    fn panic_inside_guard_still_restores_prior() {
+        let key = "GROS_ENV_GUARD_TEST_PANIC_RESTORE";
+        // SAFETY: this key is unique to this test; no other reader exists.
+        unsafe {
+            std::env::set_var(key, "before");
+        }
+        let outcome = std::panic::catch_unwind(|| {
+            let _g = EnvGuard::set(key, "during");
+            panic!("simulated test failure between set and remove");
+        });
+        assert!(outcome.is_err(), "the closure must have panicked");
+        assert_eq!(
+            std::env::var(key).as_deref(),
+            Ok("before"),
+            "Drop must restore the prior value on unwind",
+        );
+        // SAFETY: cleanup of fixture-set value.
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
 }

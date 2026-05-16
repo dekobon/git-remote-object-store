@@ -64,16 +64,6 @@ struct PushConfig {
 /// Environment override for the lock TTL, in seconds.
 pub(crate) const ENV_LOCK_TTL_SECONDS: &str = "GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS";
 
-/// Process-wide mutex for tests that mutate [`ENV_LOCK_TTL_SECONDS`].
-/// Both `protocol::push::tests` and `manage::doctor::tests` poke this
-/// env var, and Cargo's default test runner schedules them on parallel
-/// threads — without this mutex one test's `remove_var` interleaves
-/// with the other's `set_var` and the asserts see the wrong value.
-/// `Mutex` rather than `OnceLock<Mutex<()>>` because the lock itself
-/// is stateless; we only need exclusive access to "the env var".
-#[cfg(test)]
-pub(crate) static ENV_LOCK_TTL_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Stable substring embedded in the rejection message returned when the
 /// remote ref is not an ancestor of the pushed local ref. Treated as a
 /// user-facing contract: shellspec suites assert on this token to
@@ -3070,20 +3060,15 @@ mod tests {
 
     #[test]
     fn lock_ttl_env_override_falls_back_for_unset_invalid_or_zero() {
-        // Group all env-var cases in one test fn so they run sequentially
-        // — the var is process-global and mutating it from multiple
-        // parallel tests would race. `resolve_lock_ttl_seconds`'s
-        // env-touching cases live here too for the same reason.
-        // The cross-module guard against parallel `manage::doctor` tests
-        // that also poke `ENV_LOCK_TTL_SECONDS`.
-        let _guard = ENV_LOCK_TTL_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Group all env-var cases in one test fn so they share a single
+        // `EnvGuard` and its per-key lock — the var is process-global,
+        // and the guard serialises against `manage::doctor`'s
+        // env-touching test that pokes the same key. Drop restores the
+        // prior value on every exit path, including assertion panics.
+        let env = crate::test_util::EnvGuard::take(ENV_LOCK_TTL_SECONDS);
         let default_ttl = Duration::seconds(i64::try_from(DEFAULT_LOCK_TTL_SECONDS).unwrap());
         // Unset returns default.
-        unsafe {
-            env::remove_var(ENV_LOCK_TTL_SECONDS);
-        }
+        env.clear();
         assert_eq!(lock_ttl_from_env(), default_ttl);
         // `None` and `Some(0)` (issue #208) defer to env-or-default.
         assert_eq!(
@@ -3097,19 +3082,13 @@ mod tests {
             "Some(0) must not defeat per-ref locking (issue #208)",
         );
         // Non-numeric falls back.
-        unsafe {
-            env::set_var(ENV_LOCK_TTL_SECONDS, "not-a-number");
-        }
+        env.set_to("not-a-number");
         assert_eq!(lock_ttl_from_env(), default_ttl);
         // Zero falls back (would defeat per-ref locking).
-        unsafe {
-            env::set_var(ENV_LOCK_TTL_SECONDS, "0");
-        }
+        env.set_to("0");
         assert_eq!(lock_ttl_from_env(), default_ttl);
         // Positive integer wins.
-        unsafe {
-            env::set_var(ENV_LOCK_TTL_SECONDS, "120");
-        }
+        env.set_to("120");
         assert_eq!(lock_ttl_from_env(), Duration::seconds(120));
         // With env set, `None` and `Some(0)` honour the env override —
         // an operator's env var must still take effect when a CLI
@@ -3124,9 +3103,6 @@ mod tests {
             120,
             "Some(0) must honour env override",
         );
-        unsafe {
-            env::remove_var(ENV_LOCK_TTL_SECONDS);
-        }
     }
 
     // --- resolve_lock_ttl_seconds (issue #208) ------------------------

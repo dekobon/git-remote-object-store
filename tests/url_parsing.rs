@@ -4,43 +4,22 @@
 //! cases for the validation rules, the `?addressing=` override, and a
 //! `proptest` round-trip on the legal grammar.
 
-use std::env;
-use std::sync::Mutex;
-
+use git_remote_object_store::test_util::EnvGuard;
 use git_remote_object_store::url::{
     AzureAddressing, ENV_ALLOW_HTTP, ParseError, RemoteFlags, RemoteUrl, S3Addressing, parse,
 };
 use proptest::prelude::*;
 
-// Tests that mutate ENV_ALLOW_HTTP must serialize against each other
-// AND against any test that reads it via `parse()`. The mutex covers
-// only env-touching tests; the rest of the suite never reads env, so
-// it can stay parallel.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
+// Tests that mutate ENV_ALLOW_HTTP must serialize against each other.
+// `EnvGuard` holds a per-key lock for the env var's lifetime and
+// restores the prior value on drop — so an assertion panic inside the
+// closure no longer leaks the env var to subsequent tests.
 fn with_allow_http_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
-    let lock = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
-    let prev = env::var(ENV_ALLOW_HTTP).ok();
-    // SAFETY: tests that read ENV_ALLOW_HTTP via `parse()` all acquire
-    // ENV_LOCK before calling parse, so no other thread observes the
-    // env var while it is being mutated here.
-    unsafe {
-        match value {
-            Some(v) => env::set_var(ENV_ALLOW_HTTP, v),
-            None => env::remove_var(ENV_ALLOW_HTTP),
-        }
-    }
-    let result = f();
-    // SAFETY: see above; restore the previous value before releasing
-    // the lock.
-    unsafe {
-        match prev {
-            Some(p) => env::set_var(ENV_ALLOW_HTTP, p),
-            None => env::remove_var(ENV_ALLOW_HTTP),
-        }
-    }
-    drop(lock);
-    result
+    let _env = match value {
+        Some(v) => EnvGuard::set(ENV_ALLOW_HTTP, v),
+        None => EnvGuard::unset(ENV_ALLOW_HTTP),
+    };
+    f()
 }
 
 // ---------------------------------------------------------------------------

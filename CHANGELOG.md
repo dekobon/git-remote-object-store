@@ -158,6 +158,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Env-mutating tests no longer leak on panic (#220).** Tests that
+  toggled process-global env vars (`GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`,
+  `GIT_REMOTE_OBJECT_STORE_GC_GRACE_HOURS`, `GIT_REMOTE_OBJECT_STORE_VERBOSE`,
+  `GIT_REMOTE_OBJECT_STORE_ALLOW_HTTP`, the per-test `AZSTORE_AUTH_TEST_*`
+  fixtures) used a paired `set_var` / `remove_var` pattern that leaked
+  the env var to subsequent tests when an assertion between the two
+  panicked. Introduced `EnvGuard` in `git_remote_object_store::test_util`
+  — an RAII guard that holds a per-key serialization mutex and restores
+  the prior value on drop, including on unwind. Replaces the bespoke
+  `ENV_LOCK_TTL_TEST_MUTEX` (cross-module serialization is now folded
+  into the guard's per-key registry) and the panic-vulnerable
+  `with_allow_http_env` closure in `tests/url_parsing.rs`.
+
 - **`doctor` no longer silently skips future-stamped locks (#223).**
   `scan_stale_locks` and `delete_stale_lock_if_still_stale` both
   computed `age = now - last_modified` via

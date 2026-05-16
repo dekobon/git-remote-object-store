@@ -137,23 +137,14 @@ mod tests {
     /// non-debug REPL path pinned `error` and ignored `ENV_VERBOSE`).
     /// Both fixes routed those entry points through this module so
     /// all three binaries share one verbosity policy.
-    ///
-    /// `set_var` / `remove_var` are process-global; this test only
-    /// touches `RUST_LOG` (which the crate never reads) and `ENV_VERBOSE`
-    /// (which no other test sets), so cross-test interference is
-    /// limited to itself — the final `remove_var` restores both keys.
     #[test]
     fn read_verbose_env_ignores_rust_log() {
-        // SAFETY: edition 2024 marks `set_var` / `remove_var` unsafe
-        // because they mutate process-global state. The race is only
-        // observable across threads that read the same key; this test
-        // is single-threaded and the keys it touches (`RUST_LOG`,
-        // `ENV_VERBOSE`) are not read concurrently by other tests in
-        // this binary.
-        unsafe {
-            std::env::set_var("RUST_LOG", "trace");
-            std::env::remove_var(ENV_VERBOSE);
-        }
+        // `EnvGuard` holds a per-key serialization lock for each of
+        // `RUST_LOG` and `ENV_VERBOSE` and restores their prior values
+        // on drop — so a panic between the mutation and the assertion
+        // cannot leak either var into subsequent tests.
+        let _rust_log = crate::test_util::EnvGuard::set("RUST_LOG", "trace");
+        let verbose = crate::test_util::EnvGuard::unset(ENV_VERBOSE);
         assert_eq!(
             read_verbose_env(),
             0,
@@ -167,14 +158,7 @@ mod tests {
         // Confirm the inverse: ENV_VERBOSE is the *only* knob that
         // raises the floor. Setting it alongside RUST_LOG yields the
         // info filter, proving the policy is single-source.
-        unsafe {
-            std::env::set_var(ENV_VERBOSE, "2");
-        }
+        verbose.set_to("2");
         assert!(env_verbose_at_least(2));
-
-        unsafe {
-            std::env::remove_var(ENV_VERBOSE);
-            std::env::remove_var("RUST_LOG");
-        }
     }
 }

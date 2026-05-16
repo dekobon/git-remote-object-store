@@ -3187,31 +3187,28 @@ mod tests {
 
     #[test]
     fn resolved_lock_ttl_honors_env_explicit_and_zero() {
-        // The env var is process-global; serialise the read/write/clear
-        // dance inside one test to avoid racing parallel test threads
-        // inside this module — and acquire the cross-module mutex so we
-        // do not race the env-touching test in `protocol::push::tests`.
-        use crate::protocol::push::{ENV_LOCK_TTL_SECONDS, ENV_LOCK_TTL_TEST_MUTEX};
-        let _guard = ENV_LOCK_TTL_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The env var is process-global; one `EnvGuard` holds the
+        // per-key lock for the whole test, serialising against the
+        // env-touching test in `protocol::push::tests`. Drop restores
+        // the prior value on every exit path, including assertion
+        // panics — the manual cleanup-before-assert dance is no longer
+        // needed.
+        use crate::protocol::push::ENV_LOCK_TTL_SECONDS;
+        let env = crate::test_util::EnvGuard::take(ENV_LOCK_TTL_SECONDS);
         let mock = MockStore::new();
         let prompter = ScriptedPrompter::new([]);
         let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
 
         // Env override wins when `opts.lock_ttl_seconds` is `None`.
-        unsafe {
-            std::env::set_var(ENV_LOCK_TTL_SECONDS, "120");
-        }
-        let got = doctor.resolved_lock_ttl_seconds();
-        // Clean up before asserting so a failure does not leak the env
-        // var to subsequent tests on this thread.
-        unsafe {
-            std::env::remove_var(ENV_LOCK_TTL_SECONDS);
-        }
-        assert_eq!(got, 120, "env override must propagate to Doctor default");
+        env.set_to("120");
+        assert_eq!(
+            doctor.resolved_lock_ttl_seconds(),
+            120,
+            "env override must propagate to Doctor default",
+        );
 
         // Unset env falls back to the project default.
+        env.clear();
         assert_eq!(
             doctor.resolved_lock_ttl_seconds(),
             DEFAULT_LOCK_TTL_SECONDS,
@@ -3224,20 +3221,19 @@ mod tests {
             ..DoctorOpts::default()
         };
         let doctor_with_opt = Doctor::new(store_arc(&mock), "myrepo", opts, &prompter);
-        unsafe {
-            std::env::set_var(ENV_LOCK_TTL_SECONDS, "120");
-        }
-        let got_explicit = doctor_with_opt.resolved_lock_ttl_seconds();
-        unsafe {
-            std::env::remove_var(ENV_LOCK_TTL_SECONDS);
-        }
-        assert_eq!(got_explicit, 7, "explicit opts.lock_ttl_seconds must win");
+        env.set_to("120");
+        assert_eq!(
+            doctor_with_opt.resolved_lock_ttl_seconds(),
+            7,
+            "explicit opts.lock_ttl_seconds must win",
+        );
 
         // Explicit `Some(0)` is an operator-deliberate "treat every
         // lock as stale" request. `doctor` only compares ages — it
         // never acquires a lock — so the zero passes through. The
         // push/compact paths use `resolve_lock_ttl_seconds` which
         // applies the zero-clamp; doctor must not.
+        env.clear();
         let zero_opts = DoctorOpts {
             lock_ttl_seconds: Some(0),
             ..DoctorOpts::default()
@@ -3250,15 +3246,10 @@ mod tests {
         );
         // Env value is irrelevant when the operator passed an explicit
         // value — the explicit value wins, including 0.
-        unsafe {
-            std::env::set_var(ENV_LOCK_TTL_SECONDS, "240");
-        }
-        let got_zero = doctor_zero.resolved_lock_ttl_seconds();
-        unsafe {
-            std::env::remove_var(ENV_LOCK_TTL_SECONDS);
-        }
+        env.set_to("240");
         assert_eq!(
-            got_zero, 0,
+            doctor_zero.resolved_lock_ttl_seconds(),
+            0,
             "explicit Some(0) must override the env var (operator opt-in)",
         );
     }

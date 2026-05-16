@@ -2523,29 +2523,21 @@ mod tests {
 
     #[tokio::test]
     async fn grace_hours_env_override_falls_back_for_unset_or_invalid() {
+        // `EnvGuard` holds the per-key lock for the whole test and
+        // restores the prior value on drop, including on panic.
+        let env = crate::test_util::EnvGuard::take(ENV_GC_GRACE_HOURS);
         // Unset returns default.
-        unsafe {
-            std::env::remove_var(ENV_GC_GRACE_HOURS);
-        }
+        env.clear();
         assert_eq!(grace_hours_from_env(), DEFAULT_GRACE_HOURS);
         // Non-numeric falls back.
-        unsafe {
-            std::env::set_var(ENV_GC_GRACE_HOURS, "not-a-number");
-        }
+        env.set_to("not-a-number");
         assert_eq!(grace_hours_from_env(), DEFAULT_GRACE_HOURS);
         // Zero falls back (would defeat the design).
-        unsafe {
-            std::env::set_var(ENV_GC_GRACE_HOURS, "0");
-        }
+        env.set_to("0");
         assert_eq!(grace_hours_from_env(), DEFAULT_GRACE_HOURS);
         // Positive integer wins.
-        unsafe {
-            std::env::set_var(ENV_GC_GRACE_HOURS, "72");
-        }
+        env.set_to("72");
         assert_eq!(grace_hours_from_env(), 72);
-        unsafe {
-            std::env::remove_var(ENV_GC_GRACE_HOURS);
-        }
     }
 
     // --- mark list-order race (issue #135) ---------------------------
