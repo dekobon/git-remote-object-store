@@ -28,7 +28,7 @@ use uuid::Uuid;
 use super::snapshot::{
     BundleEntry, MalformedBundleKey, RefSnapshot, RepoSnapshot, analyze_objects,
 };
-use super::{DEFAULT_LOCK_TTL_SECONDS, ManageError, Prompter};
+use super::{DEFAULT_LOCK_TTL_SECONDS, ManageError, Prompter, StaleReason};
 use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
 use crate::packchain::audit::{self, AuditReport, BranchRow};
@@ -343,7 +343,10 @@ impl<'a> Doctor<'a> {
                     key = %keeper_key,
                     "doctor fix_multiple_bundles: keeper disappeared between snapshot and eviction",
                 );
-                return Err(ManageError::StaleSnapshot(ref_path.to_owned()));
+                return Err(ManageError::StaleSnapshot {
+                    entity: ref_path.to_owned(),
+                    reason: StaleReason::Deleted,
+                });
             }
             Err(e) => return Err(e.into()),
         }
@@ -529,7 +532,15 @@ impl<'a> Doctor<'a> {
                 residue_only,
                 "doctor fix_head: chosen branch disappeared between snapshot and HEAD write"
             );
-            return Err(ManageError::StaleSnapshot(new_head));
+            let reason = if residue_only {
+                StaleReason::ResidueOnly
+            } else {
+                StaleReason::Deleted
+            };
+            return Err(ManageError::StaleSnapshot {
+                entity: new_head,
+                reason,
+            });
         }
 
         let head_key = keys::join(Some(&self.prefix), "HEAD");
@@ -1070,8 +1081,21 @@ mod tests {
             .await
             .expect_err("missing keeper must surface as stale snapshot");
         assert!(
-            matches!(err, ManageError::StaleSnapshot(ref r) if r == "refs/heads/main"),
-            "expected ManageError::StaleSnapshot(refs/heads/main), got {err:?}",
+            matches!(
+                &err,
+                ManageError::StaleSnapshot { entity, reason: StaleReason::Deleted }
+                    if entity == "refs/heads/main"
+            ),
+            "expected ManageError::StaleSnapshot {{ refs/heads/main, Deleted }}, got {err:?}",
+        );
+        // Pin the rendered Display so the operator-facing wording does
+        // not silently regress to the residue-only phrasing.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("refs/heads/main")
+                && rendered.contains("was deleted between selection and write")
+                && rendered.contains("re-run doctor"),
+            "expected Deleted-flavoured Display, got: {rendered}",
         );
 
         // Critical invariant: the loser must NOT have been evicted.
@@ -1350,8 +1374,21 @@ mod tests {
             .await
             .expect_err("stale snapshot must surface as an error, not silent success");
         assert!(
-            matches!(err, ManageError::StaleSnapshot(ref b) if b == "refs/heads/main"),
-            "expected ManageError::StaleSnapshot(refs/heads/main), got {err:?}",
+            matches!(
+                &err,
+                ManageError::StaleSnapshot { entity, reason: StaleReason::Deleted }
+                    if entity == "refs/heads/main"
+            ),
+            "expected ManageError::StaleSnapshot {{ refs/heads/main, Deleted }}, got {err:?}",
+        );
+        // Pin the rendered Display so the wording stays in lockstep
+        // with the StaleReason::Deleted branch.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("refs/heads/main")
+                && rendered.contains("was deleted between selection and write")
+                && rendered.contains("re-run doctor"),
+            "expected Deleted-flavoured Display, got: {rendered}",
         );
 
         // HEAD must NOT have been written — the doctor refused to
@@ -1456,8 +1493,28 @@ mod tests {
             .await
             .expect_err("residue-only branch must surface as stale snapshot");
         assert!(
-            matches!(err, ManageError::StaleSnapshot(ref b) if b == "refs/heads/main"),
-            "expected ManageError::StaleSnapshot(refs/heads/main), got {err:?}",
+            matches!(
+                &err,
+                ManageError::StaleSnapshot { entity, reason: StaleReason::ResidueOnly }
+                    if entity == "refs/heads/main"
+            ),
+            "expected ManageError::StaleSnapshot {{ refs/heads/main, ResidueOnly }}, \
+             got {err:?}",
+        );
+        // Pin the rendered Display so the residue-only wording does
+        // not silently regress to the "was deleted" phrasing — the
+        // distinction is the whole point of issue #199.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("refs/heads/main")
+                && rendered.contains("only operational metadata")
+                && rendered.contains("PROTECTED# marker")
+                && rendered.contains("re-run doctor"),
+            "expected ResidueOnly-flavoured Display, got: {rendered}",
+        );
+        assert!(
+            !rendered.contains("was deleted between selection and write"),
+            "ResidueOnly Display must not use the Deleted wording: {rendered}",
         );
 
         // HEAD must NOT have been written — the doctor refused even

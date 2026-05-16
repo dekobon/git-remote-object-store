@@ -82,6 +82,43 @@ pub(crate) fn has_branch_data(entries: &[ObjectMeta]) -> bool {
     })
 }
 
+/// Why a [`ManageError::StaleSnapshot`] was raised. The re-check that
+/// fires immediately before a mutating write can fail in two
+/// observably different ways, and both deserve their own operator-
+/// facing wording.
+///
+/// * [`Deleted`][StaleReason::Deleted] — the re-check saw nothing at
+///   all under the entity's prefix (or the singleton key was
+///   `NotFound`). A concurrent delete completed cleanly.
+///
+/// * [`ResidueOnly`][StaleReason::ResidueOnly] — the re-check found
+///   keys, but none of them carry branch data: only `*.lock` files
+///   and / or a `PROTECTED#` marker remain. Operational metadata can
+///   outlive user-visible branch data when a concurrent delete runs
+///   partially, and writing HEAD against that residue would re-create
+///   the invalid-HEAD condition the doctor exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleReason {
+    /// Nothing remains under the entity's prefix (or its singleton
+    /// key returned `NotFound`).
+    Deleted,
+    /// Only operational metadata (lock files and / or a `PROTECTED#`
+    /// marker) remains under the entity's prefix.
+    ResidueOnly,
+}
+
+impl fmt::Display for StaleReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Deleted => f.write_str("was deleted between selection and write"),
+            Self::ResidueOnly => f.write_str(
+                "is considered gone — only operational metadata \
+                 (lock files / PROTECTED# marker) remains under its prefix",
+            ),
+        }
+    }
+}
+
 /// Errors surfaced by the management surface.
 #[derive(Debug, Error)]
 pub enum ManageError {
@@ -187,10 +224,16 @@ pub enum ManageError {
     /// the doctor was trying to fix.
     ///
     /// Carries the entity whose presence was re-verified (e.g.
-    /// `"refs/heads/main"`) so the operator-facing message names the
-    /// branch and tells them to re-run the doctor.
-    #[error("doctor snapshot is stale: {0} was deleted between selection and write; re-run doctor")]
-    StaleSnapshot(String),
+    /// `"refs/heads/main"`) and a [`StaleReason`] describing exactly
+    /// what the re-check observed, so the operator-facing message names
+    /// the branch and tells them to re-run the doctor.
+    #[error("doctor snapshot is stale: {entity} {reason}; re-run doctor")]
+    StaleSnapshot {
+        /// The ref-path or other entity whose presence was re-verified.
+        entity: String,
+        /// What the re-check actually saw under that entity's prefix.
+        reason: StaleReason,
+    },
 
     /// Packchain engine surface error. Surfaced by the `doctor`'s
     /// engine-aware audit path. Carries the typed source so the
@@ -340,5 +383,67 @@ mod scripted {
                 Answer::Select(_) => panic!("expected Confirm answer, got Select"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Issue #199: `ManageError::StaleSnapshot` is raised from two
+    // observably different conditions. The Display must distinguish
+    // them so the operator-facing wording matches the on-bucket
+    // reality. These two tests pin the wording for each branch — if a
+    // future refactor collapses them back into a single string, the
+    // tests fail loudly.
+    #[test]
+    fn stale_snapshot_deleted_display_names_branch_and_uses_deleted_wording() {
+        let err = ManageError::StaleSnapshot {
+            entity: "refs/heads/main".to_owned(),
+            reason: StaleReason::Deleted,
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("refs/heads/main"),
+            "Display must name the entity: {rendered}",
+        );
+        assert!(
+            rendered.contains("was deleted between selection and write"),
+            "Deleted branch must use the 'was deleted' wording: {rendered}",
+        );
+        assert!(
+            rendered.contains("re-run doctor"),
+            "Display must instruct the operator to re-run: {rendered}",
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_residue_only_display_names_branch_and_uses_residue_wording() {
+        let err = ManageError::StaleSnapshot {
+            entity: "refs/heads/main".to_owned(),
+            reason: StaleReason::ResidueOnly,
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("refs/heads/main"),
+            "Display must name the entity: {rendered}",
+        );
+        assert!(
+            rendered.contains("only operational metadata"),
+            "ResidueOnly must mention operational metadata: {rendered}",
+        );
+        assert!(
+            rendered.contains("PROTECTED# marker"),
+            "ResidueOnly must mention the PROTECTED# marker: {rendered}",
+        );
+        assert!(
+            !rendered.contains("was deleted between selection and write"),
+            "ResidueOnly must NOT use the 'was deleted' wording — that's \
+             precisely the bug issue #199 fixed: {rendered}",
+        );
+        assert!(
+            rendered.contains("re-run doctor"),
+            "Display must instruct the operator to re-run: {rendered}",
+        );
     }
 }
