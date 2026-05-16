@@ -4,7 +4,7 @@
 .SH NAME
 git\-remote\-object\-store\-doctor \- Analyze a remote and offer to fix duplicate bundles, invalid HEAD, and stale locks
 .SH SYNOPSIS
-\fBgit\-remote\-object\-store\-doctor\fR [\fB\-d\fR|\fB\-\-delete\-bundle\fR] [\fB\-\-lock\-ttl\fR] [\fB\-\-delete\-stale\-locks\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREMOTE\fR> 
+\fBgit\-remote\-object\-store\-doctor\fR [\fB\-d\fR|\fB\-\-delete\-bundle\fR] [\fB\-\-lock\-ttl\-seconds\fR] [\fB\-\-delete\-stale\-locks\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREMOTE\fR> 
 .SH DESCRIPTION
 Analyze a remote and offer to fix duplicate bundles, invalid HEAD, and stale locks
 .SH OPTIONS
@@ -12,8 +12,8 @@ Analyze a remote and offer to fix duplicate bundles, invalid HEAD, and stale loc
 \fB\-d\fR, \fB\-\-delete\-bundle\fR
 Delete losing bundles outright instead of moving them to a `<ref>_<uuid8>` quarantine ref
 .TP
-\fB\-\-lock\-ttl\fR \fI<SECONDS>\fR [default: 60]
-Seconds after which a lock is considered stale
+\fB\-\-lock\-ttl\-seconds\fR \fI<SECONDS>\fR
+Seconds after which a lock is considered stale. Default reads `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` (falling back to 60s) — matching `compact`, `delete\-branch`, and the helper push path so the views of "stale" cannot drift
 .TP
 \fB\-\-delete\-stale\-locks\fR
 Delete stale locks found during the scan

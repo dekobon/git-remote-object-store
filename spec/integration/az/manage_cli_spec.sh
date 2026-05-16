@@ -96,7 +96,7 @@ Describe "Azure helper: management CLI against Azurite"
 
 		quiet_doctor() {
 			git-remote-object-store doctor "$URL" \
-				--lock-ttl 0 --delete-stale-locks >/dev/null
+				--lock-ttl-seconds 0 --delete-stale-locks >/dev/null
 		}
 
 		It "removes the stale lock from the ref directory"

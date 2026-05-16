@@ -33,10 +33,11 @@ use crate::url::{BackendKind, StorageEngine};
 /// Default per-ref lock TTL (seconds) when [`ENV_LOCK_TTL_SECONDS`] is
 /// unset or unparseable. Single source of truth for the lock TTL —
 /// `manage::doctor`'s stale-lock predicate, the CLI's
-/// `--lock-ttl-seconds` default, and integration-test wire-format
-/// pinning all consume this constant (the management surface
-/// re-exports it from [`crate::manage::DEFAULT_LOCK_TTL_SECONDS`]) so
-/// the views of "stale" cannot drift silently.
+/// `--lock-ttl-seconds` default (resolved through [`lock_ttl_from_env`]
+/// when the flag is unset), and integration-test wire-format pinning
+/// all consume this constant (the management surface re-exports it
+/// from [`crate::manage::DEFAULT_LOCK_TTL_SECONDS`]) so the views of
+/// "stale" cannot drift silently.
 pub const DEFAULT_LOCK_TTL_SECONDS: u64 = 60;
 
 /// Push configuration that is constant across an entire batch.

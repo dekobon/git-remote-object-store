@@ -403,11 +403,10 @@ bucket maintenance and are covered in §9 below.
 
 `doctor` flags worth knowing:
 
-- `--lock-ttl <SECS>` — seconds after which a `*.lock` file is
-  considered stale (default `60`). Unlike `compact --lock-ttl`,
-  `doctor --lock-ttl` does **not** read
-  `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`; pass the flag
-  explicitly if you need a non-default TTL.
+- `--lock-ttl-seconds <SECS>` — seconds after which a `*.lock` file
+  is considered stale. When unset, the default reads
+  `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` (falling back to 60s) —
+  matching `compact`, `delete-branch`, and the helper push path.
 - `--delete-stale-locks` — actually remove stale locks (otherwise
   doctor only reports them).
 - `--delete-bundle` — delete losing bundles outright instead of
@@ -847,7 +846,7 @@ and retry — the helper auto-clears stale locks on contention. To
 inspect manually:
 
 ```bash
-git-remote-object-store doctor origin --lock-ttl 60 --delete-stale-locks
+git-remote-object-store doctor origin --lock-ttl-seconds 60 --delete-stale-locks
 ```
 
 ### "matches more than one" on push

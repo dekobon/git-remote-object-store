@@ -16,7 +16,7 @@ use clap::{Args, Parser, Subcommand};
 
 use git_remote_object_store::git as git_helpers;
 use git_remote_object_store::manage::{
-    DEFAULT_LOCK_TTL_SECONDS, DialoguerPrompter,
+    DialoguerPrompter,
     branch::ManageBranch,
     compact::{Compact, CompactOpts},
     doctor::{Doctor, DoctorOpts},
@@ -60,9 +60,12 @@ pub enum Command {
         #[arg(short = 'd', long)]
         delete_bundle: bool,
 
-        /// Seconds after which a lock is considered stale.
-        #[arg(long, default_value_t = DEFAULT_LOCK_TTL_SECONDS, value_name = "SECONDS")]
-        lock_ttl: u64,
+        /// Seconds after which a lock is considered stale. Default
+        /// reads `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` (falling
+        /// back to 60s) — matching `compact`, `delete-branch`, and
+        /// the helper push path so the views of "stale" cannot drift.
+        #[arg(long, value_name = "SECONDS")]
+        lock_ttl_seconds: Option<u64>,
 
         /// Delete stale locks found during the scan.
         #[arg(long)]
@@ -183,18 +186,13 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Doctor {
             target,
             delete_bundle,
-            lock_ttl,
+            lock_ttl_seconds,
             delete_stale_locks,
         } => {
             let (store, prefix, engine) = open_target_with_engine(&target).await?;
             let opts = DoctorOpts {
                 delete_bundle,
-                // The CLI flag is currently required (clap defaults it
-                // to `DEFAULT_LOCK_TTL_SECONDS`), so wrap it as `Some`
-                // here. Issue #178 will replace the flag with an
-                // `Option<u64>` that defers to the same env fallback
-                // `DoctorOpts::Default` now honours.
-                lock_ttl_seconds: Some(lock_ttl),
+                lock_ttl_seconds,
                 delete_stale_locks,
                 engine,
             };
@@ -371,6 +369,71 @@ mod tests {
             msg.contains("--mark-only") && msg.contains("--sweep-only"),
             "error must name both flags: {msg}"
         );
+    }
+
+    /// Issue #178: `doctor --lock-ttl-seconds` is optional and defers
+    /// to `lock_ttl_from_env` (which honours
+    /// `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`) when omitted. The
+    /// previous spelling (`--lock-ttl` with `default_value_t = 60`)
+    /// silently baked the compile-time default and ignored the env
+    /// var, making `--delete-stale-locks` unsafe under a tuned TTL.
+    /// Pin both shapes: an omitted flag parses to `None`, and the
+    /// renamed flag round-trips an explicit value.
+    #[test]
+    fn cli_doctor_lock_ttl_seconds_defaults_to_none() {
+        let cli = Cli::try_parse_from([
+            "git-remote-object-store",
+            "doctor",
+            "s3+https://example.com/bucket",
+        ])
+        .expect("parse without flag");
+        let Command::Doctor {
+            lock_ttl_seconds, ..
+        } = cli.command
+        else {
+            panic!("expected Doctor subcommand")
+        };
+        assert!(
+            lock_ttl_seconds.is_none(),
+            "omitted flag must parse to None so DoctorOpts can defer to the env var, got {lock_ttl_seconds:?}",
+        );
+    }
+
+    #[test]
+    fn cli_doctor_lock_ttl_seconds_round_trips() {
+        let cli = Cli::try_parse_from([
+            "git-remote-object-store",
+            "doctor",
+            "--lock-ttl-seconds",
+            "120",
+            "s3+https://example.com/bucket",
+        ])
+        .expect("parse with flag");
+        let Command::Doctor {
+            lock_ttl_seconds, ..
+        } = cli.command
+        else {
+            panic!("expected Doctor subcommand")
+        };
+        assert_eq!(lock_ttl_seconds, Some(120));
+    }
+
+    /// Issue #183: the old `--lock-ttl` spelling must no longer parse
+    /// — it was inconsistent with `compact --lock-ttl-seconds` and
+    /// hid a bug under `--delete-stale-locks`. A future attribute
+    /// edit that re-adds the alias would silently restore the bug,
+    /// so pin the rejection.
+    #[test]
+    fn cli_doctor_rejects_legacy_lock_ttl_flag() {
+        let err = Cli::try_parse_from([
+            "git-remote-object-store",
+            "doctor",
+            "--lock-ttl",
+            "60",
+            "s3+https://example.com/bucket",
+        ])
+        .expect_err("legacy --lock-ttl must not parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     /// F-008: clap also rejects the conflicting CLI invocation at
