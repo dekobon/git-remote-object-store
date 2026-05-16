@@ -639,7 +639,30 @@ fn scan_stale_locks_at(
         .iter()
         .filter(|o| super::is_lock_key(&o.key))
         .filter_map(|o| {
-            let age = Duration::try_from(now - o.last_modified).ok()?;
+            let raw_age = now - o.last_modified;
+            if raw_age.is_negative() {
+                warn!(
+                    key = %o.key,
+                    skew_secs = -raw_age.whole_seconds(),
+                    "lock's last_modified is in the future; treating as \
+                     out-of-tolerance (clock skew?)",
+                );
+                // Future-stamped lock (issue #223): NOT "older than" any
+                // positive TTL, so honor `--lock-ttl-seconds N>0` by
+                // excluding it. The operator-explicit
+                // `--lock-ttl-seconds 0` ("treat every lock as stale")
+                // path still evicts so the skew is observable and the
+                // operator can clear it. Pre-fix this branch swallowed
+                // the `try_from` `Err` as `None`, silently skipping the
+                // lock at every TTL.
+                return ttl.is_zero().then_some((o.key.as_str(), Duration::ZERO));
+            }
+            // `raw_age >= 0` from the negative branch above, so the
+            // signed-to-unsigned conversion cannot fail. `expect`
+            // surfaces a future regression that loosens this invariant
+            // rather than masking it with a fallback.
+            let age = Duration::try_from(raw_age)
+                .expect("raw_age is non-negative — branch above returned for negatives");
             (age > ttl).then_some((o.key.as_str(), age))
         })
         .collect()
@@ -687,8 +710,24 @@ async fn delete_stale_lock_if_still_stale<W: Write>(
 ) -> Result<DeleteOutcome, ManageError> {
     match store.head(key).await {
         Ok(meta) => {
-            let still_stale = Duration::try_from(OffsetDateTime::now_utc() - meta.last_modified)
-                .is_ok_and(|age| age > ttl);
+            let raw_age = OffsetDateTime::now_utc() - meta.last_modified;
+            let still_stale = if raw_age.is_negative() {
+                warn!(
+                    key,
+                    skew_secs = -raw_age.whole_seconds(),
+                    "lock's last_modified is in the future on re-check; \
+                     treating as out-of-tolerance (clock skew?)",
+                );
+                // Mirror `scan_stale_locks_at` (issue #223): a future-
+                // stamped lock is "stale" only on the operator-explicit
+                // TTL=0 sweep. Any positive TTL means "older than N
+                // seconds", which a future-stamped lock is not.
+                ttl.is_zero()
+            } else {
+                let age = Duration::try_from(raw_age)
+                    .expect("raw_age is non-negative — branch above returned for negatives");
+                age > ttl
+            };
             if !still_stale {
                 writeln!(
                     out,
@@ -3283,6 +3322,104 @@ mod tests {
             stale.is_empty(),
             "lock with age == ttl must NOT be flagged (contract is `age > ttl`, \
              not `>=`); a regression to `>=` would flag this lock: {stale:?}",
+        );
+    }
+
+    /// Issue #223: a future-stamped lock (clock skew between the lock
+    /// writer and the doctor host) MUST be evicted on the operator-
+    /// explicit `--lock-ttl-seconds 0` sweep. Pre-fix, the signed
+    /// `time::Duration` from `now - last_modified` was negative, the
+    /// `Duration::try_from` returned `Err`, and the filter swallowed
+    /// the lock as if it were fresh — even at TTL=0, the operator's
+    /// "treat every lock as stale" intent was silently violated.
+    #[tokio::test]
+    async fn scan_stale_locks_evicts_future_stamped_at_zero_ttl() {
+        let now = OffsetDateTime::now_utc();
+        let listing = [ObjectMeta {
+            key: "myrepo/refs/heads/main/LOCK#.lock".to_owned(),
+            size: 0,
+            // 60 seconds AHEAD of `now` — pathological clock skew.
+            last_modified: now + time::Duration::minutes(1),
+            etag: None,
+        }];
+        let stale = scan_stale_locks_at(now, &listing, Duration::ZERO);
+        let keys: Vec<&str> = stale.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            vec!["myrepo/refs/heads/main/LOCK#.lock"],
+            "TTL=0 must evict future-stamped locks (operator-explicit \
+             treat-every-lock-as-stale opt-in)",
+        );
+    }
+
+    /// Issue #223 negative-direction pin: a future-stamped lock is NOT
+    /// "older than" any positive TTL, so a `--lock-ttl-seconds 60` sweep
+    /// must leave it in place. Without this, an operator with a tuned
+    /// positive TTL and a single skewed lock would see the lock evicted
+    /// alongside genuinely-stale ones.
+    #[tokio::test]
+    async fn scan_stale_locks_keeps_future_stamped_at_positive_ttl() {
+        let now = OffsetDateTime::now_utc();
+        let listing = [ObjectMeta {
+            key: "myrepo/refs/heads/main/LOCK#.lock".to_owned(),
+            size: 0,
+            last_modified: now + time::Duration::minutes(1),
+            etag: None,
+        }];
+        let stale = scan_stale_locks_at(now, &listing, Duration::from_mins(1));
+        assert!(
+            stale.is_empty(),
+            "positive TTL must NOT flag a future-stamped lock: {stale:?}",
+        );
+    }
+
+    /// Issue #223: the orchestration helper's re-HEAD path has the same
+    /// signed-Duration bug shape as `scan_stale_locks_at`. Even if the
+    /// scan flagged the lock, a future-stamped `last_modified` returned
+    /// by HEAD pre-fix made `try_from` fail, `is_ok_and` return false,
+    /// and the helper report `SkippedNotStale` — refusing the explicit
+    /// operator request. Pin the TTL=0 path: the helper must delete.
+    #[tokio::test]
+    async fn delete_stale_lock_if_still_stale_evicts_future_stamped_at_zero_ttl() {
+        let mock = MockStore::new();
+        let key = "myrepo/refs/heads/main/LOCK#.lock";
+        let future = OffsetDateTime::now_utc() + time::Duration::minutes(1);
+        mock.insert_with(key, Bytes::new(), future, PutOpts::default());
+
+        let mut out = Vec::new();
+        let outcome = super::delete_stale_lock_if_still_stale(&mock, key, Duration::ZERO, &mut out)
+            .await
+            .expect("helper must not error on the future-stamped path");
+
+        assert_eq!(outcome, DeleteOutcome::Deleted);
+        assert!(
+            !mock.contains(key),
+            "future-stamped lock must be deleted at TTL=0"
+        );
+    }
+
+    /// Issue #223 negative-direction pin for the re-HEAD path: a
+    /// future-stamped lock at a POSITIVE TTL must NOT be deleted (it
+    /// is not "older than" any positive threshold). Without this pin,
+    /// a "fix" that flipped negative-age to "ancient" would erroneously
+    /// evict legitimately-future-stamped locks at every TTL.
+    #[tokio::test]
+    async fn delete_stale_lock_if_still_stale_skips_future_stamped_at_positive_ttl() {
+        let mock = MockStore::new();
+        let key = "myrepo/refs/heads/main/LOCK#.lock";
+        let future = OffsetDateTime::now_utc() + time::Duration::minutes(1);
+        mock.insert_with(key, Bytes::new(), future, PutOpts::default());
+
+        let mut out = Vec::new();
+        let outcome =
+            super::delete_stale_lock_if_still_stale(&mock, key, Duration::from_mins(1), &mut out)
+                .await
+                .expect("helper must not error when refusing a future-stamped lock");
+
+        assert_eq!(outcome, DeleteOutcome::SkippedNotStale);
+        assert!(
+            mock.contains(key),
+            "future-stamped lock must survive at positive TTL",
         );
     }
 

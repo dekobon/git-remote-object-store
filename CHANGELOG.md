@@ -126,6 +126,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`doctor` no longer silently skips future-stamped locks (#223).**
+  `scan_stale_locks` and `delete_stale_lock_if_still_stale` both
+  computed `age = now - last_modified` via
+  `Duration::try_from(...).ok()` and treated the `Err` branch
+  (negative age, i.e. `last_modified` in the future) as "not stale" —
+  silently filtering the lock out at every TTL, even
+  `--lock-ttl-seconds 0`. Now the negative-age branch is explicit:
+  emit a `warn!` naming the key and the skew magnitude, then include
+  the lock ONLY when the operator opts in via TTL=0 ("treat every
+  lock as stale"); any positive TTL still excludes it because a
+  future-stamped lock is not "older than" any positive threshold.
+
 - **Cap bundle-header reads to prevent OOM (#194).** `BundleHeader::read`
   now bounds per-line (16 KiB) and total-header (64 MiB) byte budgets
   via `BufRead::take(...).read_until(b'\n', ...)`. A malformed bundle
