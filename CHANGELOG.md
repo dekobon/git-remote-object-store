@@ -41,6 +41,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Homebrew formula publishes to the shared `dekobon/homebrew-tap`
+  repository.** Previously the release workflow pushed to a dedicated
+  `dekobon/homebrew-git-remote-object-store` tap that never got
+  created, so every release skipped the tap push with a warning in
+  the runner log. The formula now lands in `dekobon/homebrew-tap`
+  alongside `host-identity` and other `dekobon` tools, so end users
+  can install with `brew tap dekobon/tap && brew install
+  git-remote-object-store`. The `HOMEBREW_TAP_TOKEN` secret must now
+  grant `contents: write` on `dekobon/homebrew-tap`. Two related
+  hardenings on the release workflow's tap-push step: an unreachable
+  tap (set-but-misconfigured PAT) is now a hard failure rather than a
+  silent warn-and-skip, and the push retries up to five times with
+  `git fetch && git rebase origin/main` between attempts so a sibling
+  pipeline landing a commit on the shared tap's `main` between our
+  clone and push no longer aborts our release. Token-unset still
+  skips gracefully for the pre-public-flip window. Updated in
+  `docs/development/cutting-a-release.md`.
+
 - **Corrected the `ENVIRONMENT` sections of the helper man pages.**
   `man/git-remote-s3+https.1` and `man/git-remote-az+https.1` previously
   listed variables the helpers do not actually honor — `RUST_LOG`, the

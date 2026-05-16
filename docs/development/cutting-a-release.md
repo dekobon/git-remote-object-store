@@ -74,11 +74,15 @@ Configure these under **Settings → Secrets and variables → Actions**:
 | `MINISIGN_PASSWORD`      | Password for that key                                              |
 | `ALPINE_ABUILD_KEY_PRIV` | abuild RSA private key (Alpine `.apk` signing)                     |
 | `ALPINE_ABUILD_KEY_PUB`  | Matching public key                                                |
-| `HOMEBREW_TAP_TOKEN`     | Fine-grained PAT with write access to `dekobon/homebrew-git-remote-object-store` |
+| `HOMEBREW_TAP_TOKEN`     | Fine-grained PAT with write access to `dekobon/homebrew-tap` |
 
-The Homebrew tap secret is optional — if it's missing, the publish
-step warns and skips the tap push, leaving the GitHub Release
-intact.
+The Homebrew tap secret is optional only in the unset sense: if
+`HOMEBREW_TAP_TOKEN` is empty, the publish step logs and skips the
+tap push, leaving the GitHub Release intact. If the secret is set
+but the tap is unreachable (wrong scope, expired PAT, revoked
+token), the publish step fails the release job — drifting the
+formula behind a green GitHub Release and crates.io publish is
+worse than failing loudly.
 
 crates.io authentication does **not** use a repository secret; the
 `publish-crates` job authenticates via
@@ -148,10 +152,31 @@ same tag after manual first-publish is safe.
 
 ### Homebrew tap repo
 
-Create an empty `dekobon/homebrew-git-remote-object-store`
-repository, mint a fine-grained PAT scoped to **contents: write**
-on it, and store as `HOMEBREW_TAP_TOKEN`. Without the secret, the
-publish step skips the tap push without failing.
+The release workflow publishes the rendered formula to
+`dekobon/homebrew-tap` — a shared tap that also hosts formulae for
+other `dekobon` tools. The job writes
+`Formula/git-remote-object-store.rb` and commits to `main`; it never
+touches sibling formulae.
+
+Mint a fine-grained PAT scoped to **contents: write** on
+`dekobon/homebrew-tap` and store it as the `HOMEBREW_TAP_TOKEN`
+repository secret. With the secret unset, the publish step logs
+and skips the tap push (graceful no-op for the pre-flip window).
+With the secret set but misconfigured, the publish step fails
+loudly — see the secrets table above for the rationale.
+
+Because the tap is shared, sibling `dekobon/*` release pipelines
+may land on `main` between our clone and push. The job retries the
+push up to five times, rebasing onto `origin/main` each round; a
+genuine conflict on `Formula/git-remote-object-store.rb` (two
+concurrent publishes of this crate) is left to fail.
+
+End users install via:
+
+```bash
+brew tap dekobon/tap
+brew install git-remote-object-store
+```
 
 ## Per-release procedure
 
@@ -282,8 +307,9 @@ green until each is in place.
 - [ ] `ALPINE_ABUILD_KEY_PRIV` / `_PUB` repo secrets set (or
       accept ephemeral key warnings on every release).
 - [ ] `release` GitHub Environment created.
-- [ ] `dekobon/homebrew-git-remote-object-store` tap repo created
-      and `HOMEBREW_TAP_TOKEN` PAT issued.
+- [ ] `HOMEBREW_TAP_TOKEN` PAT issued with `contents: write`
+      scope on `dekobon/homebrew-tap` (the shared tap repo
+      already exists).
 - [ ] First-publish of `git-remote-object-store` and
       `git-remote-object-store-cli` to crates.io done manually
       (the registry won't accept Trusted Publisher registration

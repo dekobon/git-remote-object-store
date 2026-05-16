@@ -1054,11 +1054,16 @@ jobs:
             echo "HOMEBREW_TAP_TOKEN not set — skipping tap push"
             exit 0
           fi
-          REPO="https://github.com/dekobon/homebrew-git-remote-object-store.git"
+          REPO="https://github.com/dekobon/homebrew-tap.git"
           AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$HOMEBREW_TAP_TOKEN" | base64 -w0)"
+          # Hard fail on unreachable tap: the repo is known to exist (it
+          # already hosts sibling formulae), so a failure here means the
+          # PAT is missing scope, expired, or revoked — a misconfiguration
+          # that would otherwise let the GitHub Release and crates.io
+          # publish land without the formula update and drift unnoticed.
           if ! git -c "http.extraheader=$AUTH_HEADER" ls-remote "$REPO" &>/dev/null; then
-            echo "::warning::tap repo $REPO not reachable — skipping tap push"
-            exit 0
+            echo "::error::tap repo $REPO not reachable — check HOMEBREW_TAP_TOKEN scope"
+            exit 1
           fi
           git -c "http.extraheader=$AUTH_HEADER" clone "$REPO" tap
           mkdir -p tap/Formula
@@ -1069,10 +1074,31 @@ jobs:
           git add Formula/git-remote-object-store.rb
           if git diff --cached --quiet; then
             echo "Formula unchanged — skipping push"
-          else
-            git commit -m "git-remote-object-store ${VERSION}"
-            git -c "http.extraheader=$AUTH_HEADER" push origin HEAD
+            exit 0
           fi
+          git commit -m "git-remote-object-store ${VERSION}"
+          # Push with rebase-on-reject: the tap is shared with sibling
+          # `dekobon/*` release pipelines, so `main` may move between our
+          # clone and push. Rebase our single-file commit onto the latest
+          # main and retry. Rebase is conflict-free as long as the racing
+          # commit touches a different formula; a genuine collision on
+          # Formula/git-remote-object-store.rb means two concurrent
+          # publishes of this crate, which should fail loudly.
+          MAX_PUSH_ATTEMPTS=5
+          attempt=1
+          while true; do
+            if git -c "http.extraheader=$AUTH_HEADER" push origin HEAD; then
+              break
+            fi
+            if [[ "$attempt" -ge "$MAX_PUSH_ATTEMPTS" ]]; then
+              echo "::error::tap push failed after $MAX_PUSH_ATTEMPTS attempts"
+              exit 1
+            fi
+            echo "tap push attempt $attempt rejected; fetching origin/main and rebasing"
+            git -c "http.extraheader=$AUTH_HEADER" fetch origin main
+            git rebase origin/main
+            attempt=$((attempt + 1))
+          done
 
   # ─── Stage 5b — crates.io publish ────────────────────────────────────
   # Uploads the library first, then the CLI. The pinned toolchain's
