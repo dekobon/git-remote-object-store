@@ -321,10 +321,7 @@ pub fn parse(input: &str) -> Result<RemoteUrl, ParseError> {
         return Err(ParseError::Empty);
     }
 
-    let backend = detect_backend(trimmed)?;
-    let body = trimmed
-        .strip_prefix(backend.scheme_prefix())
-        .ok_or_else(|| ParseError::UnsupportedScheme(scheme_of(trimmed)))?;
+    let (backend, body) = detect_backend(trimmed)?;
     let endpoint = Url::parse(body)?;
 
     let host = endpoint
@@ -405,14 +402,23 @@ enum AddressingOverride {
     Virtual,
 }
 
-fn detect_backend(input: &str) -> Result<BackendKind, ParseError> {
-    if input.starts_with("s3+https://") || input.starts_with("s3+http://") {
-        Ok(BackendKind::S3)
-    } else if input.starts_with("az+https://") || input.starts_with("az+http://") {
-        Ok(BackendKind::Azure)
-    } else {
-        Err(ParseError::UnsupportedScheme(scheme_of(input)))
+/// Classify the URL by its backend scheme prefix and return both the
+/// detected [`BackendKind`] and the body of the URL with the `s3+` /
+/// `az+` tag stripped. Folding the classification and the strip into
+/// one step keeps `parse()` free of an unreachable fallback for a
+/// mismatched prefix.
+///
+/// Each branch also verifies that the body starts with `https://` or
+/// `http://` so the downstream `Url::parse` sees a recognised scheme.
+fn detect_backend(input: &str) -> Result<(BackendKind, &str), ParseError> {
+    for kind in [BackendKind::S3, BackendKind::Azure] {
+        if let Some(body) = input.strip_prefix(kind.scheme_prefix())
+            && (body.starts_with("https://") || body.starts_with("http://"))
+        {
+            return Ok((kind, body));
+        }
     }
+    Err(ParseError::UnsupportedScheme(scheme_of(input)))
 }
 
 /// Extract the part of `input` before the first `:` for error messages.
@@ -904,6 +910,24 @@ mod tests {
     fn rejects_unknown_scheme() {
         let err = parse("https://example.com/bucket").unwrap_err();
         assert!(matches!(err, ParseError::UnsupportedScheme(s) if s == "https"));
+    }
+
+    #[test]
+    fn rejects_backend_tag_with_unsupported_inner_scheme() {
+        // `detect_backend` must check both the `s3+`/`az+` tag and the
+        // inner `http(s)://` scheme — otherwise an `s3+ftp://` URL would
+        // sneak past classification and surface as a confusing downstream
+        // `Url::parse` error.
+        for input in [
+            "s3+ftp://example.com/b",
+            "az+ftp://acct.blob.core.windows.net/c",
+        ] {
+            let err = parse(input).unwrap_err();
+            assert!(
+                matches!(&err, ParseError::UnsupportedScheme(_)),
+                "expected UnsupportedScheme for {input}, got {err:?}",
+            );
+        }
     }
 
     #[test]
