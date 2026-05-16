@@ -33,7 +33,7 @@ use crate::protocol::push::{
 use crate::url::StorageEngine;
 
 use super::PackchainError;
-use super::gc::write_baseline_tombstone_best_effort;
+use super::gc::{write_baseline_tombstone_best_effort, write_baseline_tombstone_for_orphan};
 use super::keys::{chain_key, pack_idx_key, pack_key, path_index_key};
 use super::manifest::{load_chain, next_manifest, write_chain, write_path_index};
 use super::pack::{BuiltPack, build_baseline_pack, build_incremental_pack};
@@ -897,6 +897,66 @@ async fn force_push_baseline_cleanup(
     .await;
 }
 
+/// Attempt to tombstone the baseline bundle for a helper-protocol
+/// delete so the synchronous sweep loop can skip it (issue #203).
+/// Returns the bundle key that was deferred, or `None` if no deferral
+/// is possible (unparseable `chain.json`, no `<full_at>.bundle` in the
+/// listing, or a tombstone PUT failure).
+///
+/// Mirrors `manage::branch::ManageBranch::try_tombstone_baseline` —
+/// see that function and #143 for the full rationale. The `None`
+/// fall-through is correct for every "deferral is not actionable"
+/// case: with no tombstone, `gc sweep` has nothing to reclaim, so the
+/// sweep loop must remove the bundle synchronously instead. A logged
+/// warning surfaces the rarer load/parse/PUT failures for operator
+/// review without blocking the delete.
+///
+/// Runs UNDER the per-ref lock (#158): a concurrent push that landed
+/// between the tombstone and the chain.json delete would otherwise
+/// leave the bucket with a tombstone referencing a SHA no longer in
+/// the chain, and `gc sweep` would reclaim a live bundle.
+async fn try_tombstone_baseline_for_delete(
+    store: &dyn ObjectStore,
+    prefix: Option<&str>,
+    remote_ref: &RefName,
+    entries: &[crate::object_store::ObjectMeta],
+) -> Option<String> {
+    let chain = match load_chain(store, prefix, remote_ref).await {
+        Ok(Some(chain)) => chain,
+        Ok(None) => return None,
+        Err(err) => {
+            warn!(
+                remote_ref = %remote_ref.as_str(),
+                error = %err,
+                "packchain delete: chain.json read/parse failed; falling back to synchronous bundle delete",
+            );
+            return None;
+        }
+    };
+    let bundle_key = keys::bundle_key(prefix, remote_ref.as_str(), chain.full_at.as_str());
+    // The baseline bundle must actually be in the under-lock listing
+    // — otherwise the deferred delete has nothing to defer (it was
+    // already gone, or the chain points outside our prefix). A
+    // mismatched `full_at` against listing reality is the canonical
+    // "chain.json points at a missing bundle" doctor case; immediate
+    // sweep is the right fallback there too.
+    if !entries.iter().any(|m| m.key == bundle_key) {
+        return None;
+    }
+    match write_baseline_tombstone_for_orphan(store, prefix, remote_ref, &chain.full_at).await {
+        Ok(()) => Some(bundle_key),
+        Err(err) => {
+            warn!(
+                remote_ref = %remote_ref.as_str(),
+                key = %bundle_key,
+                error = %err,
+                "packchain delete: baseline tombstone write failed; falling back to synchronous bundle delete",
+            );
+            None
+        }
+    }
+}
+
 /// Delete a packchain-engine ref: remove `chain.json`, `path-index.json`,
 /// and the baseline bundle. Pack files are NOT deleted (they may be
 /// referenced by other branches; `manage gc` reaps unreferenced packs).
@@ -1023,9 +1083,38 @@ async fn delete_remote_ref_packchain(
         });
     }
 
+    // Issue #203: mirror the `manage::branch::ManageBranch::delete`
+    // pattern (#143) — write a baseline tombstone naming the current
+    // `full_at` bundle BEFORE the synchronous sweep, then exclude that
+    // bundle key from the delete loop. A concurrent fetcher that read
+    // the prior `chain.json` (t₀) and is mid-range-GET on
+    // `<full_at>.bundle` then completes against the still-live bundle;
+    // `gc sweep` reclaims it after the grace window. The tombstone
+    // write runs UNDER the lock (#158) so a concurrent push cannot
+    // sneak a chain rewrite between the tombstone and the chain.json
+    // delete. An unparseable `chain.json`, a missing
+    // `<full_at>.bundle` in the listing, or a tombstone PUT failure
+    // falls through to immediate bundle deletion so the operator's
+    // "ref is gone" intent is still satisfied.
+    let deferred_bundle_key =
+        try_tombstone_baseline_for_delete(store_ref, prefix, remote_ref, &entries).await;
+    if let Some(ref key) = deferred_bundle_key {
+        info!(
+            remote_ref = %remote_ref.as_str(),
+            key = %key,
+            "packchain delete: deferred baseline bundle delete via tombstone",
+        );
+    }
+
     let sweep_result: Result<(), PushError> = async {
         for entry in &entries {
             if entry.key == lock {
+                continue;
+            }
+            // The baseline bundle (if any) is left for `gc sweep` —
+            // see the tombstone block above. Other keys (chain.json,
+            // path-index.json) are deleted synchronously.
+            if deferred_bundle_key.as_deref() == Some(entry.key.as_str()) {
                 continue;
             }
             delete_idempotent(store_ref, &entry.key).await?;
@@ -1154,7 +1243,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_sweeps_chain_path_index_and_baseline() {
+    async fn delete_sweeps_chain_path_index_and_defers_baseline() {
+        // Issue #203: a helper-protocol delete on a packchain ref must
+        // mirror `manage delete-branch`'s #143 contract — chain.json
+        // and path-index.json are removed synchronously, but the
+        // baseline bundle survives the sweep with a baseline tombstone
+        // written under `<prefix>/gc/baseline-tomb-*.json` for the
+        // grace window. From a fresh reader's perspective the ref is
+        // gone the moment chain.json commits; the bundle stays only
+        // so an in-flight fetcher that already loaded the prior chain
+        // can finish.
         let store = Arc::new(MockStore::new());
         let prefix = Some("repo");
         let remote = rn("refs/heads/main");
@@ -1181,17 +1279,186 @@ mod tests {
         assert!(matches!(outcome, PushOutcome::Ok { .. }));
         assert!(!store.contains(&chain_key(prefix, &remote)));
         assert!(!store.contains(&path_index_key(prefix, &remote)));
-        // The test name asserts the baseline bundle is also swept;
-        // without this check, a regression that filtered the listing
-        // to chain + path-index only would still pass.
+        // #203: the baseline bundle must survive the synchronous
+        // sweep so a concurrent fetch can finish; `gc sweep` reclaims
+        // it after the grace window.
         assert!(
-            !store.contains(&baseline_key),
-            "baseline bundle at {baseline_key} must also be deleted",
+            store.contains(&baseline_key),
+            "baseline bundle at {baseline_key} must survive synchronous delete (deferred via tombstone)",
+        );
+        // Exactly one baseline tombstone under
+        // `<prefix>/gc/baseline-tomb-*.json`. The UUID-named body
+        // belongs to `BaselineTombstone`; this test pins only the
+        // listing prefix.
+        let tomb_keys: Vec<String> = store
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .collect();
+        assert_eq!(
+            tomb_keys.len(),
+            1,
+            "exactly one baseline tombstone must exist: {tomb_keys:?}",
         );
         // Lock must also be gone (release_lock deletes it after sweep).
         assert!(
             !store.contains(&lock_key(prefix, &remote)),
             "lock key must be released after a successful delete",
+        );
+    }
+
+    /// Issue #203: round-trip the tombstone contract — a helper-protocol
+    /// delete writes the tombstone, then `gc sweep --force` (skips the
+    /// grace window) finds a `chain.json`-less ref and reclaims the
+    /// bundle. A regression in the tombstone shape would surface as a
+    /// deferred sweep step rather than a reclaim.
+    #[tokio::test]
+    async fn delete_tombstone_is_reaped_by_gc_sweep() {
+        use crate::packchain::gc;
+
+        let store = Arc::new(MockStore::new());
+        let prefix = Some("repo");
+        let remote = rn("refs/heads/main");
+        let baseline_sha = Sha::from_hex("0000000000000000000000000000000000000001").unwrap();
+        let baseline_key = keys::bundle_key(prefix, &remote, baseline_sha);
+        store.insert(
+            chain_key(prefix, &remote),
+            Bytes::from_static(b"{\"v\":1,\"tip\":\"0000000000000000000000000000000000000001\",\"full_at\":\"0000000000000000000000000000000000000001\",\"segments\":[]}"),
+        );
+        store.insert(path_index_key(prefix, &remote), Bytes::from_static(b"{}"));
+        store.insert(&baseline_key, Bytes::from_static(b"PACK"));
+
+        let config = delete_test_config();
+        let outcome = delete_remote_ref_packchain(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            prefix,
+            &remote,
+            &config,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, PushOutcome::Ok { .. }));
+        assert!(
+            store.contains(&baseline_key),
+            "pre-condition: bundle still present after delete (deferred)",
+        );
+
+        let store_ref: &dyn ObjectStore = store.as_ref();
+        let sweep = gc::sweep(
+            store_ref,
+            "repo",
+            gc::SweepOpts {
+                grace_hours: 0,
+                force: true,
+            },
+        )
+        .await
+        .expect("sweep");
+        assert_eq!(
+            sweep.swept_tombstones, 1,
+            "sweep must reclaim exactly the tombstone helper-protocol delete wrote",
+        );
+        assert!(
+            !store.contains(&baseline_key),
+            "baseline bundle must be deleted by sweep: surviving keys = {:?}",
+            store.keys(),
+        );
+        let surviving_tombs: Vec<String> = store
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .collect();
+        assert!(
+            surviving_tombs.is_empty(),
+            "tombstone must be deleted by sweep: {surviving_tombs:?}",
+        );
+    }
+
+    /// Issue #203: a concurrent fetcher that already advertised the
+    /// prior baseline SHA can still range-GET the bundle immediately
+    /// after a helper-protocol delete returns. This is the race the
+    /// tombstone defers — without it, the bundle is gone the moment
+    /// the sweep completes and the fetch fails with `NotFound`.
+    #[tokio::test]
+    async fn delete_leaves_baseline_bundle_for_concurrent_fetch() {
+        let store = Arc::new(MockStore::new());
+        let prefix = Some("repo");
+        let remote = rn("refs/heads/main");
+        let baseline_sha = Sha::from_hex("0000000000000000000000000000000000000001").unwrap();
+        let baseline_key = keys::bundle_key(prefix, &remote, baseline_sha);
+        store.insert(
+            chain_key(prefix, &remote),
+            Bytes::from_static(b"{\"v\":1,\"tip\":\"0000000000000000000000000000000000000001\",\"full_at\":\"0000000000000000000000000000000000000001\",\"segments\":[]}"),
+        );
+        store.insert(path_index_key(prefix, &remote), Bytes::from_static(b"{}"));
+        store.insert(&baseline_key, Bytes::from_static(b"PACKBUNDLE"));
+
+        let config = delete_test_config();
+        let outcome = delete_remote_ref_packchain(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            prefix,
+            &remote,
+            &config,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, PushOutcome::Ok { .. }));
+
+        // A concurrent fetcher that already advertised this SHA
+        // performs a `get_bytes` against the still-live bundle key.
+        // It must succeed within the grace window.
+        let bytes = store
+            .as_ref()
+            .get_bytes(&baseline_key)
+            .await
+            .expect("concurrent fetcher must still read the bundle within the grace window");
+        assert_eq!(bytes.as_ref(), b"PACKBUNDLE");
+    }
+
+    /// Issue #203: an unparseable `chain.json` must fall through to
+    /// immediate bundle deletion — there is no SHA to tombstone, so
+    /// deferral would orphan the bundle. Mirrors the
+    /// `manage::branch::ManageBranch::try_tombstone_baseline` `Err`
+    /// branch.
+    #[tokio::test]
+    async fn delete_with_unparseable_chain_falls_back_to_synchronous_bundle_delete() {
+        let store = Arc::new(MockStore::new());
+        let prefix = Some("repo");
+        let remote = rn("refs/heads/main");
+        let baseline_sha = Sha::from_hex("0000000000000000000000000000000000000002").unwrap();
+        let baseline_key = keys::bundle_key(prefix, &remote, baseline_sha);
+        // chain.json that parses as JSON but fails ChainManifest
+        // validation (no `v`/`tip`/`full_at`/`segments` fields).
+        store.insert(chain_key(prefix, &remote), Bytes::from_static(b"{}"));
+        store.insert(&baseline_key, Bytes::from_static(b"PACK"));
+
+        let config = delete_test_config();
+        let outcome = delete_remote_ref_packchain(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            prefix,
+            &remote,
+            &config,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, PushOutcome::Ok { .. }));
+        // Bundle removed synchronously because deferral was not actionable.
+        assert!(
+            !store.contains(&baseline_key),
+            "bundle must be swept synchronously when chain.json is unparseable",
+        );
+        // No tombstone written.
+        let tomb_keys: Vec<String> = store
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .collect();
+        assert!(
+            tomb_keys.is_empty(),
+            "no tombstone should be written on the fall-back path: {tomb_keys:?}",
         );
     }
 
