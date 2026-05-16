@@ -32,6 +32,7 @@ use super::{DEFAULT_LOCK_TTL_SECONDS, ManageError, Prompter};
 use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
 use crate::packchain::audit::{self, AuditReport, BranchRow};
+use crate::protocol::push::lock_ttl_from_env;
 use crate::url::StorageEngine;
 
 /// Tunables for [`Doctor::run`].
@@ -41,8 +42,11 @@ pub struct DoctorOpts {
     /// outright. When `false` (default), they are quarantined to a
     /// fresh `<ref>_<uuid8>` ref so a human can recover them later.
     pub delete_bundle: bool,
-    /// Locks older than this TTL are considered stale.
-    pub lock_ttl_seconds: u64,
+    /// Locks older than this TTL are considered stale. `None` falls
+    /// back to [`crate::protocol::push::lock_ttl_from_env`] which
+    /// honours `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` (defaulting
+    /// to [`DEFAULT_LOCK_TTL_SECONDS`] when unset).
+    pub lock_ttl_seconds: Option<u64>,
     /// When `true`, scanned stale locks are deleted; otherwise, the
     /// doctor only reports them and recommends re-running with the
     /// flag.
@@ -58,7 +62,7 @@ impl Default for DoctorOpts {
     fn default() -> Self {
         Self {
             delete_bundle: false,
-            lock_ttl_seconds: DEFAULT_LOCK_TTL_SECONDS,
+            lock_ttl_seconds: None,
             delete_stale_locks: false,
             engine: StorageEngine::Bundle,
         }
@@ -90,6 +94,21 @@ impl<'a> Doctor<'a> {
             opts,
             prompter,
         }
+    }
+
+    /// Resolve the stale-lock TTL in seconds. Mirrors
+    /// [`crate::manage::compact::Compact`]: an explicit
+    /// [`DoctorOpts::lock_ttl_seconds`] wins, otherwise we fall back to
+    /// [`lock_ttl_from_env`] so the management CLI honours
+    /// `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` even when the operator
+    /// instantiated `DoctorOpts` via `Default`. The env helper returns a
+    /// `time::Duration`; clamp to `u64` because `scan_stale_locks` uses
+    /// `std::time::Duration` (the rest of the doctor surface speaks
+    /// `std::time`).
+    fn resolved_lock_ttl_seconds(&self) -> u64 {
+        self.opts.lock_ttl_seconds.unwrap_or_else(|| {
+            u64::try_from(lock_ttl_from_env().whole_seconds()).unwrap_or(DEFAULT_LOCK_TTL_SECONDS)
+        })
     }
 
     /// Analyze, report, and fix — writing human-readable output to
@@ -528,7 +547,7 @@ impl<'a> Doctor<'a> {
         objects: &[ObjectMeta],
     ) -> Result<(), ManageError> {
         writeln!(out, "\nScanning for stale locks...")?;
-        let ttl = Duration::from_secs(self.opts.lock_ttl_seconds);
+        let ttl = Duration::from_secs(self.resolved_lock_ttl_seconds());
         let stale = scan_stale_locks(objects, ttl);
 
         if stale.is_empty() {
@@ -3024,5 +3043,63 @@ mod tests {
             !output.contains("Moving"),
             "eviction line must not appear after user abort: {output:?}",
         );
+    }
+
+    // --- `DoctorOpts::default()` honours the env fallback (issue #189) ---
+    //
+    // The library Default impl used to bake `DEFAULT_LOCK_TTL_SECONDS`
+    // into the struct, so library consumers that instantiate
+    // `DoctorOpts::default()` would silently ignore
+    // `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`. The fix moves the env
+    // read inside the runner so `Default` defers to it.
+
+    #[test]
+    fn default_lock_ttl_is_none() {
+        assert!(DoctorOpts::default().lock_ttl_seconds.is_none());
+    }
+
+    #[test]
+    fn resolved_lock_ttl_honors_env_when_opts_unset() {
+        // The env var is process-global; serialise the read/write/clear
+        // dance inside one test to avoid racing parallel test threads.
+        use crate::protocol::push::ENV_LOCK_TTL_SECONDS;
+        let mock = MockStore::new();
+        let prompter = ScriptedPrompter::new([]);
+        let doctor = Doctor::new(store_arc(&mock), "myrepo", DoctorOpts::default(), &prompter);
+
+        // Env override wins when `opts.lock_ttl_seconds` is `None`.
+        unsafe {
+            std::env::set_var(ENV_LOCK_TTL_SECONDS, "120");
+        }
+        let got = doctor.resolved_lock_ttl_seconds();
+        // Clean up before asserting so a failure does not leak the env
+        // var to subsequent tests on this thread.
+        unsafe {
+            std::env::remove_var(ENV_LOCK_TTL_SECONDS);
+        }
+        assert_eq!(got, 120, "env override must propagate to Doctor default");
+
+        // Unset env falls back to the project default — must not "stale-lock"
+        // every lock instantly nor diverge from push's lock-acquire TTL.
+        assert_eq!(
+            doctor.resolved_lock_ttl_seconds(),
+            DEFAULT_LOCK_TTL_SECONDS,
+            "unset env must fall back to DEFAULT_LOCK_TTL_SECONDS",
+        );
+
+        // Explicit `Some` always wins over the env var.
+        let opts = DoctorOpts {
+            lock_ttl_seconds: Some(7),
+            ..DoctorOpts::default()
+        };
+        let doctor_with_opt = Doctor::new(store_arc(&mock), "myrepo", opts, &prompter);
+        unsafe {
+            std::env::set_var(ENV_LOCK_TTL_SECONDS, "120");
+        }
+        let got_explicit = doctor_with_opt.resolved_lock_ttl_seconds();
+        unsafe {
+            std::env::remove_var(ENV_LOCK_TTL_SECONDS);
+        }
+        assert_eq!(got_explicit, 7, "explicit opts.lock_ttl_seconds must win");
     }
 }

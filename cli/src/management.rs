@@ -189,7 +189,12 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let (store, prefix, engine) = open_target_with_engine(&target).await?;
             let opts = DoctorOpts {
                 delete_bundle,
-                lock_ttl_seconds: lock_ttl,
+                // The CLI flag is currently required (clap defaults it
+                // to `DEFAULT_LOCK_TTL_SECONDS`), so wrap it as `Some`
+                // here. Issue #178 will replace the flag with an
+                // `Option<u64>` that defers to the same env fallback
+                // `DoctorOpts::Default` now honours.
+                lock_ttl_seconds: Some(lock_ttl),
                 delete_stale_locks,
                 engine,
             };
