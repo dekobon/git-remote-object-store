@@ -127,4 +127,54 @@ mod tests {
         assert_eq!(parse_verbose(""), None);
         assert_eq!(parse_verbose("-1"), None);
     }
+
+    /// Pins the single-knob policy for every binary in the crate
+    /// (helper bins, LFS agent, management CLI): `RUST_LOG` MUST NOT
+    /// influence startup verbosity. Only [`ENV_VERBOSE`] is consulted.
+    ///
+    /// Regression guard for #179, which fixed a stale doc claim that
+    /// the management CLI honored `RUST_LOG` (it did, via
+    /// `EnvFilter::try_from_default_env`). The fix routed the
+    /// management CLI through this module so all three entry points
+    /// share one verbosity policy.
+    ///
+    /// `set_var` / `remove_var` are process-global; this test only
+    /// touches `RUST_LOG` (which the crate never reads) and `ENV_VERBOSE`
+    /// (which no other test sets), so cross-test interference is
+    /// limited to itself — the final `remove_var` restores both keys.
+    #[test]
+    fn read_verbose_env_ignores_rust_log() {
+        // SAFETY: edition 2024 marks `set_var` / `remove_var` unsafe
+        // because they mutate process-global state. The race is only
+        // observable across threads that read the same key; this test
+        // is single-threaded and the keys it touches (`RUST_LOG`,
+        // `ENV_VERBOSE`) are not read concurrently by other tests in
+        // this binary.
+        unsafe {
+            std::env::set_var("RUST_LOG", "trace");
+            std::env::remove_var(ENV_VERBOSE);
+        }
+        assert_eq!(
+            read_verbose_env(),
+            0,
+            "RUST_LOG must not influence verbosity; only {ENV_VERBOSE} does",
+        );
+        assert!(
+            !env_verbose_at_least(2),
+            "default floor is below info even when RUST_LOG=trace",
+        );
+
+        // Confirm the inverse: ENV_VERBOSE is the *only* knob that
+        // raises the floor. Setting it alongside RUST_LOG yields the
+        // info filter, proving the policy is single-source.
+        unsafe {
+            std::env::set_var(ENV_VERBOSE, "2");
+        }
+        assert!(env_verbose_at_least(2));
+
+        unsafe {
+            std::env::remove_var(ENV_VERBOSE);
+            std::env::remove_var("RUST_LOG");
+        }
+    }
 }

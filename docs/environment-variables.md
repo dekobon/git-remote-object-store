@@ -27,7 +27,7 @@ All four are prefixed `GIT_REMOTE_OBJECT_STORE_`.
 | Variable | Default | Effect | Read at |
 |---|---|---|---|
 | `GIT_REMOTE_OBJECT_STORE_ALLOW_HTTP` | unset | Set to `1` to allow `s3+http://` / `az+http://` against non-loopback hosts. Loopback (`localhost`, `127.0.0.1`, `::1`) is always allowed. | `src/url.rs` (`ENV_ALLOW_HTTP`) |
-| `GIT_REMOTE_OBJECT_STORE_VERBOSE` | unset | Numeric. `>= 2` raises the startup tracing level from `error` to `info`. The protocol `option verbosity 2+` directive can raise the level at runtime; it cannot lower a level set here. | `src/protocol/tracing_init.rs` (`ENV_VERBOSE`) |
+| `GIT_REMOTE_OBJECT_STORE_VERBOSE` | unset | Numeric. `>= 2` raises the startup tracing level from `error` to `info`. Honored by the helper-protocol binaries and the management CLI (`git-remote-object-store`) — uniform across both entry points so verbosity is set the same way regardless of which one is invoked. For the helper protocol, `option verbosity 2+` can raise the level at runtime but cannot lower a level set here. The LFS agent (`git-lfs-object-store`) uses its own debug-log policy (`enable-debug` / `disable-debug` subcommands) and does **not** read this variable. | `src/protocol/tracing_init.rs` (`ENV_VERBOSE`) |
 | `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` | `60` | Per-ref lock TTL in seconds. Locks older than this are considered stale. Honored by the helper push path, `compact --lock-ttl`, and `delete-branch`. **Not** read by `doctor --lock-ttl` — that flag has a hardcoded default of 60. | `src/protocol/push.rs` (`ENV_LOCK_TTL_SECONDS`) |
 | `GIT_REMOTE_OBJECT_STORE_GC_GRACE_HOURS` | `24` | Minimum age a GC tombstone must reach before its packs are eligible for sweep. Honored by `gc --grace-hours` and `compact --with-gc`. | `src/packchain/gc.rs` (`ENV_GC_GRACE_HOURS`) |
 
@@ -142,7 +142,7 @@ trying to use them.
 
 | Variable | Why it isn't read |
 |---|---|
-| `RUST_LOG` | The helpers use a custom `tracing_subscriber` with a startup level pinned by `GIT_REMOTE_OBJECT_STORE_VERBOSE` and a runtime reload driven by the helper protocol's `option verbosity` directive. The `EnvFilter` does not pick up `RUST_LOG`. |
+| `RUST_LOG` | Every binary in the crate (helper bins, LFS agent, management CLI) installs a custom `tracing_subscriber` with a startup level pinned by `GIT_REMOTE_OBJECT_STORE_VERBOSE` (or, for the LFS agent, its `enable-debug` subcommand). None of them call `EnvFilter::try_from_default_env`, so `RUST_LOG` has no effect. One knob per concern — see [`GIT_REMOTE_OBJECT_STORE_VERBOSE`](#helper-runtime). |
 | `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY`, `AZURE_STORAGE_SAS_TOKEN`, `AZURE_STORAGE_AUTH_MODE` | Process-global Azure CLI / azure-sdk env vars. The helper uses the `AZSTORE_<ALIAS>_*` scheme above so multiple credentials can coexist in one shell without shadowing each other. The shellspec harness explicitly unsets these (`spec/spec_helper.sh`) to prevent confusion. |
 | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | These are honored only indirectly, by the Azure SDK's `DeveloperToolsCredential` when `?credential=` is omitted from the URL. They have no effect on the helper's `AZSTORE_<ALIAS>_*` resolution path. |
 

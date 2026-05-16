@@ -15,9 +15,9 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
 
 use git_remote_object_store::protocol::backend::{self, BackendError};
+use git_remote_object_store::protocol::tracing_init;
 use git_remote_object_store_cli::management::{Cli, dispatch};
 
 fn main() -> ExitCode {
@@ -49,13 +49,19 @@ fn main() -> ExitCode {
     }
 }
 
-/// Initialise `tracing-subscriber` with stderr output. `git-remote-object-store`
-/// is a regular CLI, but logs still belong on stderr so they don't
-/// interleave with the doctor's report.
+/// Install the shared stderr-only tracing subscriber.
+///
+/// The management CLI uses the **same** verbosity policy as the
+/// helper-protocol binaries (see [`tracing_init::init`]): startup level
+/// is `error`, with `GIT_REMOTE_OBJECT_STORE_VERBOSE >= 2` raising it
+/// to `info`. `RUST_LOG` is intentionally **not** consulted — one knob,
+/// uniform across every binary in the crate. The reload handle returned
+/// by `init` is dropped: the management CLI has no protocol REPL that
+/// could flip verbosity at runtime.
+///
+/// `try_init` failures are swallowed — a global subscriber already
+/// installed by a test harness or a parent process is benign; we simply
+/// log nothing.
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
+    let _ = tracing_init::init();
 }
