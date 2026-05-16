@@ -95,6 +95,7 @@ pub async fn drive_in(
     // (their MockStore needs no probe) but still need the same engine
     // resolution so `protocol::run` dispatches correctly.
     let engine = backend::validate_format(
+        remote.kind(),
         store.as_ref(),
         remote.prefix().unwrap_or_default(),
         remote.flags().engine,

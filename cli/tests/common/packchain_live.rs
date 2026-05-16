@@ -189,6 +189,7 @@ pub async fn drive_in(
     });
 
     let engine = backend::validate_format(
+        remote.kind(),
         store.as_ref(),
         remote.prefix().unwrap_or_default(),
         remote.flags().engine,

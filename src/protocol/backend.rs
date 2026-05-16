@@ -30,6 +30,15 @@ pub use crate::url::BackendKind;
 /// are the single source of truth for the operator-facing wording
 /// rendered by [`fatal_message`].
 ///
+/// # Invariant for backend-specific wording
+///
+/// Every variant whose `Display` string mentions the storage container
+/// ("bucket" / "container") must carry a `kind: BackendKind` field and
+/// route the noun through [`container_word`]. Hardcoded "bucket" /
+/// "container" literals in the format string are a bug — they leak S3
+/// vocabulary into Azure diagnostics (and vice versa). New variants
+/// must follow the same pattern as [`BackendError::BucketNotFound`].
+///
 /// # Invariant for `fatal_message`
 ///
 /// [`fatal_message`] walks the error source chain starting one level
@@ -69,7 +78,7 @@ pub enum BackendError {
     /// Authentication succeeded but the principal lacks the listed
     /// `action` on the named bucket/container. Maps from a 403 /
     /// `AccessDenied` on the probe.
-    #[error("user not authorized to perform {action} on {name}")]
+    #[error("user not authorized to perform {action} on {} {name}", container_word(*kind))]
     NotAuthorized {
         /// Which backend reported the failure.
         kind: BackendKind,
@@ -108,11 +117,14 @@ pub enum BackendError {
     /// [`StorageEngine::supported_list_str`] so adding a new variant
     /// updates this message automatically.
     #[error(
-        "bucket uses unknown storage engine `{stored}`; \
+        "{} uses unknown storage engine `{stored}`; \
          this client supports {}",
+        container_word(*kind),
         StorageEngine::supported_list_str()
     )]
     UnknownStoredEngine {
+        /// Which backend reported the failure.
+        kind: BackendKind,
         /// The engine name as written in the `FORMAT` key.
         stored: String,
     },
@@ -120,10 +132,13 @@ pub enum BackendError {
     /// The `?engine=` URL parameter conflicts with the engine stored in the
     /// `FORMAT` key.
     #[error(
-        "URL specifies engine `{url_engine}` but this bucket uses `{stored_engine}`; \
-         remove the `?engine=` parameter from the remote URL"
+        "URL specifies engine `{url_engine}` but this {} uses `{stored_engine}`; \
+         remove the `?engine=` parameter from the remote URL",
+        container_word(*kind)
     )]
     EngineMismatch {
+        /// Which backend reported the failure.
+        kind: BackendKind,
         /// Engine requested via the `?engine=` URL parameter.
         url_engine: StorageEngine,
         /// Engine stored in the `FORMAT` key.
@@ -187,7 +202,10 @@ fn classify(
 }
 
 /// Read the `FORMAT` key at `<prefix>/FORMAT` and validate it against the
-/// engine declared in the URL. Returns `Ok(())` when:
+/// engine declared in the URL. `kind` selects S3 vs Azure vocabulary in
+/// the error variants this function can surface
+/// ([`BackendError::UnknownStoredEngine`], [`BackendError::EngineMismatch`]).
+/// Returns `Ok(())` when:
 ///
 /// - The key does not exist (new bucket — engine will be written on first push).
 /// - The stored engine matches the URL engine (or no engine was declared).
@@ -213,6 +231,7 @@ fn classify(
 /// - [`BackendError::InvalidCredentials`] for auth / credential failures
 ///   reading the key, or non-UTF-8 bytes in the FORMAT body.
 pub async fn validate_format(
+    kind: BackendKind,
     store: &dyn ObjectStore,
     prefix: &str,
     url_engine: Option<StorageEngine>,
@@ -247,6 +266,7 @@ pub async fn validate_format(
 
     let stored_engine =
         StorageEngine::from_name(stored_name).ok_or_else(|| BackendError::UnknownStoredEngine {
+            kind,
             stored: stored_name.to_owned(),
         })?;
 
@@ -254,6 +274,7 @@ pub async fn validate_format(
         && url_engine != stored_engine
     {
         return Err(BackendError::EngineMismatch {
+            kind,
             url_engine,
             stored_engine,
         });
@@ -304,7 +325,7 @@ pub async fn build(
             Arc::new(store)
         }
     };
-    let engine = validate_format(store.as_ref(), prefix, url_engine).await?;
+    let engine = validate_format(remote.kind(), store.as_ref(), prefix, url_engine).await?;
     Ok((store, engine))
 }
 
@@ -441,7 +462,29 @@ mod tests {
         };
         assert_eq!(
             fatal_message(&err),
-            "fatal: user not authorized to perform ListObjectsV2 on mybucket"
+            "fatal: user not authorized to perform ListObjectsV2 on bucket mybucket"
+        );
+    }
+
+    #[test]
+    fn fatal_message_azure_not_authorized_uses_container_word() {
+        // Regression guard for #193: Azure operators must not see "bucket"
+        // in `NotAuthorized` diagnostics. The variant's `kind` field is
+        // load-bearing — a regression that drops it from the `Display`
+        // format string would silently revert to S3-only vocabulary.
+        let err = BackendError::NotAuthorized {
+            kind: BackendKind::Azure,
+            action: "ListBlobs".into(),
+            name: "mycontainer".into(),
+        };
+        let fatal = fatal_message(&err);
+        assert_eq!(
+            fatal,
+            "fatal: user not authorized to perform ListBlobs on container mycontainer"
+        );
+        assert!(
+            !fatal.contains("bucket"),
+            "Azure path leaked 'bucket': {fatal}"
         );
     }
 
@@ -517,6 +560,7 @@ mod tests {
         let url_engine = StorageEngine::Packchain;
         let stored_engine = StorageEngine::Bundle;
         let err = BackendError::EngineMismatch {
+            kind: BackendKind::S3,
             url_engine,
             stored_engine,
         };
@@ -524,6 +568,27 @@ mod tests {
             fatal: URL specifies engine `packchain` but this bucket uses `bundle`; \
             remove the `?engine=` parameter from the remote URL";
         assert_eq!(fatal_message(&err), expected);
+    }
+
+    #[test]
+    fn fatal_message_azure_engine_mismatch_uses_container_word() {
+        // Regression guard for #193: Azure operators must not see "bucket"
+        // in `EngineMismatch` diagnostics. The variant's `kind` field
+        // selects "container" via `container_word`.
+        let err = BackendError::EngineMismatch {
+            kind: BackendKind::Azure,
+            url_engine: StorageEngine::Packchain,
+            stored_engine: StorageEngine::Bundle,
+        };
+        let fatal = fatal_message(&err);
+        let expected = "\
+            fatal: URL specifies engine `packchain` but this container uses `bundle`; \
+            remove the `?engine=` parameter from the remote URL";
+        assert_eq!(fatal, expected);
+        assert!(
+            !fatal.contains("bucket"),
+            "Azure path leaked 'bucket': {fatal}"
+        );
     }
 
     // --- validate_format --------------------------------------------------
@@ -534,16 +599,20 @@ mod tests {
         // No FORMAT key in the store — should resolve to Bundle (the
         // default for new buckets) when the URL also omits the engine.
         assert_eq!(
-            validate_format(&store, "", None).await.unwrap(),
+            validate_format(BackendKind::S3, &store, "", None)
+                .await
+                .unwrap(),
             StorageEngine::Bundle,
         );
         assert_eq!(
-            validate_format(&store, "my-repo", None).await.unwrap(),
+            validate_format(BackendKind::S3, &store, "my-repo", None)
+                .await
+                .unwrap(),
             StorageEngine::Bundle,
         );
         // Empty bucket + URL declares an engine → resolve to URL value.
         assert_eq!(
-            validate_format(&store, "", Some(StorageEngine::Packchain))
+            validate_format(BackendKind::S3, &store, "", Some(StorageEngine::Packchain))
                 .await
                 .unwrap(),
             StorageEngine::Packchain,
@@ -555,7 +624,7 @@ mod tests {
         let store = MockStore::new();
         store.insert("FORMAT", Bytes::from_static(b"bundle"));
         assert_eq!(
-            validate_format(&store, "", Some(StorageEngine::Bundle))
+            validate_format(BackendKind::S3, &store, "", Some(StorageEngine::Bundle))
                 .await
                 .unwrap(),
             StorageEngine::Bundle,
@@ -568,7 +637,9 @@ mod tests {
         store.insert("FORMAT", Bytes::from_static(b"bundle"));
         // No URL engine — stored value is authoritative; no conflict.
         assert_eq!(
-            validate_format(&store, "", None).await.unwrap(),
+            validate_format(BackendKind::S3, &store, "", None)
+                .await
+                .unwrap(),
             StorageEngine::Bundle,
         );
     }
@@ -578,7 +649,7 @@ mod tests {
         let store = MockStore::new();
         store.insert("FORMAT", Bytes::from_static(b"bundle\n"));
         assert_eq!(
-            validate_format(&store, "", Some(StorageEngine::Bundle))
+            validate_format(BackendKind::S3, &store, "", Some(StorageEngine::Bundle))
                 .await
                 .unwrap(),
             StorageEngine::Bundle,
@@ -592,13 +663,14 @@ mod tests {
         // is authoritative, so we must reject with a clear mismatch.
         let store = MockStore::new();
         store.insert("FORMAT", Bytes::from_static(b"bundle"));
-        let err = validate_format(&store, "", Some(StorageEngine::Packchain))
+        let err = validate_format(BackendKind::S3, &store, "", Some(StorageEngine::Packchain))
             .await
             .unwrap_err();
         assert!(
             matches!(
                 err,
                 BackendError::EngineMismatch {
+                    kind: BackendKind::S3,
                     url_engine: StorageEngine::Packchain,
                     stored_engine: StorageEngine::Bundle,
                 }
@@ -613,18 +685,47 @@ mod tests {
         // then a stale `?engine=bundle` URL is reused. Same rejection.
         let store = MockStore::new();
         store.insert("FORMAT", Bytes::from_static(b"packchain"));
-        let err = validate_format(&store, "", Some(StorageEngine::Bundle))
+        let err = validate_format(BackendKind::S3, &store, "", Some(StorageEngine::Bundle))
             .await
             .unwrap_err();
         assert!(
             matches!(
                 err,
                 BackendError::EngineMismatch {
+                    kind: BackendKind::S3,
                     url_engine: StorageEngine::Bundle,
                     stored_engine: StorageEngine::Packchain,
                 }
             ),
             "expected EngineMismatch(url=bundle, stored=packchain), got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_format_propagates_azure_kind_into_engine_mismatch() {
+        // Regression guard for #193: when `validate_format` is invoked
+        // with `BackendKind::Azure`, the resulting `EngineMismatch` must
+        // carry `Azure` so its `Display` renders "container", not
+        // "bucket". A regression that hardcoded `BackendKind::S3` in
+        // construction would still pass the prior tests.
+        let store = MockStore::new();
+        store.insert("FORMAT", Bytes::from_static(b"bundle"));
+        let err = validate_format(
+            BackendKind::Azure,
+            &store,
+            "",
+            Some(StorageEngine::Packchain),
+        )
+        .await
+        .unwrap_err();
+        let BackendError::EngineMismatch { kind, .. } = &err else {
+            panic!("expected EngineMismatch, got {err:?}");
+        };
+        assert_eq!(*kind, BackendKind::Azure);
+        let fatal = fatal_message(&err);
+        assert!(
+            fatal.contains("container") && !fatal.contains("bucket"),
+            "Azure EngineMismatch must use 'container', got `{fatal}`",
         );
     }
 
@@ -635,7 +736,9 @@ mod tests {
         let store = MockStore::new();
         store.insert("FORMAT", Bytes::from_static(b"packchain"));
         assert_eq!(
-            validate_format(&store, "", None).await.unwrap(),
+            validate_format(BackendKind::S3, &store, "", None)
+                .await
+                .unwrap(),
             StorageEngine::Packchain,
         );
     }
@@ -645,7 +748,7 @@ mod tests {
         let store = MockStore::new();
         store.insert("FORMAT", Bytes::from_static(b"packchain"));
         assert_eq!(
-            validate_format(&store, "", Some(StorageEngine::Packchain))
+            validate_format(BackendKind::S3, &store, "", Some(StorageEngine::Packchain))
                 .await
                 .unwrap(),
             StorageEngine::Packchain,
@@ -656,10 +759,42 @@ mod tests {
     async fn validate_format_rejects_unknown_stored_engine() {
         let store = MockStore::new();
         store.insert("FORMAT", Bytes::from_static(b"pack"));
-        let err = validate_format(&store, "", None).await.unwrap_err();
+        let err = validate_format(BackendKind::S3, &store, "", None)
+            .await
+            .unwrap_err();
         assert!(
-            matches!(err, BackendError::UnknownStoredEngine { ref stored } if stored == "pack"),
+            matches!(
+                err,
+                BackendError::UnknownStoredEngine { kind: BackendKind::S3, ref stored }
+                    if stored == "pack"
+            ),
             "expected UnknownStoredEngine(pack), got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_format_propagates_azure_kind_into_unknown_stored_engine() {
+        // Regression guard for #193: an Azure container whose FORMAT key
+        // contains an unrecognised engine must render "container uses
+        // unknown storage engine ...", not "bucket uses ...".
+        let store = MockStore::new();
+        store.insert("FORMAT", Bytes::from_static(b"pack"));
+        let err = validate_format(BackendKind::Azure, &store, "", None)
+            .await
+            .unwrap_err();
+        let BackendError::UnknownStoredEngine { kind, stored } = &err else {
+            panic!("expected UnknownStoredEngine, got {err:?}");
+        };
+        assert_eq!(*kind, BackendKind::Azure);
+        assert_eq!(stored, "pack");
+        let fatal = fatal_message(&err);
+        assert!(
+            fatal.contains("container uses unknown storage engine"),
+            "Azure UnknownStoredEngine must use 'container', got `{fatal}`",
+        );
+        assert!(
+            !fatal.contains("bucket"),
+            "Azure path leaked 'bucket': `{fatal}`",
         );
     }
 
@@ -682,17 +817,21 @@ mod tests {
         // `UnknownStoredEngine` variant. A regression that mapped this
         // through `Network` or `InvalidCredentials` would still produce
         // an error but for the wrong reason.
-        let err = validate_format(&store, "", None).await.unwrap_err();
+        let err = validate_format(BackendKind::S3, &store, "", None)
+            .await
+            .unwrap_err();
         assert!(
             matches!(
                 err,
-                BackendError::UnknownStoredEngine { ref stored }
+                BackendError::UnknownStoredEngine { kind: BackendKind::S3, ref stored }
                     if stored == "INVALID_SENTINEL_NEVER_AN_ENGINE"
             ),
             "expected UnknownStoredEngine(INVALID_SENTINEL_NEVER_AN_ENGINE), got {err:?}",
         );
         // With prefix "my-repo": reads "my-repo/FORMAT" = "bundle" → Ok.
-        validate_format(&store, "my-repo", None).await.unwrap();
+        validate_format(BackendKind::S3, &store, "my-repo", None)
+            .await
+            .unwrap();
     }
 
     /// T1 tripwire: the `from_utf8` hardening in `validate_format` (vs
@@ -706,7 +845,9 @@ mod tests {
     async fn validate_format_rejects_non_utf8_format_bytes() {
         let store = MockStore::new();
         store.insert("FORMAT", Bytes::from_static(b"\xff\xff\xff"));
-        let err = validate_format(&store, "", None).await.unwrap_err();
+        let err = validate_format(BackendKind::S3, &store, "", None)
+            .await
+            .unwrap_err();
         let BackendError::InvalidCredentials { source } = &err else {
             panic!("expected InvalidCredentials, got {err:?}");
         };
@@ -738,6 +879,7 @@ mod tests {
     #[test]
     fn unknown_stored_engine_error_message() {
         let err = BackendError::UnknownStoredEngine {
+            kind: BackendKind::S3,
             stored: "pack".into(),
         };
         let fatal = fatal_message(&err);
@@ -757,6 +899,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unknown_stored_engine_error_message_azure_uses_container_word() {
+        // Regression guard for #193: Azure path must render "container
+        // uses unknown storage engine ...". A regression that hardcoded
+        // "bucket" would still pass the S3 test above.
+        let err = BackendError::UnknownStoredEngine {
+            kind: BackendKind::Azure,
+            stored: "pack".into(),
+        };
+        let fatal = fatal_message(&err);
+        assert!(
+            fatal.starts_with("fatal: container uses unknown storage engine `pack`;"),
+            "Azure UnknownStoredEngine must use 'container', got `{fatal}`",
+        );
+        assert!(
+            !fatal.contains("bucket"),
+            "Azure path leaked 'bucket': {fatal}"
+        );
+    }
+
     #[tokio::test]
     async fn validate_format_returns_network_error_on_transport_failure() {
         use crate::object_store::mock::Fault;
@@ -764,7 +926,9 @@ mod tests {
         store.arm(Fault::NetworkOnGetBytes {
             key: "FORMAT".into(),
         });
-        let err = validate_format(&store, "", None).await.unwrap_err();
+        let err = validate_format(BackendKind::S3, &store, "", None)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, BackendError::Network { .. }),
             "expected Network, got {err:?}",

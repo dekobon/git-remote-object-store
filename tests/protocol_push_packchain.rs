@@ -498,15 +498,20 @@ async fn format_mismatch_rejected_at_connect_time() {
     // protocol REPL loop starts. Drive `validate_format` directly here
     // so the assertion is on a typed `BackendError::EngineMismatch`,
     // not on a panic that bubbled out of a test-harness `.expect`.
-    use git_remote_object_store::protocol::backend::{self, BackendError};
+    use git_remote_object_store::protocol::backend::{self, BackendError, BackendKind};
     use git_remote_object_store::url::StorageEngine;
 
     let store = Arc::new(MockStore::new());
     store.insert("repo/FORMAT", Bytes::from_static(b"bundle"));
 
-    let err = backend::validate_format(store.as_ref(), "repo", Some(StorageEngine::Packchain))
-        .await
-        .expect_err("format mismatch must surface as BackendError");
+    let err = backend::validate_format(
+        BackendKind::S3,
+        store.as_ref(),
+        "repo",
+        Some(StorageEngine::Packchain),
+    )
+    .await
+    .expect_err("format mismatch must surface as BackendError");
     assert!(
         matches!(err, BackendError::EngineMismatch { .. }),
         "expected EngineMismatch, got {err:?}",
