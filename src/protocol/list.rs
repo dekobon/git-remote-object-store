@@ -217,7 +217,10 @@ fn parse_bundle_key(rel_key: &str) -> Option<(&str, &str)> {
     }
     let last = segments.last()?;
     let sha = last.strip_suffix(".bundle")?;
-    if sha.len() != 40 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+    // Delegate the 40-hex stem check to `keys::is_valid_bundle_stem`
+    // so push, doctor, and list stay in lockstep — see the doc comment
+    // on `is_valid_bundle_stem` for why the predicate is centralised.
+    if !keys::is_valid_bundle_stem(sha) {
         return None;
     }
     // ref_path is everything before the trailing "/<sha>.bundle".
