@@ -132,11 +132,11 @@ mod tests {
     /// (helper bins, LFS agent, management CLI): `RUST_LOG` MUST NOT
     /// influence startup verbosity. Only [`ENV_VERBOSE`] is consulted.
     ///
-    /// Regression guard for #179, which fixed a stale doc claim that
-    /// the management CLI honored `RUST_LOG` (it did, via
-    /// `EnvFilter::try_from_default_env`). The fix routed the
-    /// management CLI through this module so all three entry points
-    /// share one verbosity policy.
+    /// Regression guard for #179 (management CLI was reading `RUST_LOG`
+    /// via `EnvFilter::try_from_default_env`) and #180 (LFS agent's
+    /// non-debug REPL path pinned `error` and ignored `ENV_VERBOSE`).
+    /// Both fixes routed those entry points through this module so
+    /// all three binaries share one verbosity policy.
     ///
     /// `set_var` / `remove_var` are process-global; this test only
     /// touches `RUST_LOG` (which the crate never reads) and `ENV_VERBOSE`

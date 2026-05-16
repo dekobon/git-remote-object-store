@@ -47,6 +47,15 @@ Standard output is reserved for the LFS custom\-transfer protocol
 The agent uses the same credentials environment variables as the remote
 helpers. See \fBgit-remote-s3+https\fR(1) and
 \fBgit-remote-az+https\fR(1).
+.SH ENVIRONMENT
+.TP
+\fBGIT_REMOTE_OBJECT_STORE_VERBOSE\fR
+Numeric. Values \(>= 2 raise the default REPL's startup tracing level
+from \fBerror\fR to \fBinfo\fR (output goes to stderr). Honored only
+when \fBenable\-debug\fR has not been run \(em the \fBdebug\fR mode
+uses its own file-based logging at \fBdebug\fR level and ignores this
+variable. See \fBgit-remote-object-store\fR(1) for full env-var
+reference.
 .SH SEE ALSO
 \fBgit-remote-object-store\fR(1), \fBgit-remote-s3+https\fR(1),
 \fBgit-remote-az+https\fR(1), \fBgit\-lfs\fR(1).

@@ -23,6 +23,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use git_remote_object_store::lfs::{self, GitRemoteResolver, disable_debug, enable_debug, install};
+use git_remote_object_store::protocol::tracing_init;
 
 const DEBUG_LOG_FILENAME: &str = "git-lfs-object-store.log";
 
@@ -117,13 +118,27 @@ fn git_dir(cwd: &Path) -> anyhow::Result<PathBuf> {
     Ok(repo.git_dir().to_owned())
 }
 
-/// Set up the global tracing subscriber. `debug_logging` (set when
-/// `enable-debug` has been run and git invokes us with the `debug`
-/// argv slot) routes lines to `<tmp_dir>/git-lfs-object-store.log`
-/// at `debug` level; otherwise we log at `error` to stderr.
+/// Set up the global tracing subscriber.
 ///
-/// Failure to initialise the subscriber is non-fatal — we want to
-/// continue serving the LFS protocol even if logging is unavailable.
+/// Two mutually exclusive code paths:
+///
+/// * `debug_logging = true` — set when `enable-debug` has flipped the
+///   repo's git config and git invokes us with the `debug` argv slot.
+///   Routes lines to `<tmp_dir>/git-lfs-object-store.log` at `debug`
+///   level. The level and writer are fixed; `GIT_REMOTE_OBJECT_STORE_VERBOSE`
+///   is intentionally **not** consulted here — the file destination and
+///   `debug` floor are the contract of `enable-debug`.
+/// * `debug_logging = false` — the default REPL path. Delegates to
+///   [`tracing_init::init`] so the LFS agent shares the single-knob
+///   verbosity policy used by the helper-protocol binaries and the
+///   management CLI: `GIT_REMOTE_OBJECT_STORE_VERBOSE >= 2` raises the
+///   startup floor from `error` to `info`; output goes to stderr. The
+///   reload handle is dropped — the LFS protocol has no `option
+///   verbosity` analogue to flip levels at runtime.
+///
+/// Failure to install a subscriber is non-fatal in both branches — we
+/// want to continue serving the LFS protocol even if logging is
+/// unavailable.
 fn init_tracing(tmp_dir: &Path, debug_logging: bool) -> anyhow::Result<()> {
     if debug_logging {
         std::fs::create_dir_all(tmp_dir)
@@ -143,10 +158,36 @@ fn init_tracing(tmp_dir: &Path, debug_logging: bool) -> anyhow::Result<()> {
             )
             .try_init();
     } else {
-        let _ = tracing_subscriber::registry()
-            .with(EnvFilter::default().add_directive(tracing::Level::ERROR.into()))
-            .with(fmt::layer().with_writer(std::io::stderr).with_target(false))
-            .try_init();
+        let _ = tracing_init::init();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard for #180.
+    ///
+    /// Before the fix, the LFS agent's non-debug path installed its own
+    /// `EnvFilter` pinned to `error`, ignoring
+    /// `GIT_REMOTE_OBJECT_STORE_VERBOSE`. The fix routes that path
+    /// through [`tracing_init::init`] so the LFS agent shares the same
+    /// single-knob verbosity policy as the helper-protocol binaries and
+    /// the management CLI.
+    ///
+    /// The compile-time `use tracing_init` in the bin's preamble and
+    /// the `tracing_init::init()` call in the non-debug branch are the
+    /// structural delegation. The test below is a value-level pin so a
+    /// future rename of `ENV_VERBOSE` doesn't silently break the
+    /// contract documented in `docs/environment-variables.md`.
+    #[test]
+    fn lfs_non_debug_path_honors_verbose_env_var() {
+        assert_eq!(
+            tracing_init::ENV_VERBOSE,
+            "GIT_REMOTE_OBJECT_STORE_VERBOSE",
+            "LFS bin's non-debug path delegates to tracing_init::init, \
+             which keys verbosity off this exact env var",
+        );
+    }
 }
