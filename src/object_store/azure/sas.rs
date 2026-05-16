@@ -19,15 +19,15 @@
 //!
 //! # Wire-format compatibility note
 //!
-//! The signed-version `sv` field is set to `2022-11-02` rather than
-//! the latest `2025-11-05` that the production Azure store policy
-//! advertises (`x-ms-version: 2025-11-05` per `auth::SharedKeySigningPolicy`).
-//! The two are independent: the per-request `x-ms-version` header
-//! controls the storage-service API contract, while `sv` in the SAS
-//! token controls the SAS validation contract. `2022-11-02` was the
-//! last GA service-SAS signing scheme at the time of writing and is
-//! universally supported; bumping it requires re-validating the
-//! `string_to_sign` field count and order.
+//! The signed-version `sv` field is pinned to [`SAS_SIGNED_VERSION`]
+//! independently of the per-request `x-ms-version` header that
+//! `azure_storage_blob` stamps onto every outgoing request. The two
+//! contracts are separate: `x-ms-version` controls the storage-service
+//! API surface for the request itself, while `sv` in the SAS token
+//! controls which SAS validation rules Azure applies. The signed-version
+//! chosen here was the last GA service-SAS signing scheme at the time of
+//! writing and is universally supported; bumping it requires
+//! re-validating the `string_to_sign` field count and order.
 
 use std::time::Duration;
 

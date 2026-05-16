@@ -60,13 +60,16 @@
 //! `get_to_file` writes `src` to a `NamedTempFile`, then `put_path`
 //! uploads it to `dst`. Both legs already stream — `get_to_file`
 //! consumes the SDK's chunked download into the file without buffering
-//! the body, and `put_path` wraps the file in a `SeekableStream` that
-//! the SDK uploads via `stage_block` + `commit_block_list` for large
-//! bodies. Memory stays bounded by the SDK's per-block partition size
-//! (4 MiB by default) regardless of blob size, which matters for
-//! `manage doctor`'s duplicate-bundle quarantine path
-//! (`Doctor::evict_losing_bundle`) — that path can copy multi-GiB
-//! bundles. Zero-byte lock files (the original §5.2 consumer) still
+//! the body, and `put_path` switches to our explicit
+//! `stage_block` + `commit_block_list` orchestrator (see
+//! [`AzureStore::multipart_put_path`]) once the body crosses
+//! [`super::multipart::MULTIPART_PUT_THRESHOLD`]. Peak in-flight bytes
+//! are bounded by
+//! [`super::multipart::MULTIPART_PUT_MAX_CONCURRENCY`] ×
+//! [`super::multipart::MULTIPART_PUT_PART_SIZE`] regardless of blob
+//! size, which matters for `manage doctor`'s duplicate-bundle
+//! quarantine path ([`crate::manage::doctor::Doctor::evict_losing_bundle`])
+//! — that path can copy multi-GiB bundles. Zero-byte lock files still
 //! round-trip fast: `get_to_file` short-circuits the GET on `size == 0`
 //! and `put_path` issues a single zero-byte `Put Blob`. Body is
 //! preserved; user metadata is not propagated, matching the S3 backend's
@@ -753,11 +756,12 @@ impl ObjectStore for AzureStore {
         // which integrates with our credential model in a clean way
         // for the SDK 0.12 surface. Stream `src` to a temp file via
         // `get_to_file` (chunked download, no body buffer), then
-        // `put_path` it back to `dst` (block-uploaded for large
-        // bodies). Memory stays bounded by the SDK's partition size
-        // regardless of blob size — necessary because
-        // `manage doctor`'s duplicate-bundle quarantine path uses
-        // `copy()` and bundles can be multi-GiB.
+        // `put_path` it back to `dst` (block-uploaded for large bodies
+        // via `multipart_put_path`). Peak in-flight bytes are bounded
+        // by `MULTIPART_PUT_MAX_CONCURRENCY` × `MULTIPART_PUT_PART_SIZE`
+        // regardless of blob size — necessary because `manage doctor`'s
+        // duplicate-bundle quarantine path uses `copy()` and bundles
+        // can be multi-GiB.
         let temp = NamedTempFile::new().map_err(other_boxed)?;
         // `get_to_file` propagates `NotFound(src)` if the source is
         // absent — exactly the trait contract for `copy`.
