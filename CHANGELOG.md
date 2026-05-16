@@ -38,12 +38,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   points at `docs/environment-variables.md` for the complete
   reference.
 
-- **Corrected `doctor --lock-ttl` env-var claim in
-  `docs/getting-started.md`.** The doctor flag is wired to
-  `default_value_t = DEFAULT_LOCK_TTL_SECONDS` (`cli/src/management.rs`),
-  not `lock_ttl_from_env`, so it does not read
-  `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` the way `compact --lock-ttl`
-  and `delete-branch` do. The page previously claimed otherwise.
+- **`doctor` flag renamed and now honors the lock-TTL env var (#178, #183, #192).**
+  The flag is renamed `doctor --lock-ttl` → `doctor --lock-ttl-seconds`
+  to match `compact --lock-ttl-seconds` (breaking; no compat shim per
+  `AGENTS.md`). The type changed from `u64` with a compile-time default
+  to `Option<u64>` that defers to `lock_ttl_from_env()` when unset.
+  `doctor --delete-stale-locks` now agrees with the push / compact /
+  delete-branch consumers about what "stale" means under any
+  `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` value, removing the
+  data-race vector previously caused by the env-blind 60s default.
+  Doc-comments at `src/protocol/push.rs::DEFAULT_LOCK_TTL_SECONDS` and
+  the env-vars index updated to match.
 
 - **`delete-branch` man page now documents
   `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`.** The subcommand reads the
@@ -59,7 +64,161 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   doc comments described the reload as a generic "flip", which implied
   bidirectional control.
 
+- **Unified configuration-value vocabulary (#187).** URL booleans
+  (`?zip=`, `?bundle_uri=`) and `GIT_REMOTE_OBJECT_STORE_ALLOW_HTTP`
+  now share one parser. Accepted truthy tokens: `1`, `true`, `yes`,
+  `on` (case-insensitive). Accepted falsy tokens: `0`, `false`,
+  `no`, `off`. Previously the URL flags accepted only case-sensitive
+  `1|true|0|false` and the env var accepted only the literal `"1"`.
+  Documented the case-sensitivity policy for string-typed URL flags
+  (`engine`, `addressing`, `credential`, `profile`, `region`) in
+  `docs/getting-started.md`.
+
+- **Single-source MSRV (#191).** Workspace `Cargo.toml` declares
+  `[workspace.package] rust-version = "1.94"`; `cli/Cargo.toml` and
+  `xtask/Cargo.toml` inherit via `rust-version.workspace = true`.
+  CI and release workflows derive the toolchain from
+  `cargo metadata` instead of duplicating the literal value. Removes
+  the two "keep in sync" comments that previously acknowledged the
+  drift risk.
+
+- **`GcOpts`, `CompactOpts`, `DoctorOpts` default-value fields are
+  now `Option<u64>` (#185, #189).** `grace_hours`, `gc_grace_hours`,
+  and `lock_ttl_seconds` on the public opts structs changed type
+  from `u64` to `Option<u64>`. `None` defers to the matching
+  env-var helper (`grace_hours_from_env` / `lock_ttl_from_env`);
+  `Some(0)` is clamped to the env-or-default value at the library
+  boundary so it no longer silently disables locking (#208).
+  Breaking change for any out-of-tree library consumer that
+  constructed these structs by literal.
+
+- **`bundle::unbundle` / `git::unbundle` / `git::unbundle_at`
+  signature change (#195).** The unused `ref_name: &RefName`
+  parameter was removed from all three. Drops a wasted
+  `RefName.clone()` from the parallel-fetch hot path. Breaking
+  change for any out-of-tree caller of these `pub` async functions.
+
+- **`ENV_GC_GRACE_HOURS` and `grace_hours_from_env` visibility
+  downgraded to `pub(crate)` (#185).** Brings them into line with
+  `ENV_LOCK_TTL_SECONDS` and `lock_ttl_from_env`. The env-var name
+  remains the public contract (documented in
+  `docs/environment-variables.md`); the constant import path is
+  no longer part of the crate's public API.
+
+- **`BackendError` variants now route storage-side wording through
+  `container_word(kind)` (#193).** `UnknownStoredEngine` and
+  `EngineMismatch` gained a `kind: BackendKind` field; their
+  `Display` strings switch between "bucket" and "container" based
+  on the backend. `NotAuthorized`'s previously-unused `kind` is now
+  load-bearing. Azure operators no longer see "bucket" in fatal
+  backend errors against Azure containers. `validate_format` gained
+  a `BackendKind` parameter — breaking for out-of-tree callers.
+
+- **`ManageError::StaleSnapshot` now distinguishes Deleted vs
+  ResidueOnly causes (#199).** The variant changed from `String`
+  to `{ entity: String, reason: StaleReason }`. `Display`
+  branches on the reason so the typed error matches the
+  stdout message the doctor wrote one line earlier.
+
 ### Fixed
+
+- **Cap bundle-header reads to prevent OOM (#194).** `BundleHeader::read`
+  now bounds per-line (16 KiB) and total-header (64 MiB) byte budgets
+  via `BufRead::take(...).read_until(b'\n', ...)`. A malformed bundle
+  whose first byte sequence has no `\n` until EOF (or many GB between
+  newlines) previously allocated unboundedly into a single `String`
+  before validation. Reached by every fetch path — pack delta from
+  any bucket the operator can read.
+
+- **Bound `apply_delta` output per op to prevent OOM (#206).**
+  `src/packchain/read.rs::apply_delta` now checks `out.len() >
+  dst_size_usize` inside the opcode loop. Mirrors git's
+  `patch-delta.c` `size -= cp_size` invariant. A 1 GiB delta of
+  `0x80` opcodes could previously push the intermediate `Vec<u8>`
+  to ~64 TiB before the post-loop size check fired.
+
+- **Reject silently-truncated ranged GETs (#207).** Real S3 and
+  Azure return HTTP 206 with the body truncated when
+  `range.start < body.len() <= range.end`. The S3/Azure backends
+  now run a post-flight length check and surface the truncation as
+  `ObjectStoreError::RangeNotSatisfiable`. Aligns the mock with the
+  real backends and surfaces pack-store corruption (truncated pack
+  file vs stale `chain.json`) that previously fed short data to
+  the decoder.
+
+- **`bundle_uri_presign_ttl` capped at 7 days (#219).** New
+  `MAX_BUNDLE_URI_PRESIGN_TTL_SECONDS = 604_800` constant; URL parser
+  rejects larger values with `BundleUriPresignTtlTooLarge`. The
+  Azure SAS builder's `time::Duration::seconds_f64` previously
+  panicked on `ttl > i64::MAX` seconds; replaced with a panic-free
+  `i64::try_from` path that returns `ObjectStoreError`. Matches the
+  AWS SigV4 ceiling so behavior is consistent across backends.
+
+- **Reject URL-special bytes in bundle-URI ref names (#213).**
+  `is_safe_for_bundle_uri_emission` now rejects `=`, `#`, `%`, `&`,
+  `;`, `,`, `?` in ref names. Previously only `=` was blocked
+  (wire framing); `#` truncated the URL at the fragment and `%XX`
+  let intermediaries re-encode the path. Refs with disallowed
+  bytes warn-and-skip via the existing path.
+
+- **LFS install / debug toggles are now idempotent (#198, #210).**
+  Re-running `git-lfs-object-store install`, `enable-debug`, or
+  `disable-debug` no longer accumulates duplicate git-config
+  entries or fails with `ConfigKeyNotSet`. New `git::config_set`
+  and `git::config_unset_if_present` helpers underpin the
+  rewrite; legacy duplicate entries from older binary versions
+  are collapsed on the next idempotent write.
+
+- **LFS agent installs SIGPIPE mask in main (#216).**
+  `git-lfs-object-store` now calls `install_sigpipe_mask`
+  before entering the REPL, matching the helper binaries. The
+  existing `is_broken_pipe()` clean-exit arm was previously
+  unreachable in production — git-lfs closing stdout killed
+  the agent with SIGPIPE instead of producing a graceful exit.
+
+- **LFS agent honors `GIT_REMOTE_OBJECT_STORE_VERBOSE` (#180).**
+  The agent's non-debug REPL path now delegates to
+  `protocol::tracing_init::init`, sharing the single-knob
+  verbosity policy with the helper binaries and management CLI.
+  The `enable-debug` path is untouched (its `debug` floor and
+  file destination are its contract).
+
+- **Management CLI no longer honors `RUST_LOG` (#179).**
+  `init_tracing` now delegates to `protocol::tracing_init::init`
+  instead of `EnvFilter::try_from_default_env`. All three binaries
+  now share one verbosity policy: `GIT_REMOTE_OBJECT_STORE_VERBOSE`
+  is the only env var that affects startup level. Matches the
+  documented policy in `docs/environment-variables.md`.
+
+- **Helper-protocol delete no longer races concurrent fetch
+  (#203, #205).** The bundle-engine and packchain-engine
+  helper-protocol delete paths (`git push :refs/heads/foo`) now
+  write a baseline tombstone via `write_baseline_tombstone_*`
+  before sweeping per-ref artefacts, deferring the bundle
+  delete to `gc sweep`. Mirrors the existing pattern from #134
+  (compact/force-push), #143 (delete-branch), and #157
+  (bundle force-push). A fetcher that resolves the bundle SHA
+  before the delete now still finds the bundle on the bucket
+  through the grace window.
+
+- **Surface non-UTF-8 Azure credential env vars (#218).**
+  `resolve_alias` in `src/object_store/azure/auth.rs` now
+  distinguishes `VarError::NotPresent` (continue chain) from
+  `VarError::NotUnicode` (surface as
+  ``env var `<NAME>` is set but its value is not valid UTF-8``).
+  Previously a corrupted env value silently fell through to
+  "credential alias has no env var set".
+
+- **Bundle-engine contention message names delete (#217).**
+  `push_one`'s lock-contention error now says "Another client
+  may be pushing or deleting", matching the packchain engine's
+  wording. The same code path handles both `Push` and `Delete`
+  arms since #133. Test strengthened from `.contains` to
+  byte-exact match.
+
+- **Removed false claim from LFS man page (#181).** The agent
+  honors credentials env vars only; the "lock TTL" half was
+  wrong (LFS reads no env vars and takes no per-ref locks).
 
 - **Pinned Azure `x-ms-date` format (#174).** Replaced
   `time::format_description::well_known::Rfc2822` plus
