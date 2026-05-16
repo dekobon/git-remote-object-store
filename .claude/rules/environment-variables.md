@@ -30,6 +30,24 @@ literal value is missing from `docs/environment-variables.md`. If `cargo
 test` flags a missing row, add the row; do not "fix" the test by relaxing
 the scan.
 
+### When you change a default value
+
+`docs/environment-variables.md`, `docs/getting-started.md`, the matching
+man pages, and the `cli/src/management.rs` doc-comments all mention the
+default values (e.g. `(falling back to 60s)`, `Default is 24 hours.`).
+The single source of truth is the `pub const DEFAULT_*: u64 = N` at the
+read site.
+
+`tests/env_var_doc_sync.rs::documented_defaults_match_live_constants`
+scans the docs and CLI doc-comments for the anchored patterns and fails
+if any documented number diverges from the live constant. If the test
+fires, update either the constant or every documented mention listed in
+the failure message; do not relax the anchor list to silence it.
+
+If you add a new `DEFAULT_*` numeric constant whose value appears in the
+docs, extend the `DEFAULT_PATTERNS` / `ENV_TABLE_BINDINGS` tables in
+that test so the new value is covered.
+
 ### When you remove or rename one
 
 Same checklist in reverse: remove the row from
