@@ -45,6 +45,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` the way `compact --lock-ttl`
   and `delete-branch` do. The page previously claimed otherwise.
 
+- **`delete-branch` man page now documents
+  `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`.** The subcommand reads the
+  variable through `lock_ttl_from_env()` at `src/manage/branch.rs`, but
+  the doc-comment on `Command::DeleteBranch` (and so the generated
+  `man/git-remote-object-store-delete-branch.1`) did not surface it.
+  Updated the doc-comment and regenerated; the wording matches the
+  `compact --lock-ttl-seconds` description ("falling back to 60s").
+
 - **`tracing_init` doc comments now state the reload is one-way.**
   `option verbosity 2+` can raise the subscriber to `info` but the
   protocol provides no inverse to lower it. The module and `raise_to_info`

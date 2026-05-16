@@ -2,11 +2,11 @@
 .el .ds Aq '
 .TH GIT-REMOTE-OBJECT-STORE-DELETE-BRANCH 1  "git-remote-object-store 0.1.0" "git-remote-object-store Manual"
 .SH NAME
-git\-remote\-object\-store\-delete\-branch \- Delete every object under `refs/heads/<branch>/` after a y/N confirmation
+git\-remote\-object\-store\-delete\-branch \- Delete every object under `refs/heads/<branch>/` after a y/N confirmation. Acquires the ref\*(Aqs per\-ref lock for the duration of the delete; the TTL reads `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` (falling back to 60s)
 .SH SYNOPSIS
 \fBgit\-remote\-object\-store\-delete\-branch\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIREMOTE\fR> <\fIBRANCH\fR> 
 .SH DESCRIPTION
-Delete every object under `refs/heads/<branch>/` after a y/N confirmation
+Delete every object under `refs/heads/<branch>/` after a y/N confirmation. Acquires the ref\*(Aqs per\-ref lock for the duration of the delete; the TTL reads `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` (falling back to 60s)
 .SH OPTIONS
 .TP
 \fB\-h\fR, \fB\-\-help\fR

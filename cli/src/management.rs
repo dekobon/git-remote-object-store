@@ -70,7 +70,9 @@ pub enum Command {
         delete_stale_locks: bool,
     },
     /// Delete every object under `refs/heads/<branch>/` after a y/N
-    /// confirmation.
+    /// confirmation. Acquires the ref's per-ref lock for the duration of
+    /// the delete; the TTL reads `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`
+    /// (falling back to 60s).
     DeleteBranch {
         /// Remote target (URL or named git remote).
         #[command(flatten)]

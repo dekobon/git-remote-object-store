@@ -20,7 +20,7 @@ git\-remote\-object\-store\-doctor(1)
 Analyze a remote and offer to fix duplicate bundles, invalid HEAD, and stale locks
 .TP
 git\-remote\-object\-store\-delete\-branch(1)
-Delete every object under `refs/heads/<branch>/` after a y/N confirmation
+Delete every object under `refs/heads/<branch>/` after a y/N confirmation. Acquires the ref\*(Aqs per\-ref lock for the duration of the delete; the TTL reads `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` (falling back to 60s)
 .TP
 git\-remote\-object\-store\-protect(1)
 Mark a branch as protected by writing the `PROTECTED#` sentinel
