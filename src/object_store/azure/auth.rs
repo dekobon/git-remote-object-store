@@ -177,7 +177,7 @@ fn resolve_alias(account: &str, alias: &str) -> Result<ResolvedCredentials, Obje
     let conn_var = format!("AZSTORE_{upper}_CONNECTION_STRING");
     let sas_var = format!("AZSTORE_{upper}_SAS");
 
-    if let Ok(key_b64) = env::var(&key_var) {
+    if let Some(key_b64) = lookup_env(&key_var)? {
         let policy = SharedKeySigningPolicy::new(account, &key_b64)?;
         let key = HmacKey::from_base64(&key_b64)?;
         return Ok(resolved(
@@ -188,7 +188,7 @@ fn resolve_alias(account: &str, alias: &str) -> Result<ResolvedCredentials, Obje
             }),
         ));
     }
-    if let Ok(conn) = env::var(&conn_var) {
+    if let Some(conn) = lookup_env(&conn_var)? {
         let parsed = parse_connection_string(&conn)?;
         let policy = SharedKeySigningPolicy::new(&parsed.account, &parsed.key_b64)?;
         let key = HmacKey::from_base64(&parsed.key_b64)?;
@@ -200,7 +200,7 @@ fn resolve_alias(account: &str, alias: &str) -> Result<ResolvedCredentials, Obje
             }),
         ));
     }
-    if let Ok(sas) = env::var(&sas_var) {
+    if let Some(sas) = lookup_env(&sas_var)? {
         let policy = SasSigningPolicy::new(&sas)?;
         // SAS-env-var path has no storage key, so we cannot derive
         // a fresh per-blob SAS for `bundle-uri` presigning. Pass
@@ -215,6 +215,22 @@ fn resolve_alias(account: &str, alias: &str) -> Result<ResolvedCredentials, Obje
         )
         .into(),
     ))
+}
+
+/// Read a credential-chain env var, distinguishing "not set" from
+/// "set to non-UTF-8 bytes". Returning `Ok(None)` for `NotPresent`
+/// keeps the chain walking; returning `Err(...)` for `NotUnicode`
+/// surfaces the misconfiguration with the offending variable name
+/// so the operator does not chase a "no env var set" message when
+/// the var actually was set.
+fn lookup_env(name: &str) -> Result<Option<String>, ObjectStoreError> {
+    match env::var(name) {
+        Ok(v) => Ok(Some(v)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(ObjectStoreError::Other(
+            format!("env var `{name}` is set but its value is not valid UTF-8").into(),
+        )),
+    }
 }
 
 /// Build a [`ResolvedCredentials`] from a per-try signing policy
@@ -881,6 +897,67 @@ mod tests {
         assert!(SasSigningPolicy::new("").is_err());
         assert!(SasSigningPolicy::new("?").is_err());
         assert!(SasSigningPolicy::new("   ").is_err());
+    }
+
+    // --- lookup_env ---------------------------------------------------
+
+    #[test]
+    fn lookup_env_returns_none_when_unset() {
+        // Use a var name that no other test touches so parallel test
+        // runs do not race. `lookup_env` does no caching, so reading
+        // a guaranteed-unset name is deterministic.
+        let name = "AZSTORE_AUTH_TEST_DEFINITELY_UNSET_VAR";
+        unsafe {
+            env::remove_var(name);
+        }
+        assert!(matches!(lookup_env(name), Ok(None)));
+    }
+
+    #[test]
+    fn lookup_env_returns_value_when_valid_utf8() {
+        let name = "AZSTORE_AUTH_TEST_VALID_UTF8";
+        unsafe {
+            env::set_var(name, "hello");
+        }
+        let got = lookup_env(name);
+        unsafe {
+            env::remove_var(name);
+        }
+        let value = got.expect("UTF-8 value must read");
+        assert_eq!(value.as_deref(), Some("hello"));
+    }
+
+    /// Issue #218: a credential env var set to non-UTF-8 bytes must
+    /// surface as a structured error naming the offending variable,
+    /// not be silently treated as "unset" (which previously sent the
+    /// operator chasing the "no env var set" message).
+    #[cfg(unix)]
+    #[test]
+    fn lookup_env_surfaces_not_unicode_error_naming_var() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let name = "AZSTORE_AUTH_TEST_NOT_UNICODE";
+        // 0xFF is never valid in a UTF-8 byte stream, so this is
+        // guaranteed to land in the `VarError::NotUnicode` branch.
+        let bad = OsString::from_vec(vec![0xFF, 0xFE, 0xFD]);
+        unsafe {
+            env::set_var(name, &bad);
+        }
+        let got = lookup_env(name);
+        unsafe {
+            env::remove_var(name);
+        }
+        let err = got.expect_err("non-UTF-8 env value must error, not be ignored");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(name),
+            "error must name the offending var (`{name}`): {msg}"
+        );
+        assert!(
+            msg.contains("not valid UTF-8") || msg.contains("UTF-8"),
+            "error must mention UTF-8: {msg}"
+        );
     }
 
     #[test]
