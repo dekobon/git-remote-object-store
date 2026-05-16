@@ -598,6 +598,14 @@ impl ObjectStore for AzureStore {
     /// supported target, so casting from `u64` is lossless; the cast
     /// is documented here so a future 32-bit port surfaces as a
     /// compile error rather than silent truncation.
+    ///
+    /// Azure silently truncates a ranged GET to EOF when the requested
+    /// range overruns the blob — `start < body.len() <= end` returns
+    /// `start..body.len()` bytes with HTTP 206 and no error. The
+    /// post-flight length check via [`super::verify_range_response_length`]
+    /// elevates that mismatch to [`ObjectStoreError::RangeNotSatisfiable`]
+    /// so callers (notably the packchain reader) cannot mistake a
+    /// truncated slice for the full requested range.
     async fn get_bytes_range(
         &self,
         key: &str,
@@ -635,7 +643,7 @@ impl ObjectStore for AzureStore {
             }
         };
         let bytes = result.body.collect().await.map_err(network_boxed)?;
-        Ok(bytes)
+        super::verify_range_response_length(key, &range, bytes)
     }
 
     async fn put_bytes(

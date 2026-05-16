@@ -427,8 +427,11 @@ impl ObjectStore for MockStore {
 
     /// Slice the in-memory body. Mirrors the trait contract:
     /// `start == end` short-circuits to `Ok(Bytes::new())` without
-    /// touching the store; `start > end` and out-of-bounds `end` both
-    /// produce [`ObjectStoreError::RangeNotSatisfiable`].
+    /// touching the store; `start > end` and `end > body.len()` both
+    /// produce [`ObjectStoreError::RangeNotSatisfiable`]. Rejecting
+    /// `end > body.len()` matches what the real S3 and Azure backends
+    /// surface after their post-flight length check elevates the
+    /// silently-truncated body to the same error.
     async fn get_bytes_range(
         &self,
         key: &str,

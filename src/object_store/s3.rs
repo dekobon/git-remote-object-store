@@ -728,6 +728,14 @@ impl ObjectStore for S3Store {
     /// the original requested range (so the wire-line names what the
     /// caller asked for, not the server's translation). All other
     /// failures route through [`classify`].
+    ///
+    /// S3 silently truncates a ranged GET to EOF when the requested
+    /// range overruns the object — `start < body.len() <= end` returns
+    /// `start..body.len()` bytes with HTTP 206 and no error. The
+    /// post-flight length check via [`super::verify_range_response_length`]
+    /// elevates that mismatch to [`ObjectStoreError::RangeNotSatisfiable`]
+    /// so callers (notably the packchain reader) cannot mistake a
+    /// truncated slice for the full requested range.
     async fn get_bytes_range(
         &self,
         key: &str,
@@ -761,7 +769,7 @@ impl ObjectStore for S3Store {
             }
         };
         let aggregated = resp.body.collect().await.map_err(network_boxed)?;
-        Ok(aggregated.into_bytes())
+        super::verify_range_response_length(key, &range, aggregated.into_bytes())
     }
 
     async fn put_bytes(

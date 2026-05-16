@@ -162,6 +162,42 @@ pub(crate) fn precheck_range(
     Ok(None)
 }
 
+/// Post-flight check for [`ObjectStore::get_bytes_range`] body responses.
+///
+/// Real S3 and Azure backends silently truncate a ranged GET when
+/// `range.start < body.len() <= range.end` — the wire response carries
+/// `range.start..body.len()` bytes with HTTP 206 and no error. The
+/// packchain reader treats the returned slice as the exact entry it
+/// asked for, so a truncated pack file (or a stale `chain.json` whose
+/// recorded offsets outrun the on-bucket pack) would propagate as
+/// downstream pack-decode garbage rather than as the data-integrity
+/// failure it is.
+///
+/// This helper asserts the SDK gave back exactly `range.end - range.start`
+/// bytes and surfaces a mismatch as [`ObjectStoreError::RangeNotSatisfiable`]
+/// with the originally requested range. It is the symmetric companion to
+/// [`precheck_range`] — the preflight guards against degenerate inputs
+/// before the SDK call; this guards against degenerate output after.
+///
+/// `precheck_range` short-circuits empty and inverted ranges, so by the
+/// time this runs `range.start < range.end` is guaranteed. Subtraction
+/// therefore cannot underflow.
+pub(crate) fn verify_range_response_length(
+    key: &str,
+    range: &std::ops::Range<u64>,
+    body: Bytes,
+) -> Result<Bytes, ObjectStoreError> {
+    let expected = range.end - range.start;
+    let actual = body.len() as u64;
+    if actual == expected {
+        return Ok(body);
+    }
+    Err(ObjectStoreError::RangeNotSatisfiable {
+        key: key.to_owned(),
+        requested: range.clone(),
+    })
+}
+
 /// Backend-neutral cloud object-store surface.
 ///
 /// Method semantics — every implementation must satisfy these contracts so
@@ -189,7 +225,14 @@ pub(crate) fn precheck_range(
 /// - **`get_bytes_range`** — half-open `[start, end)` range. `start == end`
 ///   returns `Ok(Bytes::new())` with no network call. `start > end` and
 ///   server-side 416 both surface as
-///   [`ObjectStoreError::RangeNotSatisfiable`].
+///   [`ObjectStoreError::RangeNotSatisfiable`]. When the object's body
+///   ends inside the requested range
+///   (`start < body.len() <= end`) real S3/Azure backends return a
+///   silently truncated body (HTTP 206, fewer bytes than requested);
+///   this trait elevates that mismatch to
+///   [`ObjectStoreError::RangeNotSatisfiable`] so callers never see a
+///   short slice masquerading as the full requested range. The mock
+///   backend matches this contract.
 #[async_trait::async_trait]
 pub trait ObjectStore: Send + Sync {
     /// Enumerate every object whose key has `prefix` as a byte prefix.
@@ -213,6 +256,16 @@ pub trait ObjectStore: Send + Sync {
     /// `start == end` returns `Ok(Bytes::new())` without issuing a
     /// network request. `start > end`, or a server-side 416, surfaces
     /// as [`ObjectStoreError::RangeNotSatisfiable`].
+    ///
+    /// **Truncation contract**: real S3 and Azure backends return a
+    /// silently truncated body (HTTP 206 with fewer bytes than asked)
+    /// when the requested range overruns the object's end —
+    /// `start < body.len() <= end`. Backends here elevate that mismatch
+    /// to [`ObjectStoreError::RangeNotSatisfiable`] so a successful
+    /// `Ok(bytes)` always carries exactly `end - start` bytes. The
+    /// packchain reader (issue #52) relies on this to surface stale
+    /// `chain.json` offsets and truncated pack files as data-integrity
+    /// errors instead of pack-decode garbage.
     ///
     /// Used by the packchain engine (issue #52) to read a single blob
     /// out of a larger pack file without downloading the whole pack.
@@ -391,5 +444,89 @@ impl<T: ObjectStore + ?Sized> ObjectStore for Arc<T> {
         ttl: std::time::Duration,
     ) -> Result<String, ObjectStoreError> {
         (**self).presigned_get_url(key, ttl).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn precheck_range_empty_short_circuits_with_empty_bytes() {
+        let out = precheck_range("k", &(5..5)).expect("empty range is valid");
+        let bytes = out.expect("empty range short-circuits with Some");
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn precheck_range_inverted_returns_range_not_satisfiable() {
+        let range = std::ops::Range { start: 7, end: 3 };
+        let err = precheck_range("k", &range).expect_err("inverted range must error");
+        assert!(matches!(
+            err,
+            ObjectStoreError::RangeNotSatisfiable {
+                ref key,
+                requested: ref r,
+            } if key == "k" && r.start == 7 && r.end == 3
+        ));
+    }
+
+    #[test]
+    fn precheck_range_well_formed_returns_none() {
+        let out = precheck_range("k", &(2..6)).expect("valid range");
+        assert!(out.is_none(), "well-formed range proceeds to SDK call");
+    }
+
+    #[test]
+    fn verify_range_response_length_passes_exact_length() {
+        let range = 2..6;
+        let body = Bytes::from_static(b"abcd"); // 4 bytes, matches range
+        let out = verify_range_response_length("k", &range, body.clone())
+            .expect("exact-length body must pass");
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn verify_range_response_length_rejects_truncated_body() {
+        // S3/Azure return start..body.len() when start < body.len() <= end.
+        // Caller asked for 4 bytes; SDK returned 2.
+        let range = 2..6;
+        let body = Bytes::from_static(b"ab");
+        let err = verify_range_response_length("pack-key", &range, body)
+            .expect_err("short body must be rejected");
+        assert!(
+            matches!(
+                err,
+                ObjectStoreError::RangeNotSatisfiable {
+                    ref key,
+                    requested: ref r,
+                } if key == "pack-key" && r.start == 2 && r.end == 6,
+            ),
+            "expected RangeNotSatisfiable(pack-key, 2..6), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_range_response_length_rejects_overlong_body() {
+        // Defensive: a hypothetical SDK bug that returned MORE bytes than
+        // requested would equally let downstream callers consume corrupt
+        // data. Treat as the same mismatch.
+        let range = 0..4;
+        let body = Bytes::from_static(b"abcdef");
+        let err = verify_range_response_length("k", &range, body)
+            .expect_err("overlong body must be rejected");
+        assert!(matches!(err, ObjectStoreError::RangeNotSatisfiable { .. }));
+    }
+
+    #[test]
+    fn verify_range_response_length_single_byte_round_trip() {
+        // 1-byte range is the smallest non-degenerate case (precheck
+        // already rejected 0-byte and inverted). Locks in that the
+        // single-byte path has no off-by-one.
+        let range = 7..8;
+        let body = Bytes::from_static(b"x");
+        let out = verify_range_response_length("k", &range, body.clone())
+            .expect("single-byte body must pass");
+        assert_eq!(out, body);
     }
 }
