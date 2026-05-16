@@ -534,11 +534,25 @@ async fn delete_with_held_lock_returns_contention_error() {
     .await;
     result.expect("delete should produce a refusal, not a hard error");
     let text = std::str::from_utf8(&out).unwrap();
-    assert!(
-        text.contains("failed to acquire ref lock"),
-        "delete must report lock contention, got {text:?}",
+    // Pin the EXACT wire bytes — issue #217. push_one runs both Push
+    // and Delete under the same lock, so the contention sentence must
+    // name both verbs ("pushing or deleting"); a regression that
+    // dropped "or deleting" would silently mislead delete-arm callers.
+    // The TTL flows from `DEFAULT_LOCK_TTL_SECONDS` (overridable via
+    // `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`) so a future default
+    // change updates production and this test in lockstep.
+    let ttl_secs: u64 = std::env::var("GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(git_remote_object_store::protocol::push::DEFAULT_LOCK_TTL_SECONDS);
+    let expected = format!(
+        "error refs/heads/main \"failed to acquire ref lock at \
+         repo/refs/heads/main/LOCK#.lock. Another client may be pushing \
+         or deleting. If this persists beyond {ttl_secs}s, run \
+         git-remote-object-store doctor to inspect and optionally clear \
+         stale locks.\"?\n\n",
     );
-    assert!(text.ends_with("\"?\n\n"), "wire envelope dropped: {text:?}");
+    assert_eq!(text, expected, "got {text:?}");
     // The bundle MUST survive: a regression that swept under a stale
     // pre-lock listing would have deleted it.
     assert!(

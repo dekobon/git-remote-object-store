@@ -1331,7 +1331,12 @@ async fn push_one(
         return Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
             message: format!(
-                r#""failed to acquire ref lock at {lock}. Another client may be pushing. If this persists beyond {}s, run git-remote-object-store doctor to inspect and optionally clear stale locks."?"#,
+                // `push_one` covers BOTH the Push and Delete arms under the
+                // same per-ref lock, so the contention message names both
+                // — mirroring the packchain delete path's wording. A
+                // delete-arm caller previously saw a misleading
+                // "may be pushing" hint here.
+                r#""failed to acquire ref lock at {lock}. Another client may be pushing or deleting. If this persists beyond {}s, run git-remote-object-store doctor to inspect and optionally clear stale locks."?"#,
                 config.ttl.whole_seconds(),
             ),
         });
