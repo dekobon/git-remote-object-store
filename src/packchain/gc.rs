@@ -243,7 +243,7 @@ pub(crate) async fn write_baseline_tombstone_best_effort(
 /// Environment variable that overrides [`DEFAULT_GRACE_HOURS`] when
 /// set to a positive integer. Mirrors the shape of
 /// `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` used by the protocol REPL.
-pub const ENV_GC_GRACE_HOURS: &str = "GIT_REMOTE_OBJECT_STORE_GC_GRACE_HOURS";
+pub(crate) const ENV_GC_GRACE_HOURS: &str = "GIT_REMOTE_OBJECT_STORE_GC_GRACE_HOURS";
 
 /// On-bucket schema version this build reads and writes.
 pub const TOMBSTONE_SCHEMA_VERSION: u32 = 1;
@@ -599,7 +599,7 @@ impl Default for SweepOpts {
 /// vars, non-numeric values, or zero (a zero grace would defeat the
 /// mark/sweep design's point).
 #[must_use]
-pub fn grace_hours_from_env() -> u64 {
+pub(crate) fn grace_hours_from_env() -> u64 {
     std::env::var(ENV_GC_GRACE_HOURS)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())

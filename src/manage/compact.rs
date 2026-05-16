@@ -31,7 +31,7 @@ use crate::packchain::gc;
 use crate::protocol::push::lock_ttl_from_env;
 
 /// Tunables for [`Compact::run`]. Field semantics mirror the CLI flags.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompactOpts {
     /// Compact only the named ref. `None` triggers the audit-driven
     /// "every ref meeting the heuristic" mode.
@@ -46,19 +46,10 @@ pub struct CompactOpts {
     /// `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`.
     pub lock_ttl_seconds: Option<u64>,
     /// Grace hours forwarded to `gc::sweep` when `with_gc` is set.
-    pub gc_grace_hours: u64,
-}
-
-impl Default for CompactOpts {
-    fn default() -> Self {
-        Self {
-            ref_name: None,
-            force: false,
-            with_gc: false,
-            lock_ttl_seconds: None,
-            gc_grace_hours: gc::DEFAULT_GRACE_HOURS,
-        }
-    }
+    /// `None` falls back to [`crate::packchain::gc::grace_hours_from_env`]
+    /// which honours `GIT_REMOTE_OBJECT_STORE_GC_GRACE_HOURS` (defaulting
+    /// to [`gc::DEFAULT_GRACE_HOURS`] when unset).
+    pub gc_grace_hours: Option<u64>,
 }
 
 /// `compact` runner.
@@ -274,11 +265,15 @@ impl<'a> Compact<'a> {
                 "compact --with-gc: mark completed",
             );
         }
+        let grace_hours = self
+            .opts
+            .gc_grace_hours
+            .unwrap_or_else(gc::grace_hours_from_env);
         let sweep = gc::sweep(
             store_ref,
             &self.prefix,
             gc::SweepOpts {
-                grace_hours: self.opts.gc_grace_hours,
+                grace_hours,
                 force: false,
             },
         )

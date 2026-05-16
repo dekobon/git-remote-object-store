@@ -31,7 +31,7 @@ use crate::object_store::ObjectStore;
 use crate::packchain::gc;
 
 /// Tunables for [`Gc::run`]. Field semantics mirror the CLI flags.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct GcOpts {
     /// Operating mode. The two-boolean `mark_only`/`sweep_only`
     /// shape was prone to silently no-oping the conflicting
@@ -42,9 +42,10 @@ pub struct GcOpts {
     /// re-check. Operator-asserted safe.
     pub force: bool,
     /// Grace window in hours before a tombstone becomes eligible for
-    /// sweep. The CLI defaults to [`gc::DEFAULT_GRACE_HOURS`] subject
-    /// to the [`gc::ENV_GC_GRACE_HOURS`] override.
-    pub grace_hours: u64,
+    /// sweep. `None` falls back to [`crate::packchain::gc::grace_hours_from_env`]
+    /// which honours `GIT_REMOTE_OBJECT_STORE_GC_GRACE_HOURS` (defaulting
+    /// to [`gc::DEFAULT_GRACE_HOURS`] when unset).
+    pub grace_hours: Option<u64>,
 }
 
 /// Which phases of the mark-and-sweep flow [`Gc::run`] executes.
@@ -64,16 +65,6 @@ pub enum GcMode {
     MarkOnly,
     /// Sweep only — process pre-existing tombstones, do not mark.
     SweepOnly,
-}
-
-impl Default for GcOpts {
-    fn default() -> Self {
-        Self {
-            mode: GcMode::Default,
-            force: false,
-            grace_hours: gc::DEFAULT_GRACE_HOURS,
-        }
-    }
 }
 
 /// `gc` runner. Held by the CLI for the lifetime of one invocation.
@@ -130,11 +121,15 @@ impl Gc {
         }
 
         if self.opts.mode != GcMode::MarkOnly {
+            let grace_hours = self
+                .opts
+                .grace_hours
+                .unwrap_or_else(gc::grace_hours_from_env);
             let sweep_outcome = gc::sweep(
                 store_ref,
                 &self.prefix,
                 gc::SweepOpts {
-                    grace_hours: self.opts.grace_hours,
+                    grace_hours,
                     force: self.opts.force,
                 },
             )

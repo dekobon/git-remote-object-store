@@ -23,7 +23,6 @@ use git_remote_object_store::manage::{
     gc::{Gc, GcMode, GcOpts},
 };
 use git_remote_object_store::object_store::ObjectStore;
-use git_remote_object_store::packchain::gc as packchain_gc;
 use git_remote_object_store::protocol::backend;
 use git_remote_object_store::url::{self as remote_url, RemoteUrl, StorageEngine};
 
@@ -219,7 +218,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let opts = GcOpts {
                 mode,
                 force,
-                grace_hours: grace_hours.unwrap_or_else(packchain_gc::grace_hours_from_env),
+                grace_hours,
             };
             Ok(Gc::new(store, prefix, opts).run().await?)
         }
@@ -237,7 +236,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 force,
                 with_gc,
                 lock_ttl_seconds,
-                gc_grace_hours: gc_grace_hours.unwrap_or_else(packchain_gc::grace_hours_from_env),
+                gc_grace_hours,
             };
             let prompter = DialoguerPrompter;
             Ok(Compact::new(store, prefix, opts, &prompter).run().await?)
