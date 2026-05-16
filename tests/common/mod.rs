@@ -2,30 +2,27 @@
 //!
 //! Cargo does not treat `tests/common/mod.rs` as a test target, so
 //! each `tests/protocol_*.rs` file can `mod common;` to pull these in.
+//!
+//! The cross-crate helpers (git CLI shellouts, in-process REPL driver,
+//! seed-repo factory) live in
+//! [`git_remote_object_store::test_util`] so the cli crate's
+//! integration tests share the same source of truth; this module
+//! re-exports them alongside test-suite-local helpers (the
+//! MockStore-specific URL builders and the annotated-tag / tag-of-tag
+//! seed factories) that only the lib tests need.
 
 // Each integration-test crate compiles this module independently, so
 // helpers used by one test file but not another would trigger warnings.
-#![allow(dead_code)]
+// The `pub use` re-export of `test_util` items hits `unused_imports`
+// for the same per-target reason — a test crate that uses `drive_in`
+// but not `git_available` would otherwise warn on the re-export.
+#![allow(dead_code, unused_imports)]
 
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
-
-use git_remote_object_store::object_store::ObjectStore;
-use git_remote_object_store::protocol::backend;
-use git_remote_object_store::protocol::{ProtocolError, run};
 use git_remote_object_store::url::{self, RemoteUrl};
-use tokio::io::AsyncWriteExt;
 
-/// Check whether the `git` CLI is available on `PATH`.
-pub fn git_available() -> bool {
-    static AVAIL: OnceLock<bool> = OnceLock::new();
-    *AVAIL.get_or_init(|| {
-        std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .is_ok()
-    })
-}
+pub use git_remote_object_store::test_util::{
+    drive_in, git, git_available, git_capture, make_seed_repo,
+};
 
 /// Build a test [`RemoteUrl`] pointing at a fake S3 bucket.
 pub fn s3_url(prefix: Option<&str>) -> RemoteUrl {
@@ -42,141 +39,6 @@ pub fn s3_url_with_zip(prefix: Option<&str>, zip: bool) -> RemoteUrl {
         raw.push_str("?zip=1");
     }
     url::parse(&raw).expect("test URL must parse")
-}
-
-/// Drive [`protocol::run`] in-process via a tokio duplex channel.
-///
-/// Feeds `script` to the helper's stdin, collects all stdout output,
-/// and returns `(stdout_bytes, run_result)`.
-pub async fn drive_in(
-    remote: RemoteUrl,
-    store: Arc<dyn ObjectStore>,
-    script: &str,
-    repo_dir: PathBuf,
-) -> (Vec<u8>, Result<(), ProtocolError>) {
-    let (client_side, helper_side) = tokio::io::duplex(64 * 1024);
-    let (helper_in, helper_out) = tokio::io::split(helper_side);
-    let (mut client_reader, mut client_writer) = tokio::io::split(client_side);
-
-    let script_bytes = script.as_bytes().to_owned();
-    let writer_task = tokio::spawn(async move {
-        // Tolerate `BrokenPipe`: a helper that aborts early (e.g.
-        // engine-not-implemented for `?engine=packchain`) closes its
-        // stdin reader before the full script lands. That is correct
-        // helper behaviour, not a test failure.
-        let suppress_broken_pipe = |e: std::io::Error| {
-            if e.kind() == std::io::ErrorKind::BrokenPipe {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        };
-        client_writer
-            .write_all(&script_bytes)
-            .await
-            .or_else(suppress_broken_pipe)
-            .unwrap();
-        client_writer
-            .shutdown()
-            .await
-            .or_else(suppress_broken_pipe)
-            .unwrap();
-    });
-
-    let reader_task = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut buf = Vec::new();
-        client_reader.read_to_end(&mut buf).await.unwrap();
-        buf
-    });
-
-    // Mirror production wiring: production calls `backend::build` which
-    // computes the engine from FORMAT + URL flag. Tests skip `build`
-    // (their MockStore needs no probe) but still need the same engine
-    // resolution so `protocol::run` dispatches correctly.
-    let engine = backend::validate_format(
-        remote.kind(),
-        store.as_ref(),
-        remote.prefix().unwrap_or_default(),
-        remote.flags().engine,
-    )
-    .await
-    .expect("validate_format must succeed in tests with valid setup");
-    let result = run(
-        remote,
-        store,
-        engine,
-        tokio::io::BufReader::new(helper_in),
-        helper_out,
-        None,
-        repo_dir,
-    )
-    .await;
-
-    writer_task.await.unwrap();
-    let output = reader_task.await.unwrap();
-    (output, result)
-}
-
-/// Run a `git` command and assert it succeeds.
-pub fn git(args: &[&str], cwd: &Path) {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("spawn git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
-
-/// Run a `git` command, assert it succeeds, and return its stdout.
-pub fn git_capture(args: &[&str], cwd: &Path) -> String {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("spawn git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr),
-    );
-    String::from_utf8(output.stdout).expect("git stdout utf-8")
-}
-
-/// Initialise a fresh repo with `n` linear commits on `refs/heads/main`
-/// and return the dir + Vec<sha> in commit order (oldest first).
-///
-/// `label` differentiates blob contents so two repos seeded in the same
-/// wall-clock second still produce distinct commit SHAs (commit time
-/// resolution is one second; without a per-call label, two seeded repos
-/// can hash-collide and break tests that compare their tip SHAs).
-pub fn make_seed_repo(n: usize, label: &str) -> (tempfile::TempDir, Vec<String>) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    git(&["init", "--quiet", "--initial-branch=main"], dir.path());
-    git(&["config", "user.email", "test@example.com"], dir.path());
-    git(&["config", "user.name", "Test"], dir.path());
-    git(&["config", "commit.gpgsign", "false"], dir.path());
-
-    let mut shas = Vec::with_capacity(n);
-    for i in 0..n {
-        let body = format!("{label}-{i}\n");
-        std::fs::write(dir.path().join(format!("f{i}.txt")), body.as_bytes()).unwrap();
-        git(&["add", "."], dir.path());
-        git(
-            &["commit", "--quiet", "-m", "step", "--no-gpg-sign"],
-            dir.path(),
-        );
-        let sha = git_capture(&["rev-parse", "HEAD"], dir.path())
-            .trim()
-            .to_owned();
-        shas.push(sha);
-    }
-    (dir, shas)
 }
 
 /// Initialise a fresh repo with one commit and an annotated tag

@@ -73,6 +73,15 @@ pub mod protocol;
 pub mod remote;
 pub mod url;
 
+/// Shared test helpers (git CLI shellouts, in-process REPL driver,
+/// seed-repo factory) consumed by both `tests/` integration tests and
+/// the cli crate's `cli/tests/` integration tests. Gated on
+/// `#[cfg(any(test, feature = "test-util"))]` so production builds
+/// never see it; the cli crate enables the feature on its path
+/// dependency.
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
+
 // Re-export the most commonly used types at the crate root so consumers
 // do not need three-level import paths.
 #[doc(no_inline)]

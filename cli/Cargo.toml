@@ -99,6 +99,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+# Re-declare the lib crate with `test-util` enabled so the integration
+# tests in `cli/tests/` pick up `git_remote_object_store::test_util`
+# (shared `git`, `git_capture`, `drive_in`, `make_seed_repo` helpers).
+# Cargo unifies the feature set across the two dep tables, so the
+# release binaries built from `[dependencies]` do not link the
+# test-util module — only the test build does.
+git-remote-object-store = { path = "..", features = ["test-util"] }
+
 # `async_trait::async_trait` proc macro — required by the
 # `cli/tests/common/zip_fault.rs` `ZipPutFaultStore` decorator's
 # `impl ObjectStore for ...` (the trait is declared with the same
