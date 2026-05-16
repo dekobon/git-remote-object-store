@@ -16,7 +16,7 @@ that skip cloud accounts entirely.
 - [6. Submodules](#6-submodules)
 - [7. Git LFS](#7-git-lfs)
 - [8. Management CLI](#8-management-cli)
-- [9. Garbage collection](#9-garbage-collection)
+- [9. Maintenance: `gc` and `compact`](#9-maintenance-gc-and-compact)
 - [10. Bundle URI — faster `git clone` for large repos](#10-bundle-uri--faster-git-clone-for-large-repos)
 - [11. Troubleshooting](#11-troubleshooting)
 - See also: [environment-variables.md](environment-variables.md) —
@@ -398,6 +398,9 @@ git-remote-object-store protect origin main
 git-remote-object-store unprotect origin main
 ```
 
+The `gc` and `compact` subcommands target `packchain`-engine
+bucket maintenance and are covered in §9 below.
+
 `doctor` flags worth knowing:
 
 - `--lock-ttl <SECS>` — seconds after which a `*.lock` file is
@@ -412,19 +415,25 @@ git-remote-object-store unprotect origin main
   is non-destructive — you can `git checkout` the quarantine ref and
   decide what to do).
 
-## 9. Garbage collection
+## 9. Maintenance: `gc` and `compact`
 
-The `gc` subcommand only applies to **packchain** remotes
-(`?engine=packchain`). Bundle-engine remotes have no garbage to
-collect — every push writes a fresh, self-contained bundle. See
+Both subcommands target **packchain** remotes only (see
 [storage-engines.md](storage-engines.md) for the differences between
-the two engines.
+the two engines). On a `bundle`-engine remote they exit cleanly with
+nothing to do.
+
+### 9.1. Garbage collection (`gc`)
+
+`gc` reclaims pack objects that are no longer referenced by any
+`chain.json`. Bundle-engine remotes have no garbage to collect —
+every push writes a fresh, self-contained bundle — so `gc` is a
+no-op there.
 
 ```text
 git-remote-object-store gc <remote> [--mark-only] [--sweep-only] [--force] [--grace-hours <HOURS>]
 ```
 
-### When to run
+#### When to run
 
 Run `gc` after any operation that detaches packs from the chain:
 
@@ -443,7 +452,7 @@ sweep. It is safe to run against a live bucket; concurrent pushes
 take the per-ref lock and sweep re-checks the orphan set before
 deletion.
 
-### Default flow: mark + sweep in one command
+#### Default flow: mark + sweep in one command
 
 ```bash
 git-remote-object-store gc origin
@@ -465,7 +474,7 @@ Fresh tombstones from this same invocation will not sweep — they
 have not yet aged past the grace window. Re-running `gc` after the
 grace window applies them.
 
-### Cron-friendly split
+#### Cron-friendly split
 
 The grace window protects in-flight readers: a clone that started
 before the mark phase is allowed to finish even if `gc` decided
@@ -516,7 +525,7 @@ Each `--mark-only` invocation writes a fresh tombstone; each
 `--sweep-only` invocation sweeps tombstones that have aged past
 the grace window.
 
-### Tuning the grace window
+#### Tuning the grace window
 
 The grace window is the minimum age a tombstone must reach before
 its packs are eligible for sweep. Default is 24 hours.
@@ -544,7 +553,7 @@ tombstoned pack via content-hash dedup. For routine maintenance
 keep both at their defaults; reach for them only during operator-
 asserted-quiet windows.
 
-### `--force`: skip the grace window and re-check
+#### `--force`: skip the grace window and re-check
 
 ```bash
 git-remote-object-store gc origin --force
@@ -564,7 +573,7 @@ Use it for one-off cleanup after a known-quiet maintenance window
 recurring schedule — the protections it bypasses exist precisely
 to keep clones from breaking under concurrent traffic.
 
-### Reading `gc` output
+#### Reading `gc` output
 
 The mark phase reports the orphan count or that the bucket is
 already clean:
@@ -595,6 +604,88 @@ Field meanings:
 - **deferred** (`D`) — tombstones whose grace window has not yet
   expired. They remain on the bucket and will be considered on
   the next sweep.
+
+### 9.2. Compaction (`compact`)
+
+`compact` rewrites a ref's `chain.json` into a single baseline
+segment at the current tip. Fetches against a long chain pay one
+round trip per segment to walk the chain; collapsing the chain
+restores fetch latency to the single-segment case. The pre-compact
+segment packs become orphans for `gc` to reap on its next sweep.
+
+```text
+git-remote-object-store compact <remote> [--ref-name <REF>] [--force] [--with-gc] [--lock-ttl-seconds <SECS>] [--gc-grace-hours <HOURS>]
+```
+
+Like `gc`, `compact` applies only to `packchain` remotes; on a
+`bundle`-engine remote it exits cleanly with nothing to do.
+
+#### When to run
+
+The default invocation audits every ref and only compacts those
+that meet the heuristic — currently **more than 20 segments OR
+more than 100 MiB of cumulative segment bytes since the last
+baseline**. Compact each candidate ref one at a time; you confirm
+the list interactively before any rewrite runs.
+
+Typical schedule:
+
+- **Active monorepos** — pair `compact` with the weekly `gc` cron.
+  Pass `--with-gc` so a single invocation rewrites the chains then
+  immediately reaps the orphan packs.
+- **Long-lived release branches** — run `compact --ref-name
+  refs/heads/release/X` after a force-push or large rebase so the
+  next clone of that branch picks up a single-segment baseline.
+- **Bundle URI consumers** — every `compact` advances the chain's
+  `full_at` SHA, which is the `creationToken` clients cache against.
+  Schedule compaction during low-traffic windows so cached clients
+  rebuild against the new baseline at off-peak.
+
+#### Targeting a single ref
+
+```bash
+git-remote-object-store compact origin --ref-name refs/heads/main
+```
+
+`--ref-name` accepts the fully-qualified ref path
+(`refs/heads/<branch>`). Without it, `compact` scans every ref and
+prompts before rewriting anything that meets the heuristic.
+
+#### Bypassing the heuristic
+
+```bash
+git-remote-object-store compact origin --ref-name refs/heads/main --force
+```
+
+`--force` bypasses the segments-and-bytes check and rewrites the
+chain unconditionally. Useful after a force-push when the segment
+count is below the threshold but the operator still wants to
+collapse the chain to a single baseline.
+
+#### One-command cleanup with `--with-gc`
+
+```bash
+git-remote-object-store compact origin --with-gc
+```
+
+Runs `gc` mark+sweep against the same bucket after a successful
+compact, so the freshly-orphaned segment packs are reaped in the
+same invocation. `--gc-grace-hours` forwards to the sweep (default
+reads `GIT_REMOTE_OBJECT_STORE_GC_GRACE_HOURS`, falling back to 24);
+without `--with-gc` the flag is ignored.
+
+#### Locking
+
+`compact` holds the per-ref `chain.json` lock from chain read
+through commit. Large repos can take many seconds to rewrite, so
+the lock TTL needs to be high enough to cover the rewrite. The
+default reads `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` (falling
+back to 60 seconds); override with `--lock-ttl-seconds` per
+invocation if your repo needs longer.
+
+Concurrent pushes against the same ref will fail to acquire the
+lock and surface the standard "ref is locked" error; they should
+be retried after `compact` releases.
 
 ## 10. Bundle URI — faster `git clone` for large repos
 

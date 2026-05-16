@@ -4,7 +4,7 @@ Universal project instructions for AI coding assistants.
 
 ## Project Overview
 
-`git-remote-object-store` is a Rust crate that exposes AWS S3 and Azure Blob Storage as git remote backends. It ships the helper-protocol binaries (`git-remote-s3+https`, `git-remote-az+https`, etc.), an LFS custom-transfer agent, and a management CLI (`doctor`, `delete-branch`, `protect`, `unprotect`).
+`git-remote-object-store` is a Rust crate that exposes AWS S3 and Azure Blob Storage as git remote backends. It ships the helper-protocol binaries (`git-remote-s3+https`, `git-remote-az+https`, etc.), an LFS custom-transfer agent, and a management CLI (`doctor`, `delete-branch`, `protect`, `unprotect`, `gc`, `compact`).
 
 ### Standalone project — no external compatibility contracts
 

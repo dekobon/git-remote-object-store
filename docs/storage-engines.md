@@ -122,8 +122,8 @@ orphan.
 
 A single weekly invocation is the standard schedule: each run sweeps
 the previous run's tombstones and writes new ones. See
-[Getting started §9](getting-started.md#9-garbage-collection) for
-cron and GitHub Actions examples.
+[Getting started §9.1](getting-started.md#91-garbage-collection-gc)
+for cron and GitHub Actions examples.
 
 ### Compaction
 
@@ -133,7 +133,9 @@ recommends compaction at roughly 20 segments or 100 MiB of cumulative
 segment bytes per ref, whichever comes first; `--force` overrides the
 heuristic. The compaction holds the per-ref lock for the duration of
 the rewrite; after compaction, the orphaned segment packs become GC
-candidates.
+candidates. See
+[Getting started §9.2](getting-started.md#92-compaction-compact) for
+when to run it, the `--with-gc` shortcut, and lock-TTL guidance.
 
 ### Direct single-file reads
 

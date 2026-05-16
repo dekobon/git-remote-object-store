@@ -126,7 +126,8 @@ make shellspec-integration          # both
 (`bundle` and `packchain`), both backends (S3 and Azure Blob), the
 helper-protocol REPL, parallel `fetch`, locked `push`, the
 management CLI (`doctor`, `delete-branch`, `protect`, `unprotect`,
-`gc`), the LFS custom-transfer agent, and the signed release pipeline.
+`gc`, `compact`), the LFS custom-transfer agent, and the signed
+release pipeline.
 
 Git operations are gitoxide-backed end to end — bundle read/write is
 native via `gix-pack`, and the crate spawns no `git` subprocess in
