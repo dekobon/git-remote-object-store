@@ -1288,8 +1288,10 @@ mod tests {
         );
         // Exactly one baseline tombstone under
         // `<prefix>/gc/baseline-tomb-*.json`. The UUID-named body
-        // belongs to `BaselineTombstone`; this test pins only the
-        // listing prefix.
+        // belongs to `BaselineTombstone`; this test pins both the
+        // listing prefix AND the embedded SHA — a regression that
+        // wrote the tombstone naming the wrong SHA would still pass
+        // a count-only assertion (#221 follow-on).
         let tomb_keys: Vec<String> = store
             .keys()
             .into_iter()
@@ -1300,6 +1302,20 @@ mod tests {
             1,
             "exactly one baseline tombstone must exist: {tomb_keys:?}",
         );
+        // Parse the body via `serde_json::Value` rather than
+        // `BaselineTombstone::from_json_bytes` so the assertions
+        // pin the wire-format field names — a struct rename that
+        // was applied globally would silently pass the typed path
+        // but break on-bucket compatibility.
+        let body = store
+            .get_bytes(&tomb_keys[0])
+            .await
+            .expect("tombstone body present");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("tombstone is valid JSON");
+        assert_eq!(parsed["v"], 1);
+        assert_eq!(parsed["sha"], baseline_sha.to_string());
+        assert_eq!(parsed["ref_name"], "refs/heads/main");
         // Lock must also be gone (release_lock deletes it after sweep).
         assert!(
             !store.contains(&lock_key(prefix, &remote)),
@@ -1343,6 +1359,32 @@ mod tests {
             store.contains(&baseline_key),
             "pre-condition: bundle still present after delete (deferred)",
         );
+
+        // Inspect the tombstone body BEFORE `gc::sweep` consumes the
+        // key — a regression that wrote the tombstone naming the
+        // wrong SHA would let the count-only assertion below pass
+        // while still corrupting the on-bucket record (#221).
+        // `serde_json::Value` pins the wire-format field names
+        // independently of the `BaselineTombstone` struct shape.
+        let tomb_keys_pre: Vec<String> = store
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .collect();
+        assert_eq!(
+            tomb_keys_pre.len(),
+            1,
+            "exactly one tombstone must exist pre-sweep: {tomb_keys_pre:?}",
+        );
+        let body = store
+            .get_bytes(&tomb_keys_pre[0])
+            .await
+            .expect("tombstone body present");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("tombstone is valid JSON");
+        assert_eq!(parsed["v"], 1);
+        assert_eq!(parsed["sha"], baseline_sha.to_string());
+        assert_eq!(parsed["ref_name"], "refs/heads/main");
 
         let store_ref: &dyn ObjectStore = store.as_ref();
         let sweep = gc::sweep(
@@ -1459,6 +1501,70 @@ mod tests {
         assert!(
             tomb_keys.is_empty(),
             "no tombstone should be written on the fall-back path: {tomb_keys:?}",
+        );
+    }
+
+    /// Issue #221: isolate the listing-mismatch branch from the
+    /// unparseable-chain branch. The companion test above seeds
+    /// `chain.json = "{}"`, which fails `ChainManifest::from_json_bytes`
+    /// inside [`load_chain`] — that is the *parse-error* branch of
+    /// `try_tombstone_baseline_for_delete`. This test seeds a fully
+    /// parseable `chain.json` whose `full_at` SHA has no matching
+    /// `*.bundle` listing entry, exercising the
+    /// `if !entries.iter().any(|m| m.key == bundle_key)` branch
+    /// instead. Both branches must short-circuit to immediate bundle
+    /// deletion (no tombstone), but a regression in one would still
+    /// pass the other's test without this split.
+    #[tokio::test]
+    async fn delete_with_mismatched_full_at_falls_back_to_synchronous_bundle_delete() {
+        let store = Arc::new(MockStore::new());
+        let prefix = Some("repo");
+        let remote = rn("refs/heads/main");
+        // chain.full_at names SHA 0x...02 (parseable, valid), but the
+        // only bundle we seed is at 0x...01 — listing-mismatch path.
+        let seeded_sha = Sha::from_hex("0000000000000000000000000000000000000001").unwrap();
+        let seeded_bundle_key = keys::bundle_key(prefix, &remote, seeded_sha);
+        store.insert(
+            chain_key(prefix, &remote),
+            Bytes::from_static(b"{\"v\":1,\"tip\":\"0000000000000000000000000000000000000002\",\"full_at\":\"0000000000000000000000000000000000000002\",\"segments\":[]}"),
+        );
+        store.insert(path_index_key(prefix, &remote), Bytes::from_static(b"{}"));
+        store.insert(&seeded_bundle_key, Bytes::from_static(b"PACK"));
+
+        let config = delete_test_config();
+        let outcome = delete_remote_ref_packchain(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            prefix,
+            &remote,
+            &config,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, PushOutcome::Ok { .. }));
+        // The seeded mismatched bundle is swept synchronously by the
+        // general sweep loop — deferral was not actionable for the
+        // `full_at` named in chain.json (it pointed at a missing
+        // bundle), so the engine falls back to immediate delete.
+        assert!(
+            !store.contains(&seeded_bundle_key),
+            "seeded bundle must be swept synchronously when full_at points elsewhere",
+        );
+        assert!(!store.contains(&chain_key(prefix, &remote)));
+        assert!(!store.contains(&path_index_key(prefix, &remote)));
+        // No tombstone written — there is no actionable orphan SHA.
+        let tomb_keys: Vec<String> = store
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .collect();
+        assert!(
+            tomb_keys.is_empty(),
+            "no tombstone should be written when full_at has no matching listing entry: {tomb_keys:?}",
+        );
+        assert!(
+            !store.contains(&lock_key(prefix, &remote)),
+            "lock key must be released after the fall-back delete",
         );
     }
 

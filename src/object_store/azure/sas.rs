@@ -464,6 +464,13 @@ mod tests {
     /// `?bundle_uri_presign_ttl` at 7 days, because library callers
     /// can reach `build_blob_sas_url` with any `std::time::Duration`.
     /// The fix must return a clean `ObjectStoreError`, never panic.
+    ///
+    /// Note: `build_blob_sas_url` has two overflow paths — this test
+    /// covers path A (`i64::try_from(secs)` failure, the `"ttl too
+    /// large"` wording). Path B (`OffsetDateTime::checked_add`
+    /// overflow, the `"expiry overflow"` wording) is tracked as a
+    /// separate test-coverage follow-on issue (#221 surfaced the
+    /// gap during the audit pass).
     #[test]
     fn build_blob_sas_url_huge_ttl_returns_error_not_panic() {
         let base = Url::parse(
@@ -481,9 +488,22 @@ mod tests {
             Duration::MAX,
         )
         .expect_err("u64::MAX-class TTL must surface as an error, not panic");
+        // Strengthened beyond `matches!(err, ObjectStoreError::Other(_))`
+        // (#221): pin the human-readable wording AND the offending
+        // seconds count so a regression that changes the message
+        // (or names the wrong TTL) is caught here, not only in
+        // operator log review.
+        let ObjectStoreError::Other(msg) = &err else {
+            panic!("expected ObjectStoreError::Other, got {err:?}");
+        };
+        let text = msg.to_string();
         assert!(
-            matches!(err, ObjectStoreError::Other(_)),
-            "expected ObjectStoreError::Other, got {err:?}",
+            text.contains("ttl too large"),
+            "error must name the path-A overflow wording, got {text:?}",
+        );
+        assert!(
+            text.contains(&u64::MAX.to_string()),
+            "error must name the offending TTL seconds, got {text:?}",
         );
     }
 

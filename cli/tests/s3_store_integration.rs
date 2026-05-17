@@ -277,9 +277,13 @@ async fn head_returns_size_and_recent_last_modified() {
 
 #[tokio::test]
 async fn list_paginates_past_default_page() {
+    // Name the page-walk magic number so a future S3 SDK / RustFS
+    // default-page-size bump produces a meaningful diff at the
+    // constant rather than a silent test-coverage regression (#221).
+    const S3_DEFAULT_MAXKEYS: usize = 1000;
+    const PAGINATION_MARGIN: usize = 500;
     let (store, _bucket) = fresh_bucket().await;
-    // S3 returns up to 1000 keys per page; 1500 forces ≥2 pages.
-    let count = 1500;
+    let count = S3_DEFAULT_MAXKEYS + PAGINATION_MARGIN;
     for i in 0..count {
         store
             .put_bytes(

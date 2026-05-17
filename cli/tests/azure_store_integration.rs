@@ -425,9 +425,13 @@ async fn list_paginates_past_default_page() {
     // wall-clock bounded on CI. Sequential `put_bytes` for 5500
     // blobs against localhost Azurite takes ~minutes; with 32-way
     // concurrency the test finishes in seconds.
+    // Name the page-walk magic number so a future Azurite default
+    // bump produces a meaningful diff at the constant rather than
+    // a silent test-coverage regression (#221).
+    const AZURITE_DEFAULT_MAXRESULTS: usize = 5000;
+    const PAGINATION_MARGIN: usize = 500;
     let store = Arc::new(fresh_container().await);
-    // Azurite default maxresults is 5000; 5500 forces ≥ 2 pages.
-    let count: usize = 5500;
+    let count: usize = AZURITE_DEFAULT_MAXRESULTS + PAGINATION_MARGIN;
     // Bounded concurrency: high enough to hide per-PUT latency,
     // low enough to avoid exhausting Azurite's connection pool.
     let concurrency: usize = 32;
