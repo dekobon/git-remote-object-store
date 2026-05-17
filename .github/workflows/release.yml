@@ -137,7 +137,19 @@ jobs:
           META=$(cargo metadata --format-version 1 --no-deps)
           LIB_VER=$(jq -r '.packages[] | select(.name=="git-remote-object-store") | .version' <<<"$META")
           CLI_VER=$(jq -r '.packages[] | select(.name=="git-remote-object-store-cli") | .version' <<<"$META")
-          DEP_REQ=$(jq -r '.packages[] | select(.name=="git-remote-object-store-cli") | .dependencies[] | select(.name=="git-remote-object-store") | .req' <<<"$META")
+          # Collect every normal-kind (.kind == null) dependency
+          # entry on the library. We exclude dev-deps and build-deps:
+          # cli/Cargo.toml [dev-dependencies] declares a path-only
+          # entry to opt the integration tests into the library's
+          # `test-util` feature, with no `version =` field — cargo
+          # metadata reports its `req` as `*`, which is not relevant
+          # to the crates.io publish requirement we are validating.
+          # Materialising as a JSON array lets us validate the
+          # cardinality (exactly one normal-kind entry) before
+          # touching the value.
+          DEP_REQS_JSON=$(jq '[.packages[] | select(.name=="git-remote-object-store-cli") | .dependencies[] | select(.name=="git-remote-object-store" and .kind == null) | .req]' <<<"$META")
+          DEP_REQ_COUNT=$(jq 'length' <<<"$DEP_REQS_JSON")
+          DEP_REQ=$(jq -r '.[0] // ""' <<<"$DEP_REQS_JSON")
           # Strip the cargo requirement-prefix (`^`, `~`, `=`) so we
           # compare bare versions.
           DEP_REQ_STRIPPED="${DEP_REQ#[\^~=]}"
@@ -150,11 +162,21 @@ jobs:
             echo "::error::cli/Cargo.toml [package].version is $CLI_VER, tag is $VERSION"
             fail=1
           fi
-          if [[ "$DEP_REQ_STRIPPED" != "$VERSION" ]]; then
-            # Catches the third drift: the CLI manifest pins the library
-            # via `version = "..."` for crates.io publish. A drift here
-            # passes every preceding stage and fails only at
-            # `publish-crates`, after the GitHub Release is irreversible.
+          # The third drift: the CLI manifest pins the library via
+          # `version = "..."` for crates.io publish. A drift here
+          # passes every preceding stage and fails only at
+          # `publish-crates`, after the GitHub Release is
+          # irreversible. Three distinct failure modes — surface
+          # each one with its own message so the operator does not
+          # waste time chasing "bump it in lockstep" when the
+          # underlying problem is something else entirely.
+          if [[ "$DEP_REQ_COUNT" -eq 0 ]]; then
+            echo "::error::cli/Cargo.toml has no normal-kind [dependencies].git-remote-object-store entry. The CLI requires the library as a published dep for crates.io to resolve it; restore the [dependencies] declaration before tagging."
+            fail=1
+          elif [[ "$DEP_REQ_COUNT" -gt 1 ]]; then
+            echo "::error::cli/Cargo.toml declares git-remote-object-store as a normal dep ${DEP_REQ_COUNT} times (target-gated entries under [target.'cfg(...)'.dependencies] are the usual cause). Preflight validates parity against a single declaration; consolidate the entries or extend this check to walk all of them."
+            fail=1
+          elif [[ "$DEP_REQ_STRIPPED" != "$VERSION" ]]; then
             echo "::error::cli/Cargo.toml [dependencies].git-remote-object-store version is '$DEP_REQ', tag is $VERSION — bump it in lockstep"
             fail=1
           fi
