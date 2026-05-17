@@ -1,12 +1,20 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH GIT-REMOTE-OBJECT-STORE-DELETE-BRANCH 1 "" "git-remote-object-store Manual"
+.TH GIT-REMOTE-OBJECT-STORE-DELETE-BRANCH 1  git-remote-object-store "git-remote-object-store Manual"
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
 .SH NAME
 git\-remote\-object\-store\-delete\-branch \- Delete every object under `refs/heads/<branch>/` after a y/N confirmation. Acquires the ref\*(Aqs per\-ref lock for the duration of the delete; the TTL reads `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` (falling back to 60s)
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
 .SH SYNOPSIS
 \fBgit\-remote\-object\-store\-delete\-branch\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIREMOTE\fR> <\fIBRANCH\fR> 
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
 .SH DESCRIPTION
 Delete every object under `refs/heads/<branch>/` after a y/N confirmation. Acquires the ref\*(Aqs per\-ref lock for the duration of the delete; the TTL reads `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS` (falling back to 60s)
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
 .SH OPTIONS
 .TP
 \fB\-h\fR, \fB\-\-help\fR
@@ -17,3 +25,13 @@ A remote URL (`s3+https://…`, `az+https://…`) or the name of a git remote co
 .TP
 <\fIBRANCH\fR>
 Branch name, without the `refs/heads/` prefix
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.SH SUBCOMMANDS
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.SH EXTRA
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.SH AUTHORS
+

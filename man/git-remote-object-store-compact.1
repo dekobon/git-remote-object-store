@@ -1,12 +1,20 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH GIT-REMOTE-OBJECT-STORE-COMPACT 1 "" "git-remote-object-store Manual"
+.TH GIT-REMOTE-OBJECT-STORE-COMPACT 1  git-remote-object-store "git-remote-object-store Manual"
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
 .SH NAME
 git\-remote\-object\-store\-compact \- Compact a packchain ref\*(Aqs chain.json down to a single segment at the current tip. The default scans every ref and prompts for confirmation; `\-\-ref` targets a single branch. Old segment packs become orphans for `gc` to reap
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
 .SH SYNOPSIS
 \fBgit\-remote\-object\-store\-compact\fR [\fB\-\-ref\-name\fR] [\fB\-\-force\fR] [\fB\-\-with\-gc\fR] [\fB\-\-lock\-ttl\-seconds\fR] [\fB\-\-gc\-grace\-hours\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREMOTE\fR> 
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
 .SH DESCRIPTION
 Compact a packchain ref\*(Aqs chain.json down to a single segment at the current tip. The default scans every ref and prompts for confirmation; `\-\-ref` targets a single branch. Old segment packs become orphans for `gc` to reap
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
 .SH OPTIONS
 .TP
 \fB\-\-ref\-name\fR \fI<REF>\fR
@@ -29,3 +37,13 @@ Print help
 .TP
 <\fIREMOTE\fR>
 A remote URL (`s3+https://…`, `az+https://…`) or the name of a git remote configured in the current repository
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.SH SUBCOMMANDS
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.SH EXTRA
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.SH AUTHORS
+

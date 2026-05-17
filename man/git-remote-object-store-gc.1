@@ -1,12 +1,20 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH GIT-REMOTE-OBJECT-STORE-GC 1 "" "git-remote-object-store Manual"
+.TH GIT-REMOTE-OBJECT-STORE-GC 1  git-remote-object-store "git-remote-object-store Manual"
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
 .SH NAME
 git\-remote\-object\-store\-gc \- Two\-phase mark\-and\-sweep garbage collection of orphan packs on a packchain bucket. Default flow is mark + sweep; `\-\-mark\-only` and `\-\-sweep\-only` separate the phases for cron\-style scheduling
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
 .SH SYNOPSIS
 \fBgit\-remote\-object\-store\-gc\fR [\fB\-\-mark\-only\fR] [\fB\-\-sweep\-only\fR] [\fB\-\-force\fR] [\fB\-\-grace\-hours\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREMOTE\fR> 
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
 .SH DESCRIPTION
 Two\-phase mark\-and\-sweep garbage collection of orphan packs on a packchain bucket. Default flow is mark + sweep; `\-\-mark\-only` and `\-\-sweep\-only` separate the phases for cron\-style scheduling
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
 .SH OPTIONS
 .TP
 \fB\-\-mark\-only\fR
@@ -26,3 +34,13 @@ Print help
 .TP
 <\fIREMOTE\fR>
 A remote URL (`s3+https://…`, `az+https://…`) or the name of a git remote configured in the current repository
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.SH SUBCOMMANDS
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.SH EXTRA
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.SH AUTHORS
+

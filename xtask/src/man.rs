@@ -24,7 +24,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::CommandFactory;
 
-use git_remote_object_store_cli::VERSION;
 use git_remote_object_store_cli::management::Cli;
 
 use crate::ParseOutcome;
@@ -106,17 +105,37 @@ fn render_subcommands(parent: &clap::Command, prefix: &str, out_dir: &Path) -> R
 }
 
 /// Render a single clap-derived page.
+///
+/// We compose the page section-by-section instead of calling
+/// [`clap_mangen::Man::render`] so we can omit the auto-generated
+/// VERSION section — its body would otherwise be a literal
+/// `vX.Y.Z` that drifts every release, forcing a man-page
+/// regeneration commit on each bump. `--version` on the CLI is
+/// the runtime source of truth; the man page does not need to
+/// repeat it. For the same reason `.source(...)` carries only
+/// the project name, not `project VERSION`.
 fn render_clap(cmd: &clap::Command, out_dir: &Path) -> Result<()> {
     let name = cmd.get_name().to_string();
     let man = clap_mangen::Man::new(cmd.clone())
         .title(name.to_uppercase())
         .section("1")
-        .source(format!("git-remote-object-store {VERSION}"))
+        .source("git-remote-object-store".to_string())
         .manual("git-remote-object-store Manual".to_string());
 
     let mut buffer = Vec::<u8>::new();
-    man.render(&mut buffer)
-        .with_context(|| format!("render manpage for `{name}`"))?;
+    let ctx = || format!("render manpage for `{name}`");
+    man.render_title(&mut buffer).with_context(ctx)?;
+    man.render_name_section(&mut buffer).with_context(ctx)?;
+    man.render_synopsis_section(&mut buffer).with_context(ctx)?;
+    man.render_description_section(&mut buffer)
+        .with_context(ctx)?;
+    man.render_options_section(&mut buffer).with_context(ctx)?;
+    man.render_subcommands_section(&mut buffer)
+        .with_context(ctx)?;
+    man.render_extra_section(&mut buffer).with_context(ctx)?;
+    // VERSION section deliberately omitted — see fn docstring.
+    man.render_authors_section(&mut buffer).with_context(ctx)?;
+
     let path = out_dir.join(format!("{name}.1"));
     fs::write(&path, buffer).with_context(|| format!("write {}", path.display()))?;
     Ok(())
