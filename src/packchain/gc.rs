@@ -459,7 +459,7 @@ pub(crate) async fn try_write_baseline_tombstone(
         Err(err) => {
             warn!(
                 source = log_context,
-                remote_ref = %remote_ref.as_str(),
+                ref_path = %remote_ref.as_str(),
                 error = %err,
                 "chain.json read/parse failed; falling back to synchronous bundle delete",
             );
@@ -481,7 +481,7 @@ pub(crate) async fn try_write_baseline_tombstone(
         Err(err) => {
             warn!(
                 source = log_context,
-                remote_ref = %remote_ref.as_str(),
+                ref_path = %remote_ref.as_str(),
                 key = %bundle_key,
                 error = %err,
                 "baseline tombstone write failed; falling back to synchronous bundle delete",
