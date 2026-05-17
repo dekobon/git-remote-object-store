@@ -39,3 +39,14 @@ THIRD-PARTY-LICENSES.md
 # uses its own ephemeral runner workspace; these are scratch space.
 out-deb/
 out-rpm/
+
+# Signing keypairs must never reach the repo. Covers the working
+# directory we generate abuild keys into plus the raw key file
+# extensions we use — abuild (`.rsa` / `.rsa.pub`) for Alpine `.apk`
+# signing and minisign (`.key`) for `SHA256SUMS` signing. The public
+# halves live in `minisign.pub` (committed) and in the
+# `ALPINE_ABUILD_KEY_PUB` repo secret; nothing on disk should.
+abuild-keys/
+*.rsa
+*.rsa.pub
+*.key
