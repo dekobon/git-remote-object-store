@@ -67,6 +67,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boolean parser. No behaviour change beyond the strengthened
   test assertions.
 
+- **Closed the path-B coverage gap in `build_blob_sas_url` (#224).**
+  Added `build_blob_sas_url_expiry_overflow_returns_error_not_panic`
+  alongside the existing huge-TTL test so the
+  `OffsetDateTime::checked_add` overflow path (`"SAS expiry
+  overflow"` wording) is regression-guarded — previously only the
+  `i64::try_from` overflow path (`"SAS ttl too large"`) had a test,
+  and a naïve `matches!(err, ObjectStoreError::Other(_))` assertion
+  passed through either path without distinguishing them. Surfaced
+  during the #221 audit pass.
+
 - **Homebrew formula publishes to the shared `dekobon/homebrew-tap`
   repository.** Previously the release workflow pushed to a dedicated
   `dekobon/homebrew-git-remote-object-store` tap that never got

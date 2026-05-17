@@ -468,9 +468,8 @@ mod tests {
     /// Note: `build_blob_sas_url` has two overflow paths — this test
     /// covers path A (`i64::try_from(secs)` failure, the `"ttl too
     /// large"` wording). Path B (`OffsetDateTime::checked_add`
-    /// overflow, the `"expiry overflow"` wording) is tracked as a
-    /// separate test-coverage follow-on issue (#221 surfaced the
-    /// gap during the audit pass).
+    /// overflow, the `"expiry overflow"` wording) is covered by
+    /// [`build_blob_sas_url_expiry_overflow_returns_error_not_panic`].
     #[test]
     fn build_blob_sas_url_huge_ttl_returns_error_not_panic() {
         let base = Url::parse(
@@ -503,6 +502,59 @@ mod tests {
         );
         assert!(
             text.contains(&u64::MAX.to_string()),
+            "error must name the offending TTL seconds, got {text:?}",
+        );
+    }
+
+    /// Path-B sibling of [`build_blob_sas_url_huge_ttl_returns_error_not_panic`]:
+    /// a TTL that fits in `i64` but pushes
+    /// `OffsetDateTime::now_utc() + ttl` past `OffsetDateTime::MAX`
+    /// must surface as an `ObjectStoreError::Other` carrying the
+    /// `"expiry overflow"` wording — never panic, and not be confused
+    /// with the path-A `"ttl too large"` wording.
+    ///
+    /// The boundary TTL is computed at test time from
+    /// `OffsetDateTime::MAX - now_utc()` so the test is portable across
+    /// `time`-crate releases (the absolute MAX timestamp is library
+    /// internal). The function reads `now_utc()` again, so a one-second
+    /// slack is added — under normal forward time this guarantees
+    /// path-B fires; the analysis tolerates up to ~1 s of backwards
+    /// clock skew between the test's read and the function's read.
+    #[test]
+    fn build_blob_sas_url_expiry_overflow_returns_error_not_panic() {
+        use time::{Date, Time};
+        let base = Url::parse(
+            "https://devstoreaccount1.blob.core.windows.net/repo/refs/heads/main/aa.bundle",
+        )
+        .expect("base parses");
+        // `time` 0.3 has no `OffsetDateTime::MAX`; build it from the date/time maxima.
+        let max_utc = Date::MAX.with_time(Time::MAX).assume_utc();
+        let until_max_secs = (max_utc - OffsetDateTime::now_utc()).whole_seconds();
+        let ttl = Duration::from_secs(
+            u64::try_from(until_max_secs + 1).expect("OffsetDateTime::MAX is well after now_utc()"),
+        );
+        let err = build_blob_sas_url(
+            &base,
+            "repo",
+            "refs/heads/main/aa.bundle",
+            &azurite_signing(),
+            ttl,
+        )
+        .expect_err("path-B overflow must surface as an error, not panic");
+        let ObjectStoreError::Other(msg) = &err else {
+            panic!("expected ObjectStoreError::Other, got {err:?}");
+        };
+        let text = msg.to_string();
+        assert!(
+            text.contains("expiry overflow"),
+            "error must name the path-B overflow wording, got {text:?}",
+        );
+        assert!(
+            !text.contains("ttl too large"),
+            "path-B must not surface with the path-A wording, got {text:?}",
+        );
+        assert!(
+            text.contains(&ttl.as_secs().to_string()),
             "error must name the offending TTL seconds, got {text:?}",
         );
     }
