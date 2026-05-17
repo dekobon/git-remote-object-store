@@ -473,7 +473,10 @@ mod env_guard_tests {
     fn env_var_read_lock_succeeds_when_no_writer_active() {
         let key = "GROS_ENV_READ_LOCK_NO_WRITER";
         let guard = super::env_var_read_lock(key);
-        assert!(guard.is_some(), "no writer for this key — read must succeed");
+        assert!(
+            guard.is_some(),
+            "no writer for this key — read must succeed"
+        );
     }
 
     /// The mutating-test recursion path: a thread holding an

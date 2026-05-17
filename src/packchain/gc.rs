@@ -1922,7 +1922,10 @@ mod tests {
         let metas = store.list("repo/gc/").await.unwrap();
         let tomb_key = metas
             .iter()
-            .find(|m| m.key.starts_with(&baseline_tombstone_listing_prefix(Some("repo"))))
+            .find(|m| {
+                m.key
+                    .starts_with(&baseline_tombstone_listing_prefix(Some("repo")))
+            })
             .map(|m| m.key.clone())
             .expect("baseline tombstone written");
         let body = store.get_bytes(&tomb_key).await.unwrap();
@@ -2174,7 +2177,10 @@ mod tests {
         let metas = store.list("repo/gc/").await.unwrap();
         let tomb_key = metas
             .iter()
-            .find(|m| m.key.starts_with(&baseline_tombstone_listing_prefix(Some("repo"))))
+            .find(|m| {
+                m.key
+                    .starts_with(&baseline_tombstone_listing_prefix(Some("repo")))
+            })
             .map(|m| m.key.clone())
             .unwrap();
         let stale = (OffsetDateTime::now_utc() - time::Duration::hours(48))

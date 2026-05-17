@@ -968,7 +968,10 @@ mod tests {
         let tombstones = store.list("repo/gc/").await.unwrap();
         let baseline_tomb_count = tombstones
             .iter()
-            .filter(|m| m.key.starts_with(&baseline_tombstone_listing_prefix(Some("repo"))))
+            .filter(|m| {
+                m.key
+                    .starts_with(&baseline_tombstone_listing_prefix(Some("repo")))
+            })
             .count();
         assert_eq!(
             baseline_tomb_count, 1,
@@ -1034,9 +1037,9 @@ mod tests {
         tombstone_prior_baseline_bundle(&store, Some("repo"), &ref_main(), &sha, &sha).await;
         let tombstones = store.list("repo/gc/").await.unwrap();
         assert!(
-            tombstones
-                .iter()
-                .all(|m| !m.key.starts_with(&baseline_tombstone_listing_prefix(Some("repo")))),
+            tombstones.iter().all(|m| !m
+                .key
+                .starts_with(&baseline_tombstone_listing_prefix(Some("repo")))),
             "aliasing keys must not write a baseline tombstone",
         );
     }

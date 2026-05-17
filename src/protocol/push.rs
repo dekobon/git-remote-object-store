@@ -2159,7 +2159,10 @@ mod tests {
             r#"{{"v":1,"ref_name":"refs/heads/main","sha":"{OTHER_SHA}","marked_at":"2024-01-01T00:00:00Z"}}"#
         );
         inner.insert(
-            format!("{}test.json", baseline_tombstone_listing_prefix(Some("repo"))),
+            format!(
+                "{}test.json",
+                baseline_tombstone_listing_prefix(Some("repo"))
+            ),
             Bytes::from(tomb_body),
         );
 

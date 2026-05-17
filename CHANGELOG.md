@@ -41,6 +41,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Audit-tier cleanups from the batch fix-2026-05-15 pass (#221).**
+  Strengthened tombstone-payload assertions in two packchain delete
+  tests (parse the body via `serde_json::Value` and assert the
+  embedded `sha`, matching the existing manage-branch template) and
+  added a sibling test that isolates the listing-mismatch fallback
+  branch from the unparseable-chain branch in
+  `try_write_baseline_tombstone`. Tightened the SAS huge-TTL test
+  to pin the actual error wording. Named the Azure / S3
+  list-pagination magic numbers (`AZURITE_DEFAULT_MAXRESULTS`,
+  `S3_DEFAULT_MAXKEYS`) so a future emulator default-page-size bump
+  produces a meaningful diff. Deduplicated the baseline-tombstone
+  writer (new `try_write_baseline_tombstone` in `packchain::gc`
+  replaces the near-identical helpers in `packchain::push` and
+  `manage::branch`), the baseline-tombstone key prefix (new
+  `pub(crate) BASELINE_TOMBSTONE_KEY_FRAGMENT` and
+  `baseline_tombstone_listing_prefix` composer), the config-entries
+  apply scaffolding (`apply_config_entries` for `config_set_many`
+  and `config_add_many`), the grace-hours resolver
+  (`resolve_grace_hours` — deliberately without the `Some(0)` clamp
+  that `resolve_lock_ttl_seconds` uses, since `--grace-hours 0` is
+  a legitimate force-mode operator intent), and the TTL saturation
+  idiom (`saturating_duration_seconds`). Reused the bundle
+  header-line read buffer across calls and simplified the URL
+  boolean parser. No behaviour change beyond the strengthened
+  test assertions.
+
 - **Homebrew formula publishes to the shared `dekobon/homebrew-tap`
   repository.** Previously the release workflow pushed to a dedicated
   `dekobon/homebrew-git-remote-object-store` tap that never got
