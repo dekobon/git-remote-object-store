@@ -433,6 +433,16 @@ fn parse_remote_sha_stem_from_key(key: &str) -> Option<&str> {
 /// we mirror [`crate::packchain::gc::grace_hours_from_env`] and clamp
 /// it to the default.
 pub(crate) fn lock_ttl_from_env() -> Duration {
+    // Test-only: the `cfg`-gated block compiles out of release
+    // binaries (the `test-util` feature is dev-only and `cfg(test)`
+    // is set only when the crate itself is under test), so production
+    // callers pay nothing. In test builds, the read lock serialises
+    // against env-mutating tests that hold an `EnvGuard` for this
+    // key; `env_var_read_lock` returns `None` when the current thread
+    // itself holds the writer, so the env-mutating test does not
+    // deadlock on its own write lock.
+    #[cfg(any(test, feature = "test-util"))]
+    let _read = crate::test_util::env_var_read_lock(ENV_LOCK_TTL_SECONDS);
     let secs = env::var(ENV_LOCK_TTL_SECONDS)
         .ok()
         .and_then(|s| s.parse::<u64>().ok())

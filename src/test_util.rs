@@ -21,40 +21,90 @@
 // stdout buffer that callers commonly drop after assertions.
 #![allow(clippy::missing_panics_doc, clippy::must_use_candidate)]
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use tokio::io::AsyncWriteExt;
 
-/// Per-key serialization registry for [`EnvGuard`]. Tests that touch the
-/// same env var across modules acquire the same `Mutex` so the
-/// `set_var` / `remove_var` calls do not race. The map itself is behind
-/// a `Mutex`; we `Box::leak` per-key mutexes so guards can hold a
-/// `'static` reference without a lifetime parameter.
-fn env_var_lock(key: &'static str) -> &'static Mutex<()> {
-    static REGISTRY: OnceLock<Mutex<HashMap<&'static str, &'static Mutex<()>>>> = OnceLock::new();
+/// Per-key serialization registry for [`EnvGuard`] and
+/// [`env_var_read_lock`]. Each env var name gets its own `RwLock`:
+/// writers (env-mutating tests via [`EnvGuard`]) take the write lock for
+/// the test's full duration; readers (production code reading the var,
+/// gated behind `cfg(any(test, feature = "test-util"))`) take the read
+/// lock briefly. The registry map is behind a `Mutex`; we `Box::leak`
+/// per-key locks so guards can hold a `'static` reference without a
+/// lifetime parameter.
+fn env_var_lock(key: &'static str) -> &'static RwLock<()> {
+    static REGISTRY: OnceLock<Mutex<HashMap<&'static str, &'static RwLock<()>>>> = OnceLock::new();
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = registry.lock().unwrap_or_else(PoisonError::into_inner);
     map.entry(key)
-        .or_insert_with(|| Box::leak(Box::new(Mutex::new(()))))
+        .or_insert_with(|| Box::leak(Box::new(RwLock::new(()))))
+}
+
+thread_local! {
+    /// Env-var keys for which the current thread holds an [`EnvGuard`]
+    /// write lock. Only ever non-empty inside a test that has an
+    /// [`EnvGuard`] live; release builds (where `test-util` is off and
+    /// `cfg(test)` is unset) never enter the code paths that touch
+    /// this set, so it is always empty for production threads.
+    ///
+    /// [`env_var_read_lock`] consults this set so a writer on thread T
+    /// can recurse into production code that reads the same key from
+    /// thread T without re-acquiring the lock — that would deadlock on
+    /// the writer-held `RwLock`.
+    static WRITER_KEYS: RefCell<HashSet<&'static str>> = RefCell::new(HashSet::new());
+}
+
+/// Acquire a read lock on the per-key serialization slot — see
+/// [`env_var_lock`] — and return it for the caller to hold while it
+/// reads the env var.
+///
+/// Returns `None` (without acquiring) when the current thread already
+/// holds an [`EnvGuard`] write lock for `key`: that means the caller
+/// is the mutating test itself recursing into production code, and
+/// taking a read lock on top of the same `RwLock` would deadlock.
+///
+/// Production code paths that read env vars also touched by
+/// [`EnvGuard`] should gate this acquisition behind
+/// `cfg(any(test, feature = "test-util"))` so release binaries pay no
+/// cost.
+pub(crate) fn env_var_read_lock(key: &'static str) -> Option<RwLockReadGuard<'static, ()>> {
+    let same_thread_writer = WRITER_KEYS.with(|s| s.borrow().contains(key));
+    if same_thread_writer {
+        None
+    } else {
+        Some(
+            env_var_lock(key)
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
 }
 
 /// RAII guard that mutates a process-global env var and restores its
 /// prior value when dropped — including on panic.
 ///
-/// Two correctness properties this gives every test that uses it:
+/// Three correctness properties this gives every test that uses it:
 ///
 /// 1. **Panic-safe cleanup**: the manual `set_var` / `remove_var` pair
 ///    leaks the env var to subsequent tests when an assertion between
 ///    the two panics. `Drop` runs on unwind, so the prior value is
 ///    always restored.
-/// 2. **Per-key serialization**: two tests touching the same env var
-///    across modules would race, with `set_var` from one interleaving
-///    with `remove_var` from the other. The guard holds a per-key
-///    `Mutex` for its full lifetime, so only one guard for a given key
-///    exists at a time.
+/// 2. **Per-key writer serialization**: two tests touching the same env
+///    var across modules would race, with `set_var` from one
+///    interleaving with `remove_var` from the other. The guard holds a
+///    per-key `RwLock` write lock for its full lifetime, so only one
+///    guard for a given key exists at a time.
+/// 3. **Reader-vs-writer serialization**: production code paths that
+///    read the same env var can opt in to [`env_var_read_lock`], which
+///    takes the per-key read lock. A test holding [`EnvGuard`] blocks
+///    those reads on other threads until it drops — so parallel push
+///    tests reading via gated production code never observe a
+///    mutating test's transient value.
 ///
 /// Recursive acquisition on the same thread would deadlock — hold one
 /// guard per env var at a time.
@@ -87,21 +137,22 @@ fn env_var_lock(key: &'static str) -> &'static Mutex<()> {
 pub struct EnvGuard {
     key: &'static str,
     prior: Option<OsString>,
-    /// Holds the per-key serialization lock for the guard's lifetime.
-    /// The manual `Drop for EnvGuard` runs before any field is
-    /// dropped, so `_lock` is still held while we restore the value
-    /// — no other guard for this key can interleave with the restore.
-    _lock: MutexGuard<'static, ()>,
+    /// Holds the per-key write lock for the guard's lifetime. The
+    /// manual `Drop for EnvGuard` runs before any field is dropped, so
+    /// `_lock` is still held while we restore the value — no other
+    /// guard or reader for this key can interleave with the restore.
+    _lock: RwLockWriteGuard<'static, ()>,
 }
 
 impl EnvGuard {
-    /// Acquire the per-key serialization lock and record the env var's
-    /// current value. Does not mutate. Pair with [`Self::set_to`] /
+    /// Acquire the per-key write lock and record the env var's current
+    /// value. Does not mutate. Pair with [`Self::set_to`] /
     /// [`Self::clear`] for tests that toggle through multiple values.
     pub fn take(key: &'static str) -> Self {
         let lock = env_var_lock(key)
-            .lock()
+            .write()
             .unwrap_or_else(PoisonError::into_inner);
+        WRITER_KEYS.with(|s| s.borrow_mut().insert(key));
         let prior = std::env::var_os(key);
         Self {
             key,
@@ -129,10 +180,17 @@ impl EnvGuard {
     /// Set the env var to `value`. The caller already holds the
     /// per-key lock via this guard.
     pub fn set_to(&self, value: impl AsRef<OsStr>) {
-        // SAFETY: `set_var` is process-global; the per-key mutex held
-        // by `self._lock` is the only writer for `self.key` in the
-        // test binary, and the production code that reads the var
-        // does not race against test threads.
+        // SAFETY: `set_var` is process-global. `self._lock` is the
+        // per-key `RwLockWriteGuard`, which guarantees:
+        //  - no other [`EnvGuard`] for this key exists (writers
+        //    serialise on the same `RwLock`);
+        //  - no concurrent reader on another thread can be inside
+        //    [`env_var_read_lock`] for this key (the read lock blocks
+        //    while the write lock is held).
+        // Production reads of this key are either compiled out (release
+        // builds, where the `test-util` feature is off and `cfg(test)`
+        // is unset) or routed through [`env_var_read_lock`] (test
+        // builds), so no thread observes a torn value.
         unsafe {
             std::env::set_var(self.key, value);
         }
@@ -150,14 +208,16 @@ impl EnvGuard {
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        // SAFETY: we still hold the per-key lock via `_lock`; no
-        // other thread can be reading or writing this key concurrently.
+        // SAFETY: we still hold the per-key write lock via `_lock`;
+        // no other thread can be reading or writing this key
+        // concurrently.
         unsafe {
             match &self.prior {
                 Some(value) => std::env::set_var(self.key, value),
                 None => std::env::remove_var(self.key),
             }
         }
+        WRITER_KEYS.with(|s| s.borrow_mut().remove(self.key));
     }
 }
 
@@ -407,6 +467,113 @@ mod env_guard_tests {
         unsafe {
             std::env::remove_var(key);
         }
+    }
+
+    #[test]
+    fn env_var_read_lock_succeeds_when_no_writer_active() {
+        let key = "GROS_ENV_READ_LOCK_NO_WRITER";
+        let guard = super::env_var_read_lock(key);
+        assert!(guard.is_some(), "no writer for this key — read must succeed");
+    }
+
+    /// The mutating-test recursion path: a thread holding an
+    /// [`EnvGuard`] reads the same key via production code, which
+    /// re-enters [`env_var_read_lock`]. Acquiring the read lock on top
+    /// of the held write lock would deadlock; the thread-local
+    /// [`WRITER_KEYS`] set lets the reader fast-path skip the lock and
+    /// return `None`.
+    #[test]
+    fn env_var_read_lock_skips_when_same_thread_holds_writer() {
+        let key = "GROS_ENV_READ_LOCK_SAME_THREAD_RECURSION";
+        let _g = EnvGuard::take(key);
+        let read = super::env_var_read_lock(key);
+        assert!(
+            read.is_none(),
+            "same-thread writer must be detected so reader skips locking",
+        );
+    }
+
+    /// Two readers on **different** threads must coexist when no
+    /// writer is active. The test uses a `Barrier(2)` so each thread
+    /// must hold its guard while the other is also holding one — a
+    /// single-reader-at-a-time lock would deadlock the barrier and
+    /// hang the test.
+    ///
+    /// `RwLock::read` documents that recursive same-thread reads
+    /// "might panic" depending on the platform (Linux glibc allows it,
+    /// macOS/Windows may not), so the cross-thread test is the
+    /// portable shape of the "many readers, no writer" assertion.
+    #[test]
+    fn env_var_read_lock_allows_concurrent_readers_across_threads() {
+        use std::sync::Arc;
+
+        let key = "GROS_ENV_READ_LOCK_MULTI_READERS";
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let barrier_for_thread = barrier.clone();
+        let reader = std::thread::spawn(move || {
+            let guard = super::env_var_read_lock(key);
+            assert!(guard.is_some(), "reader on spawned thread must acquire");
+            // Hold the guard across the barrier so both threads have
+            // a live read lock at the same time.
+            barrier_for_thread.wait();
+        });
+
+        let guard = super::env_var_read_lock(key);
+        assert!(guard.is_some(), "reader on main thread must acquire");
+        barrier.wait();
+
+        reader.join().expect("reader thread");
+    }
+
+    /// Cross-thread serialization: a writer on thread A holding an
+    /// [`EnvGuard`] must block readers on thread B until it drops.
+    /// Without the writer set on a different thread, the reader-thread
+    /// can't fast-path — it has to wait on the `RwLock`.
+    ///
+    /// Synchronisation: a 2-thread `Barrier` makes the reader rendezvous
+    /// with the main thread before calling [`env_var_read_lock`], so
+    /// the timing window does not include reader-thread startup
+    /// latency. The 20 ms sleep that follows is the *bug-detection
+    /// window*: under a hypothetical regression where the read lock
+    /// fails to block, the reader would acquire and set `acquired` to
+    /// true within those 20 ms, tripping the `!acquired` assertion.
+    /// Shrinking the sleep risks a false pass (the buggy reader hasn't
+    /// reached the store yet); inflating it only slows the test. 20 ms
+    /// is several orders of magnitude above the post-barrier scheduler
+    /// delay we expect on a sane machine.
+    #[test]
+    fn cross_thread_reader_blocks_until_writer_drops() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let key = "GROS_ENV_READ_LOCK_CROSS_THREAD";
+        let guard = EnvGuard::set(key, "during");
+        let acquired = Arc::new(AtomicBool::new(false));
+        let acquired_for_thread = acquired.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let barrier_for_thread = barrier.clone();
+        let reader = std::thread::spawn(move || {
+            // Rendezvous with the main thread before calling into the
+            // lock — eliminates startup-latency from the timing window.
+            barrier_for_thread.wait();
+            let _r = super::env_var_read_lock(key);
+            acquired_for_thread.store(true, Ordering::SeqCst);
+        });
+
+        barrier.wait();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "reader on another thread must block while the writer is held",
+        );
+
+        // Drop the writer; the reader should now acquire and finish.
+        drop(guard);
+        reader.join().expect("reader thread");
+        assert!(
+            acquired.load(Ordering::SeqCst),
+            "reader must acquire after writer releases",
+        );
     }
 
     /// Panic inside the guarded scope must still restore the prior

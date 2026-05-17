@@ -158,6 +158,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Reader-vs-writer race on `GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`
+  closed.** `EnvGuard` (test-only) now upgrades to a per-key `RwLock`
+  write lock and `test_util::env_var_read_lock` exposes the read side.
+  `protocol::push::lock_ttl_from_env` — which is read indirectly by
+  every test that drives `push_one` — acquires the read lock under
+  `cfg(any(test, feature = "test-util"))`, so push tests on parallel
+  threads now serialise against the env-mutating tests
+  (`lock_ttl_env_override_*`, `resolved_lock_ttl_honors_env_*`) instead
+  of racing them. The mutating test recurses into the same read path
+  from its own thread; a thread-local writer-key set lets the reader
+  fast-path skip the lock so the test does not deadlock on its own
+  write guard. Release binaries pay nothing — the cfg gate is off when
+  `test-util` is disabled.
+
 - **Env-mutating tests no longer leak on panic (#220).** Tests that
   toggled process-global env vars (`GIT_REMOTE_OBJECT_STORE_LOCK_TTL_SECONDS`,
   `GIT_REMOTE_OBJECT_STORE_GC_GRACE_HOURS`, `GIT_REMOTE_OBJECT_STORE_VERBOSE`,
