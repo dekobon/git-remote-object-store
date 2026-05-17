@@ -50,3 +50,6 @@ abuild-keys/
 *.rsa
 *.rsa.pub
 *.key
+
+# Shellspec JUnit output from `make _ci-shellspec` and `make pre-commit`.
+reports/
