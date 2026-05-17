@@ -539,20 +539,13 @@ fn parse_bool_flag(name: &str, value: &str) -> Result<bool, ParseError> {
 /// at each read site) prevents the divergence reported in issue #187,
 /// where `?zip=true` worked in the URL but `ALLOW_HTTP=true` did not.
 fn parse_bool_value(value: &str) -> Option<bool> {
-    if value.eq_ignore_ascii_case("1")
-        || value.eq_ignore_ascii_case("true")
-        || value.eq_ignore_ascii_case("yes")
-        || value.eq_ignore_ascii_case("on")
-    {
-        Some(true)
-    } else if value.eq_ignore_ascii_case("0")
-        || value.eq_ignore_ascii_case("false")
-        || value.eq_ignore_ascii_case("no")
-        || value.eq_ignore_ascii_case("off")
-    {
-        Some(false)
-    } else {
-        None
+    // One `to_ascii_lowercase` allocation plus a single match,
+    // replacing the previous 8-way `eq_ignore_ascii_case` chain (#221).
+    // Not a hot path; clarity outweighs the per-call String alloc.
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 

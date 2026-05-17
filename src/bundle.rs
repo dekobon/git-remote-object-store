@@ -74,9 +74,14 @@ impl BundleHeader {
     pub fn read(path: &Path) -> Result<Self, BundleError> {
         let mut file = BufReader::new(fs::File::open(path)?);
         let mut line = String::new();
+        // Reuse a single byte buffer across all header-line reads
+        // instead of allocating a fresh `Vec<u8>` per line (#221).
+        // `read_header_line` calls `buf.clear()` at the top, so the
+        // capacity grows once to the longest line and then stays.
+        let mut buf: Vec<u8> = Vec::new();
         let mut total_bytes: u64 = 0;
 
-        read_header_line(&mut file, &mut line, &mut total_bytes)?;
+        read_header_line(&mut file, &mut line, &mut buf, &mut total_bytes)?;
         let magic = line.trim_end_matches(['\n', '\r']);
         if magic == BUNDLE_V3_MAGIC {
             return Err(BundleError::UnsupportedVersion(3));
@@ -91,7 +96,7 @@ impl BundleHeader {
         let mut refs = Vec::new();
 
         loop {
-            read_header_line(&mut file, &mut line, &mut total_bytes)?;
+            read_header_line(&mut file, &mut line, &mut buf, &mut total_bytes)?;
             match parse_header_entry(&line)? {
                 HeaderEntry::End => break,
                 HeaderEntry::Prerequisite(oid) => prerequisites.push(oid),
@@ -127,9 +132,11 @@ impl BundleHeader {
 fn read_header_line<R: BufRead>(
     reader: &mut R,
     line: &mut String,
+    buf: &mut Vec<u8>,
     total_bytes: &mut u64,
 ) -> Result<(), BundleError> {
     line.clear();
+    buf.clear();
 
     // The total cap is the budget remaining for this line — never more
     // than the per-line cap. Saturating below the per-line cap means a
@@ -146,8 +153,9 @@ fn read_header_line<R: BufRead>(
     // `read_until` returns the bytes consumed including the delimiter
     // (if found). Reading via `take(budget)` guarantees we stop at the
     // per-call budget even if the input never produces a newline.
-    let mut buf = Vec::new();
-    let n = reader.by_ref().take(budget).read_until(b'\n', &mut buf)?;
+    // `buf` is caller-owned so its capacity is reused across header
+    // lines (#221) — `buf.clear()` above keeps the allocation.
+    let n = reader.by_ref().take(budget).read_until(b'\n', buf)?;
     if n == 0 {
         return Err(BundleError::InvalidHeader(
             "unexpected end of bundle header".to_owned(),
@@ -181,10 +189,10 @@ fn read_header_line<R: BufRead>(
     // Header lines must be valid UTF-8: the magic, OID hex, and ref
     // names are all ASCII / UTF-8 per the bundle v2 spec. Reject any
     // non-UTF-8 byte sequence with InvalidHeader instead of panicking.
-    let decoded = String::from_utf8(buf).map_err(|_| {
+    let decoded = std::str::from_utf8(buf).map_err(|_| {
         BundleError::InvalidHeader("bundle header line is not valid UTF-8".to_owned())
     })?;
-    line.push_str(&decoded);
+    line.push_str(decoded);
     Ok(())
 }
 
@@ -750,6 +758,30 @@ mod tests {
         };
         // Context is interpolated into the error message.
         assert!(msg.contains("bad ref SHA"), "context not in message: {msg}");
+    }
+
+    // --- read_header_line (#221: buffer reuse) ------------------------
+
+    #[test]
+    fn read_header_line_reuses_caller_buffer_across_lines() {
+        // Pin the buffer-reuse contract: a single caller-owned
+        // `Vec<u8>` is correctly cleared between header lines and
+        // both reads produce the expected content. A regression that
+        // dropped the `buf.clear()` at the top of the function would
+        // append line 2 onto line 1's bytes and fail the second
+        // assertion; a regression that re-introduced a per-call
+        // allocation would still pass — that property is purely a
+        // performance fix and is not observable via behaviour.
+        let mut reader: &[u8] = b"line one\nline two\n";
+        let mut line = String::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut total: u64 = 0;
+
+        read_header_line(&mut reader, &mut line, &mut buf, &mut total).expect("first line");
+        assert_eq!(line, "line one\n");
+
+        read_header_line(&mut reader, &mut line, &mut buf, &mut total).expect("second line");
+        assert_eq!(line, "line two\n");
     }
 
     // --- verify_pack_magic --------------------------------------------
