@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-05-17
+
+First release cut end-to-end by the CI release pipeline. 0.2.0 was
+manually published to crates.io to bootstrap Trusted Publisher
+registration and so has no matching GitHub Release artifacts (no
+pre-built binaries, no `.deb` / `.rpm` / `.apk` packages, no SLSA
+provenance). 0.2.1 ships byte-identical library and CLI source plus
+the full automated-release artifact set.
+
+### Fixed
+
+- Release workflow preflight version-parity check read every
+  `cargo metadata` `dependencies[]` entry, including
+  `cli/Cargo.toml`'s path-only dev-dep that opts the integration
+  tests into the library's `test-util` feature. The dev-dep has no
+  `version =` field, so the requirement came back as `*` and the
+  strip-and-compare against the tag version failed. Filter the
+  query to normal-kind dependencies only, materialise the result as
+  a JSON array, validate cardinality first, and emit case-specific
+  error messages for missing / multiple / drifted entries.
+
 ## [0.2.0] - 2026-05-16
 
 ### Added
