@@ -722,20 +722,23 @@ jobs:
             "$IMAGE" bash -eux -c '
               # Docker Ubuntu / Debian / runner-cached image variants
               # ship `path-exclude=/usr/share/doc/*` in different files
-              # under /etc/dpkg/dpkg.cfg.d/ — historically `docker-clean`
-              # or `excludes`, but at least one runner-cached image
-              # variant places it in `needrestart`. Targeting by name is
-              # fragile; strip every `path-exclude` of /usr/share/doc
-              # regardless of which file holds it. (Other excludes such
-              # as /usr/share/man are irrelevant to this smoke test.)
-              echo "smoke: dpkg.cfg.d before strip:" >&2
+              # under /etc/dpkg/dpkg.cfg.d/. Previous attempts to strip
+              # the exclude by editing existing config files were
+              # defeated on the GHA runner-cached `ubuntu:22.04` image:
+              # the cfg.d directory itself appears to be swapped between
+              # our strip and the post-install state, with `excludes`
+              # disappearing and a different `needrestart` file
+              # materializing — likely an image-layer overlay quirk.
+              # Belt-and-suspenders: write a high-priority path-include
+              # that re-includes our package's docs regardless of what
+              # path-excludes exist. dpkg evaluates patterns in
+              # file-load order (alphabetical across cfg.d/), so a `zz-`
+              # prefix guarantees this rule wins.
+              echo "smoke: dpkg.cfg.d before fix:" >&2
               ls -la /etc/dpkg/dpkg.cfg.d/ >&2 || true
-              find /etc/dpkg/dpkg.cfg.d /etc/dpkg/dpkg.cfg \
-                   /etc/apt/apt.conf /etc/apt/apt.conf.d \
-                   -type f -print0 2>/dev/null \
-                | xargs -0 sed -i \
-                  -e "\\|^[[:space:]]*path-exclude=/usr/share/doc|d" \
-                  -e "\\|DPkg::Path-Exclude.*usr/share/doc|Id" 2>/dev/null || true
+              mkdir -p /etc/dpkg/dpkg.cfg.d
+              echo 'path-include=/usr/share/doc/git-remote-object-store/*' \
+                > /etc/dpkg/dpkg.cfg.d/zz-grobs-include-docs
               apt-get update -qq
               apt-get install -y -qq /w/*.deb
               git-remote-object-store --version | grep -F "$VERSION"
