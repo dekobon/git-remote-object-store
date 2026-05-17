@@ -731,13 +731,24 @@ jobs:
               git-remote-object-store --version | grep -F "$VERSION"
               # Verify all six binaries landed and the `+`-form symlinks
               # were created by the postinst script.
+              # Every diagnostic message below goes to stderr — docker
+              # stdout buffer-flush has bitten earlier release runs where
+              # a silent `set -e` failure exited the container before the
+              # implicit `+ trace` line for the failing command made it
+              # to the action log, leaving the operator with only "exit
+              # code 1" and no idea which check tripped.
               for bin in git-remote-s3-https git-remote-s3-http \
                          git-remote-az-https git-remote-az-http \
                          git-remote-object-store git-lfs-object-store \
                          git-remote-s3+https git-remote-s3+http \
                          git-remote-az+https git-remote-az+http; do
-                test -e "/usr/bin/$bin" || { echo "missing /usr/bin/$bin"; exit 1; }
+                test -e "/usr/bin/$bin" || {
+                  echo "::error::missing /usr/bin/$bin" >&2
+                  ls -la /usr/bin/git-* >&2 || true
+                  exit 1
+                }
               done
+              echo "smoke: all 6 binaries + 4 +-form symlinks present" >&2
               # Content regression guard: ring ships `Apache-2.0 AND
               # ISC`, both texts mandatory. If either drops out, the
               # bundle is non-compliant. Run in one lane only — deb.
@@ -752,20 +763,31 @@ jobs:
               # would survive a template rename and still catch the
               # absence of the dep entirely.
               TPL=/usr/share/doc/git-remote-object-store/THIRD-PARTY-LICENSES.md
-              test -s "$TPL"
-              grep -qF "ring" "$TPL"
+              if [ ! -s "$TPL" ]; then
+                echo "::error::$TPL is missing or empty" >&2
+                ls -la /usr/share/doc/git-remote-object-store/ >&2 || true
+                echo "--- dpkg.cfg.d at install time: ---" >&2
+                ls -la /etc/dpkg/dpkg.cfg.d/ >&2 || true
+                exit 1
+              fi
+              echo "smoke: TPL present, size=$(stat -c %s "$TPL")" >&2
+              if ! grep -qF "ring" "$TPL"; then
+                echo "::error::$TPL has no reference to crate \`ring\`" >&2
+                exit 1
+              fi
               # Section-header assertions — both license texts must
               # appear at minimum as named groups in the rendered file.
-              grep -qE "^### (ISC( License)?|ISC)$" "$TPL" || {
-                echo "::error::THIRD-PARTY-LICENSES.md missing ISC license group" >&2
+              if ! grep -qE "^### (ISC( License)?|ISC)$" "$TPL"; then
+                echo "::error::$TPL missing ISC license group heading" >&2
                 grep -E "^### " "$TPL" >&2 || true
                 exit 1
-              }
-              grep -qE "^### (Apache( License)?[- ]?2\.0|Apache-2\.0)$" "$TPL" || {
-                echo "::error::THIRD-PARTY-LICENSES.md missing Apache-2.0 license group" >&2
+              fi
+              if ! grep -qE "^### (Apache( License)?[- ]?2\.0|Apache-2\.0)$" "$TPL"; then
+                echo "::error::$TPL missing Apache-2.0 license group heading" >&2
                 grep -E "^### " "$TPL" >&2 || true
                 exit 1
-              }
+              fi
+              echo "smoke: all assertions passed" >&2
             '
 
   smoke-rpm:
