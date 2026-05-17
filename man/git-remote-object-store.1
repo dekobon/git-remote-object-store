@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH GIT-REMOTE-OBJECT-STORE 1  "git-remote-object-store 0.1.0" "git-remote-object-store Manual"
+.TH GIT-REMOTE-OBJECT-STORE 1 "" "git-remote-object-store Manual"
 .SH NAME
 git\-remote\-object\-store \- Manage git remotes backed by S3 or Azure Blob Storage
 .SH SYNOPSIS
@@ -34,4 +34,4 @@ Two\-phase mark\-and\-sweep garbage collection of orphan packs on a packchain bu
 git\-remote\-object\-store\-compact(1)
 Compact a packchain ref\*(Aqs chain.json down to a single segment at the current tip. The default scans every ref and prompts for confirmation; `\-\-ref` targets a single branch. Old segment packs become orphans for `gc` to reap
 .SH VERSION
-v0.1.0
+Run \fBgit\-remote\-object\-store \-\-version\fR.

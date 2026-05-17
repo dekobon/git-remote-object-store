@@ -122,12 +122,12 @@ make shellspec-integration          # both
 
 ## Status
 
-`0.1.0`. The shipping surface covers both storage engines
-(`bundle` and `packchain`), both backends (S3 and Azure Blob), the
-helper-protocol REPL, parallel `fetch`, locked `push`, the
-management CLI (`doctor`, `delete-branch`, `protect`, `unprotect`,
-`gc`, `compact`), the LFS custom-transfer agent, and the signed
-release pipeline.
+The shipping surface covers both storage engines (`bundle` and
+`packchain`), both backends (S3 and Azure Blob), the helper-protocol
+REPL, parallel `fetch`, locked `push`, the management CLI (`doctor`,
+`delete-branch`, `protect`, `unprotect`, `gc`, `compact`), the LFS
+custom-transfer agent, and the signed release pipeline. See
+[`CHANGELOG.md`](CHANGELOG.md) for the current release.
 
 Git operations are gitoxide-backed end to end — bundle read/write is
 native via `gix-pack`, and the crate spawns no `git` subprocess in

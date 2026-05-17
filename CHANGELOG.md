@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-16
+
 ### Added
 
 - **Rustdoc check wired into `make pre-commit` and `make ci`.** New
