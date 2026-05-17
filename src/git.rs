@@ -990,6 +990,38 @@ pub fn config_add(cwd: &Path, key: &str, value: &str) -> Result<(), GitError> {
 /// [`GitError::ConfigLock`] if the lock cannot be acquired, or
 /// [`GitError::Io`] for other file I/O failures.
 pub fn config_add_many(cwd: &Path, entries: &[(&str, &str)]) -> Result<(), GitError> {
+    apply_config_entries(cwd, entries, |file, parsed| {
+        for (parts, value_name, value) in parsed {
+            let subsection = parts.subsection.map(BStr::new);
+            let mut section = file
+                .section_mut_or_create_new(parts.section, subsection)
+                .map_err(|source| GitError::ConfigInvalidSectionName {
+                    name: parts.section.to_owned(),
+                    source,
+                })?;
+            section.push(value_name.clone(), Some(BStr::new(value)));
+        }
+        Ok(true)
+    })
+}
+
+/// Shared scaffolding for [`config_set_many`] and [`config_add_many`]:
+/// parse every `(key, value)` entry up front, load + parse the
+/// existing local config, hand both to `mutate`, then write the
+/// serialised result back atomically if `mutate` reports a change
+/// (#221).
+///
+/// `mutate` is called exactly once and returns `Ok(true)` when the
+/// caller modified `file` in a way that requires re-serialisation
+/// (`config_add_many` is unconditional; `config_set_many` is
+/// idempotent and skips the write when no entry changed).
+fn apply_config_entries<F>(cwd: &Path, entries: &[(&str, &str)], mutate: F) -> Result<(), GitError>
+where
+    F: for<'a> FnOnce(
+        &mut gix::config::File<'a>,
+        &[(DottedKey<'a>, ValueName<'a>, &'a str)],
+    ) -> Result<bool, GitError>,
+{
     if entries.is_empty() {
         return Ok(());
     }
@@ -1014,15 +1046,9 @@ pub fn config_add_many(cwd: &Path, entries: &[(&str, &str)]) -> Result<(), GitEr
         GixConfigMetadata::api(),
         gix_config_init::Options::default(),
     )?;
-    for (parts, value_name, value) in parsed {
-        let subsection = parts.subsection.map(BStr::new);
-        let mut section = file
-            .section_mut_or_create_new(parts.section, subsection)
-            .map_err(|source| GitError::ConfigInvalidSectionName {
-                name: parts.section.to_owned(),
-                source,
-            })?;
-        section.push(value_name, Some(BStr::new(value)));
+
+    if !mutate(&mut file, &parsed)? {
+        return Ok(());
     }
 
     let extra: usize = entries.iter().map(|(k, v)| k.len() + v.len() + 16).sum();
@@ -1133,62 +1159,31 @@ pub fn config_set(cwd: &Path, key: &str, value: &str) -> Result<(), GitError> {
 /// [`GitError::ConfigLock`] if the lock cannot be acquired, or
 /// [`GitError::Io`] for other file I/O failures.
 pub fn config_set_many(cwd: &Path, entries: &[(&str, &str)]) -> Result<(), GitError> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-    let parsed: Vec<(DottedKey<'_>, ValueName<'_>, &str)> = entries
-        .iter()
-        .map(|(key, value)| {
-            let parts = parse_dotted_key(key)?;
-            let value_name = ValueName::try_from(parts.name).map_err(|source| {
-                GitError::ConfigInvalidValueName {
-                    name: parts.name.to_owned(),
+    apply_config_entries(cwd, entries, |file, parsed| {
+        let mut changed = false;
+        for (parts, value_name, value) in parsed {
+            let subsection = parts.subsection.map(BStr::new);
+            let mut section = file
+                .section_mut_or_create_new(parts.section, subsection)
+                .map_err(|source| GitError::ConfigInvalidSectionName {
+                    name: parts.section.to_owned(),
                     source,
-                }
-            })?;
-            Ok::<_, GitError>((parts, value_name, *value))
-        })
-        .collect::<Result<_, _>>()?;
-
-    let config_path = config_path_for_cwd(cwd)?;
-    let bytes = read_or_empty(&config_path)?;
-    let mut file = gix::config::File::from_bytes_no_includes(
-        &bytes,
-        GixConfigMetadata::api(),
-        gix_config_init::Options::default(),
-    )?;
-
-    let mut changed = false;
-    for (parts, value_name, value) in parsed {
-        let subsection = parts.subsection.map(BStr::new);
-        let mut section = file
-            .section_mut_or_create_new(parts.section, subsection)
-            .map_err(|source| GitError::ConfigInvalidSectionName {
-                name: parts.section.to_owned(),
-                source,
-            })?;
-        let existing = section.values(parts.name);
-        // Idempotent path: a single existing entry equal to `value` is the
-        // desired final state — no write needed.
-        if existing.len() == 1 && existing[0].as_ref() == value.as_bytes() {
-            continue;
+                })?;
+            let existing = section.values(parts.name);
+            // Idempotent path: a single existing entry equal to `value` is the
+            // desired final state — no write needed.
+            if existing.len() == 1 && existing[0].as_ref() == value.as_bytes() {
+                continue;
+            }
+            // Strip legacy duplicates (or a stale single value) and re-push a
+            // single canonical entry. `SectionMut::remove` removes the latest
+            // matching value per call, so loop until exhausted.
+            while section.remove(parts.name).is_some() {}
+            section.push(value_name.clone(), Some(BStr::new(value)));
+            changed = true;
         }
-        // Strip legacy duplicates (or a stale single value) and re-push a
-        // single canonical entry. `SectionMut::remove` removes the latest
-        // matching value per call, so loop until exhausted.
-        while section.remove(parts.name).is_some() {}
-        section.push(value_name, Some(BStr::new(value)));
-        changed = true;
-    }
-
-    if !changed {
-        return Ok(());
-    }
-
-    let extra: usize = entries.iter().map(|(k, v)| k.len() + v.len() + 16).sum();
-    let mut serialized = Vec::with_capacity(bytes.len() + extra);
-    file.write_to(&mut serialized).map_err(GitError::Io)?;
-    write_atomic(&config_path, &serialized)
+        Ok(changed)
+    })
 }
 
 #[cfg(test)]

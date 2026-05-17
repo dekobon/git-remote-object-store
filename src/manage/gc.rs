@@ -121,10 +121,7 @@ impl Gc {
         }
 
         if self.opts.mode != GcMode::MarkOnly {
-            let grace_hours = self
-                .opts
-                .grace_hours
-                .unwrap_or_else(gc::grace_hours_from_env);
+            let grace_hours = gc::resolve_grace_hours(self.opts.grace_hours);
             let sweep_outcome = gc::sweep(
                 store_ref,
                 &self.prefix,

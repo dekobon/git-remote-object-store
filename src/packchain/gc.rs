@@ -677,6 +677,22 @@ pub(crate) fn grace_hours_from_env() -> u64 {
         .unwrap_or(DEFAULT_GRACE_HOURS)
 }
 
+/// Resolve a caller-supplied `Option<u64>` grace-hours value to a
+/// concrete count, deferring to [`grace_hours_from_env`] when the
+/// caller passes `None` (#221).
+///
+/// Unlike [`crate::protocol::push::resolve_lock_ttl_seconds`], this
+/// resolver does **not** clamp `Some(0)`. A zero grace window is a
+/// legitimate operator intent — "sweep without a grace window, e.g.
+/// in force mode" — and is the canonical value used by force-sweep
+/// tests (`SweepOpts { grace_hours: 0, force: true }`). The lock-TTL
+/// clamp protects against `acquire_lock` treating every held lock as
+/// instantly stale (#208); grace-hours has no analogous foot-gun.
+#[must_use]
+pub(crate) fn resolve_grace_hours(opt: Option<u64>) -> u64 {
+    opt.unwrap_or_else(grace_hours_from_env)
+}
+
 /// Run the mark phase: snapshot every pack on the bucket, then every
 /// chain, then write a tombstone naming the orphans.
 ///
@@ -2629,6 +2645,29 @@ mod tests {
         // Positive integer wins.
         env.set_to("72");
         assert_eq!(grace_hours_from_env(), 72);
+    }
+
+    #[test]
+    fn resolve_grace_hours_honours_some_zero() {
+        // The key semantic divergence from `resolve_lock_ttl_seconds`:
+        // `Some(0)` is a legitimate "no grace window" operator intent
+        // (force-mode tests like `delete_tombstone_is_reaped_by_gc_sweep`
+        // depend on this), so the resolver must NOT clamp it. A
+        // regression that copy-pasted the lock-TTL filter would silently
+        // turn `--grace-hours 0` into `--grace-hours <env-default>`.
+        assert_eq!(resolve_grace_hours(Some(0)), 0);
+    }
+
+    #[test]
+    fn resolve_grace_hours_returns_explicit_value() {
+        assert_eq!(resolve_grace_hours(Some(7)), 7);
+    }
+
+    #[tokio::test]
+    async fn resolve_grace_hours_falls_back_to_env_for_none() {
+        let env = crate::test_util::EnvGuard::take(ENV_GC_GRACE_HOURS);
+        env.set_to("72");
+        assert_eq!(resolve_grace_hours(None), 72);
     }
 
     // --- mark list-order race (issue #135) ---------------------------

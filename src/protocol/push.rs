@@ -448,8 +448,16 @@ pub(crate) fn lock_ttl_from_env() -> Duration {
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|s| *s > 0)
         .unwrap_or(DEFAULT_LOCK_TTL_SECONDS);
-    // i64 cast: 60-ish seconds will never overflow; even MAX would just
-    // saturate to ~292 billion years which is fine for a TTL ceiling.
+    saturating_duration_seconds(secs)
+}
+
+/// Convert a `u64` seconds count to [`Duration`], saturating at
+/// [`i64::MAX`] (~292-billion-year sentinel TTL ceiling). Centralises
+/// the `i64::try_from(secs).unwrap_or(i64::MAX)` idiom that previously
+/// lived inline in both [`lock_ttl_from_env`] and
+/// [`crate::manage::compact::Compact::run_into`] (#221).
+#[must_use]
+pub(crate) fn saturating_duration_seconds(secs: u64) -> Duration {
     Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
@@ -3114,6 +3122,24 @@ mod tests {
             120,
             "Some(0) must honour env override",
         );
+    }
+
+    // --- saturating_duration_seconds (issue #221) ---------------------
+
+    #[test]
+    fn saturating_duration_seconds_caps_at_i64_max() {
+        // `u64::MAX` exceeds `i64::MAX` — the helper must saturate at
+        // `i64::MAX` rather than panic on the `try_from`. This is the
+        // ~292-billion-year sentinel ceiling shared by all TTL paths.
+        assert_eq!(
+            saturating_duration_seconds(u64::MAX),
+            Duration::seconds(i64::MAX),
+        );
+    }
+
+    #[test]
+    fn saturating_duration_seconds_passes_normal_value() {
+        assert_eq!(saturating_duration_seconds(60), Duration::seconds(60));
     }
 
     // --- resolve_lock_ttl_seconds (issue #208) ------------------------

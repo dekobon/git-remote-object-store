@@ -14,7 +14,6 @@
 use std::io::Write;
 use std::sync::Arc;
 
-use time::Duration;
 use tracing::{info, warn};
 
 use super::gc_output::{format_mark_outcome, format_sweep_outcome};
@@ -28,7 +27,7 @@ use crate::packchain::compact::{
     self, CompactAction, CompactOpts as PackchainCompactOpts, CompactOutcome,
 };
 use crate::packchain::gc;
-use crate::protocol::push::resolve_lock_ttl_seconds;
+use crate::protocol::push::{resolve_lock_ttl_seconds, saturating_duration_seconds};
 
 /// Tunables for [`Compact::run`]. Field semantics mirror the CLI flags.
 #[derive(Debug, Clone, Default)]
@@ -108,11 +107,11 @@ impl<'a> Compact<'a> {
     /// to `out` fails.
     pub(crate) async fn run_into<W: Write>(&self, out: &mut W) -> Result<(), ManageError> {
         // Route Option<u64> through the shared resolver so `Some(0)`
-        // cannot defeat per-ref locking (issue #208). `i64::try_from`
-        // saturates at `i64::MAX`, which `time::Duration::seconds`
-        // accepts as a sentinel ~292-billion-year ceiling.
+        // cannot defeat per-ref locking (issue #208), then saturate
+        // via the shared `saturating_duration_seconds` helper so
+        // `u64::MAX`-class TTLs map to the ~292-billion-year sentinel.
         let ttl_secs = resolve_lock_ttl_seconds(self.opts.lock_ttl_seconds);
-        let lock_ttl = Duration::seconds(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
+        let lock_ttl = saturating_duration_seconds(ttl_secs);
         let compact_opts = PackchainCompactOpts {
             force: self.opts.force,
             lock_ttl,
@@ -267,10 +266,7 @@ impl<'a> Compact<'a> {
                 "compact --with-gc: mark completed",
             );
         }
-        let grace_hours = self
-            .opts
-            .gc_grace_hours
-            .unwrap_or_else(gc::grace_hours_from_env);
+        let grace_hours = gc::resolve_grace_hours(self.opts.gc_grace_hours);
         let sweep = gc::sweep(
             store_ref,
             &self.prefix,
@@ -346,6 +342,7 @@ mod tests {
     use crate::manage::ScriptedPrompter;
     use crate::object_store::mock::MockStore;
     use std::sync::Arc;
+    use time::Duration;
 
     fn store_arc(mock: &MockStore) -> Arc<dyn ObjectStore> {
         Arc::new(mock.clone())
