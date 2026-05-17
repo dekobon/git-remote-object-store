@@ -431,7 +431,11 @@ jobs:
   package-deb:
     name: package .deb (${{ matrix.deb_arch }})
     needs: [preflight, build]
-    runs-on: ubuntu-22.04
+    # cargo-deb 3.6+ is built against GLIBC 2.39, which ubuntu-22.04
+    # (GLIBC 2.35) cannot load. The .deb's contained binaries are
+    # already built in the `build` job — this step only repackages
+    # them, so the runner OS does not affect binary compatibility.
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -792,8 +796,15 @@ jobs:
             -v "$PWD/dist:/w" -e VERSION \
             "$IMAGE" bash -eu -c '
               if command -v dnf >/dev/null; then PKG=dnf; else PKG=yum; fi
-              $PKG install -y git
-              $PKG install -y /w/*.rpm
+              # Fedora base images ship /etc/dnf/dnf.conf with
+              # tsflags=nodocs to keep image sizes small. That filter
+              # strips /usr/share/doc, including the bundled
+              # THIRD-PARTY-LICENSES.md the smoke check asserts. Force
+              # docs back on via --setopt regardless of conf state —
+              # safer than editing the file (the value can be a
+              # comma-list, e.g. `tsflags=nodocs,test`).
+              $PKG install -y --setopt=tsflags= git
+              $PKG install -y --setopt=tsflags= /w/*.rpm
               git-remote-object-store --version | grep -F "$VERSION"
               for bin in git-remote-s3-https git-remote-s3-http \
                          git-remote-az-https git-remote-az-http \
