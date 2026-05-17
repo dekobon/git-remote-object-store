@@ -23,8 +23,7 @@ use super::{ManageError, Prompter};
 use crate::git::RefName;
 use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, PutOpts};
-use crate::packchain::gc::write_baseline_tombstone_for_orphan;
-use crate::packchain::manifest::load_chain;
+use crate::packchain::gc::try_write_baseline_tombstone;
 use crate::protocol::push::{
     LockGuard, acquire_lock, lock_key, lock_ttl_from_env, release_lock,
     verify_no_orphan_protected_after_delete,
@@ -387,69 +386,28 @@ impl<'a> ManageBranch<'a> {
     /// Attempt to tombstone the baseline bundle for a packchain ref so
     /// the synchronous delete loop can skip it (issue #143). Returns
     /// the bundle key that was deferred, or `None` if no deferral is
-    /// possible (bundle-engine ref with no `chain.json`, unparseable
-    /// chain, no `<full_at>.bundle` in the listing, or a tombstone PUT
-    /// failure).
-    ///
-    /// The `None` fall-through is the correct behaviour for every
-    /// "deferral is not actionable" case: with no tombstone, `gc sweep`
-    /// has nothing to reclaim, so the sweep loop must remove the
-    /// bundle synchronously instead. A logged warning surfaces the
-    /// rarer load/parse/PUT failures for operator review without
-    /// blocking the delete.
+    /// possible. Thin caller-side wrapper that resolves `&self`'s
+    /// prefix / ref-name and delegates to the shared
+    /// [`try_write_baseline_tombstone`] helper for the actual
+    /// load-chain / listing-check / tombstone-write logic (#221).
     async fn try_tombstone_baseline(
         &self,
         fresh: &[crate::object_store::ObjectMeta],
     ) -> Option<String> {
-        let ref_path = format!("refs/heads/{}", self.branch);
         // `RefName::new` re-runs the same `gix-validate` check `open`
         // already accepted, so this is effectively infallible. Surface
         // a parse failure as "no tombstone" rather than panicking — a
         // future loosening of `open`'s validator must not make
         // delete-branch unsafe.
-        let ref_name = RefName::new(ref_path).ok()?;
-        let prefix_opt = self.prefix_opt();
-        let chain = match load_chain(self.store.as_ref(), prefix_opt, &ref_name).await {
-            Ok(Some(chain)) => chain,
-            Ok(None) => return None,
-            Err(err) => {
-                warn!(
-                    branch = %self.branch,
-                    error = %err,
-                    "delete-branch: chain.json read/parse failed; falling back to synchronous bundle delete",
-                );
-                return None;
-            }
-        };
-        let bundle_key = keys::bundle_key(prefix_opt, ref_name.as_str(), chain.full_at.as_str());
-        // The baseline bundle must actually be in the fresh listing —
-        // otherwise the deferred delete has nothing to defer (it was
-        // already gone, or the chain points outside our prefix). A
-        // mismatched `full_at` against listing reality is the
-        // canonical "chain.json points at a missing bundle" doctor
-        // case; immediate sweep is the right fallback there too.
-        if !fresh.iter().any(|m| m.key == bundle_key) {
-            return None;
-        }
-        match write_baseline_tombstone_for_orphan(
+        let ref_name = RefName::new(format!("refs/heads/{}", self.branch)).ok()?;
+        try_write_baseline_tombstone(
             self.store.as_ref(),
-            prefix_opt,
+            self.prefix_opt(),
             &ref_name,
-            &chain.full_at,
+            fresh,
+            "delete-branch",
         )
         .await
-        {
-            Ok(()) => Some(bundle_key),
-            Err(err) => {
-                warn!(
-                    branch = %self.branch,
-                    key = %bundle_key,
-                    error = %err,
-                    "delete-branch: baseline tombstone write failed; falling back to synchronous bundle delete",
-                );
-                None
-            }
-        }
     }
 
     /// Mark the branch as protected by writing the `PROTECTED#` sentinel.
@@ -642,6 +600,7 @@ mod tests {
     use super::*;
     use crate::manage::{Prompter, ScriptedPrompter, scripted::Answer};
     use crate::object_store::mock::MockStore;
+    use crate::packchain::gc::baseline_tombstone_listing_prefix;
     use bytes::Bytes;
 
     fn seed_with_branch(branch: &str) -> MockStore {
@@ -1715,7 +1674,7 @@ mod tests {
         let tomb_keys: Vec<String> = mock
             .keys()
             .into_iter()
-            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .filter(|k| k.starts_with(&baseline_tombstone_listing_prefix(Some("repo"))))
             .collect();
         assert_eq!(
             tomb_keys.len(),
@@ -1785,7 +1744,7 @@ mod tests {
         let surviving_tombs: Vec<String> = mock
             .keys()
             .into_iter()
-            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .filter(|k| k.starts_with(&baseline_tombstone_listing_prefix(Some("repo"))))
             .collect();
         assert!(
             surviving_tombs.is_empty(),
@@ -1819,7 +1778,7 @@ mod tests {
         let tomb_keys: Vec<String> = mock
             .keys()
             .into_iter()
-            .filter(|k| k.contains("/gc/baseline-tomb-"))
+            .filter(|k| k.contains(crate::packchain::gc::BASELINE_TOMBSTONE_KEY_FRAGMENT))
             .collect();
         assert!(
             tomb_keys.is_empty(),
@@ -1909,7 +1868,7 @@ mod tests {
         let tomb_keys: Vec<String> = mock
             .keys()
             .into_iter()
-            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .filter(|k| k.starts_with(&baseline_tombstone_listing_prefix(Some("repo"))))
             .collect();
         assert!(
             tomb_keys.is_empty(),

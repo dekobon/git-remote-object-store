@@ -421,6 +421,76 @@ pub(crate) async fn write_baseline_tombstone_for_orphan(
     write_baseline_tombstone_unconditional(store, prefix, ref_name, orphan_sha).await
 }
 
+/// Attempt to tombstone the baseline bundle for a delete so the
+/// synchronous sweep loop can skip it (issue #143 / #203).
+/// Returns the bundle key that was deferred, or `None` when deferral
+/// is not actionable (bundle-engine ref with no `chain.json`,
+/// unparseable `chain.json`, no `<full_at>.bundle` in the listing, or
+/// a tombstone PUT failure).
+///
+/// The `None` fall-through is the correct behaviour for every
+/// "deferral is not actionable" case: with no tombstone, `gc sweep`
+/// has nothing to reclaim, so the sweep loop must remove the bundle
+/// synchronously instead. A logged warning surfaces the rarer
+/// load/parse/PUT failures for operator review without blocking the
+/// delete.
+///
+/// Runs UNDER the per-ref lock (#158): a concurrent push that landed
+/// between the tombstone and the chain.json delete would otherwise
+/// leave the bucket with a tombstone referencing a SHA no longer in
+/// the chain, and `gc sweep` would reclaim a live bundle.
+///
+/// `log_context` discriminates the warn-event source for log
+/// scraping (`"packchain delete"`, `"delete-branch"`, etc.).
+///
+/// Replaces the previous per-call-site clones in
+/// `manage::branch::ManageBranch::try_tombstone_baseline` and
+/// `packchain::push::try_tombstone_baseline_for_delete` (#221).
+pub(crate) async fn try_write_baseline_tombstone(
+    store: &dyn ObjectStore,
+    prefix: Option<&str>,
+    remote_ref: &RefName,
+    fresh: &[crate::object_store::ObjectMeta],
+    log_context: &'static str,
+) -> Option<String> {
+    let chain = match load_chain(store, prefix, remote_ref).await {
+        Ok(Some(chain)) => chain,
+        Ok(None) => return None,
+        Err(err) => {
+            warn!(
+                source = log_context,
+                remote_ref = %remote_ref.as_str(),
+                error = %err,
+                "chain.json read/parse failed; falling back to synchronous bundle delete",
+            );
+            return None;
+        }
+    };
+    let bundle_key = keys::bundle_key(prefix, remote_ref.as_str(), chain.full_at.as_str());
+    // The baseline bundle must actually be in the under-lock listing
+    // — otherwise the deferred delete has nothing to defer (it was
+    // already gone, or the chain points outside our prefix). A
+    // mismatched `full_at` against listing reality is the canonical
+    // "chain.json points at a missing bundle" doctor case; immediate
+    // sweep is the right fallback there too.
+    if !fresh.iter().any(|m| m.key == bundle_key) {
+        return None;
+    }
+    match write_baseline_tombstone_for_orphan(store, prefix, remote_ref, &chain.full_at).await {
+        Ok(()) => Some(bundle_key),
+        Err(err) => {
+            warn!(
+                source = log_context,
+                remote_ref = %remote_ref.as_str(),
+                key = %bundle_key,
+                error = %err,
+                "baseline tombstone write failed; falling back to synchronous bundle delete",
+            );
+            None
+        }
+    }
+}
+
 /// Return the set of bundle keys (full `<prefix>/<ref>/<sha>.bundle`
 /// paths) currently named by any baseline tombstone under
 /// `<prefix>/gc/baseline-tomb-*.json`.
@@ -1028,12 +1098,33 @@ fn tombstone_key(prefix: &str, run_id: &str, marked_at: &str) -> String {
     )
 }
 
+/// Key-namespace fragment for baseline tombstones (issue #134).
+/// Composed with a bucket prefix via [`keys::join`] / [`baseline_tombstone_listing_prefix`]
+/// to form the full listable prefix; the UUID-suffixed body filename
+/// is appended by [`baseline_tombstone_key`].
+///
+/// Single source of truth for the on-bucket key shape — production
+/// builders and test assertions both compose against this constant
+/// rather than embedding the literal string (#221).
+pub(crate) const BASELINE_TOMBSTONE_KEY_FRAGMENT: &str = "gc/baseline-tomb-";
+
 /// Build a baseline tombstone key. UUID-keyed so concurrent compacts
 /// / force-pushes across different refs never clobber, and the
 /// timestamp lives in the body rather than the filename to keep the
 /// `is_baseline_tombstone_key` predicate cheap.
 fn baseline_tombstone_key(prefix: &str, run_id: &str) -> String {
-    keys::join(Some(prefix), &format!("gc/baseline-tomb-{run_id}.json"))
+    keys::join(
+        Some(prefix),
+        &format!("{BASELINE_TOMBSTONE_KEY_FRAGMENT}{run_id}.json"),
+    )
+}
+
+/// Listable prefix for every baseline tombstone under `prefix`
+/// (e.g. `"repo/gc/baseline-tomb-"`). Composes
+/// [`BASELINE_TOMBSTONE_KEY_FRAGMENT`] with the bucket prefix via
+/// [`keys::join`] so callers don't open-code the literal.
+pub(crate) fn baseline_tombstone_listing_prefix(prefix: Option<&str>) -> String {
+    keys::join(prefix, BASELINE_TOMBSTONE_KEY_FRAGMENT)
 }
 
 /// Robust check that `key` is a tombstone under our prefix. Guards
@@ -1051,10 +1142,9 @@ fn is_tombstone_key(key: &str, prefix: &str) -> bool {
 
 /// Robust check that `key` is a baseline tombstone under our prefix
 /// (issue #134). Mirrors [`is_tombstone_key`] for the
-/// `gc/baseline-tomb-` namespace.
+/// [`BASELINE_TOMBSTONE_KEY_FRAGMENT`] namespace.
 fn is_baseline_tombstone_key(key: &str, prefix: &str) -> bool {
-    let expected_prefix = keys::join(Some(prefix), "gc/baseline-tomb-");
-    key.starts_with(&expected_prefix)
+    key.starts_with(&baseline_tombstone_listing_prefix(Some(prefix)))
 }
 
 /// List every `<prefix>/refs/**/chain.json` (across every ref
@@ -1816,7 +1906,7 @@ mod tests {
         let metas = store.list("repo/gc/").await.unwrap();
         let tomb_key = metas
             .iter()
-            .find(|m| m.key.starts_with("repo/gc/baseline-tomb-"))
+            .find(|m| m.key.starts_with(&baseline_tombstone_listing_prefix(Some("repo"))))
             .map(|m| m.key.clone())
             .expect("baseline tombstone written");
         let body = store.get_bytes(&tomb_key).await.unwrap();
@@ -2068,7 +2158,7 @@ mod tests {
         let metas = store.list("repo/gc/").await.unwrap();
         let tomb_key = metas
             .iter()
-            .find(|m| m.key.starts_with("repo/gc/baseline-tomb-"))
+            .find(|m| m.key.starts_with(&baseline_tombstone_listing_prefix(Some("repo"))))
             .map(|m| m.key.clone())
             .unwrap();
         let stale = (OffsetDateTime::now_utc() - time::Duration::hours(48))
@@ -2443,7 +2533,8 @@ mod tests {
         // which is precisely the window in which a concurrent
         // force-push could land before the second iteration's chain
         // re-read.
-        let store = PostDeleteHookStore::new(inner, "repo/gc/baseline-tomb-", |inner| {
+        let tomb_listing = baseline_tombstone_listing_prefix(Some("repo"));
+        let store = PostDeleteHookStore::new(inner, &tomb_listing, |inner| {
             let chain = ChainManifest {
                 v: 1,
                 tip: sha40(SHA_TIP),

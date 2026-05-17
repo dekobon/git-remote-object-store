@@ -626,6 +626,7 @@ async fn tombstone_prior_baseline_bundle(
 mod tests {
     use super::*;
     use crate::object_store::mock::MockStore;
+    use crate::packchain::gc::baseline_tombstone_listing_prefix;
     use crate::packchain::manifest::write_chain;
     use crate::packchain::pack::{build_baseline_pack, build_incremental_pack};
     use crate::packchain::schema::{ChainSegment, Sha40};
@@ -967,7 +968,7 @@ mod tests {
         let tombstones = store.list("repo/gc/").await.unwrap();
         let baseline_tomb_count = tombstones
             .iter()
-            .filter(|m| m.key.starts_with("repo/gc/baseline-tomb-"))
+            .filter(|m| m.key.starts_with(&baseline_tombstone_listing_prefix(Some("repo"))))
             .count();
         assert_eq!(
             baseline_tomb_count, 1,
@@ -1035,7 +1036,7 @@ mod tests {
         assert!(
             tombstones
                 .iter()
-                .all(|m| !m.key.starts_with("repo/gc/baseline-tomb-")),
+                .all(|m| !m.key.starts_with(&baseline_tombstone_listing_prefix(Some("repo")))),
             "aliasing keys must not write a baseline tombstone",
         );
     }
@@ -1056,7 +1057,7 @@ mod tests {
         // the gc/ prefix. The key embeds a UUID we cannot predict
         // here, so match the `gc/baseline-tomb-` prefix.
         store.arm(crate::object_store::mock::Fault::NetworkOnPutBytesPrefix {
-            prefix: "repo/gc/baseline-tomb-".to_owned(),
+            prefix: baseline_tombstone_listing_prefix(Some("repo")),
         });
 
         let prior_bundle_key = format!("repo/refs/heads/main/{c1}.bundle");

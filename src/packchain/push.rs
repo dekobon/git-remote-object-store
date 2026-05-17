@@ -33,7 +33,7 @@ use crate::protocol::push::{
 use crate::url::StorageEngine;
 
 use super::PackchainError;
-use super::gc::{write_baseline_tombstone_best_effort, write_baseline_tombstone_for_orphan};
+use super::gc::{try_write_baseline_tombstone, write_baseline_tombstone_best_effort};
 use super::keys::{chain_key, pack_idx_key, pack_key, path_index_key};
 use super::manifest::{load_chain, next_manifest, write_chain, write_path_index};
 use super::pack::{BuiltPack, build_baseline_pack, build_incremental_pack};
@@ -897,66 +897,6 @@ async fn force_push_baseline_cleanup(
     .await;
 }
 
-/// Attempt to tombstone the baseline bundle for a helper-protocol
-/// delete so the synchronous sweep loop can skip it (issue #203).
-/// Returns the bundle key that was deferred, or `None` if no deferral
-/// is possible (unparseable `chain.json`, no `<full_at>.bundle` in the
-/// listing, or a tombstone PUT failure).
-///
-/// Mirrors `manage::branch::ManageBranch::try_tombstone_baseline` —
-/// see that function and #143 for the full rationale. The `None`
-/// fall-through is correct for every "deferral is not actionable"
-/// case: with no tombstone, `gc sweep` has nothing to reclaim, so the
-/// sweep loop must remove the bundle synchronously instead. A logged
-/// warning surfaces the rarer load/parse/PUT failures for operator
-/// review without blocking the delete.
-///
-/// Runs UNDER the per-ref lock (#158): a concurrent push that landed
-/// between the tombstone and the chain.json delete would otherwise
-/// leave the bucket with a tombstone referencing a SHA no longer in
-/// the chain, and `gc sweep` would reclaim a live bundle.
-async fn try_tombstone_baseline_for_delete(
-    store: &dyn ObjectStore,
-    prefix: Option<&str>,
-    remote_ref: &RefName,
-    entries: &[crate::object_store::ObjectMeta],
-) -> Option<String> {
-    let chain = match load_chain(store, prefix, remote_ref).await {
-        Ok(Some(chain)) => chain,
-        Ok(None) => return None,
-        Err(err) => {
-            warn!(
-                remote_ref = %remote_ref.as_str(),
-                error = %err,
-                "packchain delete: chain.json read/parse failed; falling back to synchronous bundle delete",
-            );
-            return None;
-        }
-    };
-    let bundle_key = keys::bundle_key(prefix, remote_ref.as_str(), chain.full_at.as_str());
-    // The baseline bundle must actually be in the under-lock listing
-    // — otherwise the deferred delete has nothing to defer (it was
-    // already gone, or the chain points outside our prefix). A
-    // mismatched `full_at` against listing reality is the canonical
-    // "chain.json points at a missing bundle" doctor case; immediate
-    // sweep is the right fallback there too.
-    if !entries.iter().any(|m| m.key == bundle_key) {
-        return None;
-    }
-    match write_baseline_tombstone_for_orphan(store, prefix, remote_ref, &chain.full_at).await {
-        Ok(()) => Some(bundle_key),
-        Err(err) => {
-            warn!(
-                remote_ref = %remote_ref.as_str(),
-                key = %bundle_key,
-                error = %err,
-                "packchain delete: baseline tombstone write failed; falling back to synchronous bundle delete",
-            );
-            None
-        }
-    }
-}
-
 /// Delete a packchain-engine ref: remove `chain.json`, `path-index.json`,
 /// and the baseline bundle. Pack files are NOT deleted (they may be
 /// referenced by other branches; `manage gc` reaps unreferenced packs).
@@ -1097,7 +1037,8 @@ async fn delete_remote_ref_packchain(
     // falls through to immediate bundle deletion so the operator's
     // "ref is gone" intent is still satisfied.
     let deferred_bundle_key =
-        try_tombstone_baseline_for_delete(store_ref, prefix, remote_ref, &entries).await;
+        try_write_baseline_tombstone(store_ref, prefix, remote_ref, &entries, "packchain delete")
+            .await;
     if let Some(ref key) = deferred_bundle_key {
         info!(
             remote_ref = %remote_ref.as_str(),
@@ -1162,6 +1103,7 @@ mod tests {
     use super::super::keys::path_index_key;
     use super::*;
     use crate::object_store::mock::MockStore;
+    use crate::packchain::gc::baseline_tombstone_listing_prefix;
 
     fn rn(s: &str) -> RefName {
         RefName::new(s).unwrap()
@@ -1295,7 +1237,7 @@ mod tests {
         let tomb_keys: Vec<String> = store
             .keys()
             .into_iter()
-            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .filter(|k| k.starts_with(&baseline_tombstone_listing_prefix(Some("repo"))))
             .collect();
         assert_eq!(
             tomb_keys.len(),
@@ -1369,7 +1311,7 @@ mod tests {
         let tomb_keys_pre: Vec<String> = store
             .keys()
             .into_iter()
-            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .filter(|k| k.starts_with(&baseline_tombstone_listing_prefix(Some("repo"))))
             .collect();
         assert_eq!(
             tomb_keys_pre.len(),
@@ -1409,7 +1351,7 @@ mod tests {
         let surviving_tombs: Vec<String> = store
             .keys()
             .into_iter()
-            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .filter(|k| k.starts_with(&baseline_tombstone_listing_prefix(Some("repo"))))
             .collect();
         assert!(
             surviving_tombs.is_empty(),
@@ -1496,7 +1438,7 @@ mod tests {
         let tomb_keys: Vec<String> = store
             .keys()
             .into_iter()
-            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .filter(|k| k.starts_with(&baseline_tombstone_listing_prefix(Some("repo"))))
             .collect();
         assert!(
             tomb_keys.is_empty(),
@@ -1508,7 +1450,7 @@ mod tests {
     /// unparseable-chain branch. The companion test above seeds
     /// `chain.json = "{}"`, which fails `ChainManifest::from_json_bytes`
     /// inside [`load_chain`] — that is the *parse-error* branch of
-    /// `try_tombstone_baseline_for_delete`. This test seeds a fully
+    /// [`super::gc::try_write_baseline_tombstone`]. This test seeds a fully
     /// parseable `chain.json` whose `full_at` SHA has no matching
     /// `*.bundle` listing entry, exercising the
     /// `if !entries.iter().any(|m| m.key == bundle_key)` branch
@@ -1556,7 +1498,7 @@ mod tests {
         let tomb_keys: Vec<String> = store
             .keys()
             .into_iter()
-            .filter(|k| k.starts_with("repo/gc/baseline-tomb-"))
+            .filter(|k| k.starts_with(&baseline_tombstone_listing_prefix(Some("repo"))))
             .collect();
         assert!(
             tomb_keys.is_empty(),

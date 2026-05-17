@@ -1806,6 +1806,7 @@ async fn delete_remote_ref_under_lock(
 mod tests {
     use super::*;
     use crate::object_store::mock::MockStore;
+    use crate::packchain::gc::baseline_tombstone_listing_prefix;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
     /// A second 40-char hex SHA distinct from `SHA`. Used by tests that
@@ -2124,7 +2125,7 @@ mod tests {
                 }
 
                 async fn get_bytes(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
-                    if key.starts_with("repo/gc/baseline-tomb-") {
+                    if key.starts_with(&baseline_tombstone_listing_prefix(Some("repo"))) {
                         self.tombstone_gets.fetch_add(1, Ordering::SeqCst);
                     }
                     self.inner.get_bytes(key).await
@@ -2150,7 +2151,7 @@ mod tests {
             r#"{{"v":1,"ref_name":"refs/heads/main","sha":"{OTHER_SHA}","marked_at":"2024-01-01T00:00:00Z"}}"#
         );
         inner.insert(
-            "repo/gc/baseline-tomb-test.json".to_owned(),
+            format!("{}test.json", baseline_tombstone_listing_prefix(Some("repo"))),
             Bytes::from(tomb_body),
         );
 
@@ -3429,10 +3430,11 @@ mod tests {
             "old bundle at pre_key must survive the push (deferred via tombstone)",
         );
         // A single baseline tombstone naming the prior SHA must exist.
+        let tomb_listing = baseline_tombstone_listing_prefix(Some("repo"));
         let metas = store.list("repo/gc/").await.unwrap();
         let tombstones: Vec<_> = metas
             .iter()
-            .filter(|m| m.key.starts_with("repo/gc/baseline-tomb-"))
+            .filter(|m| m.key.starts_with(&tomb_listing))
             .collect();
         assert_eq!(
             tombstones.len(),
@@ -3481,11 +3483,11 @@ mod tests {
         let store = MockStore::new();
         let pre_key = format!("repo/refs/heads/main/{OTHER_SHA}.bundle");
         store.insert(&pre_key, Bytes::from_static(b"old bundle"));
-        // Fail the tombstone PUT (any key under `repo/gc/baseline-tomb-`)
-        // AND the fallback synchronous delete of the prior bundle. The
-        // push must still report Ok.
+        // Fail the tombstone PUT (any key under the baseline-tomb
+        // namespace) AND the fallback synchronous delete of the
+        // prior bundle. The push must still report Ok.
         store.arm(Fault::NetworkOnPutBytesPrefix {
-            prefix: "repo/gc/baseline-tomb-".to_owned(),
+            prefix: baseline_tombstone_listing_prefix(Some("repo")),
         });
         store.arm(Fault::NetworkOnDelete {
             key: pre_key.clone(),
@@ -3517,10 +3519,9 @@ mod tests {
         // No tombstone was written (the PUT failed); the operator path
         // is the multi-bundle guard, not deferred reclamation.
         let metas = store.list("repo/gc/").await.unwrap();
+        let tomb_listing = baseline_tombstone_listing_prefix(Some("repo"));
         assert!(
-            !metas
-                .iter()
-                .any(|m| m.key.starts_with("repo/gc/baseline-tomb-")),
+            !metas.iter().any(|m| m.key.starts_with(&tomb_listing)),
             "no baseline tombstone must remain after a failed PUT",
         );
     }
@@ -3541,7 +3542,7 @@ mod tests {
         // Fail only the tombstone PUT — the prior-bundle delete is
         // left armable-free so the fallback path completes.
         store.arm(Fault::NetworkOnPutBytesPrefix {
-            prefix: "repo/gc/baseline-tomb-".to_owned(),
+            prefix: baseline_tombstone_listing_prefix(Some("repo")),
         });
 
         let state = push_state_with_pre_existing(Some(pre_key.clone()));
@@ -3556,10 +3557,9 @@ mod tests {
         // The fault on the tombstone PUT fired; no tombstone remains.
         assert_eq!(store.pending_faults(), 0);
         let metas = store.list("repo/gc/").await.unwrap();
+        let tomb_listing = baseline_tombstone_listing_prefix(Some("repo"));
         assert!(
-            !metas
-                .iter()
-                .any(|m| m.key.starts_with("repo/gc/baseline-tomb-")),
+            !metas.iter().any(|m| m.key.starts_with(&tomb_listing)),
             "tombstone PUT failed, so no baseline-tomb key may exist",
         );
         // The fallback synchronous delete succeeded — prior bundle gone.
