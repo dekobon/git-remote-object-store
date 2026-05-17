@@ -720,12 +720,22 @@ jobs:
           docker run --rm --platform "linux/${ARCH}" \
             -v "$PWD/dist:/w" -e VERSION -e DEBIAN_FRONTEND=noninteractive \
             "$IMAGE" bash -eux -c '
-              # Docker Ubuntu images ship /etc/dpkg/dpkg.cfg.d/docker-clean
-              # (and sometimes /excludes) with path-exclude= lines that
-              # block /usr/share/doc and /usr/share/man from being written
-              # on install. Remove those configs so dpkg ships the full
-              # payload.
-              rm -f /etc/dpkg/dpkg.cfg.d/docker-clean /etc/dpkg/dpkg.cfg.d/excludes
+              # Docker Ubuntu / Debian / runner-cached image variants
+              # ship `path-exclude=/usr/share/doc/*` in different files
+              # under /etc/dpkg/dpkg.cfg.d/ — historically `docker-clean`
+              # or `excludes`, but at least one runner-cached image
+              # variant places it in `needrestart`. Targeting by name is
+              # fragile; strip every `path-exclude` of /usr/share/doc
+              # regardless of which file holds it. (Other excludes such
+              # as /usr/share/man are irrelevant to this smoke test.)
+              echo "smoke: dpkg.cfg.d before strip:" >&2
+              ls -la /etc/dpkg/dpkg.cfg.d/ >&2 || true
+              find /etc/dpkg/dpkg.cfg.d /etc/dpkg/dpkg.cfg \
+                   /etc/apt/apt.conf /etc/apt/apt.conf.d \
+                   -type f -print0 2>/dev/null \
+                | xargs -0 sed -i \
+                  -e "\\|^[[:space:]]*path-exclude=/usr/share/doc|d" \
+                  -e "\\|DPkg::Path-Exclude.*usr/share/doc|Id" 2>/dev/null || true
               apt-get update -qq
               apt-get install -y -qq /w/*.deb
               git-remote-object-store --version | grep -F "$VERSION"
