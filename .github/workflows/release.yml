@@ -720,50 +720,26 @@ jobs:
           docker run --rm --platform "linux/${ARCH}" \
             -v "$PWD/dist:/w" -e VERSION -e DEBIAN_FRONTEND=noninteractive \
             "$IMAGE" bash -eux -c '
-              # Docker Ubuntu / Debian / runner-cached image variants
-              # ship `path-exclude=/usr/share/doc/*` in different files
-              # under /etc/dpkg/dpkg.cfg.d/. Previous attempts to strip
-              # the exclude by editing existing config files were
-              # defeated on the GHA runner-cached `ubuntu:22.04` image:
-              # the cfg.d directory itself appears to be swapped between
-              # our strip and the post-install state, with `excludes`
-              # disappearing and a different `needrestart` file
-              # materializing — likely an image-layer overlay quirk.
-              # Belt-and-suspenders: write a high-priority path-include
-              # that re-includes our package's docs regardless of what
-              # path-excludes exist. dpkg evaluates patterns in
-              # file-load order (alphabetical across cfg.d/), so a `zz-`
-              # prefix guarantees this rule wins.
-              echo "smoke: dpkg.cfg.d before fix:" >&2
-              ls -la /etc/dpkg/dpkg.cfg.d/ >&2 || true
-              for cfg in /etc/dpkg/dpkg.cfg.d/* /etc/dpkg/dpkg.cfg; do
-                [ -e "$cfg" ] || continue
-                echo "smoke: --- $cfg ---" >&2
-                cat "$cfg" >&2 || true
-              done
-              # Double-quote (not single-quote) the echo argument:
-              # the outer `bash -eux -c '...'` wrapper is itself
-              # single-quoted, so an inner `'\''path-include=...'\''`
-              # would terminate the outer string and leak the redirect
-              # onto the host shell — exactly the symptom seen on the
-              # previous run. Double quotes are safe inside the outer
-              # single-quoted block; `*` inside `"..."` is literal.
+              # NO APOSTROPHES allowed anywhere in this block.
+              # The outer wrapper is bash -eux -c single-quoted; any
+              # stray apostrophe here closes that quote and leaks the
+              # rest of the script onto the host shell, where it runs
+              # against the runner filesystem instead of the docker
+              # container. Earlier release runs masked this for weeks
+              # because the for-loop happened to run before the first
+              # stray apostrophe (a possessive in a comment), so the
+              # binary checks passed inside docker while the TPL check
+              # silently ran on the host and naturally failed.
+              # Write a dpkg path-include override so our package docs
+              # survive whatever path-exclude rules the runner image
+              # carries. The zz- prefix puts this last in cfg.d load
+              # order; dpkg uses the last matching rule per path.
               mkdir -p /etc/dpkg/dpkg.cfg.d
               echo "path-include=/usr/share/doc/git-remote-object-store/*" \
                 > /etc/dpkg/dpkg.cfg.d/zz-grobs-include-docs
-              echo "smoke: wrote path-include override:" >&2
-              cat /etc/dpkg/dpkg.cfg.d/zz-grobs-include-docs >&2
               apt-get update -qq
               apt-get install -y -qq /w/*.deb
               git-remote-object-store --version | grep -F "$VERSION"
-              # Verify all six binaries landed and the `+`-form symlinks
-              # were created by the postinst script.
-              # Every diagnostic message below goes to stderr — docker
-              # stdout buffer-flush has bitten earlier release runs where
-              # a silent `set -e` failure exited the container before the
-              # implicit `+ trace` line for the failing command made it
-              # to the action log, leaving the operator with only "exit
-              # code 1" and no idea which check tripped.
               for bin in git-remote-s3-https git-remote-s3-http \
                          git-remote-az-https git-remote-az-http \
                          git-remote-object-store git-lfs-object-store \
@@ -776,19 +752,17 @@ jobs:
                 }
               done
               echo "smoke: all 6 binaries + 4 +-form symlinks present" >&2
-              # Content regression guard: ring ships `Apache-2.0 AND
-              # ISC`, both texts mandatory. If either drops out, the
-              # bundle is non-compliant. Run in one lane only — deb.
-              #
-              # The two `^### <name>` greps couple to cargo-about's
-              # display-name strings (rendered via about.hbs as
-              # `### {{name}}` per license group). If a future
-              # cargo-about bump renames either ("ISC License" →
-              # "ISC", "Apache License 2.0" → "Apache-2.0"), update
-              # these regexes in lockstep. The crate-name grep
-              # (`ring`) is the stable cross-version anchor — it
-              # would survive a template rename and still catch the
-              # absence of the dep entirely.
+              # Content regression guard: ring ships Apache-2.0 AND ISC,
+              # both texts mandatory. If either drops out, the bundle is
+              # non-compliant. Run in one lane only — deb.
+              # The two ^### <name> greps couple to cargo-about display
+              # names (rendered via about.hbs as ### {{name}} per
+              # license group). If a future cargo-about bump renames
+              # either (ISC License -> ISC, Apache License 2.0 ->
+              # Apache-2.0), update these regexes in lockstep. The
+              # crate-name grep (ring) is the stable cross-version
+              # anchor — it would survive a template rename and still
+              # catch the absence of the dep entirely.
               TPL=/usr/share/doc/git-remote-object-store/THIRD-PARTY-LICENSES.md
               if [ ! -s "$TPL" ]; then
                 echo "::error::$TPL is missing or empty" >&2
