@@ -736,9 +736,23 @@ jobs:
               # prefix guarantees this rule wins.
               echo "smoke: dpkg.cfg.d before fix:" >&2
               ls -la /etc/dpkg/dpkg.cfg.d/ >&2 || true
+              for cfg in /etc/dpkg/dpkg.cfg.d/* /etc/dpkg/dpkg.cfg; do
+                [ -e "$cfg" ] || continue
+                echo "smoke: --- $cfg ---" >&2
+                cat "$cfg" >&2 || true
+              done
+              # Double-quote (not single-quote) the echo argument:
+              # the outer `bash -eux -c '...'` wrapper is itself
+              # single-quoted, so an inner `'\''path-include=...'\''`
+              # would terminate the outer string and leak the redirect
+              # onto the host shell — exactly the symptom seen on the
+              # previous run. Double quotes are safe inside the outer
+              # single-quoted block; `*` inside `"..."` is literal.
               mkdir -p /etc/dpkg/dpkg.cfg.d
-              echo 'path-include=/usr/share/doc/git-remote-object-store/*' \
+              echo "path-include=/usr/share/doc/git-remote-object-store/*" \
                 > /etc/dpkg/dpkg.cfg.d/zz-grobs-include-docs
+              echo "smoke: wrote path-include override:" >&2
+              cat /etc/dpkg/dpkg.cfg.d/zz-grobs-include-docs >&2
               apt-get update -qq
               apt-get install -y -qq /w/*.deb
               git-remote-object-store --version | grep -F "$VERSION"
