@@ -10,14 +10,7 @@ no-default-features = false
 [advisories]
 version = 2
 yanked = "warn"
-# astral-tokio-tar v0.6.0 is pulled in by testcontainers (dev-only). The
-# advisories below affect archive extraction in a test-only context; no
-# production surface is exposed. Ignore until testcontainers ships a version
-# that depends on astral-tokio-tar ≥ 0.6.1.
-ignore = [
-  "RUSTSEC-2026-0112", # PAX Header Desynchronization (testcontainers dev dep)
-  "RUSTSEC-2026-0113", # unpack_in symlink chmod (testcontainers dev dep)
-]
+ignore = []
 
 [bans]
 # Default to warning so a duplicate dep does not break CI overnight; the

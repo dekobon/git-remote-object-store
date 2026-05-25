@@ -14,7 +14,7 @@ updates:
     schedule:
       interval: weekly
     commit-message:
-      prefix: "deps"
+      prefix: "chore"
     ignore:
       # MSRV is 1.94 — block updates that bump the minimum Rust version.
       - dependency-name: "*"
