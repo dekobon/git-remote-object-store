@@ -1,6 +1,6 @@
 [package]
 name = "git-remote-object-store-cli"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version.workspace = true
 license = "Apache-2.0"
@@ -72,7 +72,7 @@ integration-azure = []
 # the path dep to use the registry version, but it refuses to package
 # unless the manifest declares one. Local builds still resolve via
 # `path`; the version is consulted only by the registry.
-git-remote-object-store = { path = "..", version = "0.2.1" }
+git-remote-object-store = { path = "..", version = "0.2.2" }
 
 # Async runtime — needed for #[tokio::main] macro resolution and for
 # tokio::io (BufReader, stdin, stdout) in the LFS binary. `signal` is

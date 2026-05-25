@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-05-24
+
+Maintenance release. No library or CLI source changes — dependency
+bumps and CI housekeeping only.
+
+### Changed
+
+- Bumped `aws-config` from 1.8.16 to 1.8.17.
+- Bumped `aws-sdk-s3` from 1.132.0 to 1.133.0.
+- Bumped `serde_json` from 1.0.149 to 1.0.150.
+- Bumped `astral-tokio-tar` to 0.6.2 and cleaned the corresponding
+  `cargo deny` ignores.
+- Bumped pinned GitHub Actions in the `actions` Dependabot group.
+
 ## [0.2.1] - 2026-05-17
 
 First release cut end-to-end by the CI release pipeline. 0.2.0 was
