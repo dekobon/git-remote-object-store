@@ -15,7 +15,7 @@ rust-version = "1.94"
 
 [package]
 name = "git-remote-object-store"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version.workspace = true
 license = "Apache-2.0"

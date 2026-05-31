@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-05-30
+
+Maintenance release. No library or CLI source changes — dependency
+bumps and CI housekeeping only.
+
+### Changed
+
+- Bumped `aws-sdk-s3` from 1.133.0 to 1.134.0.
+- Bumped `reqwest` from 0.13.3 to 0.13.4.
+- Bumped `uuid` from 1.23.1 to 1.23.2.
+- Bumped `gix-hash` from 0.25.0 to 0.25.1.
+- Bumped the transitive `tar` crate from 0.4.45 to 0.4.46.
+- Bumped pinned GitHub Actions in the `actions` Dependabot group
+  (`taiki-e/install-action`, `docker/setup-qemu-action`).
+
 ## [0.2.2] - 2026-05-24
 
 Maintenance release. No library or CLI source changes — dependency
