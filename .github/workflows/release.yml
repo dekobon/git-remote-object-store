@@ -87,7 +87,7 @@ jobs:
 
       # Always check out the tag ref, not the event SHA. Critical for
       # workflow_dispatch where github.sha points at the branch HEAD.
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
           ref: ${{ steps.tag.outputs.tag }}
@@ -272,7 +272,7 @@ jobs:
           - { target: x86_64-pc-windows-msvc,     runner: windows-latest, cross: false }
           - { target: aarch64-pc-windows-msvc,    runner: windows-latest, cross: false }
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
           ref: ${{ needs.preflight.outputs.ref }}
@@ -284,12 +284,12 @@ jobs:
 
       - name: Install cross (Linux / FreeBSD cross-compile)
         if: matrix.cross
-        uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2.62.23
+        uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.62.23
         with:
           tool: cross@${{ env.CROSS_VERSION }}
 
       - name: Install cargo-about
-        uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2.62.23
+        uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.62.23
         with:
           tool: cargo-about@${{ env.CARGO_ABOUT_VERSION }}
 
@@ -443,7 +443,7 @@ jobs:
           - { target: x86_64-unknown-linux-gnu,  deb_arch: amd64 }
           - { target: aarch64-unknown-linux-gnu, deb_arch: arm64 }
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
           ref: ${{ needs.preflight.outputs.ref }}
@@ -453,7 +453,7 @@ jobs:
           toolchain: ${{ needs.preflight.outputs.toolchain }}
           targets: ${{ matrix.target }}
 
-      - uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2.62.23
+      - uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.62.23
         with:
           tool: cargo-deb@${{ env.CARGO_DEB_VERSION }}
 
@@ -508,7 +508,7 @@ jobs:
           - { target: x86_64-unknown-linux-gnu,  rpm_arch: x86_64 }
           - { target: aarch64-unknown-linux-gnu, rpm_arch: aarch64 }
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
           ref: ${{ needs.preflight.outputs.ref }}
@@ -518,7 +518,7 @@ jobs:
           toolchain: ${{ needs.preflight.outputs.toolchain }}
           targets: ${{ matrix.target }}
 
-      - uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2.62.23
+      - uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.62.23
         with:
           tool: cargo-generate-rpm@${{ env.CARGO_GENERATE_RPM_VERSION }}
 
@@ -587,7 +587,7 @@ jobs:
           - { target: x86_64-unknown-linux-musl,  apk_arch: x86_64 }
           - { target: aarch64-unknown-linux-musl, apk_arch: aarch64 }
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
           ref: ${{ needs.preflight.outputs.ref }}
@@ -950,7 +950,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
           ref: ${{ needs.preflight.outputs.ref }}
@@ -980,7 +980,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable tip
         with:
           toolchain: ${{ needs.preflight.outputs.toolchain }}
-      - uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2.62.23
+      - uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.62.23
         with:
           tool: cargo-cyclonedx@${{ env.CARGO_CYCLONEDX_VERSION }}
 
@@ -1043,7 +1043,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
           ref: ${{ needs.preflight.outputs.ref }}
@@ -1192,7 +1192,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
           ref: ${{ needs.preflight.outputs.ref }}
@@ -1251,7 +1251,7 @@ jobs:
       contents: read
       attestations: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
           ref: ${{ needs.preflight.outputs.ref }}
