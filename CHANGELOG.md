@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-06-08
+
+Maintenance release. No library or CLI source changes — dependency
+bumps and CI housekeeping only.
+
+### Changed
+
+- Bumped `aws-config` from 1.8.17 to 1.8.18.
+- Bumped `aws-sdk-s3` from 1.134.0 to 1.135.0.
+- Bumped `aws-smithy-http-client` from 1.1.12 to 1.1.13.
+- Bumped pinned GitHub Actions in the `actions` Dependabot group
+  (`actions/checkout` 6.0.2 to 6.0.3, `github/codeql-action` 4.36.0
+  to 4.36.2, `taiki-e/install-action` 2.79.15 to 2.81.6).
+
 ## [0.2.3] - 2026-05-30
 
 Maintenance release. No library or CLI source changes — dependency
