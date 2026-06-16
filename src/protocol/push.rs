@@ -1146,7 +1146,7 @@ enum PrepareOutcome {
     // hidden-bundle hash set added in #165); boxing keeps the enum's
     // discriminant compact regardless of variant.
     Ready(Box<PushReadyState>),
-    Delete { remote_ref: RefName, zip: bool },
+    Delete { remote_ref: RefName },
     Done(PushOutcome),
 }
 
@@ -1238,10 +1238,7 @@ async fn prepare_push(
         // landing a new bundle between our listing and our deletion
         // cannot produce a silent false success. Defer to
         // [`delete_remote_ref_under_lock`] in [`push_one`].
-        return Ok(PrepareOutcome::Delete {
-            remote_ref,
-            zip: config.zip,
-        });
+        return Ok(PrepareOutcome::Delete { remote_ref });
     }
 
     // Issue #129: do NOT call `is_protected` here. A pre-lock check
@@ -1374,9 +1371,9 @@ async fn push_one(
                 // existing allocation instead of re-boxing.
                 UnderLockWork::Push(state),
             ),
-            PrepareOutcome::Delete { remote_ref, zip } => (
+            PrepareOutcome::Delete { remote_ref } => (
                 remote_ref.as_str().to_owned(),
-                UnderLockWork::Delete { remote_ref, zip },
+                UnderLockWork::Delete { remote_ref },
             ),
         };
 
@@ -1404,8 +1401,8 @@ async fn push_one(
         UnderLockWork::Push(state) => {
             perform_push_under_lock(store.as_ref(), prefix, config.kind, *state).await
         }
-        UnderLockWork::Delete { remote_ref, zip } => {
-            delete_remote_ref_under_lock(store.as_ref(), prefix, &remote_ref, zip, &lock).await
+        UnderLockWork::Delete { remote_ref } => {
+            delete_remote_ref_under_lock(store.as_ref(), prefix, &remote_ref, &lock).await
         }
     };
     let release_result = release_lock(guard).await;
@@ -1435,7 +1432,7 @@ async fn push_one(
 /// the [`UnderLockWork`] discriminant compact regardless of variant.
 enum UnderLockWork {
     Push(Box<PushReadyState>),
-    Delete { remote_ref: RefName, zip: bool },
+    Delete { remote_ref: RefName },
 }
 
 /// Re-list under the lock, upload the bundle, init HEAD, write the `FORMAT`
@@ -1690,15 +1687,10 @@ fn sanitize_metadata_value(s: &str) -> String {
         .collect()
 }
 
-/// Expected key count for a non-zip ref: one bundle object.
-const DELETE_EXPECTED_NO_ZIP: usize = 1;
-/// Expected key count for a zip ref: one bundle + one archive object.
-const DELETE_EXPECTED_WITH_ZIP: usize = 2;
-
 /// Handle a delete refspec (`:<remote_ref>`) UNDER the per-ref lock
-/// acquired by [`push_one`]: list `<prefix>/<ref>/`, expect 1 (or 2
-/// with zip) keys after filtering out the lock we hold, delete them
-/// all, emit `ok` or the appropriate error.
+/// acquired by [`push_one`]: list `<prefix>/<ref>/`, classify the
+/// remaining entries by shape, sweep every artifact that belongs to the
+/// ref, and emit `ok` or the appropriate error.
 ///
 /// Issue #133: this must run inside the lock window. A pre-lock
 /// listing-then-sweep races a concurrent push that lands a new bundle
@@ -1708,105 +1700,99 @@ const DELETE_EXPECTED_WITH_ZIP: usize = 2;
 ///
 /// The lock key (`<prefix>/<ref>/LOCK#.lock`) is filtered from the
 /// listing — `release_lock` removes it last, after this function
-/// returns. Apart from that one filter, the listing is unfiltered and
-/// counts `PROTECTED#` and `repo.zip` against the expected total.
+/// returns. The sweep must not touch it (deleting our own lock
+/// mid-critical-section would let concurrent clients acquire it).
 ///
 /// Issue #128: the `PROTECTED#` marker check is the FIRST guard, run
-/// against the fresh under-lock listing BEFORE any count-vs-expected
-/// dispatch. The pre-#128 ordering only consulted the marker in the
-/// `else if` mismatch branch, so a count-matching listing (e.g.
-/// `[bundle.bundle, PROTECTED#]` in zip mode, or `[PROTECTED#]` alone
-/// in non-zip mode) would sweep the marker and report `ok`. With the
-/// guard at the top, that bypass is closed.
+/// against the fresh under-lock listing BEFORE any sweep dispatch, so a
+/// listing that pairs a marker with a bundle (and/or `repo.zip`) cannot
+/// sweep the marker and report `ok`.
+///
+/// Issue #242: deletability is decided by the entry SHAPE, never by the
+/// connection-time `zip` flag. The `repo.zip` upload is best-effort and
+/// its failure is swallowed (see [`upload_zip_artifact_best_effort`]),
+/// so a `?zip=1` ref can legitimately have only its `<sha>.bundle` with
+/// no sibling archive — and a non-zip URL can be asked to delete a ref
+/// that still carries a leftover `repo.zip` from an earlier zip-mode
+/// push. Asserting `entries.len() == (1 or 2 by zip flag)` mis-routed
+/// both cases to the corruption branch. Instead we count the
+/// `<sha>.bundle` objects and treat every non-bundle sibling (the
+/// `repo.zip` archive and any future per-ref artifact) as a deletable
+/// companion of the ref's single bundle.
 ///
 /// Four behaviours fall out:
 ///
-/// 1. **Protected ref** — listing (lock filtered out) includes a key
-///    whose final segment is the [`keys::PROTECTED_MARKER_SEGMENT`].
-///    Emit a protection-specific refusal naming the management CLI's
-///    `unprotect` workflow.
-/// 2. **Count matches `expected`, no marker** — sweep the entries and
-///    report `ok`.
-/// 3. **No bundle present** — listing (lock filtered out) is empty.
-///    Returns the `"not found"?` wire error. This now includes the case
-///    of a ref whose only on-server state was a stale `LOCK#.lock`:
-///    `acquire_lock` recovers the stale lock, the post-lock listing
-///    contains only our newly-held lock, and the filter renders it
-///    empty.
-/// 4. **Genuine multi-bundle / corruption** — count exceeds `expected`
-///    and no marker is present. Fall through to the doctor message.
-///    Example listing:
-///    `[ "<prefix>/refs/heads/main/<sha-a>.bundle",
-///       "<prefix>/refs/heads/main/<sha-b>.bundle" ]`.
+/// 1. **Protected ref** — the listing (lock filtered out) includes the
+///    [`keys::PROTECTED_MARKER_SEGMENT`] marker. Emit a
+///    protection-specific refusal naming the `unprotect` workflow.
+/// 2. **Exactly one bundle** — with or without a `repo.zip` sibling,
+///    sweep every present artifact (bundle + siblings) and report `ok`.
+/// 3. **No bundle present** — emit the `"not found"?` wire error. This
+///    covers a ref whose only on-server state was a stale `LOCK#.lock`
+///    (recovered and now held by us, so filtered out) and a ref that
+///    carries only an orphaned `repo.zip` with no bundle.
+/// 4. **Two or more distinct `<sha>.bundle` keys** — genuine
+///    multi-bundle corruption. Fall through to the doctor message.
 async fn delete_remote_ref_under_lock(
     store: &dyn ObjectStore,
     prefix: Option<&str>,
     remote_ref: &RefName,
-    zip: bool,
     lock_key: &str,
 ) -> Result<PushOutcome, PushError> {
     let listing = ref_listing_prefix(prefix, remote_ref);
     let all_entries = store.list(&listing).await?;
-    // Issue #133: filter out the lock key we hold. `release_lock`
-    // removes it last; the sweep below must not touch it (deleting our
-    // own lock mid-critical-section would let concurrent clients
-    // acquire it). The remaining count is what the protocol's
-    // count-vs-expected dispatch operates on.
-    let entries: Vec<&ObjectMeta> = all_entries.iter().filter(|e| e.key != lock_key).collect();
-    let expected = if zip {
-        DELETE_EXPECTED_WITH_ZIP
-    } else {
-        DELETE_EXPECTED_NO_ZIP
-    };
     let remote_ref_str = remote_ref.as_str().to_owned();
-    // Issue #128: the canonical protection guard. Run it FIRST against
-    // the fresh, under-lock listing, BEFORE the count-match deletion
-    // branch. The pre-#128 ordering only checked for the marker in the
-    // `else if` mismatch branch, so a count-matching listing (e.g.
-    // `[bundle.bundle, PROTECTED#]` with `expected = 2` in zip mode, or
-    // `[PROTECTED#]` alone with `expected = 1`) would sweep the marker
-    // and complete the delete silently. `entries_have_protected_marker`
-    // matches only the literal `PROTECTED#` last segment — never the
+    // Issue #128: the canonical protection guard, run FIRST against the
+    // fresh under-lock listing. `entries_have_protected_marker` matches
+    // only the literal `PROTECTED#` last segment — never the
     // `LOCK#.lock` lock key — so scanning the unfiltered `all_entries`
-    // here is safe and avoids re-deriving a filtered view solely for
-    // this check.
+    // here is safe.
     if keys::entries_have_protected_marker(&all_entries) {
         return Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
             message: DELETE_PROTECTION_MESSAGE.to_owned(),
         });
     }
-    if entries.len() == expected {
-        for entry in &entries {
-            delete_idempotent(store, &entry.key).await?;
-        }
-        // Issue #151 defence-in-depth: confirm no `PROTECTED#` marker
-        // sneaked in. The lock window is still open (the caller releases
-        // it after we return), so a `protect`/`unprotect` racing this
-        // delete would be blocked on the lock per #159. Finding a marker
-        // here would indicate a contract violation; the helper logs at
-        // `error!` and the delete still reports `ok` — see the helper
-        // doc for the rationale.
-        verify_no_orphan_protected_after_delete(store, prefix, remote_ref).await;
-        Ok(PushOutcome::Ok {
-            remote_ref: remote_ref_str,
-        })
-    } else if entries.is_empty() {
-        Ok(PushOutcome::Error {
+    // Issue #133: filter out the lock key we hold so the sweep cannot
+    // delete it. Everything that survives this filter is a deletable
+    // artifact of the ref (bundle objects plus any `repo.zip` / future
+    // sibling) — the `PROTECTED#` marker already returned above.
+    let deletable: Vec<&ObjectMeta> = all_entries.iter().filter(|e| e.key != lock_key).collect();
+    // Issue #242: route on the number of distinct `<sha>.bundle` keys,
+    // not the connection-time `zip` flag. A ref is a clean single-bundle
+    // ref when exactly one bundle is present, regardless of whether a
+    // `repo.zip` sibling rode along.
+    let bundle_count = deletable
+        .iter()
+        .filter(|e| is_bundle_candidate(&e.key))
+        .count();
+    match bundle_count {
+        0 => Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
             message: r#""not found"?"#.to_owned(),
-        })
-    } else {
-        // Genuine multi-bundle / corruption: `entries` has more than
-        // `expected` items and no `PROTECTED#` marker (that case
-        // returned at the top guard above). Fall through to the doctor
-        // message — see issue #128 for the routing rationale.
-        Ok(PushOutcome::Error {
+        }),
+        1 => {
+            for entry in &deletable {
+                delete_idempotent(store, &entry.key).await?;
+            }
+            // Issue #151 defence-in-depth: confirm no `PROTECTED#` marker
+            // sneaked in. The lock window is still open (the caller
+            // releases it after we return), so a `protect`/`unprotect`
+            // racing this delete would be blocked on the lock per #159.
+            // Finding a marker here would indicate a contract violation;
+            // the helper logs at `error!` and the delete still reports
+            // `ok` — see the helper doc for the rationale.
+            verify_no_orphan_protected_after_delete(store, prefix, remote_ref).await;
+            Ok(PushOutcome::Ok {
+                remote_ref: remote_ref_str,
+            })
+        }
+        _ => Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
             message:
                 r#""multiple bundles exist on server. Run git-remote-object-store doctor to fix."?"#
                     .to_owned(),
-        })
+        }),
     }
 }
 
@@ -2752,7 +2738,6 @@ mod tests {
             &store,
             Some("repo"),
             &r,
-            false,
             "repo/refs/heads/main/LOCK#.lock",
         )
         .await
@@ -2798,7 +2783,6 @@ mod tests {
             &store,
             Some("repo"),
             &r,
-            false,
             "repo/refs/heads/main/LOCK#.lock",
         )
         .await
@@ -2826,7 +2810,6 @@ mod tests {
             &store,
             Some("repo"),
             &r,
-            false,
             "repo/refs/heads/main/LOCK#.lock",
         )
         .await
@@ -2860,7 +2843,6 @@ mod tests {
             &store,
             Some("repo"),
             &r,
-            false,
             "repo/refs/heads/main/LOCK#.lock",
         )
         .await
@@ -2878,28 +2860,24 @@ mod tests {
         assert!(store.contains(&bundle_b));
     }
 
-    /// Issue #128: the canonical PROTECTED# guard must reject even when
-    /// the count happens to match `expected`. Pre-#128 this listing
-    /// `[bundle.bundle, PROTECTED#]` matched `expected = 2` in zip mode
-    /// and was swept silently. Pin the guard: both keys survive, and
-    /// the wire error is the protection-specific message — not the
-    /// generic doctor message.
+    /// Issue #128 / #242: the canonical PROTECTED# guard must reject
+    /// before any sweep, even when a bundle rides alongside the marker.
+    /// The guard runs first against the unfiltered under-lock listing, so
+    /// a `[bundle, PROTECTED#]` listing surfaces the protection refusal
+    /// rather than sweeping the marker — independent of the connection's
+    /// `zip` flag.
     #[tokio::test]
-    async fn delete_remote_ref_rejects_protected_marker_when_count_matches_zip() {
+    async fn delete_remote_ref_rejects_protected_marker_alongside_bundle() {
         let store = MockStore::new();
         let r = rn("refs/heads/main");
         let bundle = format!("repo/refs/heads/main/{SHA}.bundle");
         let protected = "repo/refs/heads/main/PROTECTED#";
         store.insert(&bundle, Bytes::from_static(b"b"));
         store.insert(protected, Bytes::from_static(b""));
-        // zip = true → expected = 2, and the listing has exactly 2
-        // entries (bundle + marker). Pre-#128 this fell through to the
-        // count-match deletion branch.
         let outcome = delete_remote_ref_under_lock(
             &store,
             Some("repo"),
             &r,
-            true,
             "repo/refs/heads/main/LOCK#.lock",
         )
         .await
@@ -2934,7 +2912,6 @@ mod tests {
             &store,
             Some("repo"),
             &r,
-            false,
             "repo/refs/heads/main/LOCK#.lock",
         )
         .await
@@ -2978,7 +2955,7 @@ mod tests {
         // client).
         store.insert(protected, Bytes::from_static(b""));
 
-        let outcome = delete_remote_ref_under_lock(&store, Some("repo"), &r, false, lock_key)
+        let outcome = delete_remote_ref_under_lock(&store, Some("repo"), &r, lock_key)
             .await
             .unwrap();
 
@@ -2996,8 +2973,11 @@ mod tests {
         assert!(store.contains(lock_key), "held lock must survive");
     }
 
+    /// Issue #242: a single bundle with a `repo.zip` sibling sweeps both
+    /// and reports `ok`. Deletability is decided by entry shape, so this
+    /// holds regardless of the connection's `zip` flag.
     #[tokio::test]
-    async fn delete_remote_ref_zip_mode_expects_two_keys() {
+    async fn delete_remote_ref_sweeps_bundle_and_zip_sibling() {
         let store = MockStore::new();
         let r = rn("refs/heads/main");
         let bundle = format!("repo/refs/heads/main/{SHA}.bundle");
@@ -3008,7 +2988,6 @@ mod tests {
             &store,
             Some("repo"),
             &r,
-            true,
             "repo/refs/heads/main/LOCK#.lock",
         )
         .await
@@ -3021,6 +3000,107 @@ mod tests {
         );
         assert!(!store.contains(&bundle));
         assert!(!store.contains(zip));
+    }
+
+    /// Issue #242 regression: a ref whose only on-server state is a
+    /// single `<sha>.bundle` (no `repo.zip` sibling) must delete cleanly
+    /// even though the push connection was opened with `?zip=1`. The
+    /// `repo.zip` upload is best-effort, so a zip-mode ref can legitimately
+    /// carry only its bundle. Pre-#242 the count-vs-`zip`-flag assertion
+    /// (`entries.len() == 2`) mis-routed this `len == 1` listing to the
+    /// "multiple bundles exist" corruption branch. The fix routes on the
+    /// bundle count, so the lone bundle is swept and `ok` is reported.
+    #[tokio::test]
+    async fn delete_remote_ref_zip_mode_with_only_bundle_sweeps_and_oks() {
+        let store = MockStore::new();
+        let r = rn("refs/heads/main");
+        let bundle = format!("repo/refs/heads/main/{SHA}.bundle");
+        store.insert(&bundle, Bytes::from_static(b"b"));
+        // The connection's `zip` flag is no longer an input to the delete
+        // path — this listing is exactly what a `?zip=1` ref looks like
+        // after a swallowed `repo.zip` upload failure.
+        let outcome = delete_remote_ref_under_lock(
+            &store,
+            Some("repo"),
+            &r,
+            "repo/refs/heads/main/LOCK#.lock",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            PushOutcome::Ok {
+                remote_ref: "refs/heads/main".into()
+            }
+        );
+        assert!(!store.contains(&bundle), "bundle must be swept");
+    }
+
+    /// Issue #242: a ref carrying only an orphaned `repo.zip` and no
+    /// `<sha>.bundle` has zero bundles, so the delete reports `not found`
+    /// rather than `ok`. The orphan archive is left untouched — sweeping a
+    /// sibling with no owning bundle would be deleting state the delete
+    /// path cannot attribute to this ref's lifecycle.
+    #[tokio::test]
+    async fn delete_remote_ref_with_only_orphan_zip_reports_not_found() {
+        let store = MockStore::new();
+        let r = rn("refs/heads/main");
+        let zip = "repo/refs/heads/main/repo.zip";
+        store.insert(zip, Bytes::from_static(b""));
+        let outcome = delete_remote_ref_under_lock(
+            &store,
+            Some("repo"),
+            &r,
+            "repo/refs/heads/main/LOCK#.lock",
+        )
+        .await
+        .unwrap();
+        match outcome {
+            PushOutcome::Error { message, .. } => assert_eq!(message, r#""not found"?"#),
+            PushOutcome::Ok { .. } => panic!("expected not-found Error outcome"),
+        }
+        assert!(
+            store.contains(zip),
+            "orphan zip must survive a no-bundle delete",
+        );
+    }
+
+    /// Issue #242: two distinct `<sha>.bundle` keys still trip the
+    /// multi-bundle corruption guard even when a `repo.zip` sibling is
+    /// also present — the sibling does not mask the corruption, and
+    /// neither bundle is swept. (That the sibling is not itself counted
+    /// as a bundle is pinned at the 0-/1-bundle boundary by
+    /// `delete_remote_ref_with_only_orphan_zip_reports_not_found`, where
+    /// miscounting would flip the outcome; at this 2-bundle boundary it
+    /// could not.)
+    #[tokio::test]
+    async fn delete_remote_ref_two_bundles_with_zip_sibling_reports_corruption() {
+        let store = MockStore::new();
+        let r = rn("refs/heads/main");
+        let bundle_a = format!("repo/refs/heads/main/{SHA}.bundle");
+        let bundle_b = format!("repo/refs/heads/main/{OTHER_SHA}.bundle");
+        let zip = "repo/refs/heads/main/repo.zip";
+        store.insert(&bundle_a, Bytes::from_static(b"a"));
+        store.insert(&bundle_b, Bytes::from_static(b"b"));
+        store.insert(zip, Bytes::from_static(b""));
+        let outcome = delete_remote_ref_under_lock(
+            &store,
+            Some("repo"),
+            &r,
+            "repo/refs/heads/main/LOCK#.lock",
+        )
+        .await
+        .unwrap();
+        match outcome {
+            PushOutcome::Error { message, .. } => assert_eq!(
+                message,
+                r#""multiple bundles exist on server. Run git-remote-object-store doctor to fix."?"#,
+            ),
+            PushOutcome::Ok { .. } => panic!("expected corruption Error outcome"),
+        }
+        assert!(store.contains(&bundle_a), "bundle a must survive");
+        assert!(store.contains(&bundle_b), "bundle b must survive");
+        assert!(store.contains(zip), "zip sibling must survive");
     }
 
     // --- PushOutcome rendering ----------------------------------------
@@ -3795,7 +3875,7 @@ mod tests {
         store.insert(lock_key, Bytes::from_static(b"held-lock-payload"));
         let r = rn("refs/heads/main");
 
-        let outcome = delete_remote_ref_under_lock(&store, Some("repo"), &r, false, lock_key)
+        let outcome = delete_remote_ref_under_lock(&store, Some("repo"), &r, lock_key)
             .await
             .unwrap();
 
@@ -3831,7 +3911,7 @@ mod tests {
         store.insert(&bundle, Bytes::from_static(b"new"));
         store.insert(lock_key, Bytes::from_static(b"held-lock-payload"));
 
-        let outcome = delete_remote_ref_under_lock(&store, Some("repo"), &r, false, lock_key)
+        let outcome = delete_remote_ref_under_lock(&store, Some("repo"), &r, lock_key)
             .await
             .unwrap();
 
@@ -4275,7 +4355,7 @@ mod tests {
         store.insert(&bundle, Bytes::from_static(b"b"));
         store.insert(lock_key, Bytes::from_static(b"held-lock-payload"));
 
-        let outcome = delete_remote_ref_under_lock(&store, Some("repo"), &r, false, lock_key)
+        let outcome = delete_remote_ref_under_lock(&store, Some("repo"), &r, lock_key)
             .await
             .unwrap();
         assert_eq!(
