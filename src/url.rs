@@ -249,13 +249,24 @@ pub struct RemoteFlags {
     /// the flag because their bundle filenames rotate per push and a
     /// stable URL would race the next push.
     pub bundle_uri: bool,
-    /// `?bundle_uri_presign_ttl=<seconds>` — when set on a packchain
-    /// remote with `?bundle_uri=1`, the helper presigns each emitted
+    /// `?bundle_uri_presign_ttl=<seconds>` — on a packchain remote with
+    /// `?bundle_uri=1`, the helper presigns each emitted
     /// `bundle.<ref>.uri=<url>` line with an `<seconds>`-TTL signed
     /// URL (S3 `SigV4` or Azure service-SAS). Operators with private
     /// buckets need this; public-read buckets and CDN-fronted
     /// endpoints can leave it unset (the canonical URL works
     /// directly).
+    ///
+    /// Meaningful only when bundle-uri advertising is active — the TTL
+    /// solely governs presigning of the `bundle.<ref>.uri=` lines, which
+    /// are emitted nowhere else. Supplying it without `?bundle_uri=1` is
+    /// therefore rejected at the URL boundary with
+    /// [`ParseError::BundleUriPresignTtlWithoutBundleUri`] rather than
+    /// silently discarded (issue #246). The engine is **not** checked
+    /// here: it is resolved from the bucket `FORMAT` at connect time, so a
+    /// packchain bucket is validly reconnected with `?bundle_uri=1` and
+    /// the TTL but no `?engine=packchain` (a bundle-engine bucket simply
+    /// leaves the TTL inert, exactly as it does the `?bundle_uri=1` flag).
     ///
     /// `NonZeroU64` because a zero-second TTL is meaningless (the URL
     /// would expire before any client could observe it). The URL
@@ -371,6 +382,16 @@ pub enum ParseError {
         /// ([`MAX_BUNDLE_URI_PRESIGN_TTL_SECONDS`]).
         max: u64,
     },
+    /// `?bundle_uri_presign_ttl=<seconds>` was supplied without
+    /// `?bundle_uri=1`, the flag that gives it meaning: the TTL only
+    /// governs presigning of the `bundle.<ref>.uri=` lines, which are
+    /// advertised solely when bundle-uri advertising is opted into, so
+    /// accepting it without that opt-in would silently discard caller
+    /// intent. The engine is intentionally not part of this check — it is
+    /// resolved from the bucket `FORMAT` at connect time, not knowable at
+    /// URL-parse time. Issue #246.
+    #[error("bundle_uri_presign_ttl requires `?bundle_uri=1`; it has no effect otherwise")]
+    BundleUriPresignTtlWithoutBundleUri,
 }
 
 /// Parse a remote URL.
@@ -401,6 +422,7 @@ pub fn parse(input: &str) -> Result<RemoteUrl, ParseError> {
     }
 
     let (flags, addressing_override) = extract_flags(&endpoint)?;
+    reject_inapplicable_presign_ttl(&flags)?;
 
     match backend {
         BackendKind::S3 => finish_s3(endpoint, &host, flags, addressing_override),
@@ -570,6 +592,29 @@ fn reject_inapplicable_flag(
             flag: flag.to_owned(),
             backend,
         });
+    }
+    Ok(())
+}
+
+/// Reject `?bundle_uri_presign_ttl=` when `?bundle_uri=1` is absent — the
+/// TTL governs presigning of the emitted `bundle.<ref>.uri=` lines, which
+/// are only advertised when bundle-uri advertising is opted into, so a TTL
+/// without `?bundle_uri=1` silently discards the operator's intent.
+///
+/// The check is deliberately gated on `bundle_uri` alone, **not** the
+/// engine. The runtime engine is bucket-authoritative — resolved from the
+/// `FORMAT` key in `backend::build`, not the URL `?engine=` flag (see
+/// `protocol::run`) — so a packchain bucket is routinely reconnected with
+/// `?bundle_uri=1&bundle_uri_presign_ttl=<n>` and no `?engine=packchain`.
+/// The URL parser runs before `FORMAT` is read and therefore cannot know
+/// the engine; gating on the flag would reject that valid steady-state
+/// URL. `bundle_uri` is the only precondition the parser can evaluate
+/// soundly, and it mirrors how a `?bundle_uri=1` flag is itself merely
+/// inert (not rejected) on a non-packchain bucket.
+fn reject_inapplicable_presign_ttl(flags: &RemoteFlags) -> Result<(), ParseError> {
+    let has_ttl = flags.bundle_uri_presign_ttl.is_some();
+    if has_ttl && !flags.bundle_uri {
+        return Err(ParseError::BundleUriPresignTtlWithoutBundleUri);
     }
     Ok(())
 }
@@ -1793,5 +1838,105 @@ mod tests {
         assert_eq!(azure.flags().credential.as_deref(), Some("ci-cd"));
         assert_eq!(azure.flags().profile, None);
         assert_eq!(azure.flags().region, None);
+    }
+
+    // --- bundle_uri_presign_ttl cross-flag validation (issue #246) -------
+    //
+    // The TTL only governs presigning of the `bundle.<ref>.uri=` lines,
+    // which are advertised only when `?bundle_uri=1` is set. Supplying the
+    // TTL without `?bundle_uri=1` is a no-op and must be rejected at the
+    // URL boundary rather than stored and silently ignored. The engine is
+    // NOT gated here: it is resolved from the bucket `FORMAT` at connect
+    // time, so a URL carrying `?bundle_uri=1` and the TTL must parse
+    // regardless of the `?engine=` flag (or its absence).
+
+    #[test]
+    fn presign_ttl_without_bundle_uri_rejected() {
+        // packchain engine, but bundle_uri is unset (defaults to false).
+        let err = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo\
+             ?engine=packchain&bundle_uri_presign_ttl=3600",
+        )
+        .unwrap_err();
+        assert_eq!(err, ParseError::BundleUriPresignTtlWithoutBundleUri);
+    }
+
+    #[test]
+    fn presign_ttl_with_bundle_uri_disabled_rejected() {
+        // packchain engine and the TTL, but bundle_uri is explicitly off.
+        let err = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo\
+             ?engine=packchain&bundle_uri=0&bundle_uri_presign_ttl=3600",
+        )
+        .unwrap_err();
+        assert_eq!(err, ParseError::BundleUriPresignTtlWithoutBundleUri);
+    }
+
+    #[test]
+    fn presign_ttl_with_explicit_bundle_engine_still_parses() {
+        // `?engine=bundle` is the URL flag, but the runtime engine is
+        // resolved from the bucket `FORMAT`, not the flag — the same
+        // bucket may be packchain. The parser cannot know, so as long as
+        // `?bundle_uri=1` is present it must accept the TTL (a bundle
+        // bucket simply leaves it inert downstream, exactly as it does
+        // the `?bundle_uri=1` flag itself). Rejecting here would break a
+        // valid packchain reconnect that happens to carry `?engine=bundle`.
+        let url = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo\
+             ?engine=bundle&bundle_uri=1&bundle_uri_presign_ttl=3600",
+        )
+        .unwrap();
+        assert_eq!(
+            url.flags().bundle_uri_presign_ttl,
+            Some(NonZeroU64::new(3600).unwrap())
+        );
+    }
+
+    #[test]
+    fn presign_ttl_without_engine_flag_still_parses() {
+        // Regression for the steady-state packchain reconnect: a packchain
+        // bucket is routinely connected with `?bundle_uri=1` and the TTL
+        // but no `?engine=packchain` (the engine comes from `FORMAT`). The
+        // URL parser must not reject this — gating the TTL on the URL
+        // engine flag would abort every fetch/push on such a bucket.
+        let url = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo\
+             ?bundle_uri=1&bundle_uri_presign_ttl=3600",
+        )
+        .unwrap();
+        assert_eq!(url.flags().engine, None);
+        assert!(url.flags().bundle_uri);
+        assert_eq!(
+            url.flags().bundle_uri_presign_ttl,
+            Some(NonZeroU64::new(3600).unwrap())
+        );
+    }
+
+    #[test]
+    fn presign_ttl_with_packchain_and_bundle_uri_parses() {
+        // The one valid configuration: packchain + bundle_uri=1 + TTL.
+        let url = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo\
+             ?engine=packchain&bundle_uri=1&bundle_uri_presign_ttl=3600",
+        )
+        .unwrap();
+        assert_eq!(url.flags().engine, Some(StorageEngine::Packchain));
+        assert!(url.flags().bundle_uri);
+        assert_eq!(
+            url.flags().bundle_uri_presign_ttl,
+            Some(NonZeroU64::new(3600).unwrap())
+        );
+    }
+
+    #[test]
+    fn packchain_and_bundle_uri_without_ttl_parses() {
+        // The TTL is optional: the valid pairing must still parse when it
+        // is absent, leaving the field None.
+        let url = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo\
+             ?engine=packchain&bundle_uri=1",
+        )
+        .unwrap();
+        assert_eq!(url.flags().bundle_uri_presign_ttl, None);
     }
 }
