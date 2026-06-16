@@ -800,7 +800,13 @@ advances `full_at`, invalidating any cached bundle.
 seconds in the range `1..=604_800` (1 second to 7 days).
 `=0` and values above 7 days are rejected at the URL boundary;
 the 7-day cap matches AWS's hard ceiling on presigned URLs and
-keeps both backends consistent. Choose the TTL to balance
+keeps both backends consistent. The flag is meaningful **only**
+on a `packchain` remote that also sets `bundle_uri=1`. Supplying
+it without `bundle_uri=1` is a no-op and is rejected at URL-parse
+time rather than silently ignored; the engine itself is not
+checked at parse time (it is resolved from the bucket `FORMAT` at
+connect), so a packchain bucket reconnected with `bundle_uri=1`
+and the TTL but no `?engine=packchain` is accepted. Choose the TTL to balance
 accelerated-clone window vs URL-leakage risk: longer TTLs let
 one clone reuse the URL across retries, but the URL grants
 time-limited GET access to the bundle key to anyone who reads
