@@ -202,6 +202,20 @@ impl BackendKind {
             Self::Azure => "az+",
         }
     }
+
+    /// Human-readable backend name for diagnostics (`"S3"` / `"Azure"`).
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::S3 => "S3",
+            Self::Azure => "Azure",
+        }
+    }
+}
+
+impl fmt::Display for BackendKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 /// Query-string flags described in §3.2 / §3.3.
@@ -209,11 +223,17 @@ impl BackendKind {
 pub struct RemoteFlags {
     /// `?zip=1` — push uploads `repo.zip` alongside each bundle.
     pub zip: bool,
-    /// `?profile=...` — selects a named AWS profile (S3 only).
+    /// `?profile=...` — selects a named AWS profile. S3 only; an Azure
+    /// URL carrying this flag is rejected with
+    /// [`ParseError::FlagNotApplicable`].
     pub profile: Option<String>,
-    /// `?credential=...` — names an Azure credential alias.
+    /// `?credential=...` — names an Azure credential alias. Azure only;
+    /// an S3 URL carrying this flag is rejected with
+    /// [`ParseError::FlagNotApplicable`].
     pub credential: Option<String>,
-    /// `?region=...` — overrides the SDK-derived region (rare).
+    /// `?region=...` — overrides the SDK-derived region (rare). S3 only;
+    /// an Azure URL carrying this flag is rejected with
+    /// [`ParseError::FlagNotApplicable`].
     pub region: Option<String>,
     /// `?engine=...` — declares the storage engine for a new repository.
     ///
@@ -303,6 +323,18 @@ pub enum ParseError {
     /// A query parameter is not part of the documented flag set.
     #[error("unknown query flag `{0}`")]
     UnknownFlag(String),
+    /// A flag is a documented flag but does not apply to the selected
+    /// backend (e.g. `?profile=` or `?region=` on an Azure URL,
+    /// `?credential=` on an S3 URL). Rejected with the same fail-fast
+    /// policy as [`UnknownFlag`][Self::UnknownFlag] so a misplaced flag
+    /// is never silently discarded.
+    #[error("query flag `{flag}` does not apply to the {backend} backend")]
+    FlagNotApplicable {
+        /// The flag name as it appeared in the query string.
+        flag: String,
+        /// The backend the URL selected, which does not consume `flag`.
+        backend: BackendKind,
+    },
     /// `?engine=` value is not a recognised engine name.
     #[error(
         "unknown engine `{0}`; expected one of {supported}",
@@ -518,6 +550,30 @@ fn extract_flags(u: &Url) -> Result<(RemoteFlags, Option<AddressingOverride>), P
     Ok((flags, addressing))
 }
 
+/// Reject a flag that parsed globally in [`extract_flags`] but does not
+/// apply to the backend that the URL ultimately selected.
+///
+/// `extract_flags` runs before backend dispatch and therefore cannot
+/// know whether `?profile=` belongs to an S3 URL or an Azure one. The
+/// backend-specific `finish_*` functions own that context, so the
+/// cross-backend pairing check lives here and is shared by both. When
+/// `present` is true the flag is reported via
+/// [`ParseError::FlagNotApplicable`], matching the fail-fast policy used
+/// for unknown flags.
+fn reject_inapplicable_flag(
+    present: bool,
+    flag: &str,
+    backend: BackendKind,
+) -> Result<(), ParseError> {
+    if present {
+        return Err(ParseError::FlagNotApplicable {
+            flag: flag.to_owned(),
+            backend,
+        });
+    }
+    Ok(())
+}
+
 fn parse_bool_flag(name: &str, value: &str) -> Result<bool, ParseError> {
     parse_bool_value(value).ok_or_else(|| ParseError::InvalidFlagValue {
         name: name.to_owned(),
@@ -697,6 +753,10 @@ fn finish_s3(
     flags: RemoteFlags,
     addressing_override: Option<AddressingOverride>,
 ) -> Result<RemoteUrl, ParseError> {
+    // `credential` names an Azure credential alias and is consumed only
+    // by the Azure auth path; it is meaningless on S3.
+    reject_inapplicable_flag(flags.credential.is_some(), "credential", BackendKind::S3)?;
+
     let segments = path_segments(&endpoint);
 
     check_aws_s3_host(host)?;
@@ -822,6 +882,12 @@ fn finish_azure(
     flags: RemoteFlags,
     addressing_override: Option<AddressingOverride>,
 ) -> Result<RemoteUrl, ParseError> {
+    // `profile` selects an AWS named profile and `region` overrides the
+    // AWS SDK region; both are consumed only on the S3 path and have no
+    // meaning for Azure.
+    reject_inapplicable_flag(flags.profile.is_some(), "profile", BackendKind::Azure)?;
+    reject_inapplicable_flag(flags.region.is_some(), "region", BackendKind::Azure)?;
+
     let segments = path_segments(&endpoint);
 
     let addressing = match addressing_override {
@@ -1643,5 +1709,89 @@ mod tests {
                 if name == "bundle_uri" && value == "2"),
             "expected InvalidFlagValue(bundle_uri, 2), got {err:?}",
         );
+    }
+
+    // --- backend-specific flag pairing (issue #245) ----------------------
+
+    #[test]
+    fn azure_url_rejects_s3_only_profile_flag() {
+        let err =
+            parse("az+https://myaccount.blob.core.windows.net/my-container/repo?profile=prod")
+                .unwrap_err();
+        assert!(
+            matches!(&err, ParseError::FlagNotApplicable { flag, backend }
+                if flag == "profile" && *backend == BackendKind::Azure),
+            "expected FlagNotApplicable(profile, Azure), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn azure_url_rejects_s3_only_region_flag() {
+        let err =
+            parse("az+https://myaccount.blob.core.windows.net/my-container/repo?region=us-east-1")
+                .unwrap_err();
+        assert!(
+            matches!(&err, ParseError::FlagNotApplicable { flag, backend }
+                if flag == "region" && *backend == BackendKind::Azure),
+            "expected FlagNotApplicable(region, Azure), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn s3_url_rejects_azure_only_credential_flag() {
+        let err = parse("s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo?credential=ci-cd")
+            .unwrap_err();
+        assert!(
+            matches!(&err, ParseError::FlagNotApplicable { flag, backend }
+                if flag == "credential" && *backend == BackendKind::S3),
+            "expected FlagNotApplicable(credential, S3), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn inapplicable_flag_rejected_even_with_empty_value() {
+        // An empty value still records `Some("")`, so the pairing check
+        // must fire — fail-fast does not depend on the value being
+        // non-empty.
+        let err = parse("az+https://myaccount.blob.core.windows.net/my-container/repo?profile=")
+            .unwrap_err();
+        assert!(
+            matches!(&err, ParseError::FlagNotApplicable { flag, backend }
+                if flag == "profile" && *backend == BackendKind::Azure),
+            "expected FlagNotApplicable(profile, Azure), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn flag_not_applicable_message_names_flag_and_backend() {
+        let err =
+            parse("az+https://myaccount.blob.core.windows.net/my-container/repo?region=us-east-1")
+                .unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("`region`") && rendered.contains("Azure"),
+            "message must name the flag and backend, got `{rendered}`",
+        );
+    }
+
+    #[test]
+    fn valid_backend_flag_pairings_still_parse() {
+        // S3 consumes `profile` and `region`; Azure consumes
+        // `credential`. The pairing check must leave these untouched.
+        let s3 = parse(
+            "s3+https://my-bucket.s3.us-west-2.amazonaws.com/repo\
+             ?profile=prod&region=us-east-1",
+        )
+        .unwrap();
+        assert_eq!(s3.flags().profile.as_deref(), Some("prod"));
+        assert_eq!(s3.flags().region.as_deref(), Some("us-east-1"));
+        assert_eq!(s3.flags().credential, None);
+
+        let azure =
+            parse("az+https://myaccount.blob.core.windows.net/my-container/repo?credential=ci-cd")
+                .unwrap();
+        assert_eq!(azure.flags().credential.as_deref(), Some("ci-cd"));
+        assert_eq!(azure.flags().profile, None);
+        assert_eq!(azure.flags().region, None);
     }
 }
