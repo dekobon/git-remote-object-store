@@ -1,6 +1,6 @@
 //! Native git operations layered on top of [`gix`][gix].
 //!
-//! Operations that `gix` 0.82 exposes go through `gix` natively; config
+//! Operations that `gix` exposes go through `gix` natively; config
 //! reads/writes go through `gix-config` + `gix-lock` for atomic edits
 //! parity with `git config`. Bundle creation and consumption use the
 //! native `gix-pack`-based implementation in [`crate::bundle`]; no
