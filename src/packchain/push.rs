@@ -88,16 +88,9 @@ struct ReadyState {
     /// demotes it against a `PROTECTED#` marker; the protection
     /// check now runs under the lock.
     force: bool,
-    /// Whether the pre-lock chain.tip (when one existed) was an
-    /// ancestor of the local tip. Always `true` when there was no
-    /// prior chain. Used by [`perform_push_under_lock`] to render the
-    /// same `NotAncestor` wire error a pre-lock non-force probe would
-    /// have produced if a `PROTECTED#` marker lands between the
-    /// pre-lock work and the lock acquisition (issue #129).
-    prior_was_ancestor: bool,
     /// Original local refspec. Kept so the under-lock `NotAncestor`
     /// arm renders the same wire message a pre-lock non-force probe
-    /// would have produced (issue #129).
+    /// would have produced (issues #129, #243).
     local_spec: String,
     /// Owns the temp dir that backed the pack/idx/baseline files
     /// during the upload phase. Dropped after `perform_push_under_lock`
@@ -132,12 +125,6 @@ struct LocalGit {
     peeled: PeeledTip,
     prior_commit: Option<Sha>,
     cwd: PathBuf,
-    /// Whether the prior chain.tip (when one existed) was an ancestor
-    /// of the local tip. `true` when there was no prior chain. Always
-    /// computed (even on force-push) so [`perform_push_under_lock`] can
-    /// distinguish FF from non-FF if it discovers the ref became
-    /// `PROTECTED#` under the lock (issue #129).
-    prior_was_ancestor: bool,
 }
 
 /// Drive a batch of `push` commands sequentially against the packchain
@@ -297,9 +284,11 @@ async fn prepare_push(
     // check and the lock would let a force-push overwrite a now-
     // protected ref. The check now runs under the lock in
     // [`perform_push_under_lock`]. Pre-lock we just respect the user's
-    // intent; ancestry is still computed in `local_git_work_packchain`
-    // and stashed on `ReadyState` so the under-lock arm can emit the
-    // same NotAncestor wire error a non-force push would have produced.
+    // intent. Issue #243: the under-lock arm recomputes ancestry against
+    // the under-lock `current.tip` (not a pre-lock snapshot) before
+    // deciding whether a protected force-push is a legitimate
+    // fast-forward, so nothing here needs to stash a pre-lock ancestry
+    // bit.
     let force_push = force;
     debug!(local = %local_spec, remote = %remote_ref, force_push, "packchain push");
 
@@ -398,7 +387,6 @@ async fn prepare_push(
         pack_content_sha: pack.content_sha,
         pack_bytes: pack.pack_bytes,
         force: force_push,
-        prior_was_ancestor: local.prior_was_ancestor,
         local_spec,
         _temp_dir: temp_dir,
     })))
@@ -553,15 +541,15 @@ fn local_git_work_packchain(
     // push. The user must force-push to convert kinds — same contract
     // git itself uses for tag updates that aren't fast-forwards.
     //
-    // Issue #129: ancestry is always computed (even on force-push) so
-    // the caller can stash `prior_was_ancestor` on `ReadyState` and
-    // emit a NotAncestor wire error from under the lock if a concurrent
-    // `protect` lands while we hold the pre-lock work. The
-    // pack-build kind (`Baseline` vs `Incremental`) still keys off
-    // `force_push`: only a non-force push with a peeled commit ancestry
-    // produces a usable `prior_commit` for the incremental walker.
-    let (prior_commit, prior_was_ancestor) = match prior_tip {
-        None => (None, true),
+    // The pack-build kind (`Baseline` vs `Incremental`) keys off
+    // `prior_commit`: only a non-force push whose prior tip peels to a
+    // commit reachable from local produces a usable incremental base.
+    // Force-push ancestry against the *current* (under-lock) tip is
+    // recomputed in [`perform_push_under_lock`] via
+    // [`current_tip_is_ancestor_of_local`] (issue #243), so nothing
+    // pre-lock needs to stash whether the prior tip was an ancestor.
+    let prior_commit = match prior_tip {
+        None => None,
         Some(prior) => match (local_commit, git::peel_tag_chain(&repo, prior)) {
             (Some(local_commit_oid), Ok(PeeledTip::Commit { commit, .. })) => {
                 let ancestor =
@@ -571,14 +559,13 @@ fn local_git_work_packchain(
                 }
                 // Incremental pack base only when the push is non-force,
                 // commit-tipped, and the prior is reachable from local.
-                let prior_commit = (!force_push && ancestor).then_some(commit);
-                (prior_commit, ancestor)
+                (!force_push && ancestor).then_some(commit)
             }
             // Either side non-commit ⇒ kind mismatch ⇒ NotAncestor for
-            // non-force; force-push gets recorded as not-an-ancestor and
-            // proceeds with a Baseline pack. FindObject on the prior tip
-            // means it's not in the local ODB (synthesised remote-only
-            // OID, unrelated history) — also surface as not-an-ancestor.
+            // non-force; force-push falls through with no incremental
+            // base and proceeds with a Baseline pack. FindObject on the
+            // prior tip means it's not in the local ODB (synthesised
+            // remote-only OID, unrelated history) — also not an ancestor.
             (None, _)
             | (
                 _,
@@ -588,7 +575,7 @@ fn local_git_work_packchain(
                 if !force_push {
                     return Ok(Err(GitProbeError::NotAncestor));
                 }
-                (None, false)
+                None
             }
             (_, Err(e)) => return Err(PushError::Git(e)),
         },
@@ -609,8 +596,62 @@ fn local_git_work_packchain(
         peeled,
         prior_commit,
         cwd,
-        prior_was_ancestor,
     }))
+}
+
+/// Recompute, under the lock, whether the current chain tip is an
+/// ancestor of the local tip. Used by [`perform_push_under_lock`] to
+/// decide whether a force-push to a protected ref is a legitimate
+/// fast-forward (allowed — protection demotes force to FF-only) or a
+/// non-fast-forward overwrite (rejected with `NotAncestor`).
+///
+/// Issue #243: the pre-lock `prior_was_ancestor` is computed against the
+/// pre-lock `prior.tip`. A concurrent push that advances the protected
+/// ref between the pre-lock probe and lock acquisition leaves that value
+/// stale-true while the push is non-fast-forward relative to the tip read
+/// under the lock. The protection-demotion decision must therefore be
+/// evaluated against `current.tip` (read under the lock), not the stale
+/// pre-lock value.
+///
+/// Mirrors the pre-lock ancestry semantics in [`local_git_work_packchain`]:
+/// both sides are peeled through their tag chains; if either peels to a
+/// non-commit, or the current tip is absent from the local ODB
+/// ([`crate::git::GitError::FindObject`]), the answer is "not an ancestor"
+/// — a kind-mismatch or unrelated-history overwrite that force must not be
+/// allowed to slip past protection. Other peel errors propagate so a
+/// corrupted ODB surfaces a real diagnostic instead of a silent refusal.
+///
+/// Runs the `!Sync` `gix::Repository` work in `spawn_blocking` so the
+/// handle never crosses an `.await`.
+async fn current_tip_is_ancestor_of_local(
+    cwd: PathBuf,
+    current_tip: Sha40,
+    local_sha: Sha,
+) -> Result<bool, PushError> {
+    tokio::task::spawn_blocking(move || -> Result<bool, PushError> {
+        let current_tip_sha = Sha::from_hex(current_tip.as_str()).map_err(PushError::Sha)?;
+        let repo = gix::open(&cwd).map_err(|e| PushError::Git(crate::git::GitError::from(e)))?;
+
+        let local_commit = match git::peel_tag_chain(&repo, local_sha).map_err(PushError::Git)? {
+            PeeledTip::Commit { commit, .. } => commit,
+            PeeledTip::Tree { .. } | PeeledTip::Blob { .. } => return Ok(false),
+        };
+
+        let current_commit = match git::peel_tag_chain(&repo, current_tip_sha) {
+            Ok(PeeledTip::Commit { commit, .. }) => commit,
+            // Current tip peels to a non-commit (kind mismatch) or is not
+            // in the local ODB at all (`FindObject` ⇒ unrelated history):
+            // either way it is not an ancestor of local, so a force
+            // overwrite must be rejected rather than allowed.
+            Ok(PeeledTip::Tree { .. } | PeeledTip::Blob { .. })
+            | Err(crate::git::GitError::FindObject(_)) => return Ok(false),
+            Err(e) => return Err(PushError::Git(e)),
+        };
+
+        git::is_ancestor(&repo, current_commit, local_commit).map_err(PushError::Git)
+    })
+    .await
+    .map_err(|join_err| std::io::Error::other(join_err.to_string()))?
 }
 
 /// Returns `true` when `tip` is reachable through a `.git/shallow`
@@ -671,31 +712,52 @@ async fn perform_push_under_lock(
         pack_content_sha,
         pack_bytes,
         force,
-        prior_was_ancestor,
         local_spec,
         _temp_dir,
     } = state;
     let remote_ref_str = remote_ref.as_str().to_owned();
 
-    // Issue #129: under-lock force-push protection check. The pre-lock
-    // arm dropped its `is_protected` call so a concurrent `protect`
-    // could no longer race the lock. The historical "protected ref +
-    // force" semantic is "demote to non-force": fast-forward pushes go
-    // through, non-fast-forward pushes get the standard NotAncestor
-    // wire error. `is_protected` uses `head`, not `list`, so this adds
-    // one cheap probe and does not duplicate the chain.json re-read
-    // below.
-    if force && !prior_was_ancestor && is_protected(store, prefix, &remote_ref).await? {
-        return Ok(PushOutcome::Error {
-            remote_ref: remote_ref_str,
-            message: not_ancestor_wire_message(&local_spec),
-        });
-    }
-
-    // 1. Re-read chain.json under the lock.
+    // 1. Re-read chain.json under the lock. The current tip drives both
+    //    the stale-tip guard (step 2) and the under-lock force-push
+    //    protection check below — both must see the tip as it stands
+    //    under the lock, not a pre-lock snapshot.
     let current = load_chain(store, prefix, &remote_ref)
         .await
         .map_err(PushError::Packchain)?;
+
+    // Issue #129 / #243: under-lock force-push protection check. The
+    // pre-lock arm dropped its `is_protected` call so a concurrent
+    // `protect` could no longer race the lock. The historical "protected
+    // ref + force" semantic is "demote to non-force": fast-forward pushes
+    // go through, non-fast-forward pushes get the standard NotAncestor
+    // wire error.
+    //
+    // #243: the fast-forward test must run against `current.tip` (read
+    // under the lock above), not the pre-lock `prior_was_ancestor`. A
+    // concurrent push that advances the protected ref between the
+    // pre-lock ancestry probe and lock acquisition would leave that
+    // pre-lock value stale-true while the push is non-fast-forward
+    // relative to the current tip, letting a force overwrite slip past
+    // protection. `is_protected` uses `head`, not `list`, so the probe is
+    // cheap and does not duplicate the chain.json re-read above; the
+    // ancestry recompute only runs when the ref is both force-pushed and
+    // protected (the rare path), so the happy path pays nothing.
+    if force && is_protected(store, prefix, &remote_ref).await? {
+        let current_is_ancestor = match current.as_ref() {
+            // No prior chain ⇒ nothing to be non-FF relative to; the
+            // force-push creates the ref. Allowed.
+            None => true,
+            Some(c) => {
+                current_tip_is_ancestor_of_local(cwd.clone(), c.tip.clone(), local_sha).await?
+            }
+        };
+        if !current_is_ancestor {
+            return Ok(PushOutcome::Error {
+                remote_ref: remote_ref_str,
+                message: not_ancestor_wire_message(&local_spec),
+            });
+        }
+    }
 
     // 2. Stale-tip guard (skipped on force). Pre-lock uploads of pack
     //    + idx (and baseline, when applicable) become orphans for
@@ -2017,50 +2079,141 @@ mod tests {
         );
     }
 
-    // --- Issue #129: force-push protection check runs under the lock ---
+    // --- Issues #129 / #243: force-push protection runs under the lock,
+    //     evaluated against the under-lock current.tip ------------------
 
-    /// Build a [`ReadyState`] tailored for exercising the early
-    /// protection-rejection branch of [`perform_push_under_lock`].
-    /// The pre-existing pack/idx have already been uploaded by the
-    /// production code path; the test does not seed them because the
-    /// new protection check fires *before* the chain.json re-read or
-    /// the path-index walk, so the function returns without touching
-    /// any of those keys.
-    fn ready_state_for_protection_test(force: bool, prior_was_ancestor: bool) -> Box<ReadyState> {
-        let local_sha = Sha::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap();
+    /// A real git repo whose history is needed by the under-lock ancestry
+    /// recompute. `base` is the root commit; `local` is a child of `base`
+    /// (so `base` IS an ancestor of `local`); `divergent` is a *sibling*
+    /// child of `base` (so `divergent` is NOT an ancestor of `local`).
+    struct ProtectionFixture {
+        _dir: tempfile::TempDir,
+        cwd: PathBuf,
+        base: Sha,
+        local: Sha,
+        divergent: Sha,
+    }
+
+    /// Build the [`ProtectionFixture`]. Uses `gix` object writers
+    /// directly (no `git` binary) so the test stays hermetic and fast.
+    fn build_protection_fixture() -> ProtectionFixture {
+        use gix::objs::tree::{Entry, EntryKind};
+
+        let dir = tempfile::Builder::new()
+            .prefix("test_packchain_push_")
+            .tempdir()
+            .unwrap();
+        let repo = gix::init(dir.path()).expect("gix::init");
+
+        let sig = gix::actor::Signature {
+            name: "Test".into(),
+            email: "test@example.com".into(),
+            time: gix::date::Time::default(),
+        };
+        // Distinct trees give the sibling commits distinct OIDs even
+        // though they share a parent.
+        let write_tree = |content: &[u8], name: &str| {
+            let blob = repo.write_blob(content).expect("write blob").detach();
+            let tree = gix::objs::Tree {
+                entries: vec![Entry {
+                    mode: EntryKind::Blob.into(),
+                    filename: name.into(),
+                    oid: blob,
+                }],
+            };
+            repo.write_object(&tree).expect("write tree").detach()
+        };
+        let write_commit = |tree, parents: Vec<gix_hash::ObjectId>, msg: &str| {
+            let commit = gix::objs::Commit {
+                tree,
+                parents: parents.into(),
+                author: sig.clone(),
+                committer: sig.clone(),
+                encoding: None,
+                message: msg.into(),
+                extra_headers: Vec::new(),
+            };
+            repo.write_object(&commit).expect("write commit").detach()
+        };
+
+        let base = write_commit(write_tree(b"base\n", "f"), vec![], "base");
+        let local = write_commit(write_tree(b"local\n", "f"), vec![base], "local");
+        let divergent = write_commit(write_tree(b"div\n", "f"), vec![base], "divergent");
+
+        ProtectionFixture {
+            cwd: dir.path().to_owned(),
+            _dir: dir,
+            base: Sha::from_object_id(base),
+            local: Sha::from_object_id(local),
+            divergent: Sha::from_object_id(divergent),
+        }
+    }
+
+    /// Build a [`ReadyState`] whose `local_sha` is `local` and whose
+    /// `cwd` points at a real repo, so the under-lock ancestry recompute
+    /// has both tips available in the ODB.
+    fn ready_state_for_protection_test(
+        force: bool,
+        fixture: &ProtectionFixture,
+    ) -> Box<ReadyState> {
+        let local_sha = fixture.local;
         let local_sha40 = Sha40::from_oid(local_sha.as_object_id()).unwrap();
         let pack_content_sha = Sha40::try_new("1111111111111111111111111111111111111111").unwrap();
         let temp_dir = tempfile::Builder::new()
-            .prefix("test_packchain_push_")
+            .prefix("test_packchain_push_state_")
             .tempdir()
             .unwrap();
         Box::new(ReadyState {
             remote_ref: rn("refs/heads/main"),
             local_sha,
             local_sha40,
-            cwd: temp_dir.path().to_owned(),
+            cwd: fixture.cwd.clone(),
             prior: None,
             pack_content_sha,
             pack_bytes: 0,
             force,
-            prior_was_ancestor,
             local_spec: "refs/heads/main".to_owned(),
             _temp_dir: temp_dir,
         })
     }
 
-    /// Regression for issue #129 (packchain). A concurrent `protect`
-    /// that lands a `PROTECTED#` marker between the pre-lock work and
-    /// the lock acquisition must be observed by the under-lock arm of
-    /// `perform_push_under_lock`. With `force=true` and a non-FF push,
-    /// the engine must reject with the canonical `NotAncestor` wire
-    /// token rather than overwriting the now-protected ref.
+    /// Seed a `chain.json` under the lock whose `tip` is `tip_sha`. The
+    /// under-lock chain re-read (`load_chain`) returns this so the
+    /// ancestry recompute runs against `tip_sha`.
+    fn seed_chain_with_tip(store: &MockStore, tip_sha: Sha) {
+        let tip = Sha40::from_oid(tip_sha.as_object_id()).unwrap();
+        let body = format!(
+            r#"{{"v":1,"tip":"{tip}","full_at":"{tip}","segments":[]}}"#,
+            tip = tip.as_str(),
+        );
+        store.insert(
+            chain_key(Some("repo"), rn("refs/heads/main")),
+            Bytes::from(body),
+        );
+    }
+
+    /// Regression for issue #243 (packchain). The under-lock force-push
+    /// protection check must evaluate the fast-forward test against the
+    /// `current.tip` read UNDER the lock — not a pre-lock snapshot. Here
+    /// a concurrent push advanced the protected ref to `divergent` (a
+    /// sibling of `local`, NOT an ancestor) between the pre-lock probe
+    /// and lock acquisition. The engine must reject with the canonical
+    /// `NotAncestor` wire token rather than force-overwriting the
+    /// protected ref.
+    ///
+    /// Before the #243 fix this case would have been *allowed* whenever
+    /// the stale pre-lock `prior_was_ancestor` was true (e.g. the
+    /// pre-lock chain.tip was `base`).
     #[tokio::test]
-    async fn perform_push_under_lock_rejects_force_when_protected_under_lock_and_not_ff() {
+    async fn perform_push_under_lock_rejects_force_protected_when_current_tip_not_ancestor() {
+        let fixture = build_protection_fixture();
         let store = MockStore::new();
-        // Concurrent `protect` lands the marker before we get the lock.
+        // Concurrent `protect` lands the marker; a concurrent push moved
+        // the tip to `divergent` (non-FF relative to `local`).
         store.insert("repo/refs/heads/main/PROTECTED#", Bytes::from_static(b""));
-        let state = ready_state_for_protection_test(true, false);
+        seed_chain_with_tip(&store, fixture.divergent);
+
+        let state = ready_state_for_protection_test(true, &fixture);
         let outcome =
             perform_push_under_lock(&store, Some("repo"), StorageEngine::Packchain, *state)
                 .await
@@ -2071,59 +2224,89 @@ mod tests {
                 PushOutcome::Error { message, .. }
                     if message == r#""remote ref is not ancestor of refs/heads/main."?"#
             ),
-            "expected under-lock NotAncestor refusal, got {outcome:?}",
+            "expected under-lock NotAncestor refusal against current.tip, got {outcome:?}",
         );
         // Protection marker survives a refusal.
         assert!(store.contains("repo/refs/heads/main/PROTECTED#"));
-        // A refusal path that progressed past the protection check
-        // could have uploaded packchain artefacts before bailing.
-        // Assert none of those keys exist for this ref — only the
-        // `PROTECTED#` marker should be present under the ref prefix.
-        // Note: these are bucket keys (case-sensitive by S3/Azure
-        // contract), not filesystem paths, so the case-sensitive
-        // suffix check is correct.
+        // A refusal must not rewrite chain.json (still the divergent tip)
+        // nor write a path-index. Note: bucket keys are case-sensitive by
+        // S3/Azure contract, so the suffix check below is correct.
+        let chain = store
+            .get_bytes(&chain_key(Some("repo"), rn("refs/heads/main")))
+            .await
+            .expect("chain.json still present");
+        let parsed: serde_json::Value = serde_json::from_slice(&chain).unwrap();
+        let divergent40 = Sha40::from_oid(fixture.divergent.as_object_id()).unwrap();
+        assert_eq!(
+            parsed["tip"],
+            divergent40.as_str(),
+            "refused force-push must NOT advance the protected tip",
+        );
         #[allow(clippy::case_sensitive_file_extension_comparisons)]
-        let is_artefact = |k: &str| {
-            k.ends_with(".pack")
-                || k.ends_with(".idx")
-                || k.ends_with("/chain.json")
-                || k.ends_with("/path-index.json")
-        };
-        let ref_prefix = "repo/refs/heads/main/";
+        let is_artefact = |k: &str| k.ends_with("/path-index.json");
         let stray: Vec<String> = store
             .keys()
             .into_iter()
-            .filter(|k| k.starts_with(ref_prefix) && is_artefact(k))
+            .filter(|k| k.starts_with("repo/refs/heads/main/") && is_artefact(k))
             .collect();
         assert!(
             stray.is_empty(),
-            "refused push must not upload packchain artefacts, found: {stray:?}",
+            "refused push must not write a path-index, found: {stray:?}",
         );
     }
 
-    /// Companion to the rejection case: a legitimate force-push (force,
-    /// non-FF, no `PROTECTED#` marker) must NOT hit the protection
-    /// refusal. This pins the polarity of the AND-clause guarding the
-    /// rejection — a regression that dropped the `is_protected` term
-    /// would refuse every non-FF force-push, not just those against
-    /// protected refs.
-    ///
-    /// The packchain engine fails downstream against the empty tempdir
-    /// (no `.git` → path-index walk errors), so we cannot assert a
-    /// successful end-to-end outcome here. What we pin is the absence
-    /// of the `NotAncestor` wire token on every outcome arm: that token
-    /// would appear if and only if the protection guard mis-fired.
+    /// Companion to the rejection case (#243): a protected force-push
+    /// that IS a fast-forward relative to the under-lock `current.tip`
+    /// must NOT be refused. The concurrent advance moved the tip to
+    /// `base`, which IS an ancestor of `local`; protection demotes the
+    /// force to a fast-forward-only push, and a real fast-forward is
+    /// allowed through. Pins that the recompute distinguishes FF from
+    /// non-FF rather than refusing every protected force-push.
+    #[tokio::test]
+    async fn perform_push_under_lock_allows_force_protected_when_current_tip_is_ancestor() {
+        let fixture = build_protection_fixture();
+        let store = MockStore::new();
+        store.insert("repo/refs/heads/main/PROTECTED#", Bytes::from_static(b""));
+        // current.tip == base, an ancestor of local → fast-forward.
+        seed_chain_with_tip(&store, fixture.base);
+
+        let state = ready_state_for_protection_test(true, &fixture);
+        let outcome =
+            perform_push_under_lock(&store, Some("repo"), StorageEngine::Packchain, *state).await;
+        // The function proceeds past the protection check and commits the
+        // fast-forward. What we pin is the *absence* of the NotAncestor
+        // refusal on every arm — that token appears iff the guard
+        // mis-classified a fast-forward as non-FF.
+        match outcome {
+            Ok(PushOutcome::Ok { .. }) => {}
+            Ok(PushOutcome::Error { message, .. }) => assert!(
+                !message.contains("not ancestor"),
+                "fast-forward protected force-push must not emit NotAncestor: {message:?}",
+            ),
+            Err(e) => assert!(
+                !e.to_string().contains("not ancestor"),
+                "fast-forward protected force-push must not emit NotAncestor: {e}",
+            ),
+        }
+    }
+
+    /// A legitimate force-push (force, non-FF, but NO `PROTECTED#`
+    /// marker) must NOT hit the protection refusal even though it is
+    /// non-fast-forward. Pins the polarity of the `force && is_protected`
+    /// guard: a regression dropping the `is_protected` term would refuse
+    /// every non-FF force-push, protected or not.
     #[tokio::test]
     async fn perform_push_under_lock_allows_force_when_not_ancestor_and_not_protected() {
+        let fixture = build_protection_fixture();
         let store = MockStore::new();
-        // No PROTECTED# marker seeded.
-        let state = ready_state_for_protection_test(true, false);
+        // No PROTECTED# marker. current.tip == divergent (non-FF).
+        seed_chain_with_tip(&store, fixture.divergent);
+
+        let state = ready_state_for_protection_test(true, &fixture);
         let outcome =
             perform_push_under_lock(&store, Some("repo"), StorageEngine::Packchain, *state).await;
         match outcome {
-            Ok(PushOutcome::Ok { .. }) => {
-                // Passed every stage including the bypassed guard.
-            }
+            Ok(PushOutcome::Ok { .. }) => {}
             Ok(PushOutcome::Error { message, .. }) => assert!(
                 !message.contains("not ancestor"),
                 "unprotected force-push must not emit NotAncestor: {message:?}",
@@ -2135,45 +2318,29 @@ mod tests {
         }
     }
 
-    /// Non-force pushes must not consult `is_protected` under the
-    /// lock: by the time control reaches `perform_push_under_lock` a
-    /// non-force non-FF push has already been rejected by the
-    /// pre-lock ancestry probe, and a non-force FF push is unaffected
-    /// by protection. The under-lock check is gated on `force` to
-    /// keep the happy path free of an extra HEAD round-trip.
+    /// Non-force pushes must not consult `is_protected` under the lock:
+    /// by the time control reaches `perform_push_under_lock` a non-force
+    /// non-FF push has already been rejected by the pre-lock ancestry
+    /// probe, and a non-force FF push is unaffected by protection. The
+    /// under-lock check is gated on `force` to keep the happy path free
+    /// of an extra HEAD round-trip.
     ///
-    /// We trigger an early non-`Ok` outcome from a downstream stage
-    /// (the chain.json reload) to verify the function progressed past
-    /// the protection check rather than short-circuiting on it.
+    /// `current.tip == divergent` (non-FF) so a regression that ran the
+    /// recompute for non-force pushes would surface the `NotAncestor` wire
+    /// token; its absence pins that the check is bypassed.
     #[tokio::test]
     async fn perform_push_under_lock_skips_protection_check_for_non_force() {
+        let fixture = build_protection_fixture();
         let store = MockStore::new();
         // Marker present, but a non-force push must not even probe for it.
         store.insert("repo/refs/heads/main/PROTECTED#", Bytes::from_static(b""));
-        // prior_was_ancestor=false: keep the `!prior_was_ancestor` clause
-        // TRUE so the only clause holding the guard
-        // `force && !prior_was_ancestor && is_protected(...)` off is `force`
-        // itself. Using `prior_was_ancestor=true` would short-circuit on the
-        // second clause and silently mask a regression that dropped the
-        // leading `force &&` from production.
-        let state = ready_state_for_protection_test(false, false);
-        // We expect the call to progress past the protection check
-        // and fail downstream (chain.json absent → path-index walk
-        // against a tempdir without a git repo). What we're pinning is
-        // that the failure is NOT the NotAncestor protection refusal —
-        // a regression that ran the check for non-force pushes would
-        // surface as that exact wire token.
+        seed_chain_with_tip(&store, fixture.divergent);
+
+        let state = ready_state_for_protection_test(false, &fixture);
         let outcome =
             perform_push_under_lock(&store, Some("repo"), StorageEngine::Packchain, *state).await;
-        // Pin that the protection check is bypassed for non-force pushes,
-        // regardless of whether the rest of the push happens to succeed
-        // in this test setup. A regression that ran the check for
-        // non-force pushes would surface as the `not ancestor` wire token
-        // on either the Ok-with-Error or the Err arm.
         match outcome {
-            Ok(PushOutcome::Ok { .. }) => {
-                // Passed every stage including the bypassed check.
-            }
+            Ok(PushOutcome::Ok { .. }) => {}
             Ok(PushOutcome::Error { message, .. }) => assert!(
                 !message.contains("not ancestor"),
                 "non-force push must not hit the protection rejection: {message:?}",
