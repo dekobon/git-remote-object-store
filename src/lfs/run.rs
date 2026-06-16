@@ -249,10 +249,16 @@ where
 
 /// Validate `oid_raw` at the run-loop boundary. Returns `Some(oid)`
 /// on success (the caller dispatches into the agent), or `None`
-/// after emitting a `complete` event with an empty `oid` field and
-/// the raw rejected value folded into the `error.message`. The
-/// `op` label flows into the warn-log so an operator can correlate
-/// the rejection with the source event line.
+/// after emitting a `complete` event that echoes the raw rejected
+/// `oid_raw` in the wire `oid` field — so git-lfs can correlate the
+/// failure back to the pending transfer — with the validation error
+/// in `error.message`. The `op` label flows into the warn-log so an
+/// operator can correlate the rejection with the source event line.
+///
+/// `oid_raw` is wire-only: it is serde-escaped into the `complete`
+/// event and never used as a storage key. Only the validated
+/// [`LfsOid`] returned on the success path ever reaches a bucket key,
+/// so echoing the raw value carries no key-injection risk.
 async fn validate_oid<W: AsyncWrite + Unpin>(
     oid_raw: &str,
     writer: &mut W,
@@ -265,7 +271,7 @@ async fn validate_oid<W: AsyncWrite + Unpin>(
             let message = format!("invalid oid `{oid_raw}`: {err}");
             let evt = CompleteEvent {
                 event: "complete",
-                oid: "",
+                oid: oid_raw,
                 path: None,
                 error: Some(ErrorPayload {
                     code: ERR_CODE_GENERIC,
@@ -525,12 +531,12 @@ mod tests {
 
     /// F-009: oid validation moved to the run-loop boundary. A
     /// malformed oid on an `upload` event must surface as a
-    /// `complete` event with an empty `oid` field and the raw
-    /// rejected value folded into the `error.message` so the
-    /// operator can correlate the failure with the source event
-    /// line.
+    /// `complete` event that echoes the raw rejected oid in the wire
+    /// `oid` field (so git-lfs can correlate the failure back to the
+    /// pending transfer) with the validation error folded into
+    /// `error.message`.
     #[tokio::test]
-    async fn upload_with_invalid_oid_emits_complete_with_empty_oid() {
+    async fn upload_with_invalid_oid_echoes_raw_oid_in_complete() {
         let store = MockStore::new();
         let resolver = StubResolver {
             store,
@@ -559,21 +565,22 @@ mod tests {
             .iter()
             .find(|l| l.contains("\"event\":\"complete\""))
             .expect("complete event present");
-        // Byte-exact assertion on the wire format. Per the LFS
-        // spec we surface an empty oid field (we never had a
-        // validated id) and place the raw rejected string in the
-        // error message.
+        // Byte-exact assertion on the wire format. The raw rejected
+        // oid is echoed in the `oid` field so git-lfs can correlate
+        // the failure with the pending transfer; the rejected string
+        // also appears (serde-escaped) in the error message.
         assert_eq!(
             complete_line.as_str(),
-            r#"{"event":"complete","oid":"","error":{"code":2,"message":"invalid oid `not-a-real-oid`: LFS oid must be 64 chars, got 14"}}"#,
+            r#"{"event":"complete","oid":"not-a-real-oid","error":{"code":2,"message":"invalid oid `not-a-real-oid`: LFS oid must be 64 chars, got 14"}}"#,
         );
     }
 
     /// F-009: the same shape for `download`. Validation lives in the
     /// run loop, the agent is never reached, and the wire-format
-    /// failure event matches the upload case.
+    /// failure event echoes the raw rejected oid just like the upload
+    /// case.
     #[tokio::test]
-    async fn download_with_invalid_oid_emits_complete_with_empty_oid() {
+    async fn download_with_invalid_oid_echoes_raw_oid_in_complete() {
         let store = MockStore::new();
         let resolver = StubResolver {
             store,
@@ -592,17 +599,44 @@ mod tests {
             .iter()
             .find(|l| l.contains("\"event\":\"complete\""))
             .expect("complete event present");
-        assert!(
-            complete_line.contains(r#""oid":"""#),
-            "wire-format oid field must be empty for validation failure: {complete_line}"
+        // Byte-exact assertion: the raw rejected oid is echoed in the
+        // wire `oid` field so git-lfs can correlate the failure, and
+        // the rejected string also appears in the error message.
+        assert_eq!(
+            complete_line.as_str(),
+            r#"{"event":"complete","oid":"DEADBEEF","error":{"code":2,"message":"invalid oid `DEADBEEF`: LFS oid must be 64 chars, got 8"}}"#,
         );
-        assert!(
-            complete_line.contains(&format!("invalid oid `{bad_oid}`")),
-            "raw rejected oid must appear in the error message: {complete_line}"
-        );
-        assert!(
-            complete_line.contains(r#""code":2"#),
-            "error code must be the generic value 2: {complete_line}"
+    }
+
+    /// F-009: a 64-char uppercase-hex oid trips the `NotLowerHex`
+    /// branch (correct length, wrong case) rather than the length
+    /// branch the short-oid cases above exercise. The exact bytes
+    /// emitted on the wire — including the verbatim uppercase oid in
+    /// the `oid` field — are pinned here.
+    #[tokio::test]
+    async fn download_with_uppercase_oid_echoes_exact_bytes() {
+        let store = MockStore::new();
+        let resolver = StubResolver {
+            store,
+            prefix: Some("repo".to_owned()),
+        };
+        let tmp = TempDir::new().unwrap();
+        // 64 uppercase hex chars: right length, wrong case.
+        let bad_oid = "FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210";
+        let events = vec![
+            r#"{"event":"init","operation":"download","remote":"origin"}"#.to_owned(),
+            format!(r#"{{"event":"download","oid":"{bad_oid}","size":1}}"#),
+            r#"{"event":"terminate"}"#.to_owned(),
+        ];
+        let (lines, res) = drive(&events, &resolver, tmp.path()).await;
+        res.expect("run completes despite bad oid");
+        let complete_line = lines
+            .iter()
+            .find(|l| l.contains("\"event\":\"complete\""))
+            .expect("complete event present");
+        assert_eq!(
+            complete_line.as_str(),
+            r#"{"event":"complete","oid":"FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210","error":{"code":2,"message":"invalid oid `FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210`: LFS oid must be lowercase hex (0-9, a-f)"}}"#,
         );
     }
 
