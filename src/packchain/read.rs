@@ -523,6 +523,21 @@ enum ObjectKind {
     Tag,
 }
 
+impl ObjectKind {
+    /// Project to the `gix-object` kind so the resolved payload can be
+    /// re-hashed through [`gix::objs::compute_hash`] for the read-time
+    /// content-integrity check. The two enums are 1:1; this is a total,
+    /// infallible mapping.
+    fn to_gix_kind(self) -> gix::objs::Kind {
+        match self {
+            Self::Blob => gix::objs::Kind::Blob,
+            Self::Commit => gix::objs::Kind::Commit,
+            Self::Tree => gix::objs::Kind::Tree,
+            Self::Tag => gix::objs::Kind::Tag,
+        }
+    }
+}
+
 /// Validate `path` and split it on `/`.
 ///
 /// Rejects shapes that don't map to git tree semantics: empty paths,
@@ -644,6 +659,17 @@ async fn read_object_from_chain(
             depth,
         ))
         .await?;
+        // Defense-in-depth (issue #247): the `.idx` OID→offset table and
+        // the pack trailer are only validated at build time. A tampered
+        // or corrupt bucket can rewrite an entry's bytes (or remap the
+        // `.idx`) so this offset decodes to content that is *not*
+        // `target_oid`. Re-hash the reconstituted object here — the
+        // single resolution boundary every entry kind funnels through
+        // (non-delta, OFS_DELTA, and REF_DELTA all return via this
+        // `Ok`) — and refuse to hand back mismatched bytes. The hash is
+        // O(payload) but the payload is already capped at
+        // `MAX_DECOMPRESSED_BYTES`, so the cost is bounded.
+        verify_content_hash(target_oid, &resolved)?;
         return Ok(resolved);
     }
     Err(PackchainError::BlobNotInChain {
@@ -652,6 +678,37 @@ async fn read_object_from_chain(
         sha: target_oid.to_string(),
         path: String::new(),
     })
+}
+
+/// Re-hash a fully reconstituted object and confirm its git object id
+/// equals the OID the caller resolved via the `.idx` (issue #247).
+///
+/// [`gix::objs::compute_hash`] frames the canonical loose-object header
+/// (`<kind> <len>\0`) ahead of the payload and hashes the lot with the
+/// chain's hash kind (SHA-1 today, matching the `gix_hash::Kind::Sha1`
+/// the `.idx`/pack layer is parsed with). It borrows the payload, so no
+/// extra copy of the (already-capped) bytes is made. On mismatch the
+/// caller must treat the bytes as untrusted and refuse to return them.
+fn verify_content_hash(
+    target_oid: &gix_hash::ObjectId,
+    resolved: &ResolvedObject,
+) -> Result<(), PackchainError> {
+    let actual = gix::objs::compute_hash(
+        gix_hash::Kind::Sha1,
+        resolved.kind.to_gix_kind(),
+        &resolved.payload,
+    )
+    .map_err(|e| PackchainError::MalformedPackEntry {
+        offset: 0,
+        reason: format!("content-hash computation failed: {e}"),
+    })?;
+    if &actual != target_oid {
+        return Err(PackchainError::ContentHashMismatch {
+            expected: target_oid.to_string(),
+            actual: actual.to_string(),
+        });
+    }
+    Ok(())
 }
 
 async fn load_index(
@@ -2383,6 +2440,17 @@ mod tests {
         data
     }
 
+    /// Compute the real git blob OID for `payload` — the SHA-1 of
+    /// `blob <len>\0` + payload. Tests that drive the full
+    /// `read_object_from_chain` path must register this exact OID in the
+    /// `.idx` (rather than an arbitrary sha) so the read-time
+    /// content-hash check (issue #247) accepts the decoded bytes.
+    fn blob_oid_for(payload: &[u8]) -> Sha40 {
+        let oid = gix::objs::compute_hash(gix_hash::Kind::Sha1, gix::objs::Kind::Blob, payload)
+            .expect("blob hash");
+        Sha40::from_oid(&oid).expect("oid is 40-hex by construction")
+    }
+
     /// Convenience: turn the `tip_hex` and `pack_sha_hex` strings into
     /// a serialised chain.json `Bytes` body the wrapper can return.
     fn chain_json_bytes(tip_hex: &str, pack_sha_hex: &str) -> Bytes {
@@ -2406,12 +2474,12 @@ mod tests {
         let p1_sha = sha40(SHA_A);
         let p2_sha = sha40(SHA_B);
         let blob_payload = b"recovered blob";
-        // The blob's git OID — `gix_hash::ObjectId` for "hello blob"
-        // shape. We don't compute the real git sha here; we register
-        // the same sha in both the .idx names table and in
-        // `target_oid` so `gix_pack::index::File::lookup` returns the
-        // single object.
-        let blob_oid_sha = sha40(SHA_C);
+        // The blob's real git OID. It must be the genuine
+        // `blob <len>\0`+payload SHA-1 so the read-time content-hash
+        // check (issue #247) accepts the decoded entry; the same sha is
+        // registered in the .idx names table and used as `target_oid`
+        // so `gix_pack::index::File::lookup` returns the single object.
+        let blob_oid_sha = blob_oid_for(blob_payload);
         let blob_oid = sha40_to_object_id(&blob_oid_sha);
 
         // Build a P2 pack containing one Blob entry at offset 0.
@@ -2499,7 +2567,9 @@ mod tests {
         let p1_sha = sha40(SHA_A);
         let p2_sha = sha40(SHA_B);
         let blob_payload = b"recovered blob";
-        let blob_oid_sha = sha40(SHA_C);
+        // Real blob OID so the content-hash check (issue #247) accepts
+        // the decoded entry on the retry path.
+        let blob_oid_sha = blob_oid_for(blob_payload);
         let blob_oid = sha40_to_object_id(&blob_oid_sha);
 
         // Build the P2 pack + idx so the retry's read finds the blob.
@@ -2781,5 +2851,168 @@ mod tests {
             0,
             "armed chain-reload fault must have fired exactly once"
         );
+    }
+
+    // --- read-time content-hash verification (issue #247) ------------------
+    //
+    // `read_object_from_chain` re-hashes the reconstituted object and
+    // refuses to return bytes whose git OID disagrees with the OID the
+    // caller resolved via the `.idx`. These tests pin both the unit-level
+    // `verify_content_hash` boundary and the full-path behaviour when a
+    // tampered `.idx` maps an OID to mismatched content.
+
+    /// `verify_content_hash` accepts a payload whose real git blob OID
+    /// matches `target_oid`. Without this positive case a regression that
+    /// always returned `ContentHashMismatch` would still pass the
+    /// negative tests below.
+    #[test]
+    fn verify_content_hash_accepts_matching_blob() {
+        let payload = b"the quick brown fox";
+        let oid = sha40_to_object_id(&blob_oid_for(payload));
+        let resolved = ResolvedObject {
+            payload: payload.to_vec(),
+            kind: ObjectKind::Blob,
+        };
+        verify_content_hash(&oid, &resolved).expect("matching content must verify");
+    }
+
+    /// Empty-blob boundary: git's empty blob hashes
+    /// `blob 0\0` (the well-known `e69de29…` OID). The framing must
+    /// include the zero-length header, so an empty payload still
+    /// verifies against the correct OID.
+    #[test]
+    fn verify_content_hash_accepts_empty_blob() {
+        let payload = b"";
+        let oid = sha40_to_object_id(&blob_oid_for(payload));
+        assert_eq!(
+            oid.to_string(),
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+            "empty blob must hash to git's canonical empty-blob OID",
+        );
+        let resolved = ResolvedObject {
+            payload: payload.to_vec(),
+            kind: ObjectKind::Blob,
+        };
+        verify_content_hash(&oid, &resolved).expect("empty blob must verify");
+    }
+
+    /// `verify_content_hash` rejects a payload whose real OID differs
+    /// from `target_oid`, surfacing `ContentHashMismatch` with both the
+    /// expected and actual OIDs.
+    #[test]
+    fn verify_content_hash_rejects_mismatched_content() {
+        // `target_oid` names a different blob than `resolved` carries.
+        let expected_oid = sha40_to_object_id(&blob_oid_for(b"intended content"));
+        let resolved = ResolvedObject {
+            payload: b"tampered content".to_vec(),
+            kind: ObjectKind::Blob,
+        };
+        let err = verify_content_hash(&expected_oid, &resolved)
+            .expect_err("mismatched content must be rejected");
+        let PackchainError::ContentHashMismatch { expected, actual } = err else {
+            panic!("expected ContentHashMismatch, got {err:?}");
+        };
+        assert_eq!(expected, expected_oid.to_string());
+        let actual_oid = sha40_to_object_id(&blob_oid_for(b"tampered content"));
+        assert_eq!(actual, actual_oid.to_string());
+        assert_ne!(expected, actual);
+    }
+
+    /// Full-path security regression: a `.idx` maps `target_oid` to an
+    /// offset whose entry decodes to *different* content. The build-time
+    /// `.idx`/pack-trailer checks are bypassed (the bucket is tampered),
+    /// so `read_object_from_chain` must catch the divergence at read time
+    /// and surface `ContentHashMismatch` rather than return wrong bytes.
+    #[tokio::test]
+    async fn read_object_from_chain_rejects_idx_mapped_wrong_content() {
+        let inner = MockStore::new();
+        let cache = PackIndexCache::default();
+        let pack_sha = sha40(SHA_A);
+
+        // The pack entry actually decodes to "actual stored bytes"…
+        let actual_payload = b"actual stored bytes";
+        let mut pack = Vec::new();
+        let mut offsets = Vec::new();
+        push_pack_entry(
+            &mut pack,
+            &mut offsets,
+            3, /* BLOB */
+            None,
+            actual_payload,
+        );
+        inner.insert(pack_key(None, &pack_sha), Bytes::from(pack));
+
+        // …but the `.idx` claims that offset holds the blob whose OID is
+        // the hash of "what the caller wanted" — a tampered/corrupt
+        // mapping. The lookup will resolve `target_oid` to offset 0,
+        // which decodes to `actual_payload`, whose hash differs.
+        let lie_oid_sha = blob_oid_for(b"what the caller wanted");
+        let idx_bytes = build_one_object_v2_idx(&lie_oid_sha, 0);
+        inner.insert(pack_idx_key(None, &pack_sha), Bytes::from(idx_bytes));
+
+        let chain = make_chain_with(SHA_A, pack_sha.as_str());
+        let target_oid = sha40_to_object_id(&lie_oid_sha);
+        let mut depth = 0u32;
+        let err = read_object_from_chain(
+            &inner,
+            None,
+            &chain.segments,
+            &target_oid,
+            &cache,
+            &mut depth,
+        )
+        .await
+        .expect_err("idx-mapped wrong content must be rejected");
+        let PackchainError::ContentHashMismatch { expected, actual } = err else {
+            panic!("expected ContentHashMismatch, got {err:?}");
+        };
+        assert_eq!(
+            expected,
+            target_oid.to_string(),
+            "expected OID must be the caller's requested OID",
+        );
+        let actual_oid = sha40_to_object_id(&blob_oid_for(actual_payload));
+        assert_eq!(
+            actual,
+            actual_oid.to_string(),
+            "actual OID must be the hash of the bytes really stored",
+        );
+    }
+
+    /// Companion positive case: when the `.idx` maps `target_oid` to an
+    /// entry that genuinely decodes to that blob, `read_object_from_chain`
+    /// returns the payload. This proves the negative test above fails
+    /// specifically on the hash mismatch, not on some unrelated wiring.
+    #[tokio::test]
+    async fn read_object_from_chain_returns_matching_content() {
+        let inner = MockStore::new();
+        let cache = PackIndexCache::default();
+        let pack_sha = sha40(SHA_A);
+
+        let payload = b"honest stored bytes";
+        let mut pack = Vec::new();
+        let mut offsets = Vec::new();
+        push_pack_entry(&mut pack, &mut offsets, 3 /* BLOB */, None, payload);
+        inner.insert(pack_key(None, &pack_sha), Bytes::from(pack));
+
+        let oid_sha = blob_oid_for(payload);
+        let idx_bytes = build_one_object_v2_idx(&oid_sha, 0);
+        inner.insert(pack_idx_key(None, &pack_sha), Bytes::from(idx_bytes));
+
+        let chain = make_chain_with(SHA_A, pack_sha.as_str());
+        let target_oid = sha40_to_object_id(&oid_sha);
+        let mut depth = 0u32;
+        let resolved = read_object_from_chain(
+            &inner,
+            None,
+            &chain.segments,
+            &target_oid,
+            &cache,
+            &mut depth,
+        )
+        .await
+        .expect("matching content must resolve");
+        assert_eq!(resolved.payload, payload);
+        assert_eq!(resolved.kind, ObjectKind::Blob);
     }
 }

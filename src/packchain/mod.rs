@@ -367,6 +367,27 @@ pub enum PackchainError {
         /// assert on it.
         attempts: u32,
     },
+
+    /// A pack entry the `.idx` mapped to the requested OID decoded to
+    /// content whose git object id does not match. The `.idx`
+    /// OID-to-offset table and the pack trailer are validated at build
+    /// time, but a tampered or corrupted bucket can rewrite an entry's
+    /// bytes (or its `.idx` mapping) after the fact. [`read::read_blob`]
+    /// re-hashes the reconstituted object (`<kind> <len>\0` + payload)
+    /// at the resolution boundary and refuses to return bytes whose SHA
+    /// disagrees with the OID the caller resolved — defense-in-depth
+    /// against returning wrong content from an untrusted store
+    /// (issue #247).
+    #[error(
+        "packchain content-hash mismatch: entry mapped to {expected} \
+         decoded to an object hashing as {actual}; bucket is corrupt or tampered"
+    )]
+    ContentHashMismatch {
+        /// The OID the caller resolved via the `.idx` lookup.
+        expected: String,
+        /// The OID the reconstituted object actually hashes to.
+        actual: String,
+    },
 }
 
 impl From<gix_pack::bundle::write::Error> for PackchainError {
