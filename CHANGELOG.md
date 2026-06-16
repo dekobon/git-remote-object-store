@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- packchain: `read_blob` now re-hashes each reconstituted object against
+  its requested OID and returns a typed `ContentHashMismatch` error rather
+  than trusting the pack `.idx` mapping, hardening direct reads against
+  tampered or corrupt buckets (#247).
+
+### Fixed
+
+- protocol/push: zip-mode ref deletes no longer assert the on-bucket key
+  count against the URL's `zip` flag. A `?zip=1` ref with only its
+  `<sha>.bundle` (no `repo.zip`), and a non-zip URL deleting a ref with a
+  leftover `repo.zip`, now delete cleanly instead of being refused with a
+  spurious "multiple bundles exist" error. Deletability is decided by entry
+  shape; genuine multi-bundle corruption is still rejected and protected
+  refs are still refused first (#242).
+- packchain: protected force-push now evaluates the fast-forward check
+  against the ref tip read under the lock instead of a stale pre-lock
+  snapshot, closing a race where a concurrent ref advance let a
+  non-fast-forward force-push overwrite a protected ref (#243).
+- lfs: on an invalid oid the transfer agent's `complete` wire event now
+  echoes the raw rejected oid in its `oid` field (previously empty), so
+  git-lfs can correlate the failure with the pending transfer instead of
+  hanging. The raw value is wire-only and never used as a storage key
+  (#244).
+- url: backend-specific query flags are now rejected when used on the wrong
+  backend (`profile`/`region` on Azure, `credential` on S3) instead of
+  being silently ignored, via the new `ParseError::FlagNotApplicable`
+  variant (#245).
+- url: `?bundle_uri_presign_ttl=<seconds>` is rejected unless both
+  `?engine=packchain` and `?bundle_uri=1` are set; previously it was
+  accepted and stored as a silent no-op (#246).
+
+### Documentation
+
+- lfs: corrected the `UploadEvent.size` / `DownloadEvent.size` doc comments
+  to note the field is accepted per the protocol event but currently unused
+  (the byte count is reconstructed from transferred chunks) (#248).
+- git: reworded the `src/git.rs` module doc to drop the stale pinned `gix`
+  minor version from prose (#249).
+
 ## [0.2.4] - 2026-06-08
 
 Maintenance release. No library or CLI source changes — dependency
