@@ -45,7 +45,9 @@ pub(crate) struct InitEvent {
 pub(crate) struct UploadEvent {
     /// LFS object id (lowercase SHA-256 hex).
     pub(crate) oid: String,
-    /// Body length in bytes (used for the final progress event).
+    /// Body length in bytes. Accepted as part of the protocol event but
+    /// currently unused — progress and the final byte count are
+    /// reconstructed from the chunks actually transferred.
     pub(crate) size: u64,
     /// Local file containing the body to upload.
     pub(crate) path: String,
@@ -56,7 +58,9 @@ pub(crate) struct UploadEvent {
 pub(crate) struct DownloadEvent {
     /// LFS object id (lowercase SHA-256 hex).
     pub(crate) oid: String,
-    /// Body length in bytes.
+    /// Body length in bytes. Accepted as part of the protocol event but
+    /// currently unused — progress and the final byte count are
+    /// reconstructed from the chunks actually transferred.
     pub(crate) size: u64,
 }
 
