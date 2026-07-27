@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- deps: bumped `anyhow` to 1.0.104, clearing RUSTSEC-2026-0190
+  (unsoundness in `Error::downcast_mut`), and `spin` to 0.10.1 off the
+  yanked 0.10.0.
 - packchain: `read_blob` now re-hashes each reconstituted object against
   its requested OID and returns a typed `ContentHashMismatch` error rather
   than trusting the pack `.idx` mapping, hardening direct reads against
