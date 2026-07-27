@@ -1,7 +1,7 @@
 //! Service-blob SAS token generation for the `bundle-uri`
 //! presigned-URL feature (issue #76).
 //!
-//! `azure_storage_blob` 0.12 ships no high-level SAS-token helper, so
+//! `azure_storage_blob` 1.0 ships no high-level SAS-token helper, so
 //! we hand-build the `sv=2022-11-02` service-blob SAS per the
 //! Microsoft spec: <https://learn.microsoft.com/en-us/rest/api/storageservices/create-service-sas>.
 //!
