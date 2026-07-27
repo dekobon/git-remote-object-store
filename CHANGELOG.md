@@ -10,7 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - deps: bumped `anyhow` to 1.0.104, clearing RUSTSEC-2026-0190
-  (unsoundness in `Error::downcast_mut`), and `spin` to 0.10.1 off the
+  (unsoundness in `Error::downcast_mut`), `memmap2` (via `gix`) to
+  0.9.11, clearing RUSTSEC-2026-0186 (unchecked pointer offset in the
+  `advise_range` / `flush_range` family), and `spin` to 0.10.1 off the
   yanked 0.10.0.
 - azure: upgraded the Azure SDK to the GA line (`azure_core` 1.1,
   `azure_storage_blob` 1.0, `azure_identity` 1.0), which pulls in
