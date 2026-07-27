@@ -156,7 +156,7 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
 
 # Azure core — `tests/azure_store_integration.rs` imports `Method` and
 # header types directly for the one-off container-setup HTTP call.
-azure_core = "0.35"
+azure_core = "1.1"
 
 # HTTP client — `tests/azure_store_integration.rs` builds a `reqwest::Client`
 # for the signed container-setup request. Must match the library's feature set.

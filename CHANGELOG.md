@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - deps: bumped `anyhow` to 1.0.104, clearing RUSTSEC-2026-0190
   (unsoundness in `Error::downcast_mut`), and `spin` to 0.10.1 off the
   yanked 0.10.0.
+- azure: upgraded the Azure SDK to the GA line (`azure_core` 1.1,
+  `azure_storage_blob` 1.0, `azure_identity` 1.0), which pulls in
+  `quick-xml` 0.41 and clears RUSTSEC-2026-0194 (quadratic duplicate
+  attribute-name scan) and RUSTSEC-2026-0195 (unbounded
+  namespace-declaration allocation in `NsReader`).
 - packchain: `read_blob` now re-hashes each reconstituted object against
   its requested OID and returns a typed `ContentHashMismatch` error rather
   than trusting the pack `.idx` mapping, hardening direct reads against

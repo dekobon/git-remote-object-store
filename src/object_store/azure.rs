@@ -11,7 +11,7 @@
 //!
 //! ## Authentication
 //!
-//! The official `azure_storage_blob` 0.12 crate currently exposes only
+//! The official `azure_storage_blob` 1.0 crate currently exposes only
 //! `Arc<dyn TokenCredential>` (Entra ID) on its constructors. Azurite
 //! does not implement Entra ID without an `--oauth basic` HTTPS setup,
 //! and many production accounts still authenticate with shared keys.
@@ -38,7 +38,7 @@
 //!
 //! [`put_if_absent`][super::ObjectStore::put_if_absent] uses
 //! `If-None-Match: "*"` (the SDK's
-//! `BlockBlobClientUploadOptions::with_if_not_exists` convenience).
+//! `BlockBlobClientUploadOptions::if_not_exists` convenience).
 //! Azure returns 409 (`BlobAlreadyExists`) or 412
 //! (`ConditionNotMet`) for the contention case; both collapse to
 //! `Ok(false)`.
@@ -52,7 +52,7 @@
 //!
 //! ## `copy(src, dst)`
 //!
-//! `azure_storage_blob` 0.12 does not expose a `BlobClient::copy_from_url`
+//! `azure_storage_blob` 1.0 does not expose a `BlobClient::copy_from_url`
 //! method (only `BlockBlobClient::upload_blob_from_url`, which requires
 //! a SAS-tokened source URL or an `x-ms-copy-source-authorization`
 //! header — neither integrates cleanly with our credential model). We
@@ -78,7 +78,7 @@
 //! This is asymmetric with the S3 backend, which uses `CopyObject` for
 //! a true server-side copy — Azure's equivalent (`Copy Blob`,
 //! `Put Blob From URL`) requires a SAS-signed source URL or an
-//! `x-ms-copy-source-authorization` header that the 0.12 SDK does not
+//! `x-ms-copy-source-authorization` header that the 1.0 SDK does not
 //! ergonomically expose. The download+reupload path is the safe
 //! correct fallback until the SDK closes that gap.
 //!
@@ -103,7 +103,7 @@
 //!
 //! ## HTTP transport tuning
 //!
-//! `azure_core` 0.35's default transport keeps idle pooled connections
+//! `azure_core` 1.1's default transport keeps idle pooled connections
 //! forever and never sets TCP keepalive, so a pooled connection to a
 //! rotated VIP would hang an in-flight request until the OS-level TCP
 //! retransmit timeout fires (~15 minutes on Linux). [`AzureStore`]
@@ -146,10 +146,10 @@ use azure_core::http::{ClientOptions, Transport};
 use azure_storage_blob::clients::{
     BlobClient, BlobContainerClient, BlobContainerClientOptions, BlockBlobClient,
 };
-use azure_storage_blob::models::method_options::BlockBlobClientUploadOptions;
 use azure_storage_blob::models::{
     BlobClientDeleteOptions, BlobClientDownloadOptions, BlobClientGetPropertiesOptions,
-    BlobContainerClientListBlobsOptions, BlockBlobClientCommitBlockListOptions, BlockLookupList,
+    BlobContainerClientListBlobsOptions, BlockBlobClientCommitBlockListOptions,
+    BlockBlobClientUploadOptions, BlockLookupList, HttpRange,
 };
 use azure_storage_blob::stream::tokio::FileStream;
 use bytes::Bytes;
@@ -229,10 +229,10 @@ pub struct AzureStore {
 impl std::fmt::Debug for AzureStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // `BlobContainerClient` is opaque (private fields, no `Debug`);
-        // surface the endpoint instead so error / log lines remain
+        // surface the container URL instead so error / log lines remain
         // useful.
         f.debug_struct("AzureStore")
-            .field("endpoint", &self.container.endpoint().as_str())
+            .field("url", &self.container.url().as_str())
             .field("container", &self.container_name)
             .field("sas_signing", &self.sas_signing)
             .finish()
@@ -272,7 +272,7 @@ impl AzureStore {
             ));
         };
 
-        let account_url = build_account_url(endpoint, account, *addressing);
+        let container_url = build_container_url(endpoint, account, container, *addressing);
         let resolved = auth::resolve(account, flags)?;
         let sas_signing = resolved.sas_signing_key.clone();
 
@@ -284,8 +284,7 @@ impl AzureStore {
         };
 
         let container_client = BlobContainerClient::new(
-            &account_url,
-            container,
+            container_url,
             resolved.token_credential,
             Some(container_options),
         )
@@ -375,26 +374,28 @@ pub(crate) fn build_client_options(
     Ok(opts)
 }
 
-/// Construct the account-level endpoint URL the SDK constructors expect.
+/// Construct the container-level URL [`BlobContainerClient::new`] expects.
 ///
-/// The SDK takes a separate `container_name` argument, so we strip the
-/// container (and any prefix segments) from the parsed URL. For
-/// virtual-hosted addressing the path becomes `/`; for path-style
-/// addressing (Azurite, custom endpoints) the path becomes `/<account>`.
-pub(crate) fn build_account_url(
+/// The SDK addresses a container purely by URL, so any prefix segments
+/// carried by the parsed remote URL are dropped and the path is rebuilt
+/// from the account and container. For virtual-hosted addressing the
+/// path becomes `/<container>`; for path-style addressing (Azurite,
+/// custom endpoints) it becomes `/<account>/<container>`.
+pub(crate) fn build_container_url(
     endpoint: &Url,
     account: &str,
+    container: &str,
     addressing: AzureAddressing,
-) -> String {
+) -> Url {
     let mut rewritten = endpoint.clone();
     rewritten.set_query(None);
     rewritten.set_fragment(None);
     let path = match addressing {
-        AzureAddressing::VirtualHosted => "/".to_owned(),
-        AzureAddressing::PathStyle => format!("/{account}"),
+        AzureAddressing::VirtualHosted => format!("/{container}"),
+        AzureAddressing::PathStyle => format!("/{account}/{container}"),
     };
     rewritten.set_path(&path);
-    rewritten.to_string()
+    rewritten
 }
 
 /// Map an [`azure_core::Error`] into the trait's [`ObjectStoreError`] enum.
@@ -539,7 +540,7 @@ impl ObjectStore for AzureStore {
                 .into_body()
                 .xml::<azure_storage_blob::models::ListBlobsResponse>()
                 .map_err(|e| classify(e, prefix))?;
-            for item in body.segment.blob_items {
+            for item in body.blob_items {
                 let props = item.properties.unwrap_or_default();
                 let meta = item_to_meta(
                     item.name.as_deref(),
@@ -588,16 +589,10 @@ impl ObjectStore for AzureStore {
         Ok(bytes)
     }
 
-    /// Issue a Get Blob with a `Range<usize>` covering `[start, end)`.
+    /// Issue a Get Blob with an `HttpRange` covering `[start, end)`.
     /// HTTP 416 maps to [`ObjectStoreError::RangeNotSatisfiable`] with
     /// the original `Range<u64>` so the wire-line names what the
     /// caller asked for. All other failures route through [`classify`].
-    ///
-    /// The Azure SDK exposes `BlobClientDownloadOptions::range` as
-    /// `Option<Range<usize>>`. `usize` is at least 64 bits on every
-    /// supported target, so casting from `u64` is lossless; the cast
-    /// is documented here so a future 32-bit port surfaces as a
-    /// compile error rather than silent truncation.
     ///
     /// Azure silently truncates a ranged GET to EOF when the requested
     /// range overruns the blob — `start < body.len() <= end` returns
@@ -611,20 +606,13 @@ impl ObjectStore for AzureStore {
         key: &str,
         range: std::ops::Range<u64>,
     ) -> Result<Bytes, ObjectStoreError> {
-        // Compile-time guarantee: every supported target has a 64-bit
-        // usize, so the `u64 → usize` conversions below cannot
-        // truncate. A future 32-bit port surfaces as a build break,
-        // not silent corruption.
-        const _USIZE_AT_LEAST_64_BIT: () =
-            assert!(usize::BITS >= 64, "Azure backend requires 64-bit usize");
-
         if let Some(empty) = super::precheck_range(key, &range)? {
             return Ok(empty);
         }
-        let sdk_start = usize::try_from(range.start).expect("invariant: usize is at least 64 bits");
-        let sdk_end = usize::try_from(range.end).expect("invariant: usize is at least 64 bits");
+        // `precheck_range` has already rejected `start > end`, so the
+        // `HttpRange` length below cannot underflow.
         let opts = BlobClientDownloadOptions {
-            range: Some(sdk_start..sdk_end),
+            range: Some(HttpRange::from(range.clone())),
             ..Default::default()
         };
         let blob = self.blob_client(key);
@@ -730,7 +718,7 @@ impl ObjectStore for AzureStore {
 
     async fn put_if_absent(&self, key: &str, body: Bytes) -> Result<bool, ObjectStoreError> {
         let blob = self.blob_client(key);
-        let upload_opts = BlockBlobClientUploadOptions::default().with_if_not_exists();
+        let upload_opts = BlockBlobClientUploadOptions::default().if_not_exists();
         let resp = blob
             .upload(bytes_to_request_content(body), Some(upload_opts))
             .await;
@@ -762,7 +750,7 @@ impl ObjectStore for AzureStore {
         // Server-side copy via `Put Blob From URL` requires a SAS-tokened
         // source URL or `x-ms-copy-source-authorization`, neither of
         // which integrates with our credential model in a clean way
-        // for the SDK 0.12 surface. Stream `src` to a temp file via
+        // for the SDK 1.0 surface. Stream `src` to a temp file via
         // `get_to_file` (chunked download, no body buffer), then
         // `put_path` it back to `dst` (block-uploaded for large bodies
         // via `multipart_put_path`). Peak in-flight bytes are bounded
@@ -871,7 +859,7 @@ impl AzureStore {
         let blob = self.blob_client(key);
         let mut opts = BlobClientDownloadOptions::default();
         if let Some(etag) = etag {
-            opts.if_match = Some(etag.to_owned());
+            opts.if_match = Some(etag.into());
         }
         let mut result = blob
             .download(Some(opts))
@@ -1174,27 +1162,38 @@ mod tests {
         }
     }
 
-    // --- build_account_url --------------------------------------------
+    // --- build_container_url ------------------------------------------
 
     #[test]
-    fn build_account_url_virtual_hosted_strips_path() {
+    fn build_container_url_virtual_hosted_strips_prefix() {
         let url = parse_endpoint("https://acct.blob.core.windows.net/my-container/some/prefix");
-        let out = build_account_url(&url, "acct", AzureAddressing::VirtualHosted);
-        assert_eq!(out, "https://acct.blob.core.windows.net/");
+        let out = build_container_url(&url, "acct", "my-container", AzureAddressing::VirtualHosted);
+        assert_eq!(
+            out.as_str(),
+            "https://acct.blob.core.windows.net/my-container"
+        );
     }
 
     #[test]
-    fn build_account_url_path_style_keeps_account() {
+    fn build_container_url_path_style_keeps_account() {
         let url = parse_endpoint("http://127.0.0.1:10000/devstoreaccount1/my-container/repo");
-        let out = build_account_url(&url, "devstoreaccount1", AzureAddressing::PathStyle);
-        assert_eq!(out, "http://127.0.0.1:10000/devstoreaccount1");
+        let out = build_container_url(
+            &url,
+            "devstoreaccount1",
+            "my-container",
+            AzureAddressing::PathStyle,
+        );
+        assert_eq!(
+            out.as_str(),
+            "http://127.0.0.1:10000/devstoreaccount1/my-container"
+        );
     }
 
     #[test]
-    fn build_account_url_strips_query_and_fragment() {
+    fn build_container_url_strips_query_and_fragment() {
         let url = parse_endpoint("https://acct.blob.core.windows.net/c/r?credential=foo#frag");
-        let out = build_account_url(&url, "acct", AzureAddressing::VirtualHosted);
-        assert_eq!(out, "https://acct.blob.core.windows.net/");
+        let out = build_container_url(&url, "acct", "c", AzureAddressing::VirtualHosted);
+        assert_eq!(out.as_str(), "https://acct.blob.core.windows.net/c");
     }
 
     // --- classify_status_and_code -------------------------------------

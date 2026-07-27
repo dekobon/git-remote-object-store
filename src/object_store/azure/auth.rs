@@ -1,7 +1,7 @@
 //! Credential resolution and the shared-key / SAS signing policies for
 //! the Azure Blob backend.
 //!
-//! The official `azure_storage_blob` 0.12 crate accepts only
+//! The official `azure_storage_blob` 1.0 crate accepts only
 //! `Arc<dyn TokenCredential>` (Entra ID) on its constructors, but the
 //! Azurite emulator and many production accounts still authenticate
 //! with shared keys. We bridge the gap with a custom per-try
