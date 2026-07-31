@@ -207,14 +207,36 @@ brew install git-remote-object-store
 
    ```bash
    make ci
-   cargo publish -p git-remote-object-store --dry-run --locked
-   cargo publish -p git-remote-object-store-cli --dry-run --locked --allow-dirty
+   cargo publish -p git-remote-object-store --dry-run --locked --allow-dirty
    ```
 
-4. **Commit and push:**
+   Run `make deny` with the **same cargo-deny version CI pins**
+   (`CARGO_DENY_VERSION` in
+   [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)) — a
+   newer local cargo-deny can silently pass an advisory that CI's
+   pinned build rejects, which turns a green pre-flight into a red CI
+   run after the tag is already pushed:
 
    ```bash
-   git commit -am "release: 0.2.0"
+   cargo install cargo-deny --version "$(rg -o 'CARGO_DENY_VERSION: "(.*)"' -r '$1' \
+       .github/workflows/ci.yml)" --locked
+   ```
+
+   There is deliberately no CLI dry-run here. `git-remote-object-store-cli`
+   depends on `git-remote-object-store = "<this version>"` from the
+   registry, which does not exist until the pipeline's `publish-crates`
+   job uploads the library first — so a local CLI dry-run **always**
+   fails before a release. The pipeline's preflight stage dry-runs only
+   the library, for the same reason.
+
+4. **Commit and push.** The subject must be a valid conventional
+   commit — CI's `Commit Messages` job (commitsar) rejects anything
+   whose type is not one of
+   `build,ci,chore,docs,feat,fix,perf,refactor,revert,style,test`.
+   `release:` is **not** a valid type; use `chore(release):`:
+
+   ```bash
+   git commit -am "chore(release): bump to 0.2.0"
    git push origin main
    ```
 
@@ -225,9 +247,21 @@ brew install git-remote-object-store
    git push origin v0.2.0
    ```
 
-6. **Watch the workflow** under **Actions → Release**. Every stage
-   should turn green. Total wall-clock is dominated by the build
-   matrix (~10–15 min on fresh runners; less when caches warm).
+6. **Watch both workflows.** The push fires **Release** *and* the
+   ordinary **CI** workflow, and they are independent — `Release` has
+   no dependency on `CI`, so a fully green release pipeline says
+   nothing about whether CI passed on the same commit. Check both:
+
+   ```bash
+   gh run list --limit 5
+   ```
+
+   Under **Actions → Release** every stage should turn green; total
+   wall-clock is dominated by the build matrix (~10–15 min on fresh
+   runners; less when caches warm). Under **Actions → CI** the
+   `Commit Messages` and `cargo-deny` jobs are the two that most often
+   fail on a release commit specifically — the first on the subject
+   line, the second on an advisory published since the last run.
 
 ## Rehearsal via `workflow_dispatch`
 

@@ -15,6 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a `!Send` tag set via `Event::with_tag` cross a thread boundary and
   race in safe code).
 
+### Documentation
+
+- release: corrected `docs/development/cutting-a-release.md`, which
+  instructed a `release:` commit subject that CI's commitsar job always
+  rejects (`release` is not a conventional-commit type) and a
+  `git-remote-object-store-cli` publish dry-run that cannot succeed
+  before the library is on crates.io. The pre-flight now also pins
+  cargo-deny to CI's version, and the watch step covers the CI workflow
+  alongside Release.
+
 ### Security
 
 - deps: bumped `anyhow` to 1.0.104, clearing RUSTSEC-2026-0190
