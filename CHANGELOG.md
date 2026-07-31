@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.5] - 2026-07-31
+### Security
+
+- deps: bumped `event-listener` (transitive, via `azure_core` →
+  `async-lock`) from 5.4.1 to 5.4.2, clearing RUSTSEC-2026-0221
+  (`StackSlot<'_, T>` unconditionally implements `Send`/`Sync`, letting
+  a `!Send` tag set via `Event::with_tag` cross a thread boundary and
+  race in safe code).
 
 ### Security
 
