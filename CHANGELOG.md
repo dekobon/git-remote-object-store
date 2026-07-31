@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-07-31
+
 ### Security
 
 - deps: bumped `anyhow` to 1.0.104, clearing RUSTSEC-2026-0190

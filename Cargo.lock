@@ -1906,7 +1906,7 @@ dependencies = [
 
 [[package]]
 name = "git-remote-object-store"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1947,7 +1947,7 @@ dependencies = [
 
 [[package]]
 name = "git-remote-object-store-cli"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "async-trait",
