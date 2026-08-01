@@ -112,12 +112,24 @@ build-release:
 # ---------------------------------------------------------------------------
 # Test
 # ---------------------------------------------------------------------------
+# `test-util` is named explicitly rather than left to feature
+# unification. Six files under `tests/` open with
+# `#![cfg(feature = "test-util")]` and compile to nothing without it;
+# they previously ran only because `cli` dev-depends on the lib with
+# that feature and `default-members` includes `cli`. (Dropping either
+# would surface as an E0432 in `tests/url_parsing.rs`, which imports
+# `test_util` ungated — but that reports a broken build in an unrelated
+# file, not the six that went quiet.) `--all-features` is the wrong
+# lever here: it also enables the Docker-backed `integration-{s3,azure}`
+# features on `cli`.
+TEST_FEATURES := --features git-remote-object-store/test-util
+
 test:
-	cargo test --workspace --lib --bins --tests
+	cargo test --workspace $(TEST_FEATURES) --lib --bins --tests
 
 test-all:
-	cargo test --workspace --all-targets
-	cargo test --workspace --doc
+	cargo test --workspace $(TEST_FEATURES) --all-targets
+	cargo test --workspace $(TEST_FEATURES) --doc
 
 test-integration-s3:
 	cargo test --workspace --features integration-s3 --test s3_store_integration
@@ -425,8 +437,8 @@ _pc-clippy: _pc-fmt
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 _pc-test: _pc-clippy
-	cargo test --workspace --lib --bins --tests
-	cargo test --workspace --doc
+	cargo test --workspace $(TEST_FEATURES) --lib --bins --tests
+	cargo test --workspace $(TEST_FEATURES) --doc
 
 _pc-build: _pc-test
 	cargo build --workspace --all-targets
@@ -482,8 +494,8 @@ _ci-clippy:
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 _ci-test:
-	cargo test --workspace --lib --bins --tests
-	cargo test --workspace --doc
+	cargo test --workspace $(TEST_FEATURES) --lib --bins --tests
+	cargo test --workspace $(TEST_FEATURES) --doc
 
 _ci-build:
 	cargo build --workspace --all-targets
