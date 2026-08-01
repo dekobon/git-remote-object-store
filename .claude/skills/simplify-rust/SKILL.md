@@ -24,11 +24,17 @@ Determine what to review based on `$ARGUMENTS`:
 
 1. Collect the diff for the chosen scope
 2. Read each changed file to understand context around the diff hunks
-3. Use the Agent tool to spawn three parallel **read-only** review agents (one per dimension below). Agents analyse and return findings — they do NOT edit files.
-4. Aggregate findings, deduplicate, and classify by priority
-5. Apply fixes directly to the code (orchestrator only — not the review agents)
-6. Run `cargo check` to verify changes compile
+3. Work through all three dimensions below yourself — reuse, clarity, efficiency
+4. Classify findings by priority
+5. Apply the fixes directly
+6. Run `cargo check` to confirm the result compiles
 7. Summarize what changed and why, with `file:line` references
+
+For a large scope — roughly a dozen or more changed files, or a whole-directory
+argument — spawn one read-only Agent per dimension in step 3 and aggregate their
+findings before step 4. Those agents analyse and return findings; only the
+orchestrator edits files. For an ordinary diff, delegating costs more than it
+returns; do the pass directly.
 
 ## Priority Classification
 
@@ -42,7 +48,7 @@ Skip anything already clean. Do not create churn.
 
 ---
 
-## Agent 1: Reuse
+## Dimension 1: Reuse
 
 Look for duplicated logic and missing abstractions.
 
@@ -55,11 +61,12 @@ Look for duplicated logic and missing abstractions.
 **Do NOT extract**: one-off logic into tiny helpers that obscure the flow. Three
 similar lines are better than a premature abstraction.
 
-## Agent 2: Clarity
+## Dimension 2: Clarity
 
 Look for unnecessary complexity and missed Rust idioms.
 
-- `unwrap()` / `expect()` in non-test code -- must use `?` or `Result`/`Option`
+- `unwrap()` / `expect()` / `panic!()` / `assert!()` in non-test code -- must
+  use `?` or `Result`/`Option` (per `.claude/rules/rust.md`)
 - Complex nested `if`/`match` that can be flattened with early returns or `?`
 - Boolean flags or stringly-typed APIs that should be enums or newtypes
 - `pub` items that should be `pub(crate)` (not used outside the crate)
@@ -76,7 +83,7 @@ Look for unnecessary complexity and missed Rust idioms.
 `if`/`else` into clever `match` patterns; or add lifetime annotations the
 compiler already infers.
 
-## Agent 3: Efficiency
+## Dimension 3: Efficiency
 
 Look for unnecessary allocations and wasted work.
 

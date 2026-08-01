@@ -9,9 +9,6 @@
       "Bash(git worktree prune*)",
       "Bash(*git worktree remove*)",
       "Bash(*git worktree prune*)"
-    ],
-    "additionalDirectories": [
-      "../git-remote-s3"
     ]
   },
   "attribution": {

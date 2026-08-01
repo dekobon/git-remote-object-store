@@ -12,7 +12,11 @@ This crate stands on its own. It is **not** a port of, and does not maintain any
 
 Do not introduce shims, aliases, deprecated-form parsers, `--legacy-*` flags, or "matches X" doc comments aimed at accommodating any external surface. Do not cite outside implementations as authoritative references in code comments — the spec, the source itself, and tests are the contract. The helper-protocol spec, the LFS spec, and the cloud-provider API specs are the only external authorities.
 
-Coding conventions for the project live in `.claude/rules/`:
+What this does **not** waive: buckets written by an already-released version of this crate must stay readable by the next one. That is a promise to our own users, not a compatibility contract with a third party. A change to the on-bucket key layout needs a migration path and explicit sign-off.
+
+## Conventions
+
+Coding conventions for the project live in `.claude/rules/`. Claude Code loads them automatically at session start; other assistants should read them directly.
 
 | File | Topic |
 |------|-------|
@@ -31,27 +35,37 @@ Coding conventions for the project live in `.claude/rules/`:
 | `.claude/rules/lessons-learned.md` | Where hard-won lessons live and the quality bar |
 | `.claude/rules/protocol-stdout.md` | stdout/stderr discipline for the helper-protocol binaries |
 
-## Git & Workflow
+## Working Agreements
 
-### Worktree Safety (ABSOLUTE PRIORITY)
+### Task scope
 
-When running in a git worktree (e.g., via `claude -w` or `isolation: worktree`):
+Deliver what was asked, at the scope intended. Make routine judgment calls yourself, and check in only when different readings of the request would lead to materially different work. If the request seems mistaken or a better approach exists, say so in a sentence and continue with the task as asked rather than quietly narrowing, widening, or transforming it. Finish the whole task, and stop short of actions clearly beyond what was asked.
 
-- **NEVER delete worktrees** you did not create. No `git worktree remove`, no `git worktree prune`, no `rm -rf` on worktree directories. Other agents may be using them.
-- **NEVER leave your worktree**. Do not `cd` to the main repository, do not `git checkout main`, do not write files outside your worktree directory.
-- **NEVER run plugins or commands that clean up worktrees** (e.g., `/clean_gone`). Only the Claude Code runtime or the user may remove worktrees.
-- Worktrees that look "stale" may belong to another agent -- leave them alone.
-- Before any git operation, verify you are in your worktree: `git rev-parse --show-toplevel` should return a path containing `.claude/worktrees/`.
+Concretely, for this repo: a bug fix does not need the surrounding module cleaned up, a new helper does not need speculative configurability, and internal call sites do not need defensive validation. Validate at system boundaries (URL parsing, cloud responses, operator input), not between functions you control.
 
-### Plan Execution Scope
+### Plan execution scope
 
-When a plan includes multiple distinct phases (e.g., issue filing, implementation, PR creation), treat each phase boundary as a checkpoint. Complete the first phase, then confirm with the user before proceeding to the next. Do not assume "implement the plan" means "execute every phase."
+When a plan includes multiple distinct phases (e.g., issue filing, implementation, PR creation), treat each phase boundary as a checkpoint. Complete the first phase, then confirm with the user before proceeding to the next. "Implement the plan" does not mean "execute every phase."
+
+### Delegating to subagents
+
+Delegate only for large, genuinely independent tracks of work — a wide multi-file investigation, or fixing several issues that touch disjoint modules. Do not delegate work you can finish yourself in a handful of tool calls, and do not spawn subagents to verify or double-check your own work. If one subagent can do the job, use one rather than several.
+
+### Destructive and outward-facing actions
+
+Local, reversible actions (editing files, running tests, `cargo` commands) need no confirmation. Ask first for anything hard to reverse or visible to others: `git push`, `git push --force`, `git reset --hard`, deleting branches, amending pushed commits, filing or closing GitHub issues and PRs, and any write against a real (non-emulator) S3 or Azure bucket.
+
+When blocked, do not reach for a destructive shortcut: no `--no-verify`, no deleting unfamiliar files that may be another agent's in-progress work, no relaxing a test to make it pass.
+
+**Skills are already authorized.** Invoking a skill from `.claude/skills/` is the user's approval of what that skill does. When `/audit` files issues, `/fix-issue` closes one, or `/batch-fix` and `/audit` launch their isolation agents, that is the deliverable — carry it out without re-confirming, and without weighing it against the delegation guidance above. The confirmation and delegation rules govern actions you chose on your own initiative. Anything a skill does *not* cover still needs the usual judgment.
+
+Worktree deletion and branch escape are separate hard bans — see `.claude/rules/worktree-safety.md`.
 
 ## Editing Principles
 
 - Never rewrite an entire test file to add/fix tests. Only modify the specific tests/functions that need changing.
-- Verify previously passing tests still pass before committing.
 - Add useful unit and integration tests when fixing issues.
+- Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` before committing. These are the gate; they replace ad-hoc re-reading of your own diff.
 
 ## Code Intelligence (LSP / Serena)
 
@@ -74,7 +88,7 @@ When an LSP-based code intelligence tool such as Serena is available, use it as 
 - Creating new files from scratch
 - File discovery by name (use Glob/fd)
 
-**MANDATORY before any public API change**: enumerate all call sites with `find_referencing_symbols`. This prevents cross-crate breakage.
+Before changing any public API, enumerate its call sites with `find_referencing_symbols`. Signature changes that compile locally can still break `cli/` or `xtask/`.
 
 ## External Documentation (Context7)
 
@@ -86,21 +100,11 @@ When researching external libraries, frameworks, SDKs, or CLI tools, prefer inde
 
 ## GitHub CLI
 
-When using `gh` with complex arguments, write content to a temp file and pass via `--body-file`:
-
-```bash
-cat > /tmp/issue-body.md <<'EOF'
-Content with $variables, `backticks`, and "quotes"
-EOF
-gh issue create --title "Title" --label "bug" --body-file /tmp/issue-body.md
-```
-
-### GitHub Issue Hygiene
-
-- Only close an issue when ALL items are resolved
-- When updating issues, update BOTH the body AND add a comment
+See `.claude/rules/github-cli.md` for `--body-file` usage and issue hygiene.
 
 ## Tone and Behavior
 
 - Criticism is welcome -- point out mistakes, suggest better approaches, cite relevant standards
 - Be skeptical and concise
+- Keep responses focused and brief. Lead with the outcome: the first sentence should answer "what happened" or "what did you find", with supporting detail after it
+- Match written deliverables (issue bodies, CHANGELOG entries, docs) to what the task needs; cover the substance without padding out filler sections or redundant summaries

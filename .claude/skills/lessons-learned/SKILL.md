@@ -207,7 +207,7 @@ Post-completion notes to display:
 - "Changes staged but not committed."
 - "Other skills (`fix-issue`, `audit-tests`, `review`) may reference
   lessons by number. If new lessons changed the numbering of existing
-  entries, grep `.claude/skills/` for stale references."
+  entries, search `.claude/skills/` for stale references."
 
 ---
 

@@ -23,15 +23,9 @@ globs: "**/*.rs"
 
 ## Naming
 
-- **One word per concept**: Pick one verb and use it everywhere. Don't mix `fetch`/`get`/`retrieve` or `parse`/`from_str`/`decode` for the same operation across the codebase.
-- **Different words for different concepts**: If two things do different work, they need different names.
-- **Boolean names are positive predicates**: `is_valid`, `has_children` -- never `not_disabled` or `no_error`.
-- **No unexplained abbreviations**: Domain-standard (`fd`, `pid`, `url`, `sha`, `oid`) are fine. Ad-hoc abbreviations need a full name.
-- **Plural names for collections**: `errors: Vec<Error>`, not `error: Vec<Error>`. Singular for single values.
-- **Conversion method prefixes must match semantics** ([C-CONV](https://rust-lang.github.io/api-guidelines/naming.html#c-conv)): `as_` (free borrow), `to_` (expensive copy), `into_` (consuming), `from_` (constructor). Signature must match prefix.
-- **Getters omit `get_` prefix** ([C-GETTER](https://rust-lang.github.io/api-guidelines/naming.html#c-getter)): `fn name(&self) -> &str`, not `fn get_name()`
-- **`is_`/`has_` methods return `bool`**
-- **Error type word order follows stdlib**: `ParseError` not `ErrorParse`
+See `.claude/rules/naming.md` — it carries the universal rules and the
+Rust-specific ones (`as_`/`to_`/`into_`/`from_` semantics, `get_`-less
+getters, stdlib error-type word order).
 
 ## Visibility and API Surface
 

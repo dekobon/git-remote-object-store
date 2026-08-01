@@ -28,26 +28,26 @@ The authoritative project naming rules live in:
 Use those files as the standard against which findings are measured. If you
 encounter a possible finding that the project rules already permit, drop it.
 
-## ABSOLUTE CONSTRAINTS
+## Hard constraint: this skill is read-only
 
-**This skill is READ-ONLY. It MUST NOT leave any trace on the filesystem.**
+The audit runs against a tree the user may be working in, so it must leave no
+trace on the filesystem:
 
-- **NEVER commit code.** No `git commit`, no `git add`, no staging. Zero commits.
-- **NEVER leave uncommitted files.** No new files, no modified files, no temp files
-  in the worktree. If you accidentally create or modify a file, revert it
-  immediately with `git checkout -- .`.
-- **NEVER modify source files.** Not even "harmless" formatting or comment fixes.
-- **NEVER push branches.** The isolation branch is disposable and local-only.
-- The ONLY side effects of this skill are: GitHub issues filed, Serena memories
-  updated, and terminal output printed.
+- No commits and no staging — no `git commit`, no `git add`.
+- No modified or new files, including "harmless" formatting or comment fixes
+  and temp files inside the worktree. If you create or modify a file by
+  accident, revert it immediately with `git checkout -- .`.
+- No pushed branches. The isolation branch is disposable and local-only.
+
+The only side effects are GitHub issues filed, Serena memories updated (when
+Serena is available), and terminal output.
 
 ---
 
 ## Step 0: Launch isolated agent
 
-**This step is MANDATORY and must be the very first action.**
-
-The audit runs in isolation to guarantee the main working tree is never touched.
+Do this before any other action. The audit runs in isolation so the main
+working tree is never touched.
 
 ### Environment detection
 
@@ -93,9 +93,9 @@ directory path) and any prior context. Do NOT perform any audit work directly.
 - **Branch mode**: Launch the Agent WITHOUT `isolation: "worktree"`. The agent
   runs in the main project directory (safe because the audit is read-only).
 
-**CRITICAL**: In worktree mode, the Agent tool call MUST include
-`isolation: "worktree"` as a required parameter. Double-check before sending.
-In branch mode, do NOT include `isolation: "worktree"`.
+In worktree mode the Agent tool call must include `isolation: "worktree"`;
+in branch mode it must omit it. Getting this backwards either loses the
+isolation guarantee or creates a nested worktree.
 
 If sub-agents are used (e.g., to audit file groups in parallel), they inherit
 the parent context and do NOT need their own `isolation: "worktree"` — the

@@ -18,18 +18,19 @@ resolved value for every subsequent reference (memory keys, `cargo -p`, issue
 titles). Never let an unresolved or empty `$ARGUMENTS` reach a template like
 `audit-state-$ARGUMENTS` — that would write to a malformed memory key.
 
-## ABSOLUTE CONSTRAINTS
+## Hard constraint: this skill is read-only
 
-**This skill is READ-ONLY. It MUST NOT leave any trace on the filesystem.**
+The audit runs against a tree the user may be working in, so it must leave no
+trace on the filesystem:
 
-- **NEVER commit code.** No `git commit`, no `git add`, no staging. Zero commits.
-- **NEVER leave uncommitted files.** No new files, no modified files, no temp files
-  in the worktree. If you accidentally create or modify a file, revert it
-  immediately with `git checkout -- .`.
-- **NEVER modify source files.** Not even "harmless" formatting or comment fixes.
-- **NEVER push branches.** The isolation branch is disposable and local-only.
-- The ONLY side effects of this skill are: GitHub issues filed, Serena memories
-  updated, and terminal output printed.
+- No commits and no staging — no `git commit`, no `git add`.
+- No modified or new files, including "harmless" formatting or comment fixes
+  and temp files inside the worktree. If you create or modify a file by
+  accident, revert it immediately with `git checkout -- .`.
+- No pushed branches. The isolation branch is disposable and local-only.
+
+The only side effects are GitHub issues filed, Serena memories updated (when
+Serena is available), and terminal output.
 
 ---
 
@@ -42,9 +43,8 @@ Note any relevant open issues as context, but do NOT let them constrain the audi
 
 ## Step 0: Launch isolated agent
 
-**This step is MANDATORY and must be the very first action.**
-
-The audit runs in isolation to guarantee the main working tree is never touched.
+Do this before any other action. The audit runs in isolation so the main
+working tree is never touched.
 
 ### Environment detection
 
@@ -90,9 +90,9 @@ context. Do NOT perform any audit work directly.
 - **Branch mode**: Launch the Agent WITHOUT `isolation: "worktree"`. The agent
   runs in the main project directory (safe because the audit is read-only).
 
-**CRITICAL**: In worktree mode, the Agent tool call MUST include
-`isolation: "worktree"` as a required parameter. Double-check before sending.
-In branch mode, do NOT include `isolation: "worktree"`.
+In worktree mode the Agent tool call must include `isolation: "worktree"`;
+in branch mode it must omit it. Getting this backwards either loses the
+isolation guarantee or creates a nested worktree.
 
 If sub-agents are used (e.g., to audit file groups in parallel), they inherit
 the parent context and do NOT need their own `isolation: "worktree"` -- the
@@ -328,8 +328,8 @@ will apply, so the vocabulary must match end-to-end. Mapping rules:
 21. Are there unused imports, functions, or struct fields?
 22. Are there functions longer than ~50 lines of logic that should be decomposed?
 23. Are there hardcoded strings that should be named constants?
-24. Are any hardcoded lists a maintenance hazard (e.g., a list of S3/Azure backend
-    error codes that must stay in sync with upstream)?
+24. Are any hardcoded lists a maintenance hazard (e.g., a list of S3/Azure
+    backend error codes that must track a provider API as it evolves)?
 
 ### Dependency and Build Concerns
 
@@ -339,17 +339,16 @@ will apply, so the vocabulary must match end-to-end. Mapping rules:
 
 ### Project-Specific (git-remote-object-store)
 
-28. Does any change touch a wire-format surface — helper-protocol stdout
+28. Does any code touch a wire-format surface — helper-protocol stdout
     bytes, on-bucket key shapes, LFS JSON events, or error-string wording
-    matched by external tools (git, git-lfs)? If yes, has the change
-    been verified against the upstream Python reference at
-    `../git-remote-s3`? Upstream is a useful reference for these
-    surfaces, not authoritative; behavioral differences that matter to
-    a user are filed as bugs.
+    matched by external tools (git, git-lfs)? If yes, does it still satisfy
+    the helper-protocol spec, the LFS spec, and the tests that pin the
+    byte-level output? Those specs and tests are the authority; this project
+    keeps no compatibility contract with any other implementation.
 29. Does any code break the on-bucket object-layout invariant
     (`<prefix>/<ref>/<sha>.bundle`, `HEAD`, `PROTECTED#`, lock files,
-    `lfs/<oid>`)? This is the contract that keeps existing buckets
-    written by `awslabs/git-remote-s3` readable.
+    `lfs/<oid>`)? Buckets written by an already-released version of this
+    crate have to stay readable by the next one.
 30. Are there `unwrap()`, `expect()`, `assert!()`, or `panic!()` calls in
     non-test code? `expect()`/`assert!()` are acceptable in tests; production
     code must propagate with `?`. (Per `.claude/rules/rust.md`.)
@@ -379,16 +378,17 @@ the repo. `gh issue create` rejects unknown labels. Of the four categories,
 `bug`, `documentation`, and `enhancement` already exist; `security` and
 `bucket-compat` need to be created on first use:
 
-```bash
-ensure_label() {
-  local name="$1" color="$2" desc="$3"
-  if ! gh label list --limit 200 | awk '{print $1}' | grep -qx "$name"; then
-    gh label create "$name" --color "$color" --description "$desc"
-  fi
-}
+`gh label create --force` creates the label or updates an existing one's
+color and description, so this is idempotent and keeps the live labels
+matching the definitions below. A plain `create` would silently leave a
+stale description in place.
 
-ensure_label security      "ee0701" "Security-relevant finding"
-ensure_label bucket-compat "fbca04" "Touches the on-bucket layout shared with awslabs/git-remote-s3"
+```bash
+gh label create security --force \
+  --color "ee0701" --description "Security-relevant finding"
+gh label create bucket-compat --force \
+  --color "fbca04" \
+  --description "Breaks reading of buckets written by a released version"
 ```
 
 ### 5b: Create the issue
@@ -434,10 +434,10 @@ gh issue create --title "crate: short description" --label "bug" --body-file /tm
 
 Some findings touch the on-bucket object layout
 (`<prefix>/<ref>/<sha>.bundle`, `HEAD`, `PROTECTED#`, lock files,
-`lfs/<oid>`). That layout is the contract that keeps existing buckets
-written by `awslabs/git-remote-s3` readable, and changing it would
-break shipped users. Mark these findings clearly so reviewers can
-weigh the bucket-compatibility cost.
+`lfs/<oid>`). Buckets already written by a released version of this crate
+have to stay readable by the next one, so changing that layout breaks
+shipped users. Mark these findings clearly so reviewers can weigh the
+migration cost.
 
 When a finding falls into this category:
 
@@ -468,7 +468,7 @@ Signals that this category applies include:
 - Finding would change the LFS custom-transfer JSON event shape that
   external git-lfs clients depend on.
 - Finding would change locking semantics across cooperating clients
-  (mixed S3 / Azure / upstream-Python deployments).
+  (mixed S3 / Azure deployments, or a mix of crate versions).
 
 ---
 

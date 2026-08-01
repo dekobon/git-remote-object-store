@@ -74,7 +74,7 @@ Parse `$ARGUMENTS` as: `[target] [--dry-run]`
    - `replace_symbol_body` for modifying functions/methods/structs
    - `insert_before_symbol` / `insert_after_symbol` for adding code
    - `rename_symbol` for renames
-   - **MANDATORY**: call `find_referencing_symbols` before changing any public API
+   - Call `find_referencing_symbols` before changing any public API — signature changes that compile locally can still break `cli/` or `xtask/`
    - Fall back to the Edit tool for non-code files or when Serena is unavailable
 
 ### Step 4: Validate and commit
@@ -458,7 +458,7 @@ on Tier 2. Skip Tier 3 unless the user specifically requests it.
   harder to understand is not an optimization.
 - **Comment non-obvious changes.** If a transformation relies on a subtle language
   rule, leave a brief comment explaining why it is safe.
-- **MANDATORY**: Call `find_referencing_symbols` before changing any public API.
+- Call `find_referencing_symbols` before changing any public API — signature changes that compile locally can still break `cli/` or `xtask/`.
 
 ---
 

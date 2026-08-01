@@ -172,8 +172,8 @@ indicators AND **zero** disqualifiers.
   protocol")
 - Touches a wire-format surface (on-bucket object layout, helper-protocol
   stdout bytes, LFS JSON events, error wording matched by external tools)
-  — these benefit from a verification pass against the upstream Python
-  reference at `../git-remote-s3`
+  — these have to be checked against the relevant spec and the byte-level
+  tests, which is more than a quick win affords
 - Needs external input or design decision ("should we...?", "RFC")
 - Has `cross_module: true` from Step 2a
 
@@ -327,11 +327,10 @@ Pass each agent the full agent prompt (see below) with `<ISSUE_NUMBER>`,
 
 #### Worktree mode (`ISOLATION_MODE=worktree`)
 
-**CRITICAL**: Every agent MUST be launched with `isolation: "worktree"`.
-This is a required parameter on the Agent tool call, not optional. Agents
-launched without worktree isolation will modify the main project directory,
-corrupting the integration branch. Double-check that every Agent tool call
-includes `isolation: "worktree"` before sending.
+Every agent must be launched with `isolation: "worktree"`. An agent without
+it modifies the main project directory instead, corrupting the integration
+branch — and because several agents run at once, the damage is interleaved
+and hard to unwind.
 
 For a **single-issue wave**: launch one Agent with `isolation: "worktree"`
 and `model: "opus"`.
@@ -697,61 +696,48 @@ Grep/Glob tools, `rg`, or `fd`.
 Follow the `/fix-issue` workflow:
 
 1. Re-read the project conventions that govern this fix:
-   - `AGENTS.md` — relationship to upstream and greenfield rules.
+   - `AGENTS.md` — the standalone-project rules and working agreements.
    - `.claude/rules/rust.md`, `.claude/rules/naming.md`,
      `.claude/rules/testing.md`, `.claude/rules/git-commits.md`,
      `.claude/rules/worktree-safety.md`, `.claude/rules/protocol-stdout.md`.
 2. Read `docs/development/lessons_learned.md` -- check whether any lesson
    applies to this issue's domain.
-3. Investigate the codebase to understand the root cause. For any
-   behavior that touches a wire-format surface — on-bucket object
-   layout, helper-protocol stdout bytes, LFS JSON events, or error
-   wording matched by external tools — read the upstream Python at
-   `../git-remote-s3` as a reference; it is the closest existing
-   reference implementation, but is not authoritative. If the change
-   would break bucket compatibility for buckets written by upstream,
-   report FAILED with reason "bucket-compatibility risk -- needs
-   user decision".
+3. Investigate the codebase to understand the root cause. Behavior that
+   touches a wire-format surface — on-bucket object layout,
+   helper-protocol stdout bytes, LFS JSON events, or error wording matched
+   by external tools — is governed by the helper-protocol spec, the LFS
+   spec, and the cloud-provider API docs. If the change would make buckets
+   written by an already-released version of this crate unreadable, report
+   FAILED with reason "bucket-compatibility risk -- needs user decision".
 4. Use Serena LSP tools (`find_symbol`, `get_symbols_overview`,
    `find_referencing_symbols`) for code navigation. Fall back to Read/Grep
    if Serena is unavailable. Before changing any public API, run
    `find_referencing_symbols` to enumerate every call site.
 5. Check for the same bug pattern elsewhere in the codebase. If the root
    cause is repeated, fix all instances.
-6. **Plan the fix using sequential thinking.** Use the
-   `sequential-thinking:sequentialthinking` MCP tool to reason through the
-   resolution step by step before writing any code. The sequential thinking
-   process MUST:
-   - **Start** with `thoughtNumber: 1`, an initial `totalThoughts` estimate
-     (typically 5-8), and `nextThoughtNeeded: true`.
-   - **Analyze** the root cause — not just the symptom. Trace the
-     data/control flow that leads to the bug.
-   - **Enumerate approaches** and evaluate trade-offs (simplicity,
-     correctness, performance, scope).
-   - **Identify edge cases** — empty inputs, boundary values, concurrent
-     access, error paths, S3-vs-Azure backend differences, partial-multipart
-     failures, network retries, lock contention. Walk through each edge case
-     and confirm the proposed fix handles it.
-   - **Cross-check against project rules** — if the fix would introduce a
-     silent `unwrap_or_default`, an `unwrap()`/`expect()`/`panic!()` in
-     non-test code, an unexplained abbreviation, a `to_string_lossy()` on an
-     identifier path, a `splitn` on an untrusted empty pattern, an
-     `unsafe` block, a `println!`/`dbg!` in a helper binary's protocol
-     code path, or any of the other anti-patterns called out in
-     `.claude/rules/rust.md`, `.claude/rules/naming.md`, or
-     `.claude/rules/protocol-stdout.md`, redesign before proceeding.
-   - **Verify completeness** — confirm the plan covers implementation,
-     tests, and documentation before concluding.
-   - **Conclude** with `nextThoughtNeeded: false` and a final plan summary.
-   - Adjust `totalThoughts` up or down as understanding evolves. Use
-     `isRevision` if earlier reasoning needs correction.
-7. **Implement the fix.** Execute the plan from step 6. If the
-   implementation reveals issues the plan missed, revise via sequential
-   thinking before proceeding.
+6. **Plan the fix before writing code.** Reason through the root cause
+   rather than the symptom, and settle these before you start editing:
+   - The data/control flow that produces the bug, and which approach you
+     are taking among the plausible ones.
+   - Edge cases the fix has to survive — empty inputs, boundary values,
+     concurrent access, error paths, S3-vs-Azure backend differences,
+     partial-multipart failures, network retries, lock contention.
+   - Whether the design would introduce a silent `unwrap_or_default`, an
+     `unwrap()`/`expect()`/`panic!()` in non-test code, an unexplained
+     abbreviation, a `to_string_lossy()` on an identifier path, a `splitn`
+     on an untrusted empty pattern, an `unsafe` block, a `println!`/`dbg!`
+     in a helper binary's protocol code path, or anything else called out
+     in `.claude/rules/rust.md`, `.claude/rules/naming.md`, or
+     `.claude/rules/protocol-stdout.md`. Redesign now rather than during
+     review.
+
+   Pick an approach and commit to it; revisit only if you hit information
+   that contradicts the reasoning.
+7. **Implement the fix.** Execute the plan from step 6.
 8. Self-review the implementation:
    - Correctness: root cause addressed, not just symptom? For
-     wire-format-sensitive code, has the change been verified against
-     the upstream Python reference at `../git-remote-s3`?
+     wire-format-sensitive code, does the change still satisfy the
+     helper-protocol / LFS spec and the byte-level tests?
    - Performance: appropriate algorithms and data structures? Hot paths
      (push/fetch on large histories, multipart transfers) considered?
    - Simplicity: simplest fix that solves the problem? No speculative
@@ -760,7 +746,7 @@ Follow the `/fix-issue` workflow:
    - Completeness: edge cases handled? Similar patterns elsewhere?
    - Test coverage: regression tests added? Assertions specific?
    - Lessons learned: does the fix repeat any known anti-pattern?
-9. Fix any issues found in self-review. If fixes were non-trivial, re-review.
+9. Fix any issues found in self-review.
 10. **Write tests.** Sufficient testing is mandatory before proceeding. At
     minimum:
     - **Unit tests**: for all new or changed public functions. Each edge
@@ -804,6 +790,7 @@ directly:
 - Copy-pasted validation or formatting logic across functions
 - Manual error mapping chains replaceable by a single `From` impl
 - Identical match arms that can be consolidated
+- Helper functions that duplicate standard library or crate functionality
 
 **Clarity**:
 
@@ -813,15 +800,22 @@ directly:
 - Boolean flags or stringly-typed APIs that should be enums or newtypes
 - `pub` items that should be `pub(crate)` (not used outside the crate)
 - Functions longer than ~40 lines that mix unrelated concerns
+- `impl` blocks far from their struct/enum definition
+- Methods not grouped: constructor > getter > mutation > domain > helper
 - Redundant type annotations the compiler can infer
 - `to_string_lossy()` on paths used as identifiers
+- Missing input validation on public functions (empty strings, zero-length
+  slices)
+- Unreachable code using fallback logic instead of `expect("invariant")`
 - Numeric literals missing underscore separators
 
 **Efficiency**:
 
 - `.clone()` where a borrow suffices
 - `String` parameters where `&str` works
+- `Vec` allocations where a slice or iterator would do
 - Unnecessary `.collect()` into intermediate `Vec`
+- `String::from()` / `.to_string()` where `&'static str` or `Cow` works
 - Missing `with_capacity()` for collections built in loops
 
 Do NOT: extract tiny helpers that obscure flow, simplify clear `for` loops
@@ -846,7 +840,8 @@ each changed file in full for context.
 - Edge cases: empty input, single element, `None`, non-UTF-8 paths,
   S3-vs-Azure differences
 - Changed behavior for existing callers
-- Upstream-Python parity preserved for on-the-wire layout, locking, LFS
+- On-bucket layout, locking, and LFS behavior still readable/compatible
+  for buckets written by an already-released version of this crate
 
 **Performance**:
 
@@ -876,8 +871,8 @@ For each finding, classify severity and effort:
 - **performance** or **code-smell** (medium+ effort) -> fix if safe
 - **trivial code-smell** or **test-gap** -> fix if trivial, note otherwise
 
-Fix all actionable findings. If fixes were non-trivial, re-review the new
-diff. Do NOT proceed with known bugs or security issues.
+Fix all actionable findings. Do not proceed with known bugs or security
+issues.
 
 ### Phase 4: Validate
 
@@ -1049,8 +1044,7 @@ Do NOT run `git clean -fd` -- the worktree runtime manages untracked files.
   issues are always serialized across waves
 - Each worktree agent is fully self-contained -- it does not call /fix-issue,
   /simplify-rust, or /review as skills. The logic is embedded in the prompt.
-- Changes that would break bucket compatibility (the on-bucket layout
-  this crate shares with `awslabs/git-remote-s3` so existing buckets
-  remain readable) require explicit user sign-off -- agents must
-  report FAILED with a `bucket-compatibility risk` reason instead of
-  proceeding.
+- Changes that would break bucket compatibility -- making buckets written
+  by an already-released version of this crate unreadable -- require
+  explicit user sign-off. Agents must report FAILED with a
+  `bucket-compatibility risk` reason instead of proceeding.

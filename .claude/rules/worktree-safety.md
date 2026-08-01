@@ -1,34 +1,29 @@
-## ABSOLUTE BAN: Worktree Deletion and Branch Escape
+## Hard ban: worktree deletion and branch escape
 
-These rules are non-negotiable. Violating them destroys other agents' in-progress work.
+Several agents may be working in `.claude/worktrees/` at once. Removing a
+worktree, or writing outside your own, destroys another agent's in-progress
+work — work that is not in any commit and cannot be recovered. Treat these
+as bans rather than defaults to weigh.
 
-### Never Delete Worktrees You Did Not Create
+### Never remove a worktree
 
-- **NEVER** run `git worktree remove` on ANY worktree
-- **NEVER** run `git worktree prune`
-- **NEVER** run `rm -rf` on a worktree directory
-- **NEVER** use the `/clean_gone` command or any plugin that removes worktrees
-- The ONLY entity that may remove a worktree is the Claude Code runtime that created it (automatic cleanup on session end)
-- If you see stale worktrees, **leave them alone** -- another agent may be using them, or the user will clean them up manually
+Do not run `git worktree remove`, `git worktree prune`, or `rm -rf` against
+any worktree directory, and do not invoke commands or plugins that clean
+worktrees up (`/clean_gone` and friends). Only the Claude Code runtime that
+created a worktree, or the user, may remove it.
 
-### Stay In Your Worktree
+A worktree that looks stale is not evidence that it is abandoned. Leave it
+alone.
 
-If you are running inside a worktree (check: `git rev-parse --show-toplevel` returns a path under `.claude/worktrees/`):
+### Stay inside your worktree
 
-- **NEVER** `cd` to the main repository directory
-- **NEVER** `git checkout main`, `git switch main`, or check out any branch other than your worktree's branch
-- **NEVER** run write operations (Edit, Write, Bash) on files in the main repository -- all writes must be within your worktree
-- **NEVER** run `git` commands that affect the main repository's state (e.g., `git -C /path/to/main/repo ...`)
-- All your commits, file edits, and builds must happen within your worktree directory
-- Reading main repo files for reference is OK, but NEVER write to them
+If `git rev-parse --show-toplevel` returns a path under `.claude/worktrees/`,
+you are in a worktree. For the rest of that session:
 
-### Pre-Flight Check
+- Do not `cd` to the main repository, and do not target it with `git -C`.
+- Do not `git checkout` or `git switch` to any branch other than your own.
+- Keep every write — Edit, Write, Bash redirection, build output — inside
+  your worktree. Reading main-repo files for reference is fine.
 
-Before any git operation in a worktree session, verify you are in the right place:
-
-```bash
-# Confirm you're in your worktree, not main
-git rev-parse --show-toplevel
-```
-
-If the output does NOT contain `.claude/worktrees/`, STOP and re-orient -- you have escaped your worktree.
+If a git operation is about to touch shared state and you are unsure where
+you are, run `git rev-parse --show-toplevel` and confirm before proceeding.
