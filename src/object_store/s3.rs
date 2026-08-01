@@ -76,7 +76,8 @@
 //!   are not bounded by `read_timeout`. A peer that wedges mid-body
 //!   on a GET (e.g. a stuck multipart range) is still subject to the
 //!   pool-idle / TCP-keepalive layers, but not to `READ_TIMEOUT`.
-//!   Lesson #2 in `docs/development/lessons_learned.md` covers this.
+//!   "Pool-idle timeouts do not bound hot connections" in
+//!   `docs/development/lessons_learned.md` covers this.
 //!
 //! TCP keepalive (the second knob suggested in #27) is **not** wired
 //! on the S3 path: `aws-smithy-http-client` 1.1.12's public `Builder`
@@ -218,7 +219,8 @@ pub(crate) const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// large bundle uploads from being cut off at 30 s. For downloads it
 /// is a time-to-first-byte bound only — body chunks streamed after the
 /// headers are not subject to `READ_TIMEOUT`. See the module-level
-/// transport docs and lesson #2 in `docs/development/lessons_learned.md`.
+/// transport docs and "Pool-idle timeouts do not bound hot connections"
+/// in `docs/development/lessons_learned.md`.
 pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Per-operation timeout config applied to every S3 PUT (object upload).
@@ -1498,7 +1500,9 @@ impl S3Store {
                 // so classify against `src_ctx`, mirroring single-call
                 // `copy()` at the trait surface.
                 // Disable read_timeout for the same reason `put_body`
-                // does (lessons_learned.md #2 / issue #26): smithy
+                // does — issue #26, and "Pool-idle timeouts do not
+                // bound hot connections" in
+                // `docs/development/lessons_learned.md`: smithy
                 // resolves the connector future at "response-headers
                 // received," but `UploadPartCopy` doesn't return until
                 // the server-side copy completes — which for a 16 MiB

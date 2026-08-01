@@ -97,8 +97,8 @@ mkdir -p "${XDG_CONFIG_HOME}" "${XDG_DATA_HOME}"
 # resolving an `s3+http://…` / `az+https://…` URL — but our binaries are
 # named with hyphens (`git-remote-s3-http`). Create symlinks with the
 # `+` form so git can find the helpers, mirroring the install-time
-# workaround documented in README.md. See
-# docs/development/lessons_learned.md §8.
+# workaround documented in README.md. See "The suite you ran is not the
+# suite you think" in docs/development/lessons_learned.md.
 SHELLSPEC_HELPER_BIN="${SHELLSPEC_TMP_HOME}/bin"
 mkdir -p "${SHELLSPEC_HELPER_BIN}"
 for SCHEME in s3+https s3+http az+https az+http; do
@@ -113,7 +113,7 @@ export PATH="${SHELLSPEC_HELPER_BIN}:${PATH}"
 # Helpers used by `Skip if`: shellspec parses the condition expression
 # in a way that mishandles a leading `!` and shell redirection. Wrap
 # negations in plain functions that already return the desired exit
-# code. See docs/development/lessons_learned.md §7.
+# code. See "Shellspec `Skip if` conditions" in .claude/rules/bash.md.
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 missing_cmd() { ! command -v "$1" >/dev/null 2>&1; }
 flag_unset() { [[ "${!1:-0}" != "1" ]]; }

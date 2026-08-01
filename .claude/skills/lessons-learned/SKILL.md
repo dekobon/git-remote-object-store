@@ -38,11 +38,14 @@ Record the boundary date as `$BOUNDARY`.
 
 Read `docs/development/lessons_learned.md` in full. Record:
 
-1. **Highest lesson number** — new entries will start at N+1
-2. **Each lesson's title and domain** — used for overlap detection in Step 5
-3. **Issue numbers already cited** — avoid re-proposing lessons from known issues
+1. **Each lesson's title and domain** — used for overlap detection in Step 5
+2. **Issue numbers already cited** — avoid re-proposing lessons from known issues
+3. **The rule each lesson points to** — a candidate whose prescription is
+   already in `.claude/rules/` usually belongs as new evidence under an
+   existing lesson, not as a new entry
 
-This step is mandatory. Overlap detection in Steps 5 and 6 depends on it.
+Entries are keyed by title, not number. This step is mandatory; overlap
+detection in Steps 5 and 6 depends on it.
 
 ---
 
@@ -130,7 +133,7 @@ Present candidates as a ranked batch:
 ### Candidate N: <summary>
 - Source: #<issue>, <commit>
 - Quality: QUALIFIES / DOES NOT QUALIFY
-- Overlap: None / Related to lesson #N (explain distinction or overlap)
+- Overlap: None / Related to "<lesson title>" (explain distinction or overlap)
 - Reasoning: <why it meets or fails the quality bar>
 ```
 
@@ -144,9 +147,16 @@ case-by-case reasoning:
 | One-off debugging trick | Code comment at the relevant site |
 | Architectural decision | A `//!` module doc, AGENTS.md, or `.claude/rules/*.md` |
 | Testing pattern | Test file comment, or `.claude/rules/testing.md` |
+| Bucket-key or destructive-write rule | `.claude/rules/object-store-writes.md` |
 | Project convention | `.claude/rules/*.md` or `AGENTS.md` |
-| Already covered by existing lesson | Merge into existing lesson #N |
+| Already covered by existing lesson | Merge as new evidence under that lesson |
 | Too specific to one issue | Issue comment or PR description |
+
+A candidate that yields a durable "always do X" prescription belongs in
+`.claude/rules/` — those load every session, while this file is read
+only by `/review`, `/audit-tests`, and `/fix-issue`. It can still earn a
+lessons entry for the *evidence*, but the prescription must live in
+exactly one place.
 
 Push-back language must be explicit. **"No candidates qualify" is a valid
 success state.** Do not force entries to justify the workflow.
@@ -161,31 +171,34 @@ to Step 6 without user confirmation.
 For each user-selected candidate, draft an entry matching the established
 format in `docs/development/lessons_learned.md`:
 
-1. `## N. <Pithy Principle Name>` — use the next sequential number
+1. `## <Pithy Principle Name>` — no number; entries are keyed by title
 2. Opening paragraph: general lesson statement (not issue-specific)
 3. Bold sub-examples with issue/commit references (e.g., `**Description
    of specific instance** (#42, abc1234).`)
-4. Closing `**Lesson:**` paragraph summarizing the actionable takeaway
-5. Horizontal rule (`---`) separator after the entry
+4. Optional `**Lesson**:` paragraph — only for a takeaway the rule does
+   not carry (e.g. what the *repetition* of the bug revealed)
+5. Closing `**Rule**:` line naming the section and file in
+   `.claude/rules/` that carries the prescription
+6. Horizontal rule (`---`) separator after the entry
 
 ### Overlap handling
 
 - If a candidate overlaps with an existing lesson, propose one of:
-  - **Merge**: add a new bold sub-example to the existing lesson
-  - **Cross-reference**: add a note like "Related to lesson #N, which
-    covers X; this lesson addresses the distinct Y aspect"
+  - **Merge**: add a new bold sub-example to the existing lesson. This
+    is the default — a recurrence is stronger evidence than a new entry,
+    and the file's value comes from staying small
   - **Skip**: if the overlap is too close, recommend not adding it
+- Prefer merging over cross-referencing. A "Related to X" paragraph that
+  exists only to justify why two entries are separate is a signal they
+  should be one entry
 - Do NOT modify existing lessons without explicit user approval
 
 ### Placement
 
-- **Default**: append as the next numbered entry (after the current
-  highest number)
-- If the user requests insertion at a specific position, warn:
-  > "Inserting here will change lesson numbers. Other skills (e.g.,
-  > `fix-issue`, `audit-tests`) reference lessons by number. Consider
-  > grepping `.claude/skills/` for affected references before
-  > applying."
+- **Default**: append at the end of the file
+- Grouping trumps position: if the candidate belongs beside an existing
+  lesson, propose placing it there. Entries are cited by title, so
+  reordering is safe and needs no renumbering sweep
 
 Show the complete draft in context (the markdown that would be appended).
 **Wait for user approval before applying.**
@@ -205,9 +218,8 @@ After user approval:
 Post-completion notes to display:
 
 - "Changes staged but not committed."
-- "Other skills (`fix-issue`, `audit-tests`, `review`) may reference
-  lessons by number. If new lessons changed the numbering of existing
-  entries, search `.claude/skills/` for stale references."
+- If an entry was retitled, note it: `src/`, `spec/`, and `tests/` cite
+  lessons by title. Search for the old title before finishing.
 
 ---
 
@@ -219,10 +231,10 @@ Post-completion notes to display:
 - **No automatic commits**: stage only. The user decides when and how to
   commit.
 - **Preserve existing lessons**: no modifications to existing entries
-  without explicit user approval. This includes rewording, renumbering,
-  and reordering.
-- **Append by default**: warn about renumbering risks if insertion is
-  requested.
+  without explicit user approval. This includes rewording and
+  reordering.
+- **One home per prescription**: never restate in this file a rule that
+  `.claude/rules/` already carries. Point at it instead.
 - **Complete evidence trail**: every drafted lesson must cite at least
   one issue number or commit hash. No lessons from vibes.
 - **No forced lessons**: "no candidates qualify" is a valid and expected

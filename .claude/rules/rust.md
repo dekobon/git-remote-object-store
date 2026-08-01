@@ -21,6 +21,34 @@ globs: "**/*.rs"
 - Choose ownership deliberately per field: `&str` vs `String`, slices vs `Vec`, `Arc<T>` for shared ownership, `Cow<'a, T>` for flexible ownership
 - Prefer borrowing over cloning when the owned value isn't needed
 
+## Trait Defaults and Non-Signature Invariants
+
+A trait method can carry an invariant its signature cannot express —
+streaming, bounded memory, atomicity, progress reporting, conditional
+semantics. A default implementation that satisfies the signature but not
+the invariant is a trap: new impls inherit it, the invariant is lost
+silently, and the gap compiles, passes small-fixture tests, and only
+shows under production-scale input.
+
+- Omit the default and force every impl to provide one, **or**
+- Write the default to fail loudly (return `Unsupported`) rather than
+  silently degrade
+- If a convenience default must exist, document the invariant it does
+  *not* preserve in the trait doc comment, and keep a checklist of the
+  impls that need an explicit override
+
+## Recursion and Cycle Bounds
+
+Put the bound at the single chokepoint every recursive path traverses —
+typically the function that *dispatches* on the recursive shape — not at
+one of the callers that re-enters. A sibling edge that bypasses the
+guarded function consumes none of the budget and recurses freely, which
+on attacker-controlled input is a stack overflow.
+
+If the bound must live at a caller (to capture call-site context),
+enumerate every caller in the same change and add a regression test that
+exercises the edge you suspect of bypassing the guard.
+
 ## Naming
 
 See `.claude/rules/naming.md` — it carries the universal rules and the

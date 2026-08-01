@@ -34,6 +34,7 @@ Coding conventions for the project live in `.claude/rules/`. Claude Code loads t
 | `.claude/rules/environment-variables.md` | Adding/removing env vars (single index in `docs/environment-variables.md`) |
 | `.claude/rules/lessons-learned.md` | Where hard-won lessons live and the quality bar |
 | `.claude/rules/protocol-stdout.md` | stdout/stderr discipline for the helper-protocol binaries |
+| `.claude/rules/object-store-writes.md` | Bucket-key construction and destructive-write safety |
 
 ## Working Agreements
 
@@ -65,7 +66,7 @@ Worktree deletion and branch escape are separate hard bans — see `.claude/rule
 
 - Never rewrite an entire test file to add/fix tests. Only modify the specific tests/functions that need changing.
 - Add useful unit and integration tests when fixing issues.
-- Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` before committing. These are the gate; they replace ad-hoc re-reading of your own diff.
+- Run `make pre-commit` before committing. It is the gate — formatting, `clippy --all-features`, the test suite with `test-util` enabled, shellspec, and the doc/lint checks — and it replaces ad-hoc re-reading of your own diff. A bare `cargo test --workspace` relies on incidental feature unification for part of its coverage — see "Feature-Gated Integration Tests" in `.claude/rules/testing.md`.
 
 ## Code Intelligence (LSP / Serena)
 
