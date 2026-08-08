@@ -109,7 +109,7 @@ jobs:
           echo "toolchain=$TOOLCHAIN" >> "$GITHUB_OUTPUT"
           echo "Derived toolchain: $TOOLCHAIN"
 
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable tip
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable tip
         with:
           toolchain: ${{ steps.toolchain.outputs.toolchain }}
 
@@ -277,19 +277,19 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.preflight.outputs.ref }}
 
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable tip
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable tip
         with:
           toolchain: ${{ needs.preflight.outputs.toolchain }}
           targets: ${{ matrix.target }}
 
       - name: Install cross (Linux / FreeBSD cross-compile)
         if: matrix.cross
-        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.62.23
+        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.62.23
         with:
           tool: cross@${{ env.CROSS_VERSION }}
 
       - name: Install cargo-about
-        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.62.23
+        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.62.23
         with:
           tool: cargo-about@${{ env.CARGO_ABOUT_VERSION }}
 
@@ -448,12 +448,12 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.preflight.outputs.ref }}
 
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable tip
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable tip
         with:
           toolchain: ${{ needs.preflight.outputs.toolchain }}
           targets: ${{ matrix.target }}
 
-      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.62.23
+      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.62.23
         with:
           tool: cargo-deb@${{ env.CARGO_DEB_VERSION }}
 
@@ -513,12 +513,12 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.preflight.outputs.ref }}
 
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable tip
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable tip
         with:
           toolchain: ${{ needs.preflight.outputs.toolchain }}
           targets: ${{ matrix.target }}
 
-      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.62.23
+      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.62.23
         with:
           tool: cargo-generate-rpm@${{ env.CARGO_GENERATE_RPM_VERSION }}
 
@@ -977,10 +977,10 @@ jobs:
             -exec cp -n {} release/ \;
           ls -la release/
 
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable tip
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable tip
         with:
           toolchain: ${{ needs.preflight.outputs.toolchain }}
-      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.62.23
+      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.62.23
         with:
           tool: cargo-cyclonedx@${{ env.CARGO_CYCLONEDX_VERSION }}
 
@@ -1197,7 +1197,7 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.preflight.outputs.ref }}
 
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable tip
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable tip
         with:
           toolchain: ${{ needs.preflight.outputs.toolchain }}
 
