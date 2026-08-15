@@ -284,12 +284,12 @@ jobs:
 
       - name: Install cross (Linux / FreeBSD cross-compile)
         if: matrix.cross
-        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.62.23
+        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.62.23
         with:
           tool: cross@${{ env.CROSS_VERSION }}
 
       - name: Install cargo-about
-        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.62.23
+        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.62.23
         with:
           tool: cargo-about@${{ env.CARGO_ABOUT_VERSION }}
 
@@ -453,7 +453,7 @@ jobs:
           toolchain: ${{ needs.preflight.outputs.toolchain }}
           targets: ${{ matrix.target }}
 
-      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.62.23
+      - uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.62.23
         with:
           tool: cargo-deb@${{ env.CARGO_DEB_VERSION }}
 
@@ -518,7 +518,7 @@ jobs:
           toolchain: ${{ needs.preflight.outputs.toolchain }}
           targets: ${{ matrix.target }}
 
-      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.62.23
+      - uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.62.23
         with:
           tool: cargo-generate-rpm@${{ env.CARGO_GENERATE_RPM_VERSION }}
 
@@ -980,7 +980,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable tip
         with:
           toolchain: ${{ needs.preflight.outputs.toolchain }}
-      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.62.23
+      - uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.62.23
         with:
           tool: cargo-cyclonedx@${{ env.CARGO_CYCLONEDX_VERSION }}
 
@@ -1020,7 +1020,7 @@ jobs:
             -m release/SHA256SUMS -x release/SHA256SUMS.minisig
 
       - name: SLSA build provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             release/*.tar.gz
