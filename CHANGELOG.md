@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a `!Send` tag set via `Event::with_tag` cross a thread boundary and
   race in safe code).
 
+### Changed
+
+- msrv: raised the minimum supported Rust version from 1.94 to 1.96.
+  `aws-sdk-s3` 1.144.0 and `aws-config` 1.11.0 require 1.94.1, and
+  `kstring` 2.0.3 (transitive, via `gix-attributes`) requires 1.96;
+  taking 1.96 keeps the lockfile on the newest release of each rather
+  than pinning dependencies back to hold an older floor.
+
 ### Documentation
 
 - release: corrected `docs/development/cutting-a-release.md`, which

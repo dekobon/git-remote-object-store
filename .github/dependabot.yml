@@ -16,6 +16,9 @@ updates:
     commit-message:
       prefix: "chore"
     ignore:
-      # MSRV is 1.94 — block updates that bump the minimum Rust version.
+      # Skip semver-major bumps; they usually need code changes. This
+      # does not catch every MSRV raise — kstring 2.0.3 lifted its floor
+      # from 1.73 to 1.96 in a patch release — so the real guard is
+      # `resolver.incompatible-rust-versions` in .cargo/config.toml.
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]

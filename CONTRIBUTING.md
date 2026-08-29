@@ -24,7 +24,7 @@ cargo test --workspace
 ```
 
 MSRV is declared in the workspace `Cargo.toml` (`rust-version`).
-The current floor is **Rust 1.94**.
+The current floor is **Rust 1.96**.
 
 The repository ships a `Makefile` that mirrors CI:
 
