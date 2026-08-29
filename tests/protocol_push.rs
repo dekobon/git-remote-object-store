@@ -295,7 +295,7 @@ async fn multi_bundle_pre_lock_rejects_push() {
     drop(other_seed);
 
     let store = Arc::new(MockStore::new());
-    let primary_key = format!("repo/refs/heads/main/{}.bundle", &shas[0]);
+    let primary_key = format!("repo/refs/heads/main/{}.bundle", shas[0]);
     let extra_key = format!("repo/refs/heads/main/{extra_sha}.bundle");
     store.insert(&primary_key, Bytes::from_static(b"a"));
     store.insert(&extra_key, Bytes::from_static(b"b"));
@@ -383,7 +383,7 @@ async fn push_recovers_stale_lock() {
     .await;
     result.expect("push should succeed via stale-lock recovery");
     assert_eq!(std::str::from_utf8(&out).unwrap(), "ok refs/heads/main\n\n");
-    assert!(store.contains(&format!("repo/refs/heads/main/{}.bundle", &shas[0])));
+    assert!(store.contains(&format!("repo/refs/heads/main/{}.bundle", shas[0])));
     // Lock cleared on release.
     assert!(!store.contains("repo/refs/heads/main/LOCK#.lock"));
 }
@@ -439,7 +439,7 @@ async fn delete_remote_ref_removes_single_bundle() {
     let (seed, shas) = make_seed_repo(1, "primary");
     let store = Arc::new(MockStore::new());
     store.insert(
-        format!("repo/refs/heads/main/{}.bundle", &shas[0]),
+        format!("repo/refs/heads/main/{}.bundle", shas[0]),
         Bytes::from_static(b"x"),
     );
 
@@ -467,7 +467,7 @@ async fn delete_protected_remote_ref_emits_protection_refusal() {
     // counts both keys, inflating past `expected`; the helper must
     // detect the marker and emit a protection-specific refusal.
     store.insert(
-        format!("repo/refs/heads/main/{}.bundle", &shas[0]),
+        format!("repo/refs/heads/main/{}.bundle", shas[0]),
         Bytes::from_static(b"x"),
     );
     store.insert("repo/refs/heads/main/PROTECTED#", Bytes::from_static(b""));
@@ -492,7 +492,7 @@ async fn delete_protected_remote_ref_emits_protection_refusal() {
     );
     // Both keys must remain — the helper must not delete on the way
     // to the refusal.
-    assert!(store.contains(&format!("repo/refs/heads/main/{}.bundle", &shas[0])));
+    assert!(store.contains(&format!("repo/refs/heads/main/{}.bundle", shas[0])));
     assert!(store.contains("repo/refs/heads/main/PROTECTED#"));
 }
 
@@ -539,7 +539,7 @@ async fn delete_with_held_lock_returns_contention_error() {
     // A bundle exists — without the lock check, the delete would
     // happily sweep it and return Ok, racing the concurrent push.
     store.insert(
-        format!("repo/refs/heads/main/{}.bundle", &shas[0]),
+        format!("repo/refs/heads/main/{}.bundle", shas[0]),
         Bytes::from_static(b"x"),
     );
     // A concurrent client holds the per-ref lock (fresh, non-stale).
@@ -581,7 +581,7 @@ async fn delete_with_held_lock_returns_contention_error() {
     // The bundle MUST survive: a regression that swept under a stale
     // pre-lock listing would have deleted it.
     assert!(
-        store.contains(&format!("repo/refs/heads/main/{}.bundle", &shas[0])),
+        store.contains(&format!("repo/refs/heads/main/{}.bundle", shas[0])),
         "bundle must survive the lock-contention refusal",
     );
     // The concurrent client's lock is untouched.
@@ -621,7 +621,7 @@ async fn delete_acquires_and_releases_per_ref_lock() {
     let (seed, shas) = make_seed_repo(1, "primary");
     let store = Arc::new(MockStore::new());
     store.insert(
-        format!("repo/refs/heads/main/{}.bundle", &shas[0]),
+        format!("repo/refs/heads/main/{}.bundle", shas[0]),
         Bytes::from_static(b"x"),
     );
 
