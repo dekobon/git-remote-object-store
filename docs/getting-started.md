@@ -28,7 +28,7 @@ that skip cloud accounts entirely.
 
 - `git` (any reasonably recent version)
 - A Rust toolchain (`rustup` / `cargo`) if you are building from
-  source. Stable Rust ≥ 1.94.
+  source. Stable Rust ≥ 1.96.
 
 ### Build and install
 
