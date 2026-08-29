@@ -4,3 +4,14 @@
 # creates the `+`-form helper-binary symlinks git invokes by scheme
 # (see xtask/src/install.rs and README §Quick install).
 xtask = "run --package xtask --quiet --"
+
+[resolver]
+# Keep `cargo update` inside the workspace MSRV. Cargo's resolver
+# ignores `rust-version` by default, so a routine `cargo update` can
+# pull a dependency that no longer builds on our floor — and a patch
+# release is enough to do it: `kstring` 2.0.3 lifted its own floor from
+# 1.73 to 1.96. Such a break surfaces only under CI's toolchain, never
+# under a newer local stable. `fallback` makes cargo prefer the newest
+# version that still satisfies `rust-version`, reaching past it only
+# when no compatible option exists.
+incompatible-rust-versions = "fallback"
