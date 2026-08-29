@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `kstring` 2.0.3 (transitive, via `gix-attributes`) requires 1.96;
   taking 1.96 keeps the lockfile on the newest release of each rather
   than pinning dependencies back to hold an older floor.
+- build: `.cargo/config.toml` now sets `resolver.incompatible-rust-versions
+  = "fallback"`, so `cargo update` prefers dependency versions that still
+  satisfy the workspace `rust-version` instead of silently selecting one
+  that no longer builds on the declared floor.
 
 ### Documentation
 
