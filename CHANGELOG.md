@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- deps: refreshed the lockfile, clearing RUSTSEC-2026-0258 (`h2`
+  0.4.13 → 0.4.19; empty DATA frames were accepted and queued without
+  limit, so a stream that is not actively drained could grow memory
+  unboundedly or panic on length overflow) and RUSTSEC-2026-0253 (`lru`
+  0.16.4 → 0.18.3; `LruCache::pop()` was not panic-safe, leaving
+  dangling pointers in the intrusive list when a key's `Drop` panicked,
+  which a later eviction would then dereference). `lru` is reachable
+  only through `aws-sdk-s3`, which pinned `lru ^0.16.3` until 1.144.0 —
+  so the fix carries `aws-sdk-s3` 1.137.0 → 1.144.0 and `aws-config`
+  1.8.18 → 1.11.0 with it. The same refresh moves `chacha20` off the
+  yanked 0.10.0.
 - deps: bumped `event-listener` (transitive, via `azure_core` →
   `async-lock`) from 5.4.1 to 5.4.2, clearing RUSTSEC-2026-0221
   (`StackSlot<'_, T>` unconditionally implements `Send`/`Sync`, letting
