@@ -256,7 +256,11 @@ impl AzureStore {
     ///
     /// Returns [`ObjectStoreError::Other`] if `url` is not the Azure
     /// variant or if credential resolution fails.
-    #[allow(clippy::unused_async)]
+    // Rust 1.98 fires both `unused_async` and the newer
+    // `unused_async_trait_impl` on this function. The MSRV toolchain
+    // knows only the former and rejects the latter as an unknown lint,
+    // so `unknown_lints` is what keeps one attribute valid on both.
+    #[allow(unknown_lints, clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn from_remote_url(url: &RemoteUrl) -> Result<Self, ObjectStoreError> {
         let RemoteUrl::Azure {
             endpoint,
