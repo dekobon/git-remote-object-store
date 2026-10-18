@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- deps: bumped `rustls` 0.23.43 → 0.23.46, clearing RUSTSEC-2026-0285
+  (TLS 1.3 handshake messages were accepted at the wrong encryption
+  level when they followed a key-changing message in the same record),
+  and `faster-hex` (transitive, via `gix-hash`) 0.10.0 → 0.10.1,
+  clearing RUSTSEC-2026-0306 (the AVX2 path of the safe
+  `hex_decode_unchecked` read past the end of a short `src`).
 - deps: refreshed the lockfile, clearing RUSTSEC-2026-0258 (`h2`
   0.4.13 → 0.4.19; empty DATA frames were accepted and queued without
   limit, so a stream that is not actively drained could grow memory
