@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-10-19
+
+CI-only release. No behavioral changes to the library or CLI.
+
 ### Changed
 
 - ci: the release workflow's `workflow_dispatch` trigger no longer
