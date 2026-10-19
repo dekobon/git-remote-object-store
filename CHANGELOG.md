@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-10-18
+
+Maintenance release. No behavioral changes to the library or CLI —
+security fixes, an MSRV raise, dependency bumps, and CI housekeeping
+only.
+
 ### Security
 
 - deps: bumped `rustls` 0.23.43 → 0.23.46, clearing RUSTSEC-2026-0285
@@ -43,6 +49,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   = "fallback"`, so `cargo update` prefers dependency versions that still
   satisfy the workspace `rust-version` instead of silently selecting one
   that no longer builds on the declared floor.
+- deps: bumped direct dependencies within their existing requirements:
+  `async-trait` 0.1.92, `aws-config` 1.12.0, `aws-smithy-http-client`
+  1.4.0, `azure_storage_blob` 1.1.0, `bytes` 1.12.1, `clap` 4.6.7,
+  `flate2` 1.1.10, `futures` 0.3.34, `gix-validate` 0.11.4, `reqwest`
+  0.13.5, `serde` 1.0.229, `serde_json` 1.0.151, `thiserror` 2.0.20,
+  `time` 0.3.55, `tokio` 1.53.1, and `uuid` 1.28.0.
+- ci: bumped pinned GitHub Actions in the `actions` Dependabot group,
+  including `actions-rust-lang/setup-rust-toolchain` 1.17.0 → 2.0.0,
+  which no longer sets `RUSTFLAGS="-D warnings"` by default. Clippy
+  still runs with `-D warnings`, so lint enforcement is unchanged.
 
 ### Documentation
 
@@ -53,6 +69,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before the library is on crates.io. The pre-flight now also pins
   cargo-deny to CI's version, and the watch step covers the CI workflow
   alongside Release.
+
+## [0.2.5] - 2026-07-31
 
 ### Security
 
