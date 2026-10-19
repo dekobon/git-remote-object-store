@@ -1,17 +1,15 @@
 name: Release
 
 # Triggered by `v*` tags. `workflow_dispatch` is available for rehearsal
-# against an existing tag; the pre-release gate keeps tap and crates.io
-# updates from leaking during rehearsal.
+# against an existing tag and must be started from that tag ref
+# (`gh workflow run release.yml --ref v0.0.0-test1`), so the run's cache
+# scope and checkout both belong to the tag rather than to main. The
+# pre-release gate keeps tap and crates.io updates from leaking during
+# rehearsal.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Existing tag to release (e.g. v0.1.0 or v0.0.0-test1)"
-        required: true
-        type: string
 
 # Never cancel an in-flight release — external publishes must be atomic.
 concurrency:
@@ -52,22 +50,20 @@ jobs:
       version: ${{ steps.classify.outputs.version }}
       tag: ${{ steps.classify.outputs.tag }}
       prerelease: ${{ steps.classify.outputs.prerelease }}
-      ref: ${{ steps.classify.outputs.ref }}
       toolchain: ${{ steps.toolchain.outputs.toolchain }}
     steps:
       - name: Resolve tag
         id: tag
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_TAG: ${{ inputs.tag }}
+          REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -eu
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            TAG="$INPUT_TAG"
-          else
-            TAG="$REF_NAME"
+          if [[ "$REF_TYPE" != "tag" ]]; then
+            echo "::error::Release must run from a tag ref, not $REF_TYPE '$REF_NAME'. Dispatch with --ref <tag>."
+            exit 1
           fi
+          TAG="$REF_NAME"
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
             echo "::error::Tag '$TAG' is not a valid semver release tag"
             exit 1
@@ -85,12 +81,12 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
-      # Always check out the tag ref, not the event SHA. Critical for
-      # workflow_dispatch where github.sha points at the branch HEAD.
+      # The Resolve tag step guarantees github.ref is a tag, so the
+      # default checkout (github.sha) is the tagged commit on both
+      # triggers. Every job relies on this instead of an explicit `ref:`.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ steps.tag.outputs.tag }}
 
       # Read MSRV from Cargo.toml so every downstream job pins to the
       # same toolchain without a duplicated literal. The runner's
@@ -245,7 +241,6 @@ jobs:
             echo "tag=$TAG"
             echo "version=$VERSION"
             echo "prerelease=$PRERELEASE"
-            echo "ref=$TAG"
           } >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -275,7 +270,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.preflight.outputs.ref }}
 
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable tip
         with:
@@ -446,7 +440,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.preflight.outputs.ref }}
 
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable tip
         with:
@@ -511,7 +504,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.preflight.outputs.ref }}
 
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable tip
         with:
@@ -590,7 +582,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.preflight.outputs.ref }}
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -953,7 +944,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.preflight.outputs.ref }}
 
       - name: Gather all artefacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -1046,7 +1036,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.preflight.outputs.ref }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-bundle
@@ -1195,7 +1184,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.preflight.outputs.ref }}
 
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable tip
         with:
@@ -1254,7 +1242,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.preflight.outputs.ref }}
       - name: Install minisign
         run: sudo apt-get update && sudo apt-get install -y minisign
       - name: Download artefact + signature from published release

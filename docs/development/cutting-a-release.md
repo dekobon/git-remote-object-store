@@ -272,8 +272,13 @@ git tag v0.0.0-test1
 git push origin v0.0.0-test1
 ```
 
-Or trigger the workflow on an existing tag through the Actions UI
-(`workflow_dispatch → tag = v0.0.0-test1`). Pre-release tags
+Or trigger the workflow on an existing tag by starting the
+dispatch from the tag ref itself — Actions UI → Run workflow →
+"Use workflow from: `v0.0.0-test1`", or
+`gh workflow run release.yml --ref v0.0.0-test1`. A dispatch from a
+branch fails in preflight. The run uses the workflow file as it
+exists at that tag, so workflow changes made after the tag cannot be
+rehearsed against it; cut a fresh test tag instead. Pre-release tags
 (anything with a `-` suffix) skip the Homebrew tap push and
 crates.io publish, so the rehearsal cannot leak. Clean up
 afterwards:
@@ -296,11 +301,10 @@ git push origin :v0.0.0-test1
 
 ## Troubleshooting
 
-- **`workflow_dispatch` checkout points at the wrong SHA.** The
-  workflow always re-checks out the tag ref via
-  `actions/checkout@…  with: ref: ${{ steps.tag.outputs.tag }}`.
-  If you see drift, look for an in-flight job that started before
-  the tag was force-moved.
+- **Checkout points at the wrong SHA.** Every job checks out the
+  event SHA, which preflight guarantees is a tagged commit (a
+  dispatch from a branch is rejected). If you see drift, look for
+  an in-flight job that started before the tag was force-moved.
 - **`publish-crates` errored with "version already exists".** The
   job is idempotent; re-run on the same tag and it will skip the
   uploaded crate. If it errored on the *first* upload, you need to

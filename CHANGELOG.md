@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- ci: the release workflow's `workflow_dispatch` trigger no longer
+  takes a `tag` input; dispatch it from the tag ref instead
+  (`gh workflow run release.yml --ref <tag>`). Checking out an
+  input-supplied ref under main's cache scope was a cache-poisoning
+  path flagged by CodeQL.
+- ci: CodeQL no longer analyses test code (`tests/`, `spec/`,
+  `src/**/tests.rs`), which produced line-unstable
+  `rust/cleartext-logging` false positives. `url`'s unit tests moved to
+  `src/url/tests.rs` so the exclusion can match them by path.
+
 ## [0.2.6] - 2026-10-18
 
 Maintenance release. No behavioral changes to the library or CLI —
