@@ -1,0 +1,13 @@
+name: git-remote-object-store CodeQL config
+
+# Test code formats parse errors with `{err:?}` in assert messages, and
+# CodeQL's sensitive-name heuristic classifies ParseError::InvalidAccount
+# (a public Azure storage-account name) as a secret. The resulting
+# rust/cleartext-logging alerts are false positives whose line numbers
+# shift with every edit, so dismissals do not stick. Production code
+# under src/ stays fully analysed; unit tests live in `tests.rs` files so
+# they can be matched by path here.
+paths-ignore:
+  - tests/**
+  - spec/**
+  - "src/**/tests.rs"
