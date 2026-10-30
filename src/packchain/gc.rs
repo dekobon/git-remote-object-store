@@ -134,7 +134,7 @@ use time::format_description::well_known::Rfc3339;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::git::RefName;
+use crate::git::{RefName, Sha};
 use crate::keys;
 use crate::object_store::{ObjectStore, ObjectStoreError, PutOpts};
 use crate::protocol::fetch::MAX_FETCH_CONCURRENCY;
@@ -569,6 +569,48 @@ pub(crate) async fn tombstoned_bundle_keys(
         keys.insert(keys::bundle_key(prefix, &ref_name, tombstone.sha.as_str()));
     }
     Ok(keys)
+}
+
+/// Complete revival of one baseline bundle while the caller holds the
+/// publication lock. Leave unrelated and unparseable records untouched.
+pub(crate) async fn remove_baseline_tombstones_for_bundle(
+    store: &dyn ObjectStore,
+    prefix: Option<&str>,
+    ref_name: &RefName,
+    sha: Sha,
+) -> Result<(), ObjectStoreError> {
+    let sha = sha.to_string();
+    let prefix_str = prefix.unwrap_or("");
+    let metas = match store.list(&gc_listing_prefix(prefix_str)).await {
+        Ok(metas) => metas,
+        Err(ObjectStoreError::NotFound(_)) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for meta in metas {
+        if !is_baseline_tombstone_key(&meta.key, prefix_str) {
+            continue;
+        }
+        let body = match store.get_bytes(&meta.key).await {
+            Ok(body) => body,
+            Err(ObjectStoreError::NotFound(_)) => continue,
+            Err(e) => return Err(e),
+        };
+        let tombstone = match BaselineTombstone::from_json_bytes(&body) {
+            Ok(tombstone) => tombstone,
+            Err(e) => {
+                warn!(
+                    key = %meta.key,
+                    error = %e,
+                    "bundle revival: leaving unparseable baseline tombstone",
+                );
+                continue;
+            }
+        };
+        if tombstone.ref_name == ref_name.as_str() && tombstone.sha.as_str() == sha.as_str() {
+            crate::protocol::push::delete_idempotent(store, &meta.key).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Shared body of [`write_baseline_tombstone`] and

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- bundle: force-pushing a retired tip makes that exact ref visible
+  again after its predecessor is retired. Retirement-marker removal
+  failures report an error and can be retried with the same explicit
+  tip instead of acknowledging a hidden ref.
+
 ## [0.2.7] - 2026-10-19
 
 CI-only release. No behavioral changes to the library or CLI.

@@ -26,7 +26,10 @@ use tracing::{debug, info, warn};
 use crate::git::{self, GitError, RefName, RefNameError, Sha, ShaError, is_valid_ref_name};
 use crate::keys;
 use crate::object_store::{ObjectMeta, ObjectStore, ObjectStoreError, ProgressSink, PutOpts};
-use crate::packchain::gc::{tombstoned_bundle_keys, write_baseline_tombstone_best_effort};
+use crate::packchain::gc::{
+    remove_baseline_tombstones_for_bundle, tombstoned_bundle_keys,
+    write_baseline_tombstone_best_effort,
+};
 use crate::packchain::schema::Sha40;
 use crate::url::{BackendKind, StorageEngine};
 
@@ -1478,10 +1481,17 @@ async fn perform_push_under_lock(
         });
     }
 
-    // Issue #165: reuse the tombstone set captured in `prepare_push`.
-    // The per-ref lock prevents any new tombstone for this ref from
-    // landing between then and now.
-    let current = bundles_for_ref(store, prefix, &remote_ref, Some(&hidden_bundles)).await?;
+    let bundle_dest = keys::bundle_key(prefix, &remote_ref, local_sha);
+    let is_revival = hidden_bundles.contains(&bundle_dest);
+    // Keep #165's cached view for ordinary pushes. Revival changes the
+    // retirement records itself, so verify its active predecessor from
+    // a fresh view under the publication lock.
+    let hidden = if is_revival {
+        None
+    } else {
+        Some(&hidden_bundles)
+    };
+    let current = bundles_for_ref(store, prefix, &remote_ref, hidden).await?;
     if current.len() > 1 {
         return Ok(PushOutcome::Error {
             remote_ref: remote_ref_str,
@@ -1509,21 +1519,7 @@ async fn perform_push_under_lock(
         });
     }
 
-    let bundle_dest = keys::bundle_key(prefix, &remote_ref, local_sha);
-    // Stat once for "X / total" formatting in progress logs. The
-    // multipart upload re-stats `bundle_path` to size the part plan;
-    // a brief race here would surface as the log showing a stale
-    // total — never as wrong bytes — so we tolerate it. On stat
-    // failure (vanishingly rare on a tempdir we just wrote) fall
-    // back to "unknown" rather than aborting the push.
-    let bundle_total = tokio::fs::metadata(&bundle_path)
-        .await
-        .map(|m| m.len())
-        .ok();
-    let bundle_opts = PutOpts {
-        progress: Some(bundle_progress_sink(&bundle_dest, bundle_total)),
-        ..PutOpts::default()
-    };
+    let bundle_opts = bundle_upload_opts(&bundle_dest, &bundle_path).await;
     store
         .put_path(&bundle_dest, &bundle_path, bundle_opts)
         .await?;
@@ -1558,6 +1554,10 @@ async fn perform_push_under_lock(
         // `list` would otherwise race the GET against this DELETE; the
         // tombstone gives `fetch_one` the grace window it needs.
         defer_prior_bundle_via_tombstone(store, prefix, &remote_ref, &prev, local_sha).await;
+    }
+
+    if is_revival {
+        complete_bundle_revival(store, prefix, &remote_ref, local_sha).await?;
     }
 
     if let Some(artifacts) = zip_artifacts {
@@ -1603,6 +1603,50 @@ async fn perform_push_under_lock(
     Ok(PushOutcome::Ok {
         remote_ref: remote_ref_str,
     })
+}
+
+/// Build bundle upload progress options without making metadata failure fatal.
+async fn bundle_upload_opts(bundle_dest: &str, bundle_path: &Path) -> PutOpts {
+    // Stat once for "X / total" formatting in progress logs. The
+    // multipart upload re-stats `bundle_path` to size the part plan;
+    // a brief race here would surface as the log showing a stale
+    // total — never as wrong bytes — so we tolerate it. On stat
+    // failure (vanishingly rare on a tempdir we just wrote) fall
+    // back to "unknown" rather than aborting the push.
+    let bundle_total = tokio::fs::metadata(bundle_path).await.map(|m| m.len()).ok();
+    PutOpts {
+        progress: Some(bundle_progress_sink(bundle_dest, bundle_total)),
+        ..PutOpts::default()
+    }
+}
+
+/// Complete visibility of an uploaded retired tip under the publication lock.
+async fn complete_bundle_revival(
+    store: &dyn ObjectStore,
+    prefix: Option<&str>,
+    remote_ref: &RefName,
+    sha: Sha,
+) -> Result<(), ObjectStoreError> {
+    let bundle_dest = keys::bundle_key(prefix, remote_ref, sha);
+    // Unlike a new tip, the uploaded destination remains hidden by
+    // its old retirement records. Retire the predecessor first;
+    // otherwise unhiding the destination advertises two tips. If
+    // retirement failed, leave it hidden and report a store error.
+    if bundles_for_ref(store, prefix, remote_ref, None)
+        .await?
+        .iter()
+        .any(|bundle| bundle.key != bundle_dest)
+    {
+        return Err(ObjectStoreError::Network(Box::new(std::io::Error::other(
+            "bundle revival retirement incomplete; retry the same explicit tip",
+        ))));
+    }
+    // Removing the final matching marker completes visibility, not
+    // optional cleanup. Propagate failures rather than ACK a hidden
+    // tip. An interrupted revival can advertise no tip until retry;
+    // retrying the same explicit tip also tolerates accepted deletes
+    // whose replies were lost.
+    remove_baseline_tombstones_for_bundle(store, prefix, remote_ref, sha).await
 }
 
 /// Build a [`ProgressSink`] that emits one structured `tracing::info!`
