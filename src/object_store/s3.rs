@@ -526,6 +526,11 @@ where
         if let Some(mapped) = classify_status_and_code(status, code, key) {
             return mapped;
         }
+        // Keep the original typed SDK response, but expose retryable service
+        // failures through the existing provider-neutral transient category.
+        if matches!(status, 429 | 500 | 502 | 503 | 504) {
+            return network_boxed(err);
+        }
     }
     match &err {
         SdkError::DispatchFailure(_) | SdkError::TimeoutError(_) => network_boxed(err),
@@ -810,17 +815,33 @@ impl ObjectStore for S3Store {
         if should_use_multipart(body_len) {
             return self.multipart_put_path(key, file, body_len, opts).await;
         }
-        // Below the threshold: single PutObject. `FsBuilder::file`
-        // consumes our already-open handle so the SDK does not
-        // re-open by path (which would re-introduce the race).
+        // The SDK can replay path-backed streams, but reopening the caller's
+        // mutable path would violate the original open-handle identity. Freeze
+        // this bounded small payload into a private file and retain its guard
+        // through all SDK attempts. Large multipart uploads keep their existing
+        // per-part replay path and do not pay this extra copy.
+        let snapshot = NamedTempFile::new().map_err(other_boxed)?;
+        let mut staged = tokio::fs::File::from_std(snapshot.reopen().map_err(other_boxed)?);
+        let mut input = tokio::io::AsyncReadExt::take(file, body_len.saturating_add(1));
+        let copied = tokio::io::copy(&mut input, &mut staged)
+            .await
+            .map_err(other_boxed)?;
+        if copied != body_len {
+            return Err(other_boxed(std::io::Error::other(
+                "upload source length changed while staging",
+            )));
+        }
+        staged.flush().await.map_err(other_boxed)?;
+        drop(staged);
         let stream = ByteStream::read_from()
-            .file(file)
+            .path(snapshot.path())
             .length(Length::Exact(body_len))
             .build()
             .await
             .map_err(other_boxed)?;
         let progress = opts.progress.clone();
         self.put_body(key, stream, opts).await?;
+        drop(snapshot);
         if let Some(sink) = progress
             && body_len > 0
         {
@@ -2529,5 +2550,121 @@ mod tests {
             "captured URI must carry the guard's upload-id in the \
              query string; got {uri}",
         );
+    }
+    #[test]
+    fn regression_retryable_service_status_preserves_typed_sdk_source() {
+        use aws_sdk_s3::config::http::HttpResponse;
+        use aws_sdk_s3::error::ErrorMetadata;
+        use aws_sdk_s3::operation::put_object::PutObjectError;
+        use aws_sdk_s3::primitives::SdkBody;
+        for status in [429_u16, 500, 502, 503, 504] {
+            let error = SdkError::service_error(
+                PutObjectError::generic(
+                    ErrorMetadata::builder()
+                        .code("SlowDown")
+                        .message("test transient service")
+                        .build(),
+                ),
+                HttpResponse::new(status.try_into().expect("HTTP status"), SdkBody::empty()),
+            );
+            let classified = classify(error, "fixture.bundle");
+            let ObjectStoreError::Network(source) = classified else {
+                panic!(
+                    "retryable service status must keep finite transport category: {status}/{classified:?}"
+                );
+            };
+            let sdk = source
+                .downcast_ref::<SdkError<PutObjectError>>()
+                .expect("original SDK error remains typed");
+            let SdkError::ServiceError(service) = sdk else {
+                panic!("typed service response");
+            };
+            assert_eq!(service.raw().status().as_u16(), status);
+            assert_eq!(service.err().code(), Some("SlowDown"));
+        }
+    }
+
+    #[tokio::test]
+    async fn regression_small_file_put_replays_immutable_payload_after_service_retry() {
+        use aws_sdk_s3::config::http::HttpResponse;
+        use aws_sdk_s3::config::retry::RetryConfig;
+        use aws_sdk_s3::config::{Credentials, RequestChecksumCalculation};
+        use aws_sdk_s3::primitives::SdkBody;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        let scratch = tempfile::tempdir().expect("fixture");
+        let source = scratch.path().join("payload.bundle");
+        let original = b"exact original immutable bundle payload\0\xff";
+        std::fs::write(&source, original).expect("source");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let count = attempts.clone();
+        let bodies = observed.clone();
+        let replace = source.clone();
+        // The official mock connector consumes each actual SDK body before
+        // responding. No socket, credentials discovery, custom retry loop or
+        // new HTTP dependency is involved.
+        let http = aws_smithy_http_client::test_util::infallible_client_fn(move |request| {
+            let body = futures::executor::block_on(ByteStream::new(request.into_body()).collect())
+                .expect("actual request body")
+                .into_bytes();
+            bodies.lock().expect("bodies").push(body.to_vec());
+            let first = count.fetch_add(1, Ordering::SeqCst) == 0;
+            let status = if first { 503_u16 } else { 200 };
+            if first {
+                std::fs::write(&replace, b"different source file after first request")
+                    .expect("source mutation control");
+            }
+            HttpResponse::new(
+                status.try_into().expect("status"),
+                if first {
+                    SdkBody::from(
+                        "<Error><Code>SlowDown</Code><Message>retry fixture</Message></Error>",
+                    )
+                } else {
+                    SdkBody::empty()
+                },
+            )
+            .try_into_http1x()
+            .expect("SDK HTTP1 response")
+        });
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new(
+                format!("fake-{}", uuid::Uuid::new_v4()),
+                format!("fake-{}", uuid::Uuid::new_v4()),
+                None,
+                None,
+                "generated-test-only",
+            ))
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+            .retry_config(
+                RetryConfig::standard()
+                    .with_max_attempts(3)
+                    .with_initial_backoff(Duration::from_millis(1)),
+            )
+            .http_client(http)
+            .force_path_style(true)
+            .build();
+        let store = S3Store {
+            client: aws_sdk_s3::Client::from_conf(config),
+            bucket: "test-only".to_owned(),
+        };
+        store
+            .put_path("fixture.bundle", &source, PutOpts::default())
+            .await
+            .expect("SDK must replay retryable small PUT");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "real SDK issued one retry"
+        );
+        assert_eq!(
+            *observed.lock().expect("observed"),
+            vec![original.to_vec(), original.to_vec()],
+            "retry must not reopen changed caller source"
+        );
+        assert_ne!(std::fs::read(&source).expect("source changed"), original);
     }
 }

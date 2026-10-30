@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- s3: classify retryable service failures as transient and let the AWS SDK
+  replay small file uploads from a private snapshot, preserving the payload
+  when the caller's source file changes between attempts.
+
 ## [0.2.7] - 2026-10-19
 
 CI-only release. No behavioral changes to the library or CLI.
